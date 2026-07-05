@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub fn resolve(explicit: Option<&str>) -> PathBuf {
     if let Some(path) = explicit {
@@ -13,11 +13,4 @@ pub fn resolve(explicit: Option<&str>) -> PathBuf {
         }
     }
     PathBuf::from("wintun.dll")
-}
-
-pub fn wintun_load_hint(path: &Path) -> String {
-    format!(
-        "could not load wintun.dll at {}. Download https://wintun.net/, extract the DLL for your CPU architecture, place it next to tuntun-agent.exe (or pass --wintun-file), and run as Administrator",
-        path.display()
-    )
 }

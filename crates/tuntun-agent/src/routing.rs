@@ -40,10 +40,6 @@ impl RoutingTable {
         }
     }
 
-    pub fn snapshot(&self) -> Arc<Tables> {
-        self.inner.load_full()
-    }
-
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
         self.inner.load().by_ip.get(ip).cloned()
     }
@@ -75,9 +71,5 @@ impl RoutingTable {
             by_endpoint,
             version,
         }));
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.load().by_ip.len()
     }
 }

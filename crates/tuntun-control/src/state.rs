@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
@@ -62,13 +61,3 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
-
-pub fn boot_at() -> &'static Duration {
-    use std::sync::OnceLock;
-    static BOOT: OnceLock<Duration> = OnceLock::new();
-    BOOT.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-    })
-}

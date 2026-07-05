@@ -47,10 +47,6 @@ impl ConnPool {
         *guard = Some(conn.clone());
         Ok(conn)
     }
-
-    pub fn drop_peer(&self, peer: &EndpointId) {
-        self.entries.remove(peer);
-    }
 }
 
 pub fn send_packet(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {

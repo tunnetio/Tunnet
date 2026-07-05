@@ -84,19 +84,4 @@ impl WsHub {
             self.push_to(&id, ServerMsg::Ping { nonce: 0 }).await;
         }
     }
-
-    pub async fn notify_org_changed(&self, organization_id: &str, pool: &sqlx::PgPool) {
-        let Ok(rows) = sqlx::query_scalar::<_, String>(
-            "SELECT endpoint_id FROM devices WHERE organization_id = $1 AND agent_connected",
-        )
-        .bind(organization_id)
-        .fetch_all(pool)
-        .await
-        else {
-            return;
-        };
-        for id in rows {
-            self.push_to(&id, ServerMsg::Ping { nonce: 0 }).await;
-        }
-    }
 }

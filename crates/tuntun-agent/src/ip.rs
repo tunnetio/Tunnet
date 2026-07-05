@@ -46,8 +46,3 @@ pub fn parse_ipv4(packet: &[u8]) -> Option<ParsedIpv4> {
         dst_port,
     })
 }
-
-#[inline]
-pub fn ipv4_dest(packet: &[u8]) -> Option<Ipv4Addr> {
-    parse_ipv4(packet).map(|p| p.dst)
-}
