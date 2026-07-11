@@ -79,7 +79,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 ipnet = { version = "2", features = ["serde"] }
 ipnetwork = "0.20"
-hickory-proto = "0.25"
+hickory-proto = "0.26"
 
 prometheus = "0.14"
 

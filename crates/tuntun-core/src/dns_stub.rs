@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{
+    DEFAULT_MAX_PAYLOAD_LEN, Edns, Message, MessageType, OpCode, ResponseCode,
+};
 use hickory_proto::rr::{Name, RData, Record, RecordType, rdata::A};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use tokio::net::UdpSocket;
@@ -15,6 +17,8 @@ use tuntun_common::DnsConfig;
 use crate::routing::RoutingTable;
 
 const TTL_SECS: u32 = 30;
+/// Recv buffer sized for modern EDNS payloads (default max is 1232).
+const UDP_BUF: usize = DEFAULT_MAX_PAYLOAD_LEN as usize;
 
 pub fn spawn(
     bind: SocketAddr,
@@ -65,7 +69,7 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
         }
     };
     let sock = Arc::new(sock);
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; UDP_BUF];
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await?;
         let request = buf[..n].to_vec();
@@ -90,44 +94,42 @@ async fn handle_query(
     upstream: &[IpAddr],
 ) -> anyhow::Result<()> {
     let query = Message::from_bytes(bytes).context("decode dns")?;
-    if query.message_type() != MessageType::Query || query.op_code() != OpCode::Query {
+    if query.metadata.message_type != MessageType::Query || query.metadata.op_code != OpCode::Query
+    {
         return Ok(());
     }
-    let Some(question) = query.queries().first() else {
+    let Some(question) = query.queries.first() else {
         return Ok(());
     };
-    let name = question.name().to_string();
-    let qtype = question.query_type();
 
-    let our_zone = name_in_suffix(&name, suffix)
+    let qname = &question.name;
+    let qtype = question.query_type;
+    let name_str = qname.to_string();
+
+    let our_zone = name_in_suffix(qname, suffix)
         || routes
-            .lookup_hostname_route(name.trim_end_matches('.'))
+            .lookup_hostname_route(name_str.trim_end_matches('.'))
             .is_some();
 
     if our_zone && (qtype == RecordType::A || qtype == RecordType::AAAA) {
-        let mut response = Message::new();
-        response.set_id(query.id());
-        response.set_message_type(MessageType::Response);
-        response.set_op_code(OpCode::Query);
-        response.set_recursion_desired(query.recursion_desired());
-        response.set_recursion_available(true);
-        response.add_query(question.clone());
+        let mut response = Message::response(query.metadata.id, OpCode::Query);
+        response.metadata.recursion_desired = query.metadata.recursion_desired;
+        response.metadata.authoritative = true;
+        response.metadata.recursion_available = true;
+        response.queries = query.queries.clone();
+        echo_edns(&query, &mut response);
 
         if qtype == RecordType::A {
-            if let Some(ip) = routes.resolve_dns_a(&name) {
-                let rr = Record::from_rdata(
-                    Name::from_utf8(name.trim_end_matches('.')).unwrap_or_else(|_| Name::root()),
-                    TTL_SECS,
-                    RData::A(A(ip)),
-                );
+            if let Some(ip) = routes.resolve_dns_a(&name_str) {
+                let rr = Record::from_rdata(qname.clone(), TTL_SECS, RData::A(A(ip)));
                 response.add_answer(rr);
-                response.set_response_code(ResponseCode::NoError);
+                response.metadata.response_code = ResponseCode::NoError;
             } else {
-                response.set_response_code(ResponseCode::NXDomain);
+                response.metadata.response_code = ResponseCode::NXDomain;
             }
         } else {
-            // No AAAA yet — NODATA for our zone.
-            response.set_response_code(ResponseCode::NoError);
+            // No AAAA yet — NODATA (NOERROR, empty answer) for our zone.
+            response.metadata.response_code = ResponseCode::NoError;
         }
 
         let out = response.to_bytes().context("encode dns")?;
@@ -135,19 +137,34 @@ async fn handle_query(
         return Ok(());
     }
 
-    // Forward non-mesh queries upstream.
-    if let Some(answer) = forward_upstream(bytes, upstream).await? {
+    if let Some(answer) = forward_upstream(bytes, query.metadata.id, upstream).await? {
         sock.send_to(&answer, peer).await?;
     }
     Ok(())
 }
 
-fn name_in_suffix(name: &str, suffix: &str) -> bool {
-    let lower = name.trim_end_matches('.').to_ascii_lowercase();
-    lower == suffix || lower.ends_with(&format!(".{suffix}"))
+/// RFC 6891: if the request carried OPT, the response must include OPT.
+fn echo_edns(query: &Message, response: &mut Message) {
+    if let Some(req_edns) = &query.edns {
+        let mut edns = Edns::new();
+        edns.set_max_payload(req_edns.max_payload().max(DEFAULT_MAX_PAYLOAD_LEN));
+        edns.set_version(0);
+        response.set_edns(edns);
+    }
 }
 
-async fn forward_upstream(query: &[u8], upstream: &[IpAddr]) -> anyhow::Result<Option<Vec<u8>>> {
+fn name_in_suffix(qname: &Name, suffix: &str) -> bool {
+    let Ok(zone) = Name::from_utf8(suffix) else {
+        return false;
+    };
+    zone.zone_of(qname) || zone == *qname
+}
+
+async fn forward_upstream(
+    query: &[u8],
+    expect_id: u16,
+    upstream: &[IpAddr],
+) -> anyhow::Result<Option<Vec<u8>>> {
     if upstream.is_empty() {
         return Ok(None);
     }
@@ -159,9 +176,28 @@ async fn forward_upstream(query: &[u8], upstream: &[IpAddr]) -> anyhow::Result<O
         if sock.send_to(query, target).await.is_err() {
             continue;
         }
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; UDP_BUF];
         match tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, _))) => return Ok(Some(buf[..n].to_vec())),
+            Ok(Ok((n, _))) => match Message::from_bytes(&buf[..n]) {
+                Ok(msg)
+                    if msg.metadata.message_type == MessageType::Response
+                        && msg.metadata.id == expect_id =>
+                {
+                    return Ok(Some(buf[..n].to_vec()));
+                }
+                Ok(msg) => {
+                    tracing::debug!(
+                        %addr,
+                        id = msg.metadata.id,
+                        expect_id,
+                        ty = ?msg.metadata.message_type,
+                        "upstream DNS reply rejected"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(?e, %addr, "upstream DNS decode failed");
+                }
+            },
             _ => continue,
         }
     }
@@ -171,4 +207,37 @@ async fn forward_upstream(query: &[u8], upstream: &[IpAddr]) -> anyhow::Result<O
 /// Bind address for the stub on the TUN IP.
 pub fn bind_addr(tun_ip: Ipv4Addr) -> SocketAddr {
     SocketAddr::from((tun_ip, 53))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn zone_match_uses_name_hierarchy() {
+        let host = Name::from_str("db.office.tuntun.").unwrap();
+        let bare = Name::from_str("tuntun.").unwrap();
+        assert!(name_in_suffix(&host, "tuntun"));
+        assert!(name_in_suffix(&bare, "tuntun"));
+        assert!(!name_in_suffix(
+            &Name::from_str("evil-tuntun.com.").unwrap(),
+            "tuntun"
+        ));
+    }
+
+    #[test]
+    fn response_uses_public_metadata_fields() {
+        let mut msg = Message::response(42, OpCode::Query);
+        msg.metadata.authoritative = true;
+        msg.metadata.recursion_available = true;
+        msg.metadata.response_code = ResponseCode::NXDomain;
+        assert_eq!(msg.metadata.id, 42);
+        assert_eq!(msg.metadata.message_type, MessageType::Response);
+        let bytes = msg.to_bytes().unwrap();
+        let decoded = Message::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.metadata.id, 42);
+        assert!(decoded.metadata.authoritative);
+        assert_eq!(decoded.metadata.response_code, ResponseCode::NXDomain);
+    }
 }
