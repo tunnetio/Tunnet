@@ -2,7 +2,7 @@ import { type Database, schema } from "@tuntun/db";
 import { formatIp } from "@tuntun/ip";
 import { and, eq } from "drizzle-orm";
 import { db } from "./db";
-import { normalizeDeviceMetadata } from "./device-metadata";
+import { deviceDisplayName, normalizeDeviceMetadata } from "./device-metadata";
 import { toIso } from "./serialize";
 
 type DbConn = Database | Parameters<Parameters<Database["transaction"]>[0]>[0];
@@ -22,6 +22,7 @@ export function serializeDeviceDetail(
   return {
     endpointId: device.endpointId,
     organizationId: device.organizationId,
+    name: deviceDisplayName(device.name, device.metadata, device.endpointId),
     metadata: normalizeDeviceMetadata(device.metadata, device.endpointId),
     publicIp: formatNullableIp(device.publicIp),
     ipv6Enabled: device.ipv6Enabled,
@@ -76,7 +77,7 @@ export async function applyDevicePatch(
   conn: DbConn,
   endpointId: string,
   organizationId: string,
-  patch: { ipv6Enabled?: boolean },
+  patch: { name?: string; ipv6Enabled?: boolean },
 ) {
   const device = await conn.query.devices.findFirst({
     where: and(
@@ -87,6 +88,10 @@ export async function applyDevicePatch(
   if (!device) return null;
 
   const updates: Partial<typeof schema.devices.$inferInsert> = {};
+
+  if (patch.name !== undefined) {
+    updates.name = patch.name;
+  }
 
   if (patch.ipv6Enabled !== undefined) {
     updates.ipv6Enabled = patch.ipv6Enabled;

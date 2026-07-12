@@ -13,6 +13,16 @@ export function deviceHostname(metadata: unknown, endpointId: string): string {
   return endpointId.slice(0, 8);
 }
 
+/** Display name with hostname fallback for legacy / empty rows. */
+export function deviceDisplayName(
+  name: string | null | undefined,
+  metadata: unknown,
+  endpointId: string,
+): string {
+  if (typeof name === "string" && name.trim().length > 0) return name.trim();
+  return deviceHostname(metadata, endpointId);
+}
+
 export function deviceOs(metadata: unknown): string | null {
   const value = parseDeviceMetadata(metadata).os;
   return typeof value === "string" && value.length > 0 ? value : null;

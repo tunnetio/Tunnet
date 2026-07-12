@@ -2,7 +2,7 @@ import { schema } from "@tuntun/db";
 import { and, eq, inArray } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { db } from "../../lib/db";
-import { deviceHostname } from "../../lib/device-metadata";
+import { deviceDisplayName } from "../../lib/device-metadata";
 import { toIso } from "../../lib/serialize";
 import { getAuth, requireAuth } from "./middleware/authz";
 import { notFound, sessionPlugin } from "./middleware/session";
@@ -41,6 +41,7 @@ export const topologyRoutes = new Elysia()
         .select({
           endpointId: schema.devices.endpointId,
           type: schema.devices.type,
+          name: schema.devices.name,
           metadata: schema.devices.metadata,
           assignedIp: schema.networkMemberships.assignedIp,
           agentConnected: schema.devices.agentConnected,
@@ -161,11 +162,11 @@ export const topologyRoutes = new Elysia()
       const activeMachines = memberships.filter((m) => m.status === "active");
 
       for (const m of activeMachines) {
-        const hostname = deviceHostname(m.metadata, m.endpointId);
+        const label = deviceDisplayName(m.name, m.metadata, m.endpointId);
         nodes.push({
           id: `machine:${m.endpointId}`,
           kind: "machine",
-          label: hostname,
+          label,
           secondary: m.assignedIp,
           endpointId: m.endpointId,
           online: isOnline(m.agentConnected, m.lastHeartbeatAt),

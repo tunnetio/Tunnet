@@ -108,8 +108,8 @@ export function CreateTunnelDialog({
 
   const machineLabel =
     defaultHostname ??
-    lockedMachine?.hostname ??
-    selectedMachine?.hostname ??
+    lockedMachine?.name ??
+    selectedMachine?.name ??
     defaultEndpointId?.slice(0, 12);
 
   const healthyRelays = useMemo(
@@ -126,7 +126,7 @@ export function CreateTunnelDialog({
     selectedRelay?.domain ?? healthyRelays[0]?.domain ?? "*.tuntun.pub";
 
   const hostnameForPreview =
-    machineLabel ?? selectedMachine?.hostname ?? lockedMachine?.hostname;
+    machineLabel ?? selectedMachine?.name ?? lockedMachine?.name;
 
   const subdomainPreview =
     subdomain.trim() ||
@@ -309,7 +309,7 @@ export function CreateTunnelDialog({
                           key={machine.endpointId}
                           value={machine.endpointId}
                         >
-                          {machine.hostname} ({machine.networkName})
+                          {machine.name} ({machine.networkName})
                         </SelectItem>
                       ))}
                     </SelectContent>

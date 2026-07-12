@@ -626,8 +626,7 @@ function TunnelDetailPage() {
                         {rule.targetEndpointId
                           ? (networkMachines.find(
                               (m) => m.endpointId === rule.targetEndpointId,
-                            )?.hostname ??
-                            `${rule.targetEndpointId.slice(0, 8)}…`)
+                            )?.name ?? `${rule.targetEndpointId.slice(0, 8)}…`)
                           : "localhost"}
                         :{rule.targetPort}
                       </span>
@@ -711,7 +710,7 @@ function TunnelDetailPage() {
                           .filter((m) => m.endpointId !== tunnel.endpointId)
                           .map((m) => (
                             <SelectItem key={m.endpointId} value={m.endpointId}>
-                              {m.hostname}
+                              {m.name}
                             </SelectItem>
                           ))}
                       </SelectContent>
@@ -766,7 +765,7 @@ function TunnelDetailPage() {
                         {mapping.targetEndpointId
                           ? (networkMachines.find(
                               (m) => m.endpointId === mapping.targetEndpointId,
-                            )?.hostname ??
+                            )?.name ??
                             `${mapping.targetEndpointId.slice(0, 8)}…`)
                           : "localhost"}
                         :{mapping.targetPort}
@@ -852,7 +851,7 @@ function TunnelDetailPage() {
                           .filter((m) => m.endpointId !== tunnel.endpointId)
                           .map((m) => (
                             <SelectItem key={m.endpointId} value={m.endpointId}>
-                              {m.hostname}
+                              {m.name}
                             </SelectItem>
                           ))}
                       </SelectContent>

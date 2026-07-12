@@ -86,8 +86,8 @@ pub async fn register_device(
     );
 
     sqlx::query(
-        "INSERT INTO devices (endpoint_id, organization_id, tenant_ipv6, type, metadata) \
-         VALUES ($1, $2, $3, $4, $5) \
+        "INSERT INTO devices (endpoint_id, organization_id, tenant_ipv6, type, name, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (endpoint_id) DO UPDATE \
          SET metadata = devices.metadata || EXCLUDED.metadata, \
              type = EXCLUDED.type, \
@@ -97,6 +97,7 @@ pub async fn register_device(
     .bind(&params.organization_id)
     .bind(crate::pg_inet::pg_ipv6_host(tenant_ipv6))
     .bind(&params.device_type)
+    .bind(&params.hostname)
     .bind(initial_metadata)
     .execute(&mut *tx)
     .await

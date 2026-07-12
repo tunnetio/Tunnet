@@ -86,7 +86,7 @@ export function GatewaySelect({
         <SelectContent>
           {devices.map((device) => (
             <SelectItem key={device.endpointId} value={device.endpointId}>
-              {device.hostname} ({device.assignedIp})
+              {device.name} ({device.assignedIp})
             </SelectItem>
           ))}
         </SelectContent>

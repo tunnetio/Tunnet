@@ -8,6 +8,7 @@ import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { writeAudit } from "../../lib/audit";
 import { db } from "../../lib/db";
+import { deviceDisplayName } from "../../lib/device-metadata";
 import { bumpNetworkAndNotify } from "../../lib/notify";
 import { toIso } from "../../lib/serialize";
 import { getAuth, requireAdmin, requireAuth } from "./middleware/authz";
@@ -56,6 +57,7 @@ export const subnetRoutesRoutes = new Elysia()
         .select({
           route: schema.subnetRoutes,
           assignedIp: schema.networkMemberships.assignedIp,
+          name: schema.devices.name,
           metadata: schema.devices.metadata,
         })
         .from(schema.subnetRoutes)
@@ -79,13 +81,9 @@ export const subnetRoutesRoutes = new Elysia()
         .where(eq(schema.subnetRoutes.networkId, params.networkId));
 
       return {
-        routes: rows.map(({ route, assignedIp, metadata }) => {
-          const meta =
-            metadata && typeof metadata === "object"
-              ? (metadata as { hostname?: string })
-              : {};
+        routes: rows.map(({ route, assignedIp, name, metadata }) => {
           return serializeRoute(route, {
-            hostname: meta.hostname,
+            hostname: deviceDisplayName(name, metadata, route.endpointId),
             viaIp: assignedIp ?? undefined,
           });
         }),

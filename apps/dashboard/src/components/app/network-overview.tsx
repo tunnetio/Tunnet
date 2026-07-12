@@ -104,6 +104,7 @@ export function NetworkOverviewPage() {
       if (tableStatus === "offline" && presence === "online") return false;
       if (!q) return true;
       return (
+        d.name.toLowerCase().includes(q) ||
         d.hostname.toLowerCase().includes(q) ||
         d.assignedIp.includes(q) ||
         (d.os?.toLowerCase().includes(q) ?? false)
@@ -122,7 +123,7 @@ export function NetworkOverviewPage() {
             params={{ endpointId: row.original.endpointId }}
             className="font-medium hover:underline"
           >
-            {row.original.hostname}
+            {row.original.name}
           </Link>
         ),
       },
@@ -186,10 +187,15 @@ export function NetworkOverviewPage() {
       <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_280px]">
         <div className="min-w-0 space-y-5">
           <div className="panel overflow-hidden">
-            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/50 px-3 py-2">
-              <span className="text-muted-foreground text-[12px] font-medium tracking-wide uppercase">
-                Topology
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border/50 px-3 py-2.5">
+              <div className="min-w-0">
+                <span className="text-[13px] font-medium tracking-tight">
+                  Mesh
+                </span>
+                <p className="text-muted-foreground text-[11px]">
+                  {onlineCount} online · {devices?.length ?? 0} machines
+                </p>
+              </div>
               <div className="flex items-center gap-2">
                 <Select
                   value={statusFilter}
@@ -235,7 +241,7 @@ export function NetworkOverviewPage() {
               </div>
             </div>
             {topoPending ? (
-              <Skeleton className="h-[340px] w-full rounded-none sm:h-[400px]" />
+              <Skeleton className="h-[360px] w-full rounded-none sm:h-[440px]" />
             ) : (
               <NetworkForceGraph
                 nodes={topology?.nodes ?? []}

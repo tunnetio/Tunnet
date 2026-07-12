@@ -85,7 +85,7 @@ function MachinesPage() {
   const [confirmRemove, setConfirmRemove] = useState<{
     networkId: string;
     endpointId: string;
-    hostname: string;
+    name: string;
   } | null>(null);
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [confirmBulkRemove, setConfirmBulkRemove] = useState(false);
@@ -121,6 +121,7 @@ function MachinesPage() {
     if (!q) return list;
     return list.filter(
       (m) =>
+        m.name.toLowerCase().includes(q) ||
         m.hostname.toLowerCase().includes(q) ||
         m.networkName.toLowerCase().includes(q) ||
         m.assignedIp.includes(q) ||
@@ -154,7 +155,7 @@ function MachinesPage() {
               params={{ endpointId: machine.endpointId }}
               className="font-medium hover:underline"
             >
-              {machine.hostname}
+              {machine.name}
             </Link>
           );
         },
@@ -257,7 +258,7 @@ function MachinesPage() {
                         onClick={() => {
                           setActionEndpointId(machine.endpointId);
                           setActionNetworkId(machine.networkId);
-                          setActionHostname(machine.hostname);
+                          setActionHostname(machine.name);
                           setTunnelOpen(true);
                         }}
                       >
@@ -267,7 +268,7 @@ function MachinesPage() {
                         onClick={() => {
                           setActionEndpointId(machine.endpointId);
                           setActionNetworkId(machine.networkId);
-                          setActionHostname(machine.hostname);
+                          setActionHostname(machine.name);
                           setServeOpen(true);
                         }}
                       >
@@ -302,7 +303,7 @@ function MachinesPage() {
                           setConfirmRemove({
                             networkId: machine.networkId,
                             endpointId: machine.endpointId,
-                            hostname: machine.hostname,
+                            name: machine.name,
                           })
                         }
                       >
@@ -438,7 +439,7 @@ function MachinesPage() {
         open={confirmRemove !== null}
         onOpenChange={(open) => !open && setConfirmRemove(null)}
         title="Remove machine"
-        description={`Remove ${confirmRemove?.hostname ?? "this machine"} from the network? This cannot be undone.`}
+        description={`Remove ${confirmRemove?.name ?? "this machine"} from the network? This cannot be undone.`}
         confirmLabel="Remove"
         destructive
         loading={deviceMutations.remove.isPending}

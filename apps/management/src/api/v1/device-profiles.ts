@@ -8,6 +8,7 @@ import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { writeAudit } from "../../lib/audit";
 import { db } from "../../lib/db";
+import { deviceDisplayName } from "../../lib/device-metadata";
 import { bumpNetworkAndNotify } from "../../lib/notify";
 import { toIso } from "../../lib/serialize";
 import { getAuth, requireAdmin, requireAuth } from "./middleware/authz";
@@ -39,6 +40,7 @@ export const deviceProfilesRoutes = new Elysia()
         .select({
           config: schema.exitNodeConfig,
           assignedIp: schema.networkMemberships.assignedIp,
+          name: schema.devices.name,
           metadata: schema.devices.metadata,
         })
         .from(schema.exitNodeConfig)
@@ -62,11 +64,7 @@ export const deviceProfilesRoutes = new Elysia()
         .where(eq(schema.exitNodeConfig.networkId, params.networkId));
 
       return {
-        exitNodes: rows.map(({ config, assignedIp, metadata }) => {
-          const meta =
-            metadata && typeof metadata === "object"
-              ? (metadata as { hostname?: string })
-              : {};
+        exitNodes: rows.map(({ config, assignedIp, name, metadata }) => {
           return {
             endpointId: config.endpointId,
             networkId: config.networkId,
@@ -74,7 +72,7 @@ export const deviceProfilesRoutes = new Elysia()
             allowedCidrs: config.allowedCidrs,
             createdAt: toIso(config.createdAt)!,
             updatedAt: toIso(config.updatedAt)!,
-            hostname: meta.hostname,
+            hostname: deviceDisplayName(name, metadata, config.endpointId),
             viaIp: assignedIp ?? undefined,
           };
         }),

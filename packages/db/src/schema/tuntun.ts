@@ -101,6 +101,7 @@ export const devices = pgTable(
       .defaultNow()
       .notNull(),
     type: text("type").notNull().default("agent"),
+    name: text("name").notNull().default(""),
     metadata: jsonb("metadata").notNull().default({}),
   },
   (table) => [

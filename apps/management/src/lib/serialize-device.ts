@@ -2,6 +2,7 @@ import { formatIp } from "@tuntun/ip";
 
 import {
   deviceAgentVersion,
+  deviceDisplayName,
   deviceHostname,
   deviceKind,
   deviceOs,
@@ -18,6 +19,7 @@ export function serializeDevice(row: {
   organizationId: string;
   networkId: string;
   type?: string;
+  name?: string | null;
   metadata: unknown;
   assignedIp: string;
   publicIp: string | null;
@@ -35,6 +37,7 @@ export function serializeDevice(row: {
     endpointId: row.endpointId,
     organizationId: row.organizationId,
     networkId: row.networkId,
+    name: deviceDisplayName(row.name, row.metadata, row.endpointId),
     hostname: deviceHostname(row.metadata, row.endpointId),
     type: deviceKind(row.type ?? "agent", row.metadata),
     os: deviceOs(row.metadata),

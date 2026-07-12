@@ -98,7 +98,7 @@ body {
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
-  --hub: oklch(0.75 0.14 55);
+  --hub: oklch(0.62 0.2 275);
 }
 
 .dark {
@@ -133,7 +133,7 @@ body {
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
-  --hub: oklch(0.75 0.14 55);
+  --hub: oklch(0.62 0.2 275);
 }
 
 @layer base {
@@ -149,17 +149,23 @@ body {
 }
 
 .mesh-surface {
-  background-color: oklch(0.12 0 0);
-  background-image:
-    radial-gradient(
-      ellipse 70% 50% at 50% 42%,
-      oklch(0.75 0.14 55 / 0.025),
-      transparent 55%
-    ),
-    radial-gradient(circle at 1px 1px, oklch(1 0 0 / 0.12) 1px, transparent 0);
-  background-size:
-    100% 100%,
-    16px 16px;
+  background-color: oklch(0.985 0 0);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    oklch(0.7 0 0 / 0.18) 1px,
+    transparent 0
+  );
+  background-size: 14px 14px;
+}
+
+.dark .mesh-surface {
+  background-color: oklch(0.16 0 0);
+  background-image: radial-gradient(
+    circle at 1px 1px,
+    oklch(1 0 0 / 0.1) 1px,
+    transparent 0
+  );
+  background-size: 16px 16px;
 }
 
 .panel {

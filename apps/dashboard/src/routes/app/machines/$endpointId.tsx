@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/breadcrumb";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
@@ -161,6 +162,7 @@ function MachineDetailPage() {
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [createTunnelOpen, setCreateTunnelOpen] = useState(false);
   const [createServeOpen, setCreateServeOpen] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
   const queryClient = useQueryClient();
   usePresenceStream(orgId);
 
@@ -188,7 +190,11 @@ function MachineDetailPage() {
       endpointId: device.endpointId,
       organizationId: device.organizationId,
       networkId,
+      name: device.name,
       hostname: device.metadata.hostname,
+      type: (device.metadata.kind === "sdk" ? "sdk" : "agent") as
+        | "agent"
+        | "sdk",
       os: device.metadata.os,
       agentVersion: device.metadata.agentVersion ?? null,
       assignedIp: membership.assignedIp,
@@ -204,6 +210,10 @@ function MachineDetailPage() {
       status: membership.status,
     };
   }, [device, membership, networkId]);
+
+  useEffect(() => {
+    if (device?.name) setNameDraft(device.name);
+  }, [device?.name]);
 
   useEffect(() => {
     if (orgId && listDevice) {
@@ -243,13 +253,13 @@ function MachineDetailPage() {
             <ChevronRightIcon className="size-4" />
           </BreadcrumbSeparator>
           <BreadcrumbItem>
-            <BreadcrumbPage>{device.metadata.hostname}</BreadcrumbPage>
+            <BreadcrumbPage>{device.name}</BreadcrumbPage>
           </BreadcrumbItem>
         </BreadcrumbList>
       </Breadcrumb>
 
       <PageHeader
-        title={device.metadata.hostname}
+        title={device.name}
         description={
           membership
             ? `Member of ${membership.networkName}`
@@ -405,7 +415,7 @@ function MachineDetailPage() {
             orgId={orgId}
             networkId={networkId}
             endpointId={endpointId}
-            hostname={device.metadata.hostname}
+            hostname={device.name}
             isAdmin={isAdmin}
           />
         </TabsContent>
@@ -519,6 +529,47 @@ function MachineDetailPage() {
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
               <Card>
                 <CardHeader>
+                  <CardTitle className="text-base">Name</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="machine-name">Display name</Label>
+                    <Input
+                      id="machine-name"
+                      value={nameDraft}
+                      onChange={(e) => setNameDraft(e.target.value)}
+                      maxLength={253}
+                      placeholder={device.metadata.hostname}
+                    />
+                    <p className="text-muted-foreground text-xs leading-relaxed">
+                      Defaults to the machine hostname (
+                      {device.metadata.hostname}). Changing it does not affect
+                      the reported hostname.
+                    </p>
+                  </div>
+                  <Button
+                    disabled={
+                      deviceMutations.update.isPending ||
+                      nameDraft.trim().length === 0 ||
+                      nameDraft.trim() === device.name
+                    }
+                    onClick={() =>
+                      void deviceMutations.update
+                        .mutateAsync({
+                          endpointId,
+                          body: { name: nameDraft.trim() },
+                        })
+                        .then(() => toast.success("Machine name updated"))
+                        .catch((err: Error) => toast.error(err.message))
+                    }
+                  >
+                    Save name
+                  </Button>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
                   <CardTitle className="text-base">Connectivity</CardTitle>
                 </CardHeader>
                 <CardContent>
@@ -627,7 +678,7 @@ function MachineDetailPage() {
           open={confirmRemove}
           onOpenChange={setConfirmRemove}
           title="Remove machine"
-          description={`Remove ${device.metadata.hostname} from ${membership.networkName}?`}
+          description={`Remove ${device.name} from ${membership.networkName}?`}
           confirmLabel="Remove"
           destructive
           loading={deviceMutations.remove.isPending}
@@ -656,7 +707,7 @@ function MachineDetailPage() {
             onOpenChange={setCreateTunnelOpen}
             defaultEndpointId={endpointId}
             defaultNetworkId={networkId}
-            defaultHostname={device?.metadata.hostname}
+            defaultHostname={device?.name}
           />
           <CreateServeDialog
             orgId={orgId}
@@ -664,7 +715,7 @@ function MachineDetailPage() {
             onOpenChange={setCreateServeOpen}
             defaultEndpointId={endpointId}
             defaultNetworkId={networkId}
-            defaultHostname={device?.metadata.hostname}
+            defaultHostname={device?.name}
           />
         </>
       ) : null}

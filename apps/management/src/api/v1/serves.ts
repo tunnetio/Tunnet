@@ -6,6 +6,7 @@ import { Elysia } from "elysia";
 import { writeAudit } from "../../lib/audit";
 import { pushStartServe, pushStopServe } from "../../lib/control-plane-client";
 import { db } from "../../lib/db";
+import { deviceDisplayName } from "../../lib/device-metadata";
 import { issueLeafCertificate } from "../../lib/internal-ca";
 import { bumpNetworkAndNotify, notifyEntityChanged } from "../../lib/notify";
 import { toIso } from "../../lib/serialize";
@@ -44,16 +45,12 @@ async function getNetworkInOrg(networkId: string, organizationId: string) {
   });
 }
 
-function deviceHostname(metadata: unknown): string {
-  if (
-    metadata &&
-    typeof metadata === "object" &&
-    "hostname" in metadata &&
-    typeof (metadata as { hostname: unknown }).hostname === "string"
-  ) {
-    return (metadata as { hostname: string }).hostname;
-  }
-  return "unknown";
+function deviceLabel(
+  name: string | null | undefined,
+  metadata: unknown,
+  endpointId: string,
+): string {
+  return deviceDisplayName(name, metadata, endpointId);
 }
 
 export const servesRoutes = new Elysia()
@@ -72,6 +69,7 @@ export const servesRoutes = new Elysia()
       const rows = await db
         .select({
           serve: schema.serves,
+          name: schema.devices.name,
           metadata: schema.devices.metadata,
         })
         .from(schema.serves)
@@ -85,7 +83,7 @@ export const servesRoutes = new Elysia()
       return {
         serves: rows.map((r) =>
           serializeServe(r.serve, {
-            hostname: deviceHostname(r.metadata),
+            hostname: deviceLabel(r.name, r.metadata, r.serve.endpointId),
           }),
         ),
       };
@@ -177,7 +175,11 @@ export const servesRoutes = new Elysia()
           });
           if (!device) return notFound("Machine not found");
 
-          const host = deviceHostname(device.metadata)
+          const host = deviceLabel(
+            device.name,
+            device.metadata,
+            device.endpointId,
+          )
             .toLowerCase()
             .replace(/[^a-z0-9-]/g, "-")
             .replace(/^-+|-+$/g, "")
@@ -273,14 +275,22 @@ export const servesRoutes = new Elysia()
               .returning();
             return {
               serve: serializeServe(errored ?? serve, {
-                hostname: deviceHostname(device.metadata),
+                hostname: deviceLabel(
+                  device.name,
+                  device.metadata,
+                  device.endpointId,
+                ),
               }),
             };
           }
 
           return {
             serve: serializeServe(serve, {
-              hostname: deviceHostname(device.metadata),
+              hostname: deviceLabel(
+                device.name,
+                device.metadata,
+                device.endpointId,
+              ),
             }),
             /** Delivered once so the agent can start TLS — never logged. */
             ...(leafCertificatePem && leafPrivateKeyPem

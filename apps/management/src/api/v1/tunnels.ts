@@ -17,6 +17,7 @@ import { blake3 } from "hash-wasm";
 import { writeAudit } from "../../lib/audit";
 import { pushOpenTunnel, pushStopTunnel } from "../../lib/control-plane-client";
 import { db } from "../../lib/db";
+import { deviceDisplayName } from "../../lib/device-metadata";
 import { bumpNetworkAndNotify, notifyEntityChanged } from "../../lib/notify";
 import { toIso } from "../../lib/serialize";
 import { getAuth, requireAdmin, requireAuth } from "./middleware/authz";
@@ -153,16 +154,12 @@ async function getTunnelInNetwork(
   });
 }
 
-function deviceHostname(metadata: unknown): string {
-  if (
-    metadata &&
-    typeof metadata === "object" &&
-    "hostname" in metadata &&
-    typeof (metadata as { hostname: unknown }).hostname === "string"
-  ) {
-    return (metadata as { hostname: string }).hostname;
-  }
-  return "unknown";
+function deviceLabel(
+  name: string | null | undefined,
+  metadata: unknown,
+  endpointId: string,
+): string {
+  return deviceDisplayName(name, metadata, endpointId);
 }
 
 export const tunnelsRoutes = new Elysia()
@@ -181,6 +178,7 @@ export const tunnelsRoutes = new Elysia()
       const rows = await db
         .select({
           tunnel: schema.tunnels,
+          name: schema.devices.name,
           metadata: schema.devices.metadata,
           relayName: schema.relays.name,
         })
@@ -196,7 +194,7 @@ export const tunnelsRoutes = new Elysia()
       return {
         tunnels: rows.map((r) =>
           serializeTunnel(r.tunnel, {
-            hostname: deviceHostname(r.metadata),
+            hostname: deviceLabel(r.name, r.metadata, r.tunnel.endpointId),
             relayName: r.relayName ?? undefined,
           }),
         ),
@@ -376,7 +374,11 @@ export const tunnelsRoutes = new Elysia()
             );
           }
 
-          const host = deviceHostname(device.metadata)
+          const host = deviceLabel(
+            device.name,
+            device.metadata,
+            device.endpointId,
+          )
             .toLowerCase()
             .replace(/[^a-z0-9-]/g, "-")
             .replace(/^-+|-+$/g, "")
@@ -515,7 +517,11 @@ export const tunnelsRoutes = new Elysia()
               .returning();
             return {
               tunnel: serializeTunnel(errored ?? tunnel, {
-                hostname: deviceHostname(device.metadata),
+                hostname: deviceLabel(
+                  device.name,
+                  device.metadata,
+                  device.endpointId,
+                ),
                 relayName: relay.name,
               }),
               relayAuthToken: authToken,
@@ -524,7 +530,11 @@ export const tunnelsRoutes = new Elysia()
 
           return {
             tunnel: serializeTunnel(tunnel, {
-              hostname: deviceHostname(device.metadata),
+              hostname: deviceLabel(
+                device.name,
+                device.metadata,
+                device.endpointId,
+              ),
               relayName: relay.name,
             }),
             relayAuthToken: authToken,

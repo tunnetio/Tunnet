@@ -93,8 +93,8 @@ export function CreateServeDialog({
 
   const machineLabel =
     defaultHostname ??
-    lockedMachine?.hostname ??
-    selectedMachine?.hostname ??
+    lockedMachine?.name ??
+    selectedMachine?.name ??
     defaultEndpointId?.slice(0, 12);
 
   const peerMachines = useMemo(() => {
@@ -242,7 +242,7 @@ export function CreateServeDialog({
                           key={machine.endpointId}
                           value={machine.endpointId}
                         >
-                          {machine.hostname} ({machine.networkName})
+                          {machine.name} ({machine.networkName})
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -372,7 +372,7 @@ export function CreateServeDialog({
                                 }
                               }}
                             />
-                            {machine.hostname}
+                            {machine.name}
                           </div>
                         );
                       })

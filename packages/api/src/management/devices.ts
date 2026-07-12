@@ -29,6 +29,7 @@ export const deviceSchema = z.object({
   endpointId: z.string().length(64),
   organizationId: z.string(),
   networkId: z.string().uuid(),
+  name: z.string(),
   hostname: z.string(),
   type: z.enum(["agent", "sdk"]),
   os: z.string().nullable(),
@@ -49,6 +50,7 @@ export const deviceSchema = z.object({
 export const deviceDetailSchema = z.object({
   endpointId: z.string().length(64),
   organizationId: z.string(),
+  name: z.string(),
   metadata: deviceMetadataSchema,
   publicIp: z.string().nullable(),
   ipv6Enabled: z.boolean(),
@@ -65,9 +67,10 @@ export const deviceDetailSchema = z.object({
 
 export const patchDeviceBody = z
   .object({
+    name: z.string().trim().min(1).max(253).optional(),
     ipv6Enabled: z.boolean().optional(),
   })
-  .refine((body) => body.ipv6Enabled !== undefined, {
+  .refine((body) => body.name !== undefined || body.ipv6Enabled !== undefined, {
     message: "At least one field must be provided",
   });
 

@@ -420,7 +420,7 @@ function ServeDetailPage() {
                                 }
                               }}
                             />
-                            {machine.hostname}
+                            {machine.name}
                           </div>
                         );
                       })

@@ -21,39 +21,115 @@ type GraphLink = LinkObject &
     curvature?: number;
   };
 
-const KIND_COLOR: Record<GraphKind, string> = {
-  hub: "#f5a524",
-  machine: "#e8eaed",
+const HUB_COLOR = "#5b6cff";
+const ONLINE_GREEN = "#22c55e";
+const OFFLINE_SLATE = "#94a3b8";
+
+const KIND_COLOR: Record<Exclude<GraphKind, "hub" | "machine">, string> = {
   subnet: "#34d399",
-  hostname: "#38bdf8",
-  exit: "#fbbf24",
+  hostname: "#0ea5e9",
+  exit: "#f59e0b",
   relay: "#ef4444",
 };
 
 const EDGE_COLOR: Record<TopologyEdge["kind"] | "hub", string> = {
-  hub: "rgba(245, 165, 36, 0.35)",
+  hub: "rgba(91, 108, 255, 0.45)",
   peer: "#22c55e",
-  subnet: "#34d39988",
-  hostname: "#38bdf888",
-  exit: "#fbbf2488",
-  tunnel: "rgba(239, 68, 68, 0.85)",
+  subnet: "rgba(52, 211, 153, 0.55)",
+  hostname: "rgba(14, 165, 233, 0.55)",
+  exit: "rgba(245, 158, 11, 0.55)",
+  tunnel: "rgba(239, 68, 68, 0.75)",
 };
 
 function nodeRadius(node: GraphNode): number {
   if (node.kind === "hub") return 14;
-  if (node.kind === "relay") return 9;
-  if (node.kind === "machine") return node.online ? 7 : 5;
-  if (node.kind === "exit") return 8;
-  return 6;
+  if (node.kind === "relay") return 7;
+  if (node.kind === "machine") return 20;
+  if (node.kind === "exit") return 7;
+  return 5;
 }
 
-function linkSourceId(link: GraphLink): string {
-  const source = link.source;
-  if (source == null) return "";
-  if (typeof source === "object") {
-    return String((source as { id?: string | number }).id ?? "");
+function pinStaticLayout(nodes: GraphNode[]) {
+  const hub = nodes.find((n) => n.kind === "hub");
+  if (hub) {
+    hub.x = 0;
+    hub.y = 0;
+    hub.fx = 0;
+    hub.fy = 0;
   }
-  return String(source);
+
+  const machines = nodes.filter((n) => n.kind === "machine");
+  const others = nodes.filter((n) => n.kind !== "hub" && n.kind !== "machine");
+  const ring = 110;
+
+  machines.forEach((machine, i) => {
+    const angle =
+      machines.length === 1
+        ? -Math.PI / 2
+        : (2 * Math.PI * i) / machines.length - Math.PI / 2;
+    const x = Math.cos(angle) * ring;
+    const y = Math.sin(angle) * ring;
+    machine.x = x;
+    machine.y = y;
+    machine.fx = x;
+    machine.fy = y;
+  });
+
+  const outer = 170;
+  others.forEach((node, i) => {
+    const count = Math.max(others.length, 1);
+    const angle = (2 * Math.PI * i) / count + Math.PI / count;
+    const x = Math.cos(angle) * outer;
+    const y = Math.sin(angle) * outer;
+    node.x = x;
+    node.y = y;
+    node.fx = x;
+    node.fy = y;
+  });
+}
+
+function linkEndId(end: GraphLink["source"] | GraphLink["target"]): string {
+  if (end == null) return "";
+  if (typeof end === "object") {
+    return String((end as { id?: string | number }).id ?? "");
+  }
+  return String(end);
+}
+
+function isHubLink(link: GraphLink): boolean {
+  return (
+    linkEndId(link.source).startsWith("hub:") ||
+    linkEndId(link.target).startsWith("hub:")
+  );
+}
+
+function linkMachineOnline(link: GraphLink): boolean {
+  const ends = [link.source, link.target];
+  for (const end of ends) {
+    if (typeof end === "object" && end != null) {
+      const node = end as GraphNode;
+      if (node.kind === "machine") return Boolean(node.online);
+    }
+  }
+  return false;
+}
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  const radius = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
 }
 
 export function NetworkForceGraph({
@@ -82,20 +158,36 @@ export function NetworkForceGraph({
   const fgRef = useRef<ForceGraphMethods<GraphNode, GraphLink> | undefined>(
     undefined,
   );
-  const [size, setSize] = useState({ w: 800, h: 380 });
+  const logoRef = useRef<HTMLImageElement | null>(null);
+  const [logoReady, setLogoReady] = useState(false);
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+
+  useEffect(() => {
+    const img = new Image();
+    img.src = "/logo.png";
+    img.onload = () => {
+      logoRef.current = img;
+      setLogoReady(true);
+    };
+    img.onerror = () => {
+      logoRef.current = null;
+      setLogoReady(false);
+    };
+  }, []);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const { width, height } = entry.contentRect;
+    const measure = () => {
+      const { width, height } = el.getBoundingClientRect();
+      if (width < 2 || height < 2) return;
       setSize({
         w: Math.max(320, Math.floor(width)),
         h: Math.max(260, Math.floor(height)),
       });
-    });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
@@ -106,9 +198,6 @@ export function NetworkForceGraph({
       if (n.kind === "machine") {
         if (statusFilter === "online" && !n.online) return false;
         if (statusFilter === "offline" && n.online) return false;
-      } else if (statusFilter !== "all") {
-        // Keep non-machines when filtering status only if attached via visible machine
-        return true;
       }
       return true;
     });
@@ -122,23 +211,14 @@ export function NetworkForceGraph({
   const graphData = useMemo(() => {
     const gNodes: GraphNode[] = filteredNodes.map((n) => ({
       ...n,
-      val:
-        n.kind === "machine"
-          ? n.online
-            ? 1.4
-            : 0.8
-          : n.kind === "relay"
-            ? 1.8
-            : n.kind === "exit"
-              ? 1.6
-              : 1,
+      val: 1,
     }));
 
     const gLinks: GraphLink[] = edges
       .filter((e) => visibleIds.has(e.source) && visibleIds.has(e.target))
       .map((e) => ({
         ...e,
-        curvature: e.kind === "peer" ? 0.12 : e.kind === "tunnel" ? 0.2 : 0.05,
+        curvature: 0,
       }));
 
     if (showHub) {
@@ -147,8 +227,8 @@ export function NetworkForceGraph({
         id: hubId,
         kind: "hub",
         label: "TunTun",
-        secondary: "Control plane",
-        val: 3,
+        secondary: "Edge",
+        val: 1,
         online: true,
       });
       for (const n of filteredNodes) {
@@ -158,59 +238,135 @@ export function NetworkForceGraph({
           source: hubId,
           target: n.id,
           kind: "peer",
-          intensity: n.online ? 0.55 : 0.2,
-          curvature: 0.08,
+          intensity: n.online ? 0.7 : 0.25,
+          curvature: 0,
           direct: true,
         });
       }
     }
 
+    pinStaticLayout(gNodes);
     return { nodes: gNodes, links: gLinks };
   }, [filteredNodes, edges, visibleIds, showHub]);
+
+  const [viewReady, setViewReady] = useState(false);
+
+  const fitViewport = useCallback(() => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    fg.d3Force("charge", null);
+    fg.d3Force("center", null);
+    fg.d3Force("link", null);
+    fg.zoomToFit(0, 96);
+    setViewReady(true);
+  }, []);
+
+  const topologyKey = `${graphData.nodes.length}:${graphData.links.length}`;
+
+  useEffect(() => {
+    void topologyKey;
+    setViewReady(false);
+  }, [topologyKey]);
+
+  useEffect(() => {
+    void topologyKey;
+    if (!size) return;
+    const id = window.requestAnimationFrame(fitViewport);
+    return () => window.cancelAnimationFrame(id);
+  }, [size, topologyKey, fitViewport]);
 
   const paintNode = useCallback(
     (node: GraphNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const r = nodeRadius(node);
       const x = node.x ?? 0;
       const y = node.y ?? 0;
+      const scale = Math.max(globalScale, 0.85);
 
       if (node.kind === "hub") {
-        const glow = ctx.createRadialGradient(x, y, r * 0.4, x, y, r * 1.8);
-        glow.addColorStop(0, "rgba(245, 165, 36, 0.12)");
-        glow.addColorStop(0.55, "rgba(245, 165, 36, 0.04)");
-        glow.addColorStop(1, "rgba(245, 165, 36, 0)");
-        ctx.beginPath();
-        ctx.arc(x, y, r * 1.8, 0, Math.PI * 2);
-        ctx.fillStyle = glow;
-        ctx.fill();
+        const logo = logoRef.current;
+        if (logo && logoReady) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.clip();
+          ctx.drawImage(logo, x - r, y - r, r * 2, r * 2);
+          ctx.restore();
+        } else {
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.fillStyle = HUB_COLOR;
+          ctx.fill();
+          const fontSize = Math.max(11 / scale, 4);
+          ctx.font = `700 ${fontSize}px Geist Variable, ui-sans-serif, system-ui`;
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = "#fff";
+          ctx.fillText("T", x, y + 0.5);
+        }
 
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.fillStyle = "#f5a524";
-        ctx.fill();
-        ctx.strokeStyle = "rgba(255, 220, 160, 0.55)";
-        ctx.lineWidth = 1.25;
-        ctx.stroke();
-
-        const fontSize = Math.max(11 / globalScale, 3.6);
-        ctx.font = `600 ${fontSize}px Geist Variable, ui-sans-serif, system-ui`;
+        const labelSize = Math.max(10 / scale, 3.2);
+        ctx.font = `500 ${labelSize}px Geist Variable, ui-sans-serif, system-ui`;
         ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillStyle = "rgba(20, 16, 8, 0.92)";
-        ctx.fillText("T", x, y + 0.5);
-
-        ctx.font = `${Math.max(10 / globalScale, 3.2)}px Geist Variable, ui-sans-serif`;
         ctx.textBaseline = "top";
-        ctx.fillStyle = "rgba(245, 200, 120, 0.75)";
-        ctx.fillText("TunTun", x, y + r + 3);
+        ctx.fillStyle = "rgba(71, 85, 105, 0.9)";
+        // ctx.fillText("TunTun", x, y + r + 5);
         return;
       }
 
-      if (node.kind === "machine" && node.online) {
-        ctx.beginPath();
-        ctx.arc(x, y, r + 3.5, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(52, 211, 153, 0.18)";
+      if (node.kind === "machine") {
+        const online = Boolean(node.online);
+        const name = node.label || "machine";
+        const ip = node.secondary ?? node.assignedIp ?? "—";
+        const nameSize = Math.max(12 / scale, 3.6);
+        const ipSize = Math.max(10 / scale, 3);
+        ctx.font = `600 ${nameSize}px Geist Variable, ui-sans-serif, system-ui`;
+        const nameW = ctx.measureText(name).width;
+        ctx.font = `${ipSize}px Geist Mono Variable, ui-monospace, monospace`;
+        const ipW = ctx.measureText(ip).width;
+
+        const padX = 12 / scale;
+        const padY = 10 / scale;
+        const pip = 5 / scale;
+        const gap = 8 / scale;
+        const cardW = Math.max(nameW, ipW) + pip + gap + padX * 2;
+        const cardH = nameSize + ipSize + 4 / scale + padY * 2;
+        const cardX = x - cardW / 2;
+        const cardY = y - cardH / 2;
+
+        roundRect(ctx, cardX, cardY, cardW, cardH, 6 / scale);
+        ctx.fillStyle = online ? "#ffffff" : "rgba(248, 250, 252, 0.95)";
         ctx.fill();
+        ctx.strokeStyle = online
+          ? "rgba(15, 23, 42, 0.12)"
+          : "rgba(148, 163, 184, 0.45)";
+        ctx.lineWidth = 1 / scale;
+        ctx.stroke();
+
+        const textTop = cardY + padY;
+        ctx.beginPath();
+        ctx.arc(
+          cardX + padX + pip / 2,
+          textTop + nameSize / 2,
+          pip / 2,
+          0,
+          Math.PI * 2,
+        );
+        ctx.fillStyle = online ? ONLINE_GREEN : OFFLINE_SLATE;
+        ctx.fill();
+
+        const textX = cardX + padX + pip + gap;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "top";
+        ctx.font = `600 ${nameSize}px Geist Variable, ui-sans-serif, system-ui`;
+        ctx.fillStyle = online
+          ? "rgba(15, 23, 42, 0.95)"
+          : "rgba(100, 116, 139, 0.95)";
+        ctx.fillText(name, textX, textTop);
+
+        ctx.font = `${ipSize}px Geist Mono Variable, ui-monospace, monospace`;
+        ctx.fillStyle = "rgba(100, 116, 139, 0.95)";
+        ctx.fillText(ip, textX, textTop + nameSize + 4 / scale);
+        return;
       }
 
       ctx.beginPath();
@@ -231,71 +387,28 @@ export function NetworkForceGraph({
           else ctx.lineTo(px, py);
         }
         ctx.closePath();
-      } else if (node.kind === "relay") {
-        // Rounded diamond for relays
+      } else {
         ctx.moveTo(x, y - r);
         ctx.lineTo(x + r * 0.85, y);
         ctx.lineTo(x, y + r);
         ctx.lineTo(x - r * 0.85, y);
         ctx.closePath();
-      } else {
-        ctx.arc(x, y, r, 0, Math.PI * 2);
       }
 
-      ctx.fillStyle =
-        node.kind === "machine" && !node.online
-          ? "rgba(148, 163, 184, 0.45)"
-          : KIND_COLOR[node.kind];
+      ctx.fillStyle = KIND_COLOR[node.kind];
       ctx.fill();
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.7)";
+      ctx.lineWidth = 1 / scale;
+      ctx.stroke();
 
-      if (node.kind === "machine") {
-        ctx.strokeStyle = node.online
-          ? "rgba(52, 211, 153, 0.9)"
-          : "rgba(100, 116, 139, 0.7)";
-        ctx.lineWidth = 1.25;
-        ctx.stroke();
-
-        // Status pip
-        ctx.beginPath();
-        ctx.arc(x + r * 0.65, y - r * 0.65, 2.2, 0, Math.PI * 2);
-        ctx.fillStyle = node.online ? "#34d399" : "#64748b";
-        ctx.fill();
-      }
-
-      const label =
-        node.kind === "machine"
-          ? [
-              node.label,
-              node.tunnelCount || node.serveCount
-                ? [
-                    node.tunnelCount ? `t${node.tunnelCount}` : null,
-                    node.serveCount ? `s${node.serveCount}` : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")
-                : null,
-            ]
-              .filter(Boolean)
-              .join(" · ")
-          : node.kind === "relay" && node.publicHostname
-            ? `${node.label}`
-            : node.label;
-      const fontSize = Math.max(10 / globalScale, 3.2);
+      const fontSize = Math.max(10 / scale, 3.2);
       ctx.font = `${fontSize}px Geist Variable, ui-sans-serif, system-ui`;
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
-      ctx.fillStyle = "rgba(226, 232, 240, 0.85)";
-      ctx.fillText(label, x, y + r + 2.5);
-
-      if (node.kind === "machine" && (node.serveCount ?? 0) > 0) {
-        const tip = `${node.serveCount} serve${node.serveCount === 1 ? "" : "s"}`;
-        const tipSize = Math.max(8 / globalScale, 2.6);
-        ctx.font = `${tipSize}px Geist Variable, ui-sans-serif`;
-        ctx.fillStyle = "rgba(148, 163, 184, 0.75)";
-        ctx.fillText(tip, x, y + r + 2.5 + fontSize + 1);
-      }
+      ctx.fillStyle = "rgba(71, 85, 105, 0.9)";
+      ctx.fillText(node.label, x, y + r + 3);
     },
-    [],
+    [logoReady],
   );
 
   const paintLink = useCallback(
@@ -323,15 +436,18 @@ export function NetworkForceGraph({
       ctx.font = `${fontSize}px Geist Mono Variable, ui-monospace, monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillStyle = "rgba(252, 165, 165, 0.85)";
+      ctx.fillStyle = "rgba(220, 38, 38, 0.8)";
       ctx.fillText(hostname, x, y - 4);
     },
     [],
   );
 
   const linkColor = useCallback((link: GraphLink) => {
-    const sourceId = linkSourceId(link);
-    if (sourceId.startsWith("hub:")) return EDGE_COLOR.hub;
+    if (isHubLink(link)) {
+      return linkMachineOnline(link)
+        ? "rgba(34, 197, 94, 0.55)"
+        : "rgba(148, 163, 184, 0.45)";
+    }
     if (link.kind === "peer") {
       return link.direct === false ? "#eab308" : EDGE_COLOR.peer;
     }
@@ -340,7 +456,7 @@ export function NetworkForceGraph({
 
   const linkWidth = useCallback(
     (link: GraphLink) => {
-      if (linkSourceId(link).startsWith("hub:")) return 0.8;
+      if (isHubLink(link)) return linkMachineOnline(link) ? 1.4 : 1.1;
       const intensity = link.intensity ?? 0.35;
       if (heatmap) {
         return 0.5 + intensity * 4.5;
@@ -352,19 +468,26 @@ export function NetworkForceGraph({
   );
 
   const linkLineDash = useCallback((link: GraphLink) => {
+    if (isHubLink(link)) return [5, 4];
     if (link.kind === "tunnel") return [4, 3];
     return null;
   }, []);
 
   const linkParticles = useCallback((link: GraphLink) => {
-    if (linkSourceId(link).startsWith("hub:")) return 2;
+    if (isHubLink(link)) {
+      return linkMachineOnline(link) ? 3 : 0;
+    }
     if (link.kind === "tunnel") return 3;
-    if (link.kind !== "peer")
+    if (link.kind !== "peer") {
       return Math.round(1 + (link.intensity ?? 0.3) * 2);
-    return Math.max(1, Math.round((link.intensity ?? 0.35) * 6));
+    }
+    // Peer traffic animation only when intensity suggests activity
+    if ((link.intensity ?? 0) < 0.15) return 0;
+    return Math.max(1, Math.round((link.intensity ?? 0.35) * 5));
   }, []);
 
   const linkParticleSpeed = useCallback((link: GraphLink) => {
+    if (isHubLink(link)) return 0.006;
     return 0.004 + (link.intensity ?? 0.35) * 0.012;
   }, []);
 
@@ -373,51 +496,70 @@ export function NetworkForceGraph({
       ref={containerRef}
       className={cn(
         "mesh-surface relative w-full overflow-hidden rounded-lg border border-border/60",
-        heightClassName ?? "h-[340px] sm:h-[400px]",
+        heightClassName ?? "h-[360px] sm:h-[440px]",
         className,
       )}
     >
-      <ForceGraph2D
-        ref={fgRef}
-        width={size.w}
-        height={size.h}
-        graphData={graphData}
-        backgroundColor="rgba(0,0,0,0)"
-        nodeId="id"
-        linkSource="source"
-        linkTarget="target"
-        nodeCanvasObject={paintNode}
-        linkCanvasObjectMode={() => "after"}
-        linkCanvasObject={paintLink}
-        nodePointerAreaPaint={(node, color, ctx) => {
-          const r = nodeRadius(node as GraphNode) + 4;
-          ctx.beginPath();
-          ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, Math.PI * 2);
-          ctx.fillStyle = color;
-          ctx.fill();
-        }}
-        linkColor={linkColor}
-        linkWidth={linkWidth}
-        linkLineDash={linkLineDash}
-        linkCurvature="curvature"
-        linkDirectionalParticles={linkParticles}
-        linkDirectionalParticleSpeed={linkParticleSpeed}
-        linkDirectionalParticleWidth={(link) =>
-          1.2 + ((link as GraphLink).intensity ?? 0.3) * 2
-        }
-        linkDirectionalParticleColor={linkColor}
-        cooldownTicks={90}
-        onNodeClick={(node) => {
-          const n = node as GraphNode;
-          if (n.kind === "hub") {
-            onSelect?.(null);
-            return;
-          }
-          onSelect?.(n as TopologyNode);
-        }}
-        onBackgroundClick={() => onSelect?.(null)}
-        enableNodeDrag
-      />
+      {size ? (
+        <div
+          className={cn("size-full", viewReady ? "opacity-100" : "opacity-0")}
+        >
+          <ForceGraph2D
+            ref={fgRef}
+            width={size.w}
+            height={size.h}
+            graphData={graphData}
+            backgroundColor="rgba(0,0,0,0)"
+            nodeId="id"
+            linkSource="source"
+            linkTarget="target"
+            nodeCanvasObject={paintNode}
+            linkCanvasObjectMode={() => "after"}
+            linkCanvasObject={paintLink}
+            nodePointerAreaPaint={(node, color, ctx) => {
+              const n = node as GraphNode;
+              const r = nodeRadius(n) + 4;
+              ctx.beginPath();
+              ctx.arc(node.x ?? 0, node.y ?? 0, r, 0, Math.PI * 2);
+              ctx.fillStyle = color;
+              ctx.fill();
+            }}
+            linkColor={linkColor}
+            linkWidth={linkWidth}
+            linkLineDash={linkLineDash}
+            linkCurvature="curvature"
+            linkDirectionalParticles={linkParticles}
+            linkDirectionalParticleSpeed={linkParticleSpeed}
+            linkDirectionalParticleWidth={(link) =>
+              isHubLink(link as GraphLink)
+                ? 2.2
+                : 1.2 + ((link as GraphLink).intensity ?? 0.3) * 2
+            }
+            linkDirectionalParticleColor={(link) =>
+              isHubLink(link as GraphLink)
+                ? ONLINE_GREEN
+                : linkColor(link as GraphLink)
+            }
+            warmupTicks={0}
+            cooldownTicks={0}
+            d3AlphaDecay={1}
+            d3VelocityDecay={1}
+            enableNodeDrag={false}
+            enableZoomInteraction={false}
+            enablePanInteraction={false}
+            onEngineStop={fitViewport}
+            onNodeClick={(node) => {
+              const n = node as GraphNode;
+              if (n.kind === "hub") {
+                onSelect?.(null);
+                return;
+              }
+              onSelect?.(n as TopologyNode);
+            }}
+            onBackgroundClick={() => onSelect?.(null)}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -16,8 +16,8 @@ export function AppShell({ children }: AppShellProps) {
   usePresenceStream(activeOrg?.id);
 
   return (
-    <div className="bg-background min-h-screen">
-      <header className="border-border/60 border-b">
+    <div className="bg-background flex min-h-dvh flex-col">
+      <header className="border-border/60 bg-background sticky top-0 z-40 border-b">
         <div className="mx-auto flex h-12 max-w-[1400px] items-center justify-between gap-4 px-4 sm:px-6">
           <div className="flex min-w-0 items-center gap-4">
             <Link
@@ -40,7 +40,7 @@ export function AppShell({ children }: AppShellProps) {
           <NavTabs />
         </div>
       </header>
-      <main className="mx-auto max-w-[1400px] space-y-6 px-4 py-6 sm:px-6 sm:py-8">
+      <main className="mx-auto w-full max-w-[1400px] flex-1 space-y-6 px-4 py-6 sm:px-6 sm:py-8">
         {children}
       </main>
     </div>
