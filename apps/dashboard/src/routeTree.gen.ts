@@ -8,611 +8,611 @@
 // You should NOT make any changes in this file as it will be overwritten.
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
-import { Route as rootRouteImport } from "./routes/__root";
-import { Route as AcceptInvitationInvitationIdRouteImport } from "./routes/accept-invitation.$invitationId";
-import { Route as AppAccessRouteImport } from "./routes/app/access";
-import { Route as AppIndexRouteImport } from "./routes/app/index";
-import { Route as AppLogsRouteImport } from "./routes/app/logs";
-import { Route as AppMachinesEndpointIdRouteImport } from "./routes/app/machines/$endpointId";
-import { Route as AppMachinesIndexRouteImport } from "./routes/app/machines/index";
-import { Route as AppNetworksNetworkIdAccessRouteImport } from "./routes/app/networks/$networkId/access";
-import { Route as AppNetworksNetworkIdEnrollmentRouteImport } from "./routes/app/networks/$networkId/enrollment";
-import { Route as AppNetworksNetworkIdIndexRouteImport } from "./routes/app/networks/$networkId/index";
-import { Route as AppNetworksNetworkIdMachinesRouteImport } from "./routes/app/networks/$networkId/machines";
-import { Route as AppNetworksNetworkIdMapRouteImport } from "./routes/app/networks/$networkId/map";
-import { Route as AppNetworksNetworkIdRouteRouteImport } from "./routes/app/networks/$networkId/route";
-import { Route as AppNetworksNetworkIdRoutesRouteImport } from "./routes/app/networks/$networkId/routes";
-import { Route as AppNetworksIndexRouteImport } from "./routes/app/networks/index";
-import { Route as AppOnboardingRouteImport } from "./routes/app/onboarding";
-import { Route as AppRelaysRelayIdRouteImport } from "./routes/app/relays/$relayId";
-import { Route as AppRelaysIndexRouteImport } from "./routes/app/relays/index";
-import { Route as AppRouteRouteImport } from "./routes/app/route";
-import { Route as AppServesServeIdRouteImport } from "./routes/app/serves/$serveId";
-import { Route as AppServesIndexRouteImport } from "./routes/app/serves/index";
-import { Route as AppSettingsAccountRouteImport } from "./routes/app/settings/account";
-import { Route as AppSettingsApiKeysRouteImport } from "./routes/app/settings/api-keys";
-import { Route as AppSettingsIndexRouteImport } from "./routes/app/settings/index";
-import { Route as AppSettingsRouteRouteImport } from "./routes/app/settings/route";
-import { Route as AppTunnelsTunnelIdRouteImport } from "./routes/app/tunnels/$tunnelId";
-import { Route as AppTunnelsIndexRouteImport } from "./routes/app/tunnels/index";
-import { Route as AppUsersRouteImport } from "./routes/app/users";
-import { Route as IndexRouteImport } from "./routes/index";
-import { Route as LoginRouteImport } from "./routes/login";
+import { Route as rootRouteImport } from './routes/__root'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as AppRouteRouteImport } from './routes/app/route'
+import { Route as IndexRouteImport } from './routes/index'
+import { Route as AppIndexRouteImport } from './routes/app/index'
+import { Route as AppUsersRouteImport } from './routes/app/users'
+import { Route as AppOnboardingRouteImport } from './routes/app/onboarding'
+import { Route as AppLogsRouteImport } from './routes/app/logs'
+import { Route as AppAccessRouteImport } from './routes/app/access'
+import { Route as AcceptInvitationInvitationIdRouteImport } from './routes/accept-invitation.$invitationId'
+import { Route as AppSettingsRouteRouteImport } from './routes/app/settings/route'
+import { Route as AppTunnelsIndexRouteImport } from './routes/app/tunnels/index'
+import { Route as AppSettingsIndexRouteImport } from './routes/app/settings/index'
+import { Route as AppServesIndexRouteImport } from './routes/app/serves/index'
+import { Route as AppRelaysIndexRouteImport } from './routes/app/relays/index'
+import { Route as AppNetworksIndexRouteImport } from './routes/app/networks/index'
+import { Route as AppMachinesIndexRouteImport } from './routes/app/machines/index'
+import { Route as AppTunnelsTunnelIdRouteImport } from './routes/app/tunnels/$tunnelId'
+import { Route as AppSettingsApiKeysRouteImport } from './routes/app/settings/api-keys'
+import { Route as AppSettingsAccountRouteImport } from './routes/app/settings/account'
+import { Route as AppServesServeIdRouteImport } from './routes/app/serves/$serveId'
+import { Route as AppRelaysRelayIdRouteImport } from './routes/app/relays/$relayId'
+import { Route as AppMachinesEndpointIdRouteImport } from './routes/app/machines/$endpointId'
+import { Route as AppNetworksNetworkIdRouteRouteImport } from './routes/app/networks/$networkId/route'
+import { Route as AppNetworksNetworkIdIndexRouteImport } from './routes/app/networks/$networkId/index'
+import { Route as AppNetworksNetworkIdRoutesRouteImport } from './routes/app/networks/$networkId/routes'
+import { Route as AppNetworksNetworkIdMapRouteImport } from './routes/app/networks/$networkId/map'
+import { Route as AppNetworksNetworkIdMachinesRouteImport } from './routes/app/networks/$networkId/machines'
+import { Route as AppNetworksNetworkIdEnrollmentRouteImport } from './routes/app/networks/$networkId/enrollment'
+import { Route as AppNetworksNetworkIdAccessRouteImport } from './routes/app/networks/$networkId/access'
 
 const LoginRoute = LoginRouteImport.update({
-  id: "/login",
-  path: "/login",
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const AppRouteRoute = AppRouteRouteImport.update({
-  id: "/app",
-  path: "/app",
+  id: '/app',
+  path: '/app',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const IndexRoute = IndexRouteImport.update({
-  id: "/",
-  path: "/",
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
-} as any);
+} as any)
 const AppIndexRoute = AppIndexRouteImport.update({
-  id: "/",
-  path: "/",
+  id: '/',
+  path: '/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppUsersRoute = AppUsersRouteImport.update({
-  id: "/users",
-  path: "/users",
+  id: '/users',
+  path: '/users',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppOnboardingRoute = AppOnboardingRouteImport.update({
-  id: "/onboarding",
-  path: "/onboarding",
+  id: '/onboarding',
+  path: '/onboarding',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppLogsRoute = AppLogsRouteImport.update({
-  id: "/logs",
-  path: "/logs",
+  id: '/logs',
+  path: '/logs',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppAccessRoute = AppAccessRouteImport.update({
-  id: "/access",
-  path: "/access",
+  id: '/access',
+  path: '/access',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AcceptInvitationInvitationIdRoute =
   AcceptInvitationInvitationIdRouteImport.update({
-    id: "/accept-invitation/$invitationId",
-    path: "/accept-invitation/$invitationId",
+    id: '/accept-invitation/$invitationId',
+    path: '/accept-invitation/$invitationId',
     getParentRoute: () => rootRouteImport,
-  } as any);
+  } as any)
 const AppSettingsRouteRoute = AppSettingsRouteRouteImport.update({
-  id: "/settings",
-  path: "/settings",
+  id: '/settings',
+  path: '/settings',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppTunnelsIndexRoute = AppTunnelsIndexRouteImport.update({
-  id: "/tunnels/",
-  path: "/tunnels/",
+  id: '/tunnels/',
+  path: '/tunnels/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppSettingsIndexRoute = AppSettingsIndexRouteImport.update({
-  id: "/",
-  path: "/",
+  id: '/',
+  path: '/',
   getParentRoute: () => AppSettingsRouteRoute,
-} as any);
+} as any)
 const AppServesIndexRoute = AppServesIndexRouteImport.update({
-  id: "/serves/",
-  path: "/serves/",
+  id: '/serves/',
+  path: '/serves/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppRelaysIndexRoute = AppRelaysIndexRouteImport.update({
-  id: "/relays/",
-  path: "/relays/",
+  id: '/relays/',
+  path: '/relays/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppNetworksIndexRoute = AppNetworksIndexRouteImport.update({
-  id: "/networks/",
-  path: "/networks/",
+  id: '/networks/',
+  path: '/networks/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppMachinesIndexRoute = AppMachinesIndexRouteImport.update({
-  id: "/machines/",
-  path: "/machines/",
+  id: '/machines/',
+  path: '/machines/',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppTunnelsTunnelIdRoute = AppTunnelsTunnelIdRouteImport.update({
-  id: "/tunnels/$tunnelId",
-  path: "/tunnels/$tunnelId",
+  id: '/tunnels/$tunnelId',
+  path: '/tunnels/$tunnelId',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppSettingsApiKeysRoute = AppSettingsApiKeysRouteImport.update({
-  id: "/api-keys",
-  path: "/api-keys",
+  id: '/api-keys',
+  path: '/api-keys',
   getParentRoute: () => AppSettingsRouteRoute,
-} as any);
+} as any)
 const AppSettingsAccountRoute = AppSettingsAccountRouteImport.update({
-  id: "/account",
-  path: "/account",
+  id: '/account',
+  path: '/account',
   getParentRoute: () => AppSettingsRouteRoute,
-} as any);
+} as any)
 const AppServesServeIdRoute = AppServesServeIdRouteImport.update({
-  id: "/serves/$serveId",
-  path: "/serves/$serveId",
+  id: '/serves/$serveId',
+  path: '/serves/$serveId',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppRelaysRelayIdRoute = AppRelaysRelayIdRouteImport.update({
-  id: "/relays/$relayId",
-  path: "/relays/$relayId",
+  id: '/relays/$relayId',
+  path: '/relays/$relayId',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppMachinesEndpointIdRoute = AppMachinesEndpointIdRouteImport.update({
-  id: "/machines/$endpointId",
-  path: "/machines/$endpointId",
+  id: '/machines/$endpointId',
+  path: '/machines/$endpointId',
   getParentRoute: () => AppRouteRoute,
-} as any);
+} as any)
 const AppNetworksNetworkIdRouteRoute =
   AppNetworksNetworkIdRouteRouteImport.update({
-    id: "/networks/$networkId",
-    path: "/networks/$networkId",
+    id: '/networks/$networkId',
+    path: '/networks/$networkId',
     getParentRoute: () => AppRouteRoute,
-  } as any);
+  } as any)
 const AppNetworksNetworkIdIndexRoute =
   AppNetworksNetworkIdIndexRouteImport.update({
-    id: "/",
-    path: "/",
+    id: '/',
+    path: '/',
     getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-  } as any);
+  } as any)
 const AppNetworksNetworkIdRoutesRoute =
   AppNetworksNetworkIdRoutesRouteImport.update({
-    id: "/routes",
-    path: "/routes",
+    id: '/routes',
+    path: '/routes',
     getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-  } as any);
+  } as any)
 const AppNetworksNetworkIdMapRoute = AppNetworksNetworkIdMapRouteImport.update({
-  id: "/map",
-  path: "/map",
+  id: '/map',
+  path: '/map',
   getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-} as any);
+} as any)
 const AppNetworksNetworkIdMachinesRoute =
   AppNetworksNetworkIdMachinesRouteImport.update({
-    id: "/machines",
-    path: "/machines",
+    id: '/machines',
+    path: '/machines',
     getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-  } as any);
+  } as any)
 const AppNetworksNetworkIdEnrollmentRoute =
   AppNetworksNetworkIdEnrollmentRouteImport.update({
-    id: "/enrollment",
-    path: "/enrollment",
+    id: '/enrollment',
+    path: '/enrollment',
     getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-  } as any);
+  } as any)
 const AppNetworksNetworkIdAccessRoute =
   AppNetworksNetworkIdAccessRouteImport.update({
-    id: "/access",
-    path: "/access",
+    id: '/access',
+    path: '/access',
     getParentRoute: () => AppNetworksNetworkIdRouteRoute,
-  } as any);
+  } as any)
 
 export interface FileRoutesByFullPath {
-  "/": typeof IndexRoute;
-  "/app": typeof AppRouteRouteWithChildren;
-  "/login": typeof LoginRoute;
-  "/app/settings": typeof AppSettingsRouteRouteWithChildren;
-  "/accept-invitation/$invitationId": typeof AcceptInvitationInvitationIdRoute;
-  "/app/access": typeof AppAccessRoute;
-  "/app/logs": typeof AppLogsRoute;
-  "/app/onboarding": typeof AppOnboardingRoute;
-  "/app/users": typeof AppUsersRoute;
-  "/app/": typeof AppIndexRoute;
-  "/app/networks/$networkId": typeof AppNetworksNetworkIdRouteRouteWithChildren;
-  "/app/machines/$endpointId": typeof AppMachinesEndpointIdRoute;
-  "/app/relays/$relayId": typeof AppRelaysRelayIdRoute;
-  "/app/serves/$serveId": typeof AppServesServeIdRoute;
-  "/app/settings/account": typeof AppSettingsAccountRoute;
-  "/app/settings/api-keys": typeof AppSettingsApiKeysRoute;
-  "/app/tunnels/$tunnelId": typeof AppTunnelsTunnelIdRoute;
-  "/app/machines/": typeof AppMachinesIndexRoute;
-  "/app/networks/": typeof AppNetworksIndexRoute;
-  "/app/relays/": typeof AppRelaysIndexRoute;
-  "/app/serves/": typeof AppServesIndexRoute;
-  "/app/settings/": typeof AppSettingsIndexRoute;
-  "/app/tunnels/": typeof AppTunnelsIndexRoute;
-  "/app/networks/$networkId/access": typeof AppNetworksNetworkIdAccessRoute;
-  "/app/networks/$networkId/enrollment": typeof AppNetworksNetworkIdEnrollmentRoute;
-  "/app/networks/$networkId/machines": typeof AppNetworksNetworkIdMachinesRoute;
-  "/app/networks/$networkId/map": typeof AppNetworksNetworkIdMapRoute;
-  "/app/networks/$networkId/routes": typeof AppNetworksNetworkIdRoutesRoute;
-  "/app/networks/$networkId/": typeof AppNetworksNetworkIdIndexRoute;
+  '/': typeof IndexRoute
+  '/app': typeof AppRouteRouteWithChildren
+  '/login': typeof LoginRoute
+  '/app/settings': typeof AppSettingsRouteRouteWithChildren
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
+  '/app/access': typeof AppAccessRoute
+  '/app/logs': typeof AppLogsRoute
+  '/app/onboarding': typeof AppOnboardingRoute
+  '/app/users': typeof AppUsersRoute
+  '/app/': typeof AppIndexRoute
+  '/app/networks/$networkId': typeof AppNetworksNetworkIdRouteRouteWithChildren
+  '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
+  '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
+  '/app/serves/$serveId': typeof AppServesServeIdRoute
+  '/app/settings/account': typeof AppSettingsAccountRoute
+  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
+  '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
+  '/app/machines/': typeof AppMachinesIndexRoute
+  '/app/networks/': typeof AppNetworksIndexRoute
+  '/app/relays/': typeof AppRelaysIndexRoute
+  '/app/serves/': typeof AppServesIndexRoute
+  '/app/settings/': typeof AppSettingsIndexRoute
+  '/app/tunnels/': typeof AppTunnelsIndexRoute
+  '/app/networks/$networkId/access': typeof AppNetworksNetworkIdAccessRoute
+  '/app/networks/$networkId/enrollment': typeof AppNetworksNetworkIdEnrollmentRoute
+  '/app/networks/$networkId/machines': typeof AppNetworksNetworkIdMachinesRoute
+  '/app/networks/$networkId/map': typeof AppNetworksNetworkIdMapRoute
+  '/app/networks/$networkId/routes': typeof AppNetworksNetworkIdRoutesRoute
+  '/app/networks/$networkId/': typeof AppNetworksNetworkIdIndexRoute
 }
 export interface FileRoutesByTo {
-  "/": typeof IndexRoute;
-  "/login": typeof LoginRoute;
-  "/accept-invitation/$invitationId": typeof AcceptInvitationInvitationIdRoute;
-  "/app/access": typeof AppAccessRoute;
-  "/app/logs": typeof AppLogsRoute;
-  "/app/onboarding": typeof AppOnboardingRoute;
-  "/app/users": typeof AppUsersRoute;
-  "/app": typeof AppIndexRoute;
-  "/app/machines/$endpointId": typeof AppMachinesEndpointIdRoute;
-  "/app/relays/$relayId": typeof AppRelaysRelayIdRoute;
-  "/app/serves/$serveId": typeof AppServesServeIdRoute;
-  "/app/settings/account": typeof AppSettingsAccountRoute;
-  "/app/settings/api-keys": typeof AppSettingsApiKeysRoute;
-  "/app/tunnels/$tunnelId": typeof AppTunnelsTunnelIdRoute;
-  "/app/machines": typeof AppMachinesIndexRoute;
-  "/app/networks": typeof AppNetworksIndexRoute;
-  "/app/relays": typeof AppRelaysIndexRoute;
-  "/app/serves": typeof AppServesIndexRoute;
-  "/app/settings": typeof AppSettingsIndexRoute;
-  "/app/tunnels": typeof AppTunnelsIndexRoute;
-  "/app/networks/$networkId/access": typeof AppNetworksNetworkIdAccessRoute;
-  "/app/networks/$networkId/enrollment": typeof AppNetworksNetworkIdEnrollmentRoute;
-  "/app/networks/$networkId/machines": typeof AppNetworksNetworkIdMachinesRoute;
-  "/app/networks/$networkId/map": typeof AppNetworksNetworkIdMapRoute;
-  "/app/networks/$networkId/routes": typeof AppNetworksNetworkIdRoutesRoute;
-  "/app/networks/$networkId": typeof AppNetworksNetworkIdIndexRoute;
+  '/': typeof IndexRoute
+  '/login': typeof LoginRoute
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
+  '/app/access': typeof AppAccessRoute
+  '/app/logs': typeof AppLogsRoute
+  '/app/onboarding': typeof AppOnboardingRoute
+  '/app/users': typeof AppUsersRoute
+  '/app': typeof AppIndexRoute
+  '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
+  '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
+  '/app/serves/$serveId': typeof AppServesServeIdRoute
+  '/app/settings/account': typeof AppSettingsAccountRoute
+  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
+  '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
+  '/app/machines': typeof AppMachinesIndexRoute
+  '/app/networks': typeof AppNetworksIndexRoute
+  '/app/relays': typeof AppRelaysIndexRoute
+  '/app/serves': typeof AppServesIndexRoute
+  '/app/settings': typeof AppSettingsIndexRoute
+  '/app/tunnels': typeof AppTunnelsIndexRoute
+  '/app/networks/$networkId/access': typeof AppNetworksNetworkIdAccessRoute
+  '/app/networks/$networkId/enrollment': typeof AppNetworksNetworkIdEnrollmentRoute
+  '/app/networks/$networkId/machines': typeof AppNetworksNetworkIdMachinesRoute
+  '/app/networks/$networkId/map': typeof AppNetworksNetworkIdMapRoute
+  '/app/networks/$networkId/routes': typeof AppNetworksNetworkIdRoutesRoute
+  '/app/networks/$networkId': typeof AppNetworksNetworkIdIndexRoute
 }
 export interface FileRoutesById {
-  __root__: typeof rootRouteImport;
-  "/": typeof IndexRoute;
-  "/app": typeof AppRouteRouteWithChildren;
-  "/login": typeof LoginRoute;
-  "/app/settings": typeof AppSettingsRouteRouteWithChildren;
-  "/accept-invitation/$invitationId": typeof AcceptInvitationInvitationIdRoute;
-  "/app/access": typeof AppAccessRoute;
-  "/app/logs": typeof AppLogsRoute;
-  "/app/onboarding": typeof AppOnboardingRoute;
-  "/app/users": typeof AppUsersRoute;
-  "/app/": typeof AppIndexRoute;
-  "/app/networks/$networkId": typeof AppNetworksNetworkIdRouteRouteWithChildren;
-  "/app/machines/$endpointId": typeof AppMachinesEndpointIdRoute;
-  "/app/relays/$relayId": typeof AppRelaysRelayIdRoute;
-  "/app/serves/$serveId": typeof AppServesServeIdRoute;
-  "/app/settings/account": typeof AppSettingsAccountRoute;
-  "/app/settings/api-keys": typeof AppSettingsApiKeysRoute;
-  "/app/tunnels/$tunnelId": typeof AppTunnelsTunnelIdRoute;
-  "/app/machines/": typeof AppMachinesIndexRoute;
-  "/app/networks/": typeof AppNetworksIndexRoute;
-  "/app/relays/": typeof AppRelaysIndexRoute;
-  "/app/serves/": typeof AppServesIndexRoute;
-  "/app/settings/": typeof AppSettingsIndexRoute;
-  "/app/tunnels/": typeof AppTunnelsIndexRoute;
-  "/app/networks/$networkId/access": typeof AppNetworksNetworkIdAccessRoute;
-  "/app/networks/$networkId/enrollment": typeof AppNetworksNetworkIdEnrollmentRoute;
-  "/app/networks/$networkId/machines": typeof AppNetworksNetworkIdMachinesRoute;
-  "/app/networks/$networkId/map": typeof AppNetworksNetworkIdMapRoute;
-  "/app/networks/$networkId/routes": typeof AppNetworksNetworkIdRoutesRoute;
-  "/app/networks/$networkId/": typeof AppNetworksNetworkIdIndexRoute;
+  __root__: typeof rootRouteImport
+  '/': typeof IndexRoute
+  '/app': typeof AppRouteRouteWithChildren
+  '/login': typeof LoginRoute
+  '/app/settings': typeof AppSettingsRouteRouteWithChildren
+  '/accept-invitation/$invitationId': typeof AcceptInvitationInvitationIdRoute
+  '/app/access': typeof AppAccessRoute
+  '/app/logs': typeof AppLogsRoute
+  '/app/onboarding': typeof AppOnboardingRoute
+  '/app/users': typeof AppUsersRoute
+  '/app/': typeof AppIndexRoute
+  '/app/networks/$networkId': typeof AppNetworksNetworkIdRouteRouteWithChildren
+  '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
+  '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
+  '/app/serves/$serveId': typeof AppServesServeIdRoute
+  '/app/settings/account': typeof AppSettingsAccountRoute
+  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
+  '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
+  '/app/machines/': typeof AppMachinesIndexRoute
+  '/app/networks/': typeof AppNetworksIndexRoute
+  '/app/relays/': typeof AppRelaysIndexRoute
+  '/app/serves/': typeof AppServesIndexRoute
+  '/app/settings/': typeof AppSettingsIndexRoute
+  '/app/tunnels/': typeof AppTunnelsIndexRoute
+  '/app/networks/$networkId/access': typeof AppNetworksNetworkIdAccessRoute
+  '/app/networks/$networkId/enrollment': typeof AppNetworksNetworkIdEnrollmentRoute
+  '/app/networks/$networkId/machines': typeof AppNetworksNetworkIdMachinesRoute
+  '/app/networks/$networkId/map': typeof AppNetworksNetworkIdMapRoute
+  '/app/networks/$networkId/routes': typeof AppNetworksNetworkIdRoutesRoute
+  '/app/networks/$networkId/': typeof AppNetworksNetworkIdIndexRoute
 }
 export interface FileRouteTypes {
-  fileRoutesByFullPath: FileRoutesByFullPath;
+  fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    | "/"
-    | "/app"
-    | "/login"
-    | "/app/settings"
-    | "/accept-invitation/$invitationId"
-    | "/app/access"
-    | "/app/logs"
-    | "/app/onboarding"
-    | "/app/users"
-    | "/app/"
-    | "/app/networks/$networkId"
-    | "/app/machines/$endpointId"
-    | "/app/relays/$relayId"
-    | "/app/serves/$serveId"
-    | "/app/settings/account"
-    | "/app/settings/api-keys"
-    | "/app/tunnels/$tunnelId"
-    | "/app/machines/"
-    | "/app/networks/"
-    | "/app/relays/"
-    | "/app/serves/"
-    | "/app/settings/"
-    | "/app/tunnels/"
-    | "/app/networks/$networkId/access"
-    | "/app/networks/$networkId/enrollment"
-    | "/app/networks/$networkId/machines"
-    | "/app/networks/$networkId/map"
-    | "/app/networks/$networkId/routes"
-    | "/app/networks/$networkId/";
-  fileRoutesByTo: FileRoutesByTo;
+    | '/'
+    | '/app'
+    | '/login'
+    | '/app/settings'
+    | '/accept-invitation/$invitationId'
+    | '/app/access'
+    | '/app/logs'
+    | '/app/onboarding'
+    | '/app/users'
+    | '/app/'
+    | '/app/networks/$networkId'
+    | '/app/machines/$endpointId'
+    | '/app/relays/$relayId'
+    | '/app/serves/$serveId'
+    | '/app/settings/account'
+    | '/app/settings/api-keys'
+    | '/app/tunnels/$tunnelId'
+    | '/app/machines/'
+    | '/app/networks/'
+    | '/app/relays/'
+    | '/app/serves/'
+    | '/app/settings/'
+    | '/app/tunnels/'
+    | '/app/networks/$networkId/access'
+    | '/app/networks/$networkId/enrollment'
+    | '/app/networks/$networkId/machines'
+    | '/app/networks/$networkId/map'
+    | '/app/networks/$networkId/routes'
+    | '/app/networks/$networkId/'
+  fileRoutesByTo: FileRoutesByTo
   to:
-    | "/"
-    | "/login"
-    | "/accept-invitation/$invitationId"
-    | "/app/access"
-    | "/app/logs"
-    | "/app/onboarding"
-    | "/app/users"
-    | "/app"
-    | "/app/machines/$endpointId"
-    | "/app/relays/$relayId"
-    | "/app/serves/$serveId"
-    | "/app/settings/account"
-    | "/app/settings/api-keys"
-    | "/app/tunnels/$tunnelId"
-    | "/app/machines"
-    | "/app/networks"
-    | "/app/relays"
-    | "/app/serves"
-    | "/app/settings"
-    | "/app/tunnels"
-    | "/app/networks/$networkId/access"
-    | "/app/networks/$networkId/enrollment"
-    | "/app/networks/$networkId/machines"
-    | "/app/networks/$networkId/map"
-    | "/app/networks/$networkId/routes"
-    | "/app/networks/$networkId";
+    | '/'
+    | '/login'
+    | '/accept-invitation/$invitationId'
+    | '/app/access'
+    | '/app/logs'
+    | '/app/onboarding'
+    | '/app/users'
+    | '/app'
+    | '/app/machines/$endpointId'
+    | '/app/relays/$relayId'
+    | '/app/serves/$serveId'
+    | '/app/settings/account'
+    | '/app/settings/api-keys'
+    | '/app/tunnels/$tunnelId'
+    | '/app/machines'
+    | '/app/networks'
+    | '/app/relays'
+    | '/app/serves'
+    | '/app/settings'
+    | '/app/tunnels'
+    | '/app/networks/$networkId/access'
+    | '/app/networks/$networkId/enrollment'
+    | '/app/networks/$networkId/machines'
+    | '/app/networks/$networkId/map'
+    | '/app/networks/$networkId/routes'
+    | '/app/networks/$networkId'
   id:
-    | "__root__"
-    | "/"
-    | "/app"
-    | "/login"
-    | "/app/settings"
-    | "/accept-invitation/$invitationId"
-    | "/app/access"
-    | "/app/logs"
-    | "/app/onboarding"
-    | "/app/users"
-    | "/app/"
-    | "/app/networks/$networkId"
-    | "/app/machines/$endpointId"
-    | "/app/relays/$relayId"
-    | "/app/serves/$serveId"
-    | "/app/settings/account"
-    | "/app/settings/api-keys"
-    | "/app/tunnels/$tunnelId"
-    | "/app/machines/"
-    | "/app/networks/"
-    | "/app/relays/"
-    | "/app/serves/"
-    | "/app/settings/"
-    | "/app/tunnels/"
-    | "/app/networks/$networkId/access"
-    | "/app/networks/$networkId/enrollment"
-    | "/app/networks/$networkId/machines"
-    | "/app/networks/$networkId/map"
-    | "/app/networks/$networkId/routes"
-    | "/app/networks/$networkId/";
-  fileRoutesById: FileRoutesById;
+    | '__root__'
+    | '/'
+    | '/app'
+    | '/login'
+    | '/app/settings'
+    | '/accept-invitation/$invitationId'
+    | '/app/access'
+    | '/app/logs'
+    | '/app/onboarding'
+    | '/app/users'
+    | '/app/'
+    | '/app/networks/$networkId'
+    | '/app/machines/$endpointId'
+    | '/app/relays/$relayId'
+    | '/app/serves/$serveId'
+    | '/app/settings/account'
+    | '/app/settings/api-keys'
+    | '/app/tunnels/$tunnelId'
+    | '/app/machines/'
+    | '/app/networks/'
+    | '/app/relays/'
+    | '/app/serves/'
+    | '/app/settings/'
+    | '/app/tunnels/'
+    | '/app/networks/$networkId/access'
+    | '/app/networks/$networkId/enrollment'
+    | '/app/networks/$networkId/machines'
+    | '/app/networks/$networkId/map'
+    | '/app/networks/$networkId/routes'
+    | '/app/networks/$networkId/'
+  fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute;
-  AppRouteRoute: typeof AppRouteRouteWithChildren;
-  LoginRoute: typeof LoginRoute;
-  AcceptInvitationInvitationIdRoute: typeof AcceptInvitationInvitationIdRoute;
+  IndexRoute: typeof IndexRoute
+  AppRouteRoute: typeof AppRouteRouteWithChildren
+  LoginRoute: typeof LoginRoute
+  AcceptInvitationInvitationIdRoute: typeof AcceptInvitationInvitationIdRoute
 }
 
-declare module "@tanstack/react-router" {
+declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    "/login": {
-      id: "/login";
-      path: "/login";
-      fullPath: "/login";
-      preLoaderRoute: typeof LoginRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/app": {
-      id: "/app";
-      path: "/app";
-      fullPath: "/app";
-      preLoaderRoute: typeof AppRouteRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/": {
-      id: "/";
-      path: "/";
-      fullPath: "/";
-      preLoaderRoute: typeof IndexRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/app/": {
-      id: "/app/";
-      path: "/";
-      fullPath: "/app/";
-      preLoaderRoute: typeof AppIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/users": {
-      id: "/app/users";
-      path: "/users";
-      fullPath: "/app/users";
-      preLoaderRoute: typeof AppUsersRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/onboarding": {
-      id: "/app/onboarding";
-      path: "/onboarding";
-      fullPath: "/app/onboarding";
-      preLoaderRoute: typeof AppOnboardingRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/logs": {
-      id: "/app/logs";
-      path: "/logs";
-      fullPath: "/app/logs";
-      preLoaderRoute: typeof AppLogsRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/access": {
-      id: "/app/access";
-      path: "/access";
-      fullPath: "/app/access";
-      preLoaderRoute: typeof AppAccessRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/accept-invitation/$invitationId": {
-      id: "/accept-invitation/$invitationId";
-      path: "/accept-invitation/$invitationId";
-      fullPath: "/accept-invitation/$invitationId";
-      preLoaderRoute: typeof AcceptInvitationInvitationIdRouteImport;
-      parentRoute: typeof rootRouteImport;
-    };
-    "/app/settings": {
-      id: "/app/settings";
-      path: "/settings";
-      fullPath: "/app/settings";
-      preLoaderRoute: typeof AppSettingsRouteRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/tunnels/": {
-      id: "/app/tunnels/";
-      path: "/tunnels";
-      fullPath: "/app/tunnels/";
-      preLoaderRoute: typeof AppTunnelsIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/settings/": {
-      id: "/app/settings/";
-      path: "/";
-      fullPath: "/app/settings/";
-      preLoaderRoute: typeof AppSettingsIndexRouteImport;
-      parentRoute: typeof AppSettingsRouteRoute;
-    };
-    "/app/serves/": {
-      id: "/app/serves/";
-      path: "/serves";
-      fullPath: "/app/serves/";
-      preLoaderRoute: typeof AppServesIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/relays/": {
-      id: "/app/relays/";
-      path: "/relays";
-      fullPath: "/app/relays/";
-      preLoaderRoute: typeof AppRelaysIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/networks/": {
-      id: "/app/networks/";
-      path: "/networks";
-      fullPath: "/app/networks/";
-      preLoaderRoute: typeof AppNetworksIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/machines/": {
-      id: "/app/machines/";
-      path: "/machines";
-      fullPath: "/app/machines/";
-      preLoaderRoute: typeof AppMachinesIndexRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/tunnels/$tunnelId": {
-      id: "/app/tunnels/$tunnelId";
-      path: "/tunnels/$tunnelId";
-      fullPath: "/app/tunnels/$tunnelId";
-      preLoaderRoute: typeof AppTunnelsTunnelIdRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/settings/api-keys": {
-      id: "/app/settings/api-keys";
-      path: "/api-keys";
-      fullPath: "/app/settings/api-keys";
-      preLoaderRoute: typeof AppSettingsApiKeysRouteImport;
-      parentRoute: typeof AppSettingsRouteRoute;
-    };
-    "/app/settings/account": {
-      id: "/app/settings/account";
-      path: "/account";
-      fullPath: "/app/settings/account";
-      preLoaderRoute: typeof AppSettingsAccountRouteImport;
-      parentRoute: typeof AppSettingsRouteRoute;
-    };
-    "/app/serves/$serveId": {
-      id: "/app/serves/$serveId";
-      path: "/serves/$serveId";
-      fullPath: "/app/serves/$serveId";
-      preLoaderRoute: typeof AppServesServeIdRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/relays/$relayId": {
-      id: "/app/relays/$relayId";
-      path: "/relays/$relayId";
-      fullPath: "/app/relays/$relayId";
-      preLoaderRoute: typeof AppRelaysRelayIdRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/machines/$endpointId": {
-      id: "/app/machines/$endpointId";
-      path: "/machines/$endpointId";
-      fullPath: "/app/machines/$endpointId";
-      preLoaderRoute: typeof AppMachinesEndpointIdRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/networks/$networkId": {
-      id: "/app/networks/$networkId";
-      path: "/networks/$networkId";
-      fullPath: "/app/networks/$networkId";
-      preLoaderRoute: typeof AppNetworksNetworkIdRouteRouteImport;
-      parentRoute: typeof AppRouteRoute;
-    };
-    "/app/networks/$networkId/": {
-      id: "/app/networks/$networkId/";
-      path: "/";
-      fullPath: "/app/networks/$networkId/";
-      preLoaderRoute: typeof AppNetworksNetworkIdIndexRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
-    "/app/networks/$networkId/routes": {
-      id: "/app/networks/$networkId/routes";
-      path: "/routes";
-      fullPath: "/app/networks/$networkId/routes";
-      preLoaderRoute: typeof AppNetworksNetworkIdRoutesRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
-    "/app/networks/$networkId/map": {
-      id: "/app/networks/$networkId/map";
-      path: "/map";
-      fullPath: "/app/networks/$networkId/map";
-      preLoaderRoute: typeof AppNetworksNetworkIdMapRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
-    "/app/networks/$networkId/machines": {
-      id: "/app/networks/$networkId/machines";
-      path: "/machines";
-      fullPath: "/app/networks/$networkId/machines";
-      preLoaderRoute: typeof AppNetworksNetworkIdMachinesRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
-    "/app/networks/$networkId/enrollment": {
-      id: "/app/networks/$networkId/enrollment";
-      path: "/enrollment";
-      fullPath: "/app/networks/$networkId/enrollment";
-      preLoaderRoute: typeof AppNetworksNetworkIdEnrollmentRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
-    "/app/networks/$networkId/access": {
-      id: "/app/networks/$networkId/access";
-      path: "/access";
-      fullPath: "/app/networks/$networkId/access";
-      preLoaderRoute: typeof AppNetworksNetworkIdAccessRouteImport;
-      parentRoute: typeof AppNetworksNetworkIdRouteRoute;
-    };
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/app': {
+      id: '/app'
+      path: '/app'
+      fullPath: '/app'
+      preLoaderRoute: typeof AppRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/app/': {
+      id: '/app/'
+      path: '/'
+      fullPath: '/app/'
+      preLoaderRoute: typeof AppIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/users': {
+      id: '/app/users'
+      path: '/users'
+      fullPath: '/app/users'
+      preLoaderRoute: typeof AppUsersRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/onboarding': {
+      id: '/app/onboarding'
+      path: '/onboarding'
+      fullPath: '/app/onboarding'
+      preLoaderRoute: typeof AppOnboardingRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/logs': {
+      id: '/app/logs'
+      path: '/logs'
+      fullPath: '/app/logs'
+      preLoaderRoute: typeof AppLogsRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/access': {
+      id: '/app/access'
+      path: '/access'
+      fullPath: '/app/access'
+      preLoaderRoute: typeof AppAccessRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/accept-invitation/$invitationId': {
+      id: '/accept-invitation/$invitationId'
+      path: '/accept-invitation/$invitationId'
+      fullPath: '/accept-invitation/$invitationId'
+      preLoaderRoute: typeof AcceptInvitationInvitationIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/app/settings': {
+      id: '/app/settings'
+      path: '/settings'
+      fullPath: '/app/settings'
+      preLoaderRoute: typeof AppSettingsRouteRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/tunnels/': {
+      id: '/app/tunnels/'
+      path: '/tunnels'
+      fullPath: '/app/tunnels/'
+      preLoaderRoute: typeof AppTunnelsIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/settings/': {
+      id: '/app/settings/'
+      path: '/'
+      fullPath: '/app/settings/'
+      preLoaderRoute: typeof AppSettingsIndexRouteImport
+      parentRoute: typeof AppSettingsRouteRoute
+    }
+    '/app/serves/': {
+      id: '/app/serves/'
+      path: '/serves'
+      fullPath: '/app/serves/'
+      preLoaderRoute: typeof AppServesIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/relays/': {
+      id: '/app/relays/'
+      path: '/relays'
+      fullPath: '/app/relays/'
+      preLoaderRoute: typeof AppRelaysIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/networks/': {
+      id: '/app/networks/'
+      path: '/networks'
+      fullPath: '/app/networks/'
+      preLoaderRoute: typeof AppNetworksIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/machines/': {
+      id: '/app/machines/'
+      path: '/machines'
+      fullPath: '/app/machines/'
+      preLoaderRoute: typeof AppMachinesIndexRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/tunnels/$tunnelId': {
+      id: '/app/tunnels/$tunnelId'
+      path: '/tunnels/$tunnelId'
+      fullPath: '/app/tunnels/$tunnelId'
+      preLoaderRoute: typeof AppTunnelsTunnelIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/settings/api-keys': {
+      id: '/app/settings/api-keys'
+      path: '/api-keys'
+      fullPath: '/app/settings/api-keys'
+      preLoaderRoute: typeof AppSettingsApiKeysRouteImport
+      parentRoute: typeof AppSettingsRouteRoute
+    }
+    '/app/settings/account': {
+      id: '/app/settings/account'
+      path: '/account'
+      fullPath: '/app/settings/account'
+      preLoaderRoute: typeof AppSettingsAccountRouteImport
+      parentRoute: typeof AppSettingsRouteRoute
+    }
+    '/app/serves/$serveId': {
+      id: '/app/serves/$serveId'
+      path: '/serves/$serveId'
+      fullPath: '/app/serves/$serveId'
+      preLoaderRoute: typeof AppServesServeIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/relays/$relayId': {
+      id: '/app/relays/$relayId'
+      path: '/relays/$relayId'
+      fullPath: '/app/relays/$relayId'
+      preLoaderRoute: typeof AppRelaysRelayIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/machines/$endpointId': {
+      id: '/app/machines/$endpointId'
+      path: '/machines/$endpointId'
+      fullPath: '/app/machines/$endpointId'
+      preLoaderRoute: typeof AppMachinesEndpointIdRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/networks/$networkId': {
+      id: '/app/networks/$networkId'
+      path: '/networks/$networkId'
+      fullPath: '/app/networks/$networkId'
+      preLoaderRoute: typeof AppNetworksNetworkIdRouteRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/networks/$networkId/': {
+      id: '/app/networks/$networkId/'
+      path: '/'
+      fullPath: '/app/networks/$networkId/'
+      preLoaderRoute: typeof AppNetworksNetworkIdIndexRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
+    '/app/networks/$networkId/routes': {
+      id: '/app/networks/$networkId/routes'
+      path: '/routes'
+      fullPath: '/app/networks/$networkId/routes'
+      preLoaderRoute: typeof AppNetworksNetworkIdRoutesRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
+    '/app/networks/$networkId/map': {
+      id: '/app/networks/$networkId/map'
+      path: '/map'
+      fullPath: '/app/networks/$networkId/map'
+      preLoaderRoute: typeof AppNetworksNetworkIdMapRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
+    '/app/networks/$networkId/machines': {
+      id: '/app/networks/$networkId/machines'
+      path: '/machines'
+      fullPath: '/app/networks/$networkId/machines'
+      preLoaderRoute: typeof AppNetworksNetworkIdMachinesRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
+    '/app/networks/$networkId/enrollment': {
+      id: '/app/networks/$networkId/enrollment'
+      path: '/enrollment'
+      fullPath: '/app/networks/$networkId/enrollment'
+      preLoaderRoute: typeof AppNetworksNetworkIdEnrollmentRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
+    '/app/networks/$networkId/access': {
+      id: '/app/networks/$networkId/access'
+      path: '/access'
+      fullPath: '/app/networks/$networkId/access'
+      preLoaderRoute: typeof AppNetworksNetworkIdAccessRouteImport
+      parentRoute: typeof AppNetworksNetworkIdRouteRoute
+    }
   }
 }
 
 interface AppSettingsRouteRouteChildren {
-  AppSettingsAccountRoute: typeof AppSettingsAccountRoute;
-  AppSettingsApiKeysRoute: typeof AppSettingsApiKeysRoute;
-  AppSettingsIndexRoute: typeof AppSettingsIndexRoute;
+  AppSettingsAccountRoute: typeof AppSettingsAccountRoute
+  AppSettingsApiKeysRoute: typeof AppSettingsApiKeysRoute
+  AppSettingsIndexRoute: typeof AppSettingsIndexRoute
 }
 
 const AppSettingsRouteRouteChildren: AppSettingsRouteRouteChildren = {
   AppSettingsAccountRoute: AppSettingsAccountRoute,
   AppSettingsApiKeysRoute: AppSettingsApiKeysRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,
-};
+}
 
 const AppSettingsRouteRouteWithChildren =
-  AppSettingsRouteRoute._addFileChildren(AppSettingsRouteRouteChildren);
+  AppSettingsRouteRoute._addFileChildren(AppSettingsRouteRouteChildren)
 
 interface AppNetworksNetworkIdRouteRouteChildren {
-  AppNetworksNetworkIdAccessRoute: typeof AppNetworksNetworkIdAccessRoute;
-  AppNetworksNetworkIdEnrollmentRoute: typeof AppNetworksNetworkIdEnrollmentRoute;
-  AppNetworksNetworkIdMachinesRoute: typeof AppNetworksNetworkIdMachinesRoute;
-  AppNetworksNetworkIdMapRoute: typeof AppNetworksNetworkIdMapRoute;
-  AppNetworksNetworkIdRoutesRoute: typeof AppNetworksNetworkIdRoutesRoute;
-  AppNetworksNetworkIdIndexRoute: typeof AppNetworksNetworkIdIndexRoute;
+  AppNetworksNetworkIdAccessRoute: typeof AppNetworksNetworkIdAccessRoute
+  AppNetworksNetworkIdEnrollmentRoute: typeof AppNetworksNetworkIdEnrollmentRoute
+  AppNetworksNetworkIdMachinesRoute: typeof AppNetworksNetworkIdMachinesRoute
+  AppNetworksNetworkIdMapRoute: typeof AppNetworksNetworkIdMapRoute
+  AppNetworksNetworkIdRoutesRoute: typeof AppNetworksNetworkIdRoutesRoute
+  AppNetworksNetworkIdIndexRoute: typeof AppNetworksNetworkIdIndexRoute
 }
 
 const AppNetworksNetworkIdRouteRouteChildren: AppNetworksNetworkIdRouteRouteChildren =
@@ -623,30 +623,30 @@ const AppNetworksNetworkIdRouteRouteChildren: AppNetworksNetworkIdRouteRouteChil
     AppNetworksNetworkIdMapRoute: AppNetworksNetworkIdMapRoute,
     AppNetworksNetworkIdRoutesRoute: AppNetworksNetworkIdRoutesRoute,
     AppNetworksNetworkIdIndexRoute: AppNetworksNetworkIdIndexRoute,
-  };
+  }
 
 const AppNetworksNetworkIdRouteRouteWithChildren =
   AppNetworksNetworkIdRouteRoute._addFileChildren(
     AppNetworksNetworkIdRouteRouteChildren,
-  );
+  )
 
 interface AppRouteRouteChildren {
-  AppSettingsRouteRoute: typeof AppSettingsRouteRouteWithChildren;
-  AppAccessRoute: typeof AppAccessRoute;
-  AppLogsRoute: typeof AppLogsRoute;
-  AppOnboardingRoute: typeof AppOnboardingRoute;
-  AppUsersRoute: typeof AppUsersRoute;
-  AppIndexRoute: typeof AppIndexRoute;
-  AppNetworksNetworkIdRouteRoute: typeof AppNetworksNetworkIdRouteRouteWithChildren;
-  AppMachinesEndpointIdRoute: typeof AppMachinesEndpointIdRoute;
-  AppRelaysRelayIdRoute: typeof AppRelaysRelayIdRoute;
-  AppServesServeIdRoute: typeof AppServesServeIdRoute;
-  AppTunnelsTunnelIdRoute: typeof AppTunnelsTunnelIdRoute;
-  AppMachinesIndexRoute: typeof AppMachinesIndexRoute;
-  AppNetworksIndexRoute: typeof AppNetworksIndexRoute;
-  AppRelaysIndexRoute: typeof AppRelaysIndexRoute;
-  AppServesIndexRoute: typeof AppServesIndexRoute;
-  AppTunnelsIndexRoute: typeof AppTunnelsIndexRoute;
+  AppSettingsRouteRoute: typeof AppSettingsRouteRouteWithChildren
+  AppAccessRoute: typeof AppAccessRoute
+  AppLogsRoute: typeof AppLogsRoute
+  AppOnboardingRoute: typeof AppOnboardingRoute
+  AppUsersRoute: typeof AppUsersRoute
+  AppIndexRoute: typeof AppIndexRoute
+  AppNetworksNetworkIdRouteRoute: typeof AppNetworksNetworkIdRouteRouteWithChildren
+  AppMachinesEndpointIdRoute: typeof AppMachinesEndpointIdRoute
+  AppRelaysRelayIdRoute: typeof AppRelaysRelayIdRoute
+  AppServesServeIdRoute: typeof AppServesServeIdRoute
+  AppTunnelsTunnelIdRoute: typeof AppTunnelsTunnelIdRoute
+  AppMachinesIndexRoute: typeof AppMachinesIndexRoute
+  AppNetworksIndexRoute: typeof AppNetworksIndexRoute
+  AppRelaysIndexRoute: typeof AppRelaysIndexRoute
+  AppServesIndexRoute: typeof AppServesIndexRoute
+  AppTunnelsIndexRoute: typeof AppTunnelsIndexRoute
 }
 
 const AppRouteRouteChildren: AppRouteRouteChildren = {
@@ -666,28 +666,27 @@ const AppRouteRouteChildren: AppRouteRouteChildren = {
   AppRelaysIndexRoute: AppRelaysIndexRoute,
   AppServesIndexRoute: AppServesIndexRoute,
   AppTunnelsIndexRoute: AppTunnelsIndexRoute,
-};
+}
 
 const AppRouteRouteWithChildren = AppRouteRoute._addFileChildren(
   AppRouteRouteChildren,
-);
+)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AppRouteRoute: AppRouteRouteWithChildren,
   LoginRoute: LoginRoute,
   AcceptInvitationInvitationIdRoute: AcceptInvitationInvitationIdRoute,
-};
+}
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
-  ._addFileTypes<FileRouteTypes>();
+  ._addFileTypes<FileRouteTypes>()
 
-import type { createStart } from "@tanstack/react-start";
-import type { getRouter } from "./router.tsx";
-
-declare module "@tanstack/react-start" {
+import type { getRouter } from './router.tsx'
+import type { createStart } from '@tanstack/react-start'
+declare module '@tanstack/react-start' {
   interface Register {
-    ssr: true;
-    router: Awaited<ReturnType<typeof getRouter>>;
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
   }
 }

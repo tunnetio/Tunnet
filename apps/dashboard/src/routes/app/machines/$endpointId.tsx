@@ -12,6 +12,7 @@ import { CreateTunnelDialog } from "@/components/app/create-tunnel-dialog";
 import { EmptyState } from "@/components/app/empty-state";
 import { EntityStatus } from "@/components/app/entity-status";
 import { LastSeenCell } from "@/components/app/last-seen-cell";
+import { MachineRoutesPanel } from "@/components/app/machine-routes-panel";
 import { PageHeader } from "@/components/app/page-header";
 import { StatusBadge } from "@/components/app/status-badge";
 import { Badge } from "@/components/ui/badge";
@@ -260,6 +261,7 @@ function MachineDetailPage() {
         <TabsList variant="line">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="networking">Networking</TabsTrigger>
+          <TabsTrigger value="routes">Routes</TabsTrigger>
           <TabsTrigger value="tunnels">Tunnels</TabsTrigger>
           <TabsTrigger value="serves">Serves</TabsTrigger>
           <TabsTrigger value="system">System</TabsTrigger>
@@ -396,6 +398,16 @@ function MachineDetailPage() {
               </CardContent>
             </Card>
           </div>
+        </TabsContent>
+
+        <TabsContent value="routes">
+          <MachineRoutesPanel
+            orgId={orgId}
+            networkId={networkId}
+            endpointId={endpointId}
+            hostname={device.metadata.hostname}
+            isAdmin={isAdmin}
+          />
         </TabsContent>
 
         <TabsContent value="tunnels">

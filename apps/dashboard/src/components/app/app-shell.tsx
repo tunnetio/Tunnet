@@ -24,9 +24,11 @@ export function AppShell({ children }: AppShellProps) {
               to="/app"
               className="text-foreground flex shrink-0 items-center gap-2 font-medium tracking-tight"
             >
-              <span className="bg-hub flex size-6 items-center justify-center rounded-md text-[11px] font-bold text-black">
-                T
-              </span>
+              <img
+                src="/logo.png"
+                alt="Tuntun"
+                className="h-6 w-6 rounded-md"
+              />
               <span className="hidden sm:inline">TunTun</span>
             </Link>
             <div className="bg-border hidden h-4 w-px sm:block" />

@@ -1,27 +1,25 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
 import type {
   CreateHostnameRouteBody,
   CreateSubnetRouteBody,
 } from "@tuntun/api/management";
-import { PlusIcon, SearchIcon } from "lucide-react";
+import { PlusIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { DataTable } from "@/components/app/data-table";
+import { EmptyState } from "@/components/app/empty-state";
 import {
-  buildNetworkRouteColumns,
+  AddRouteTypeDialog,
+  buildMachineRouteColumns,
   CreateHostnameRouteDialog,
   CreateSubnetRouteDialog,
-  NetworkRoutesMiniDiagram,
+  MachineConnectedRoutesDiagram,
   toUnifiedRoutes,
   type UnifiedRoute,
 } from "@/components/app/route-management";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { isAdminRole, useMemberRole } from "@/hooks/use-member-role";
-import { useActiveOrganization } from "@/lib/auth-client";
 import { createManagementClient } from "@/lib/management-client";
 import {
   useDevices,
@@ -29,38 +27,56 @@ import {
   useSubnetRoutes,
 } from "@/lib/queries/management";
 import { queryKeys } from "@/lib/query-keys";
-import { cn } from "@/lib/utils";
 
-export const Route = createFileRoute("/app/networks/$networkId/routes")({
-  component: NetworkRoutesPage,
-});
+type MachineRoutesPanelProps = {
+  orgId: string;
+  networkId: string | undefined;
+  endpointId: string;
+  hostname: string;
+  isAdmin: boolean;
+};
 
-type RouteKind = "all" | "subnet" | "hostname";
-
-function NetworkRoutesPage() {
-  const { networkId } = Route.useParams();
-  const { data: activeOrg } = useActiveOrganization();
-  const orgId = activeOrg?.id;
-  const { data: role } = useMemberRole(orgId);
-  const isAdmin = isAdminRole(role);
+export function MachineRoutesPanel({
+  orgId,
+  networkId,
+  endpointId,
+  hostname,
+  isAdmin,
+}: MachineRoutesPanelProps) {
+  const queryClient = useQueryClient();
   const { data: subnetRoutes, isPending: subnetsPending } = useSubnetRoutes(
     orgId,
-    networkId,
+    networkId ?? "",
   );
   const { data: hostnameRoutes, isPending: hostnamesPending } =
-    useHostnameRoutes(orgId, networkId);
-  const { data: devices } = useDevices(orgId, networkId);
-  const queryClient = useQueryClient();
+    useHostnameRoutes(orgId, networkId ?? "");
+  const { data: devices } = useDevices(orgId, networkId ?? "");
 
-  const [kind, setKind] = useState<RouteKind>("all");
-  const [query, setQuery] = useState("");
+  const [typePickerOpen, setTypePickerOpen] = useState(false);
   const [createSubnetOpen, setCreateSubnetOpen] = useState(false);
   const [createHostnameOpen, setCreateHostnameOpen] = useState(false);
   const [deleteSubnetId, setDeleteSubnetId] = useState<string | null>(null);
   const [deleteHostnameId, setDeleteHostnameId] = useState<string | null>(null);
 
+  const deviceType = devices?.find((d) => d.endpointId === endpointId)?.type;
+  const canAdvertise = deviceType !== "sdk";
+
+  const machineSubnets = useMemo(
+    () => (subnetRoutes ?? []).filter((r) => r.endpointId === endpointId),
+    [subnetRoutes, endpointId],
+  );
+  const machineHostnames = useMemo(
+    () => (hostnameRoutes ?? []).filter((r) => r.endpointId === endpointId),
+    [hostnameRoutes, endpointId],
+  );
+
+  const rows = useMemo(
+    () => toUnifiedRoutes(machineSubnets, machineHostnames),
+    [machineSubnets, machineHostnames],
+  );
+
   const invalidateRoutes = () => {
-    if (!orgId) return;
+    if (!networkId) return;
     void queryClient.invalidateQueries({
       queryKey: queryKeys.subnetRoutes(orgId, networkId),
     });
@@ -74,7 +90,7 @@ function NetworkRoutesPage() {
 
   const createSubnet = useMutation({
     mutationFn: async (body: CreateSubnetRouteBody) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).createSubnetRoute(networkId, body);
     },
     onSuccess: invalidateRoutes,
@@ -87,20 +103,18 @@ function NetworkRoutesPage() {
       routeId: string;
       enabled: boolean;
     }) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).updateSubnetRoute(
         networkId,
         routeId,
-        {
-          enabled,
-        },
+        { enabled },
       );
     },
     onSuccess: invalidateRoutes,
   });
   const deleteSubnet = useMutation({
     mutationFn: async (routeId: string) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).deleteSubnetRoute(
         networkId,
         routeId,
@@ -111,7 +125,7 @@ function NetworkRoutesPage() {
 
   const createHostname = useMutation({
     mutationFn: async (body: CreateHostnameRouteBody) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).createHostnameRoute(networkId, body);
     },
     onSuccess: invalidateRoutes,
@@ -124,7 +138,7 @@ function NetworkRoutesPage() {
       routeId: string;
       enabled: boolean;
     }) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).updateHostnameRoute(
         networkId,
         routeId,
@@ -135,7 +149,7 @@ function NetworkRoutesPage() {
   });
   const deleteHostname = useMutation({
     mutationFn: async (routeId: string) => {
-      if (!orgId) throw new Error("No organization");
+      if (!networkId) throw new Error("No network");
       return createManagementClient(orgId).deleteHostnameRoute(
         networkId,
         routeId,
@@ -144,36 +158,14 @@ function NetworkRoutesPage() {
     onSuccess: invalidateRoutes,
   });
 
-  const rows = useMemo(
-    () => toUnifiedRoutes(subnetRoutes ?? [], hostnameRoutes ?? []),
-    [subnetRoutes, hostnameRoutes],
-  );
-
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return rows.filter((r) => {
-      if (kind !== "all" && r.kind !== kind) return false;
-      if (!q) return true;
-      return (
-        r.name.toLowerCase().includes(q) ||
-        r.destination.toLowerCase().includes(q) ||
-        r.via.toLowerCase().includes(q) ||
-        r.description.toLowerCase().includes(q)
-      );
-    });
-  }, [rows, kind, query]);
-
   const columns = useMemo(
     () =>
-      buildNetworkRouteColumns({
+      buildMachineRouteColumns({
         isAdmin,
-        onToggle: (r: UnifiedRoute) => {
+        onToggle: (r) => {
           const run = r.kind === "subnet" ? toggleSubnet : toggleHostname;
           void run
-            .mutateAsync({
-              routeId: r.id,
-              enabled: !r.enabled,
-            })
+            .mutateAsync({ routeId: r.id, enabled: !r.enabled })
             .then(() => toast.success("Updated"))
             .catch((err: unknown) =>
               toast.error(
@@ -189,94 +181,89 @@ function NetworkRoutesPage() {
     [isAdmin, toggleHostname, toggleSubnet],
   );
 
+  if (!networkId) {
+    return (
+      <EmptyState
+        title="No network membership"
+        description="Join a network before advertising private routes through this machine."
+      />
+    );
+  }
+
+  if (deviceType === "sdk") {
+    return (
+      <EmptyState
+        title="Routes not available"
+        description="SDK machines cannot advertise subnet or hostname routes. Use an agent machine as a gateway."
+      />
+    );
+  }
+
   const pending = subnetsPending || hostnamesPending;
-  const subnetCount = subnetRoutes?.length ?? 0;
-  const hostnameCount = hostnameRoutes?.length ?? 0;
+  const canAdd = isAdmin && canAdvertise;
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="max-w-2xl space-y-1">
           <h2 className="text-sm font-medium tracking-tight">Routes</h2>
-          <p className="text-muted-foreground text-xs tabular-nums">
-            {subnetCount} subnet · {hostnameCount} hostname
+          <p className="text-muted-foreground text-sm leading-relaxed">
+            Add private network routes so devices on your mesh can reach hosts
+            behind this machine - even if those hosts aren&apos;t running the
+            agent.
           </p>
         </div>
-        {isAdmin ? (
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setCreateHostnameOpen(true)}
-            >
-              <PlusIcon className="size-3.5" />
-              Hostname
-            </Button>
-            <Button size="sm" onClick={() => setCreateSubnetOpen(true)}>
-              <PlusIcon className="size-3.5" />
-              Subnet
-            </Button>
-          </div>
+        {canAdd ? (
+          <Button size="sm" onClick={() => setTypePickerOpen(true)}>
+            <PlusIcon className="size-3.5" />
+            Add route
+          </Button>
         ) : null}
       </div>
 
-      <NetworkRoutesMiniDiagram
-        subnets={subnetRoutes ?? []}
-        hostnames={hostnameRoutes ?? []}
+      <MachineConnectedRoutesDiagram
+        hostname={hostname}
+        subnets={machineSubnets}
+        hostnames={machineHostnames}
+        canAdd={canAdd}
+        onAddRoute={() => setTypePickerOpen(true)}
       />
-
-      <div className="flex flex-wrap items-center gap-2">
-        {(
-          [
-            ["all", "All", rows.length],
-            ["subnet", "Subnet", subnetCount],
-            ["hostname", "Hostname", hostnameCount],
-          ] as const
-        ).map(([id, label, count]) => (
-          <button
-            key={id}
-            type="button"
-            onClick={() => setKind(id)}
-            className={cn(
-              "inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs transition-colors",
-              kind === id
-                ? "border-border bg-secondary text-foreground"
-                : "border-transparent bg-transparent text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
-            )}
-          >
-            {label}
-            <span className="text-muted-foreground tabular-nums">{count}</span>
-          </button>
-        ))}
-        <div className="relative ml-auto w-full max-w-xs sm:w-56">
-          <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2" />
-          <Input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search routes"
-            className="h-8 pl-8 text-xs"
-          />
-        </div>
-      </div>
 
       {pending ? (
         <Skeleton className="h-48 w-full" />
-      ) : filtered.length === 0 ? (
-        <div className="text-muted-foreground flex h-32 items-center justify-center rounded-lg border border-dashed border-border/70 text-sm">
-          No routes
+      ) : rows.length === 0 ? (
+        <div className="text-muted-foreground flex h-32 flex-col items-center justify-center rounded-lg border border-dashed border-border/70 px-6 text-center text-sm">
+          <p className="font-medium text-foreground">No routes configured</p>
+          <p className="mt-1 max-w-md text-xs leading-relaxed">
+            Add a private network route that will be accessible through this
+            machine. Traffic to this destination will be routed through the
+            node.
+          </p>
         </div>
       ) : (
         <DataTable
           columns={columns}
-          data={filtered}
+          data={rows}
           getRowId={(row) => `${row.kind}:${row.id}`}
         />
       )}
 
+      <AddRouteTypeDialog
+        open={typePickerOpen}
+        onOpenChange={setTypePickerOpen}
+        onSelect={(kind) => {
+          setTypePickerOpen(false);
+          window.setTimeout(() => {
+            if (kind === "subnet") setCreateSubnetOpen(true);
+            else setCreateHostnameOpen(true);
+          }, 150);
+        }}
+      />
+
       <CreateSubnetRouteDialog
         open={createSubnetOpen}
         onOpenChange={setCreateSubnetOpen}
-        devices={devices ?? []}
+        fixedEndpointId={endpointId}
         loading={createSubnet.isPending}
         onSubmit={async (body) => {
           try {
@@ -294,7 +281,7 @@ function NetworkRoutesPage() {
       <CreateHostnameRouteDialog
         open={createHostnameOpen}
         onOpenChange={setCreateHostnameOpen}
-        devices={devices ?? []}
+        fixedEndpointId={endpointId}
         loading={createHostname.isPending}
         onSubmit={async (body) => {
           try {
@@ -313,7 +300,7 @@ function NetworkRoutesPage() {
         open={deleteSubnetId !== null}
         onOpenChange={(open) => !open && setDeleteSubnetId(null)}
         title="Delete subnet route"
-        description="This CIDR will stop advertising through the gateway."
+        description="This CIDR will stop advertising through this machine."
         confirmLabel="Delete"
         destructive
         loading={deleteSubnet.isPending}
@@ -335,7 +322,7 @@ function NetworkRoutesPage() {
         open={deleteHostnameId !== null}
         onOpenChange={(open) => !open && setDeleteHostnameId(null)}
         title="Delete hostname route"
-        description="This hostname will stop resolving through the gateway."
+        description="This hostname will stop resolving through this machine."
         confirmLabel="Delete"
         destructive
         loading={deleteHostname.isPending}
