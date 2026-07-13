@@ -13,7 +13,7 @@ pub fn default_ipc_path(network_id: Uuid) -> PathBuf {
     #[cfg(unix)]
     {
         let base = std::env::var("TUNTUN_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        return PathBuf::from(base).join(format!("tuntun-{network_id}.sock"));
+        PathBuf::from(base).join(format!("tuntun-{network_id}.sock"))
     }
     #[cfg(windows)]
     {
@@ -73,13 +73,13 @@ impl IpcListener {
             }
             let unix = tokio::net::UnixListener::bind(&path)?;
             tracing::info!(path = %path.display(), "IPC listening (unix)");
-            return Ok((
+            Ok((
                 Self {
                     unix,
                     path: path.clone(),
                 },
                 path,
-            ));
+            ))
         }
         #[cfg(windows)]
         {
@@ -120,7 +120,7 @@ impl IpcListener {
         #[cfg(unix)]
         {
             let (stream, _) = self.unix.accept().await?;
-            return Ok(IpcStream::Unix(stream));
+            Ok(IpcStream::Unix(stream))
         }
         #[cfg(windows)]
         {
@@ -186,7 +186,7 @@ pub async fn connect(path: &Path) -> io::Result<ClientStream> {
     #[cfg(unix)]
     {
         let stream = tokio::net::UnixStream::connect(path).await?;
-        return Ok(ClientStream::Unix(stream));
+        Ok(ClientStream::Unix(stream))
     }
     #[cfg(windows)]
     {

@@ -505,7 +505,7 @@ impl RawModeGuard {
                 if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) != 0 {
                     bail!("tcsetattr failed");
                 }
-                return Ok(Self { original });
+                Ok(Self { original })
             }
         }
         #[cfg(not(unix))]

@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+#![allow(dead_code, clippy::too_many_arguments)]
 
 use std::sync::Arc;
 

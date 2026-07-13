@@ -173,10 +173,10 @@ enum NodeInner {
         node: Arc<CoreNode>,
         _sock_path: PathBuf,
     },
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     Client {
         sock_path: PathBuf,
-        network_id: uuid::Uuid,
+        _network_id: uuid::Uuid,
     },
 }
 
@@ -275,7 +275,7 @@ impl TunTunNode {
                     Ok(Self {
                         inner: Arc::new(NodeInner::Client {
                             sock_path,
-                            network_id,
+                            _network_id: network_id,
                         }),
                     })
                 }
@@ -348,6 +348,7 @@ impl TunTunNode {
     pub fn endpoint_id(&self) -> String {
         match &*self.inner {
             NodeInner::Coordinator { node, .. } => node.endpoint_id_hex(),
+            #[cfg(unix)]
             NodeInner::Client { .. } => String::new(),
         }
     }
@@ -375,7 +376,7 @@ impl TunTunNode {
                 .collect()),
             #[cfg(unix)]
             NodeInner::Client { sock_path, .. } => {
-                use tokio::io::{AsyncBufReadExt, BufReader};
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let mut conn = tokio::net::UnixStream::connect(sock_path)
                     .await
                     .map_err(err_io)?;
@@ -402,10 +403,6 @@ impl TunTunNode {
                     _ => Err(Error::from_reason("unexpected coord response")),
                 }
             }
-            #[cfg(not(unix))]
-            NodeInner::Client { .. } => Err(Error::from_reason(
-                "client mode not supported on this platform",
-            )),
         }
     }
 
@@ -424,6 +421,7 @@ impl TunTunNode {
             }
             #[cfg(unix)]
             NodeInner::Client { sock_path, .. } => {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
                 let mut conn = tokio::net::UnixStream::connect(sock_path)
                     .await
                     .map_err(err_io)?;
@@ -432,9 +430,6 @@ impl TunTunNode {
                 buf.push(b'\n');
                 conn.write_all(&buf).await.map_err(err_io)?;
 
-                // Read a single newline-terminated ready/error response, then
-                // hand the socket off as raw bytes.
-                use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut br = BufReader::new(&mut conn);
                 let mut line = String::new();
                 br.read_line(&mut line).await.map_err(err_io)?;
@@ -452,18 +447,18 @@ impl TunTunNode {
                     _ => Err(Error::from_reason("unexpected coord response")),
                 }
             }
-            #[cfg(not(unix))]
-            NodeInner::Client { .. } => Err(Error::from_reason(
-                "client mode not supported on this platform",
-            )),
         }
     }
 
     /// Best-effort shutdown. Multiple calls are safe.
     #[napi]
     pub async fn close(&self) -> Result<()> {
-        if let NodeInner::Coordinator { node, .. } = &*self.inner {
-            node.shutdown().await;
+        match &*self.inner {
+            NodeInner::Coordinator { node, .. } => {
+                node.shutdown().await;
+            }
+            #[cfg(unix)]
+            NodeInner::Client { .. } => {}
         }
         Ok(())
     }
@@ -552,4 +547,14 @@ impl TunTunStream {
 
 fn err(e: anyhow::Error) -> Error {
     Error::from_reason(format!("{e:#}"))
+}
+
+#[cfg(unix)]
+fn err_io(e: std::io::Error) -> Error {
+    err(e.into())
+}
+
+#[cfg(unix)]
+fn err_json(e: serde_json::Error) -> Error {
+    err(e.into())
 }

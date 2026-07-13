@@ -79,7 +79,7 @@ fn build_unix_command(req: &SshRequestHeader) -> anyhow::Result<CommandBuilder> 
     if passwd.is_null() {
         bail!("user `{}` not found", req.target_user);
     }
-    let (uid, gid, shell, home, name) = unsafe {
+    let (uid, _gid, shell, home, name) = unsafe {
         let pw = &*passwd;
         let shell = if pw.pw_shell.is_null() {
             "/bin/sh".to_string()
@@ -101,7 +101,9 @@ fn build_unix_command(req: &SshRequestHeader) -> anyhow::Result<CommandBuilder> 
         (pw.pw_uid, pw.pw_gid, shell, home, name)
     };
 
-    let mut cmd = if let Some(command) = &req.command {
+    let mut cmd = if uid != unsafe { libc::getuid() } {
+        build_user_switched_command(&name, &shell, req.command.as_deref())?
+    } else if let Some(command) = &req.command {
         let mut c = CommandBuilder::new(&shell);
         c.arg("-c");
         c.arg(command);
@@ -116,10 +118,45 @@ fn build_unix_command(req: &SshRequestHeader) -> anyhow::Result<CommandBuilder> 
     cmd.env("USER", &name);
     cmd.env("LOGNAME", &name);
     cmd.env("SHELL", &shell);
-    // portable-pty CommandBuilder supports uid/gid on unix via these methods.
-    cmd.uid(uid);
-    cmd.gid(gid);
     Ok(cmd)
+}
+
+#[cfg(unix)]
+fn build_user_switched_command(
+    username: &str,
+    shell: &str,
+    command: Option<&str>,
+) -> anyhow::Result<CommandBuilder> {
+    if let Some(runuser) = ["/usr/sbin/runuser", "/bin/runuser", "runuser"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+    {
+        let mut c = CommandBuilder::new(runuser);
+        c.arg("-u");
+        c.arg(username);
+        c.arg("--");
+        c.arg(shell);
+        if let Some(command) = command {
+            c.arg("-c");
+            c.arg(command);
+        } else {
+            c.arg("-l");
+        }
+        return Ok(c);
+    }
+
+    let mut c = CommandBuilder::new("su");
+    if command.is_none() {
+        c.arg("-");
+        c.arg(username);
+        return Ok(c);
+    }
+
+    c.arg(username);
+    c.arg("-c");
+    let command = command.unwrap();
+    c.arg(format!("{shell} -c {command}"));
+    Ok(c)
 }
 
 #[cfg(windows)]

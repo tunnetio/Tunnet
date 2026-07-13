@@ -7,11 +7,11 @@ use std::net::Ipv4Addr;
 pub fn configure(dns_ip: Ipv4Addr, suffix: &str) -> anyhow::Result<DnsGuard> {
     #[cfg(target_os = "linux")]
     {
-        return linux::configure(dns_ip, suffix);
+        linux::configure(dns_ip, suffix)
     }
     #[cfg(target_os = "macos")]
     {
-        return macos::configure(dns_ip, suffix);
+        macos::configure(dns_ip, suffix)
     }
     #[cfg(target_os = "windows")]
     {

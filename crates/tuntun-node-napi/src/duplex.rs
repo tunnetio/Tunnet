@@ -1,6 +1,7 @@
 use anyhow::Result;
 use iroh::endpoint::{RecvStream, SendStream};
-
+#[cfg(unix)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub enum Duplex {
     Iroh {
         send: SendStream,

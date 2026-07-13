@@ -124,6 +124,7 @@ impl LockFile {
         use std::os::unix::io::AsRawFd;
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .read(true)
             .open(path)?;

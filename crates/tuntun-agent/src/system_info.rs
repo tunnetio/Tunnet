@@ -31,7 +31,7 @@ fn read_os_version() -> Option<String> {
                 return Some(rest.trim_matches('"').to_string());
             }
         }
-        return None;
+        None
     }
 
     #[cfg(target_os = "macos")]
@@ -78,7 +78,7 @@ fn read_total_memory_bytes() -> Option<u64> {
                 return Some(kb * 1024);
             }
         }
-        return None;
+        None
     }
 
     #[cfg(target_os = "macos")]
