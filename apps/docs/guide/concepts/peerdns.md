@@ -12,7 +12,18 @@ Non-matching queries are forwarded to configured upstream resolvers (default: 1.
 
 ## Configuration
 
-The DNS suffix is configured in **Settings → Organization** in the dashboard. You can also configure upstream resolvers per network.
+**Managed mode** - the DNS suffix is configured in **Settings → Organization** in the dashboard. You can also configure upstream resolvers per network.
+
+**Direct mode** - configure per network in [`tuntun.toml`](/guide/configuration):
+
+```toml
+[direct.homelab.dns]
+magic-ip = "100.100.100.53"
+tld = "tuntun"
+upstream = ["1.1.1.1", "8.8.8.8"]
+```
+
+Apply changes with `tuntun reload`.
 
 ## CLI
 

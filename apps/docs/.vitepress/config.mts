@@ -101,6 +101,7 @@ export default defineConfig({
               text: "Quick Start (Direct)",
               link: "/guide/quickstart-direct",
             },
+            { text: "Configuration", link: "/guide/configuration" },
           ],
         },
         {
@@ -117,7 +118,10 @@ export default defineConfig({
             },
             { text: "PeerDNS", link: "/guide/concepts/peerdns" },
             { text: "Routing", link: "/guide/concepts/routing" },
-            { text: "Encryption & QUIC", link: "/guide/concepts/encryption" },
+            {
+              text: "Encryption & Secrets",
+              link: "/guide/concepts/encryption",
+            },
           ],
         },
       ],
@@ -250,6 +254,8 @@ export default defineConfig({
             { text: "tuntun route", link: "/cli/route" },
             { text: "tuntun dns", link: "/cli/dns" },
             { text: "tuntun login / logout", link: "/cli/login" },
+            { text: "tuntun validate", link: "/cli/validate" },
+            { text: "tuntun reload", link: "/cli/reload" },
             { text: "Direct Mode Commands", link: "/cli/direct" },
             { text: "tuntun service", link: "/cli/service" },
             { text: "tuntun update", link: "/cli/update" },

@@ -1,6 +1,6 @@
 # Enrollment & Identity
 
-Every TunTun agent has a persistent identity: an Ed25519 keypair generated at first enrollment. The public key (as a 64-character hex string) serves as the endpoint ID - a globally unique identifier for that machine.
+Every TunTun agent has a persistent identity: an Ed25519 keypair generated at first enrollment (or first Direct create/join). The public key (as a 64-character hex string) serves as the endpoint ID - a globally unique identifier for that machine.
 
 ## Enrollment flow (Managed)
 
@@ -18,7 +18,13 @@ sudo tuntun enroll --control-url http://control:8080 --token TOKEN
 sudo tuntun enroll --control-url http://control:8080 --org my-company
 ```
 
-After enrollment, the agent stores its identity and network state in `~/.local/state/tuntun` (Linux), configurable with `--state-dir` or `TUNTUN_STATE_DIR`.
+After enrollment, the agent stores public state in `state.json` and seals the identity seed (and later login tokens) in `state.enc`. Public settings go in `tuntun.toml`. See [Configuration](/guide/configuration) and [Encryption & Secrets](/guide/concepts/encryption).
+
+Default state directory: `~/.local/state/tuntun` (Linux user), `/var/lib/tuntun` (Linux service), or override with `--state-dir` / `TUNTUN_STATE_DIR`.
+
+Pass `--no-encrypt-state` (or `TUNTUN_NO_ENCRYPT_STATE=1`) only for containers/CI when platform sealing is unavailable.
+
+You cannot enroll into Managed mode while already joined to Direct networks (or the reverse). Wipe local state first with `tuntun reset --yes`.
 
 ## Request signing
 
@@ -32,4 +38,4 @@ Separate from machine enrollment, users can authenticate from the CLI to the man
 tuntun login --management-url http://localhost:3000
 ```
 
-This opens a browser flow where the user enters a code displayed in the terminal. The resulting token is stored locally and enables management operations from the CLI.
+This opens a browser flow where the user enters a code displayed in the terminal. The resulting token is sealed in `state.enc` and enables management operations from the CLI.

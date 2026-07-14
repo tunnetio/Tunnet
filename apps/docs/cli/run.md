@@ -24,6 +24,6 @@ The agent needs root/admin privileges to create the TUN interface. On Linux, thi
 
 ## Behavior
 
-The agent first loads its persisted identity and state. In managed mode, it connects to the control plane via WebSocket and receives the network snapshot. In direct mode, it joins the iroh-docs membership document and discovers peers via DHT.
+The agent first unlocks sealed secrets (`state.enc`) and loads public state (`state.json`) plus `tuntun.toml`. In Managed mode, it connects to the control plane via WebSocket and receives the network snapshot. In Direct mode, it joins each network's iroh-docs membership document and discovers peers via DHT.
 
-It then creates the TUN interface, configures routing and DNS, starts the iroh endpoint, and enters its main event loop - handling packets, maintaining peer connections, and syncing configuration.
+It then creates the TUN interface, configures routing and DNS, starts the iroh endpoint, and enters its main event loop - handling packets, maintaining peer connections, and syncing configuration. If `[update].enabled` is set in `tuntun.toml`, it also runs the auto-update loop.

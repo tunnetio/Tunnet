@@ -31,14 +31,20 @@ The `tuntun` CLI is the primary interface for interacting with TunTun from the c
 | `tuntun ssh` | Identity-based SSH to a peer |
 | `tuntun login` | Sign in to management (device auth) |
 | `tuntun logout` | Clear stored management tokens |
+| `tuntun validate` | Validate `tuntun.toml` |
+| `tuntun reload` | Hot-reload firewall / DNS / logging from `tuntun.toml` |
 | `tuntun create` | Create a Direct (P2P) network |
 | `tuntun join` | Join a Direct network with an invite |
 | `tuntun invite` | Create an invite code |
-| `tuntun connect` | Ephemeral 2-peer connection |
+| `tuntun leave` | Leave one Direct network |
+| `tuntun override-ip` | Override a peer IP (multi-network collisions) |
+| `tuntun connect` | Ephemeral 2-peer connection (contact id) |
 | `tuntun requests` | List pending join requests |
 | `tuntun accept` | Accept a join request |
 | `tuntun deny` | Deny a join request |
 | `tuntun kick` | Remove a peer from a Direct network |
 | `tuntun firewall` | Manage the local Direct firewall |
+| `tuntun policy` | Coordinator firewall policy |
+| `tuntun keep-alive` | Keep a Direct peer connection always open |
 | `tuntun upgrade-to-managed` | Migrate from Direct to Managed |
 | `tuntun update` | Upgrade the agent from GitHub Releases |

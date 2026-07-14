@@ -22,6 +22,8 @@ sudo tuntun service start
 
 See [Quick Start (Managed)](/guide/quickstart-managed) or [Quick Start (Direct)](/guide/quickstart-direct).
 
+Agent config lands in `tuntun.toml` next to sealed secrets in the state directory. See [Configuration](/guide/configuration).
+
 ## Options
 
 Pin a version:
@@ -53,6 +55,8 @@ sudo tuntun update
 
 On Linux this reloads the agent gracefully by default. Pass `--restart` for a full service restart. Use `tuntun update --check` to only look for a newer release.
 
+For unattended upgrades, enable `[update]` in `tuntun.toml` (see [tuntun update](/cli/update)).
+
 ## Building from source
 
 If you are developing TunTun or self-hosting the full stack from a checkout:
@@ -70,3 +74,4 @@ Binaries land in `target/release/`. For the management API and dashboard, also r
 - **Linux** - root (or `CAP_NET_ADMIN`) for the TUN interface.
 - **macOS** - admin privileges for the TUN interface.
 - **Windows** - Administrator privileges and the [Wintun](https://www.wintun.net/) driver.
+- **Containers / CI** - pass `--no-encrypt-state` (or `TUNTUN_NO_ENCRYPT_STATE=1`) if platform secret sealing is unavailable.

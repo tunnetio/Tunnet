@@ -16,4 +16,4 @@ tuntun status [--peers]
 
 ## Output
 
-Shows the agent's endpoint ID, assigned mesh IP, network name, mode (managed/direct), and control plane connectivity. With `--peers`, also lists all connected peers with their IPs, hostnames, and connection status.
+Shows the agent's endpoint ID, assigned mesh IP(s), network name(s), mode (managed/direct), and control plane connectivity. In Direct mode with multiple networks, all joined networks are listed. With `--peers`, also lists connected peers with their IPs, hostnames, and connection status.
