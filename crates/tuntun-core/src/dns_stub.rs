@@ -71,7 +71,16 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
     let sock = Arc::new(sock);
     let mut buf = vec![0u8; UDP_BUF];
     loop {
-        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            // Windows surfaces ICMP port-unreachable as WSAECONNRESET (10054) on
+            // the next recv. That is normal for UDP and must not kill PeerDNS.
+            Err(e) if is_transient_udp_recv_error(&e) => {
+                tracing::debug!(?e, %bind, "PeerDNS ignoring transient UDP recv error");
+                continue;
+            }
+            Err(e) => return Err(e).context("PeerDNS recv_from"),
+        };
         let request = buf[..n].to_vec();
         let sock = sock.clone();
         let routes = routes.clone();
@@ -83,6 +92,17 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
             }
         });
     }
+}
+
+fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+    )
 }
 
 async fn handle_query(
@@ -239,5 +259,13 @@ mod tests {
         assert_eq!(decoded.metadata.id, 42);
         assert!(decoded.metadata.authoritative);
         assert_eq!(decoded.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[test]
+    fn windows_udp_connreset_is_transient() {
+        let err = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(is_transient_udp_recv_error(&err));
+        let fatal = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        assert!(!is_transient_udp_recv_error(&fatal));
     }
 }
