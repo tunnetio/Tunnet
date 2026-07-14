@@ -55,6 +55,14 @@ impl AclEngine {
     }
 
     pub fn allow_inbound_peer(&self, peer_endpoint_hex: &str) -> bool {
+        self.allow_peer(peer_endpoint_hex, Direction::Inbound)
+    }
+
+    pub fn allow_outbound_peer(&self, peer_endpoint_hex: &str) -> bool {
+        self.allow_peer(peer_endpoint_hex, Direction::Outbound)
+    }
+
+    pub fn allow_peer(&self, peer_endpoint_hex: &str, direction: Direction) -> bool {
         let peer = self.routes.lookup_endpoint(peer_endpoint_hex);
         self.check(
             peer.as_deref(),
@@ -62,7 +70,7 @@ impl AclEngine {
             None,
             None,
             Protocol::Any,
-            Direction::Inbound,
+            direction,
         )
     }
 

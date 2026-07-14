@@ -7,6 +7,7 @@ use iroh::{Endpoint, SecretKey, endpoint::presets};
 use tuntun_common::{SEND_ALPN, TUNNEL_ALPN};
 
 use crate::acl::{AclEngine, SelfIdentity};
+use crate::acl_hook::AclHook;
 use crate::control::{SignedClient, basic_metadata};
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
@@ -86,22 +87,8 @@ impl CoreNode {
         alpns.push(SEND_ALPN.to_vec());
         alpns.push(iroh_blobs::ALPN.to_vec());
 
-        let secret = SecretKey::from_bytes(&identity.secret_bytes);
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret)
-            .alpns(alpns)
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
-
-        let my_id_hex = format!("{}", endpoint.id());
-        debug_assert_eq!(my_id_hex, identity.endpoint_id_hex());
-
-        match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
-            Ok(()) => tracing::info!("endpoint online"),
-            Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
-        }
-
+        // Register with CP before binding so ACL policy is ready for EndpointHooks.
+        let my_id_hex = identity.endpoint_id_hex();
         let signed = SignedClient::new(
             persisted.control_url.clone(),
             my_id_hex.clone(),
@@ -144,6 +131,22 @@ impl CoreNode {
             snapshot.version,
             &my_id_hex,
         );
+
+        let secret = SecretKey::from_bytes(&identity.secret_bytes);
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret)
+            .alpns(alpns)
+            .hooks(AclHook::new(acl.clone()))
+            .bind()
+            .await
+            .context("bind iroh endpoint")?;
+
+        debug_assert_eq!(format!("{}", endpoint.id()), my_id_hex);
+
+        match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
+            Ok(()) => tracing::info!("endpoint online"),
+            Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+        }
 
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);

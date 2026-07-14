@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod acl_hook;
 pub mod control;
 pub mod coordinator;
 pub mod dns_stub;
@@ -19,6 +20,7 @@ pub mod tunnel;
 pub mod ws_client;
 
 pub use acl::{AclEngine, SelfIdentity};
+pub use acl_hook::AclHook;
 pub use control::{SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
 pub use iroh_pool::ConnPool;
