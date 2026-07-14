@@ -1,0 +1,255 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.4.0)"
+        required: true
+        type: string
+      dry-run:
+        description: "Build everything but skip publish & release"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-binaries-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  RUST_TOOLCHAIN: "1.96"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      dry-run: ${{ steps.meta.outputs.dry-run }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "dry_run=${{ inputs.dry-run }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Extract & validate version
+        id: meta
+        shell: bash
+        run: |
+          tag="${{ steps.resolve.outputs.tag }}"
+          tag="${tag#v}"
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+          echo "tag=v${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag}" >> "$GITHUB_OUTPUT"
+          echo "dry-run=${{ steps.resolve.outputs.dry_run }}" >> "$GITHUB_OUTPUT"
+
+          if echo "$tag" | grep -qE '(alpha|beta|rc|dev|pre)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-binaries:
+    name: Binaries - ${{ matrix.target }}
+    needs: [validate]
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - host: macos-latest
+            target: x86_64-apple-darwin
+          - host: macos-latest
+            target: aarch64-apple-darwin
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+          - host: windows-latest
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: bin-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: bin-${{ matrix.target }}-
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p tuntun-agent -p tuntun-control -p tuntun-relay
+
+      - name: Build (cross)
+        if: matrix.cross
+        shell: bash
+        run: |
+          cross build --release --target ${{ matrix.target }} \
+            -p tuntun-agent -p tuntun-control -p tuntun-relay
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          target="${{ matrix.target }}"
+          staging="tuntun-${version}-${target}"
+          mkdir -p "$staging"
+
+          ext=""
+          if [[ "$target" == *windows* ]]; then ext=".exe"; fi
+
+          for bin in tuntun tuntun-control tuntun-relay; do
+            src="target/${target}/release/${bin}${ext}"
+            if [ -f "$src" ]; then cp "$src" "$staging/"; fi
+          done
+
+          cp LICENSE README.md "$staging/" 2>/dev/null || true
+
+          if [[ "$target" == *windows* ]]; then
+            7z a "${staging}.zip" "$staging"
+            echo "asset=${staging}.zip" >> "$GITHUB_OUTPUT"
+          else
+            tar czf "${staging}.tar.gz" "$staging"
+            echo "asset=${staging}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checksums
+        shell: bash
+        run: sha256sum "${{ steps.package.outputs.asset }}" > "${{ steps.package.outputs.asset }}.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub Release (draft)
+    needs: [validate, build-binaries]
+    if: needs.validate.outputs.dry-run != 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          version="${{ needs.validate.outputs.version }}"
+          {
+            echo "## Checksums"
+            echo ""
+            echo '```'
+            cat artifacts/*.sha256
+            echo '```'
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo '```bash'
+            echo "# Linux x86_64"
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${version}/tuntun-${version}-x86_64-unknown-linux-gnu.tar.gz | tar xz"
+            echo "sudo mv tuntun-${version}-x86_64-unknown-linux-gnu/tuntun* /usr/local/bin/"
+            echo '```'
+          } > release-notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: TunTun ${{ needs.validate.outputs.tag }}
+          body_path: release-notes.md
+          draft: true
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
+
+  attest:
+    name: Attestation
+    needs: [validate, build-binaries, github-release]
+    if: needs.validate.outputs.dry-run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: binaries-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip

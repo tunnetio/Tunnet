@@ -1,4 +1,4 @@
-name: Release
+name: Release SDK
 
 on:
   push:
@@ -12,19 +12,18 @@ on:
         required: true
         type: string
       dry-run:
-        description: "Build everything but skip publish & release"
+        description: "Build everything but skip publish"
         required: false
         default: false
         type: boolean
 
 concurrency:
-  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  group: release-sdk-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   id-token: write
-  attestations: write
 
 env:
   RUST_TOOLCHAIN: "1.96"
@@ -80,112 +79,6 @@ jobs:
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
-
-  build-binaries:
-    name: Binaries - ${{ matrix.target }}
-    needs: [validate]
-    runs-on: ${{ matrix.host }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-          - host: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: true
-          - host: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            cross: true
-          - host: macos-latest
-            target: x86_64-apple-darwin
-          - host: macos-latest
-            target: aarch64-apple-darwin
-          - host: windows-latest
-            target: x86_64-pc-windows-msvc
-          - host: windows-latest
-            target: aarch64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.validate.outputs.tag }}
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: bin-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: bin-${{ matrix.target }}-
-
-      - name: Install cross
-        if: matrix.cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        shell: bash
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            -p tuntun-agent -p tuntun-control -p tuntun-relay
-
-      - name: Build (cross)
-        if: matrix.cross
-        shell: bash
-        run: |
-          cross build --release --target ${{ matrix.target }} \
-            -p tuntun-agent -p tuntun-control -p tuntun-relay
-
-      - name: Package
-        id: package
-        shell: bash
-        run: |
-          version="${{ needs.validate.outputs.version }}"
-          target="${{ matrix.target }}"
-          staging="tuntun-${version}-${target}"
-          mkdir -p "$staging"
-
-          ext=""
-          if [[ "$target" == *windows* ]]; then ext=".exe"; fi
-
-          for bin in tuntun tuntun-control tuntun-relay; do
-            src="target/${target}/release/${bin}${ext}"
-            if [ -f "$src" ]; then cp "$src" "$staging/"; fi
-          done
-
-          cp LICENSE README.md "$staging/" 2>/dev/null || true
-
-          if [[ "$target" == *windows* ]]; then
-            7z a "${staging}.zip" "$staging"
-            echo "asset=${staging}.zip" >> "$GITHUB_OUTPUT"
-          else
-            tar czf "${staging}.tar.gz" "$staging"
-            echo "asset=${staging}.tar.gz" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checksums
-        shell: bash
-        run: sha256sum "${{ steps.package.outputs.asset }}" > "${{ steps.package.outputs.asset }}.sha256"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: binaries-${{ matrix.target }}
-          path: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.asset }}.sha256
-          if-no-files-found: error
 
   build-sdk:
     name: SDK - ${{ matrix.target }}
@@ -270,77 +163,9 @@ jobs:
           path: crates/tuntun-node-napi/${{ env.APP_NAME }}.*.node
           if-no-files-found: error
 
-  github-release:
-    name: GitHub Release (draft)
-    needs: [validate, build-binaries]
-    if: needs.validate.outputs.dry-run != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.validate.outputs.tag }}
-          fetch-depth: 0
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: binaries-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Generate release notes
-        shell: bash
-        run: |
-          version="${{ needs.validate.outputs.version }}"
-          {
-            echo "## Checksums"
-            echo ""
-            echo '```'
-            cat artifacts/*.sha256
-            echo '```'
-            echo ""
-            echo "## Installation"
-            echo ""
-            echo '```bash'
-            echo "# Linux x86_64"
-            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${version}/tuntun-${version}-x86_64-unknown-linux-gnu.tar.gz | tar xz"
-            echo "sudo mv tuntun-${version}-x86_64-unknown-linux-gnu/tuntun* /usr/local/bin/"
-            echo '```'
-          } > release-notes.md
-
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          name: TunTun ${{ needs.validate.outputs.tag }}
-          body_path: release-notes.md
-          draft: true
-          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
-          generate_release_notes: true
-          files: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
-            artifacts/*.sha256
-
-  attest:
-    name: Attestation
-    needs: [validate, build-binaries, github-release]
-    if: needs.validate.outputs.dry-run != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: binaries-*
-          path: artifacts
-          merge-multiple: true
-
-      - uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
-
   publish-sdk:
     name: Publish SDK (npm)
-    needs: [validate, build-sdk, github-release]
+    needs: [validate, build-sdk]
     if: needs.validate.outputs.dry-run != 'true'
     runs-on: ubuntu-latest
     environment: production
