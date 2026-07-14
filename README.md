@@ -50,7 +50,7 @@ curl -fsSL https://github.com/orielhaim/TunTun/releases/latest/download/install.
 irm https://github.com/orielhaim/TunTun/releases/latest/download/install.ps1 | iex
 ```
 
-Verify with `tuntun -v`. Later upgrades: `tuntun update`.
+Verify with `tuntun --version`. Later upgrades: `tuntun update`.
 
 ### Managed mode
 

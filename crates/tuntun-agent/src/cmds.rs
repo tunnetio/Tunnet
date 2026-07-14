@@ -104,14 +104,12 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
         print_service_lines(&out, &service, agent_running);
         if agent_running {
             out.writeln(out.dim(
-                "  Idle - run `tuntun create` / `enroll` / `join` (agent will load automatically).",
+                "  Idle — run `sudo tuntun create` / `enroll` / `join` (agent loads automatically).",
             ));
         } else {
-            out.writeln(
-                out.dim(
-                    "  Use `tuntun create` for Direct mode or `tuntun enroll` for Managed mode.",
-                ),
-            );
+            out.writeln(out.dim(
+                "  Use `sudo tuntun create` for Direct mode or `tuntun enroll` for Managed mode.",
+            ));
         }
         return Ok(());
     };
@@ -156,6 +154,7 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
                     "network_name": offline.network_name,
                     "network_id": offline.network_id,
                     "endpoint_id": offline.endpoint_id,
+                    "state_dir": paths.dir,
                     "service": {
                         "installed": service.installed,
                         "active": service.active,
@@ -163,7 +162,7 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
                     },
                 }));
             }
-            print_offline_status(&out, &offline, mode, &service);
+            print_offline_status(&out, &offline, mode, &service, &paths.dir);
             Ok(())
         }
     }
@@ -250,6 +249,7 @@ fn print_offline_status(
     info: &OfflineStatus,
     mode: &str,
     service: &crate::service::ServiceProbe,
+    state_dir: &std::path::Path,
 ) {
     out.writeln(format!(
         "{} {}  {}  {}",
@@ -266,7 +266,23 @@ fn print_offline_status(
         ));
     }
     print_service_lines(out, service, false);
-    out.writeln(out.dim("  Start with `sudo tuntun service start` or `tuntun run`."));
+    out.writeln(format!(
+        "  state      {}",
+        out.dim(&state_dir.display().to_string())
+    ));
+    let system = StatePaths::system_dir();
+    if service.installed && state_dir != system.as_path() {
+        out.writeln(out.yellow(&format!(
+            "  note       service uses {} — CLI state is separate; recreate with sudo or set TUNTUN_STATE_DIR",
+            system.display()
+        )));
+    } else if service.active {
+        out.writeln(
+            out.dim("  Service is up but IPC is down — try `sudo tuntun service restart`."),
+        );
+    } else {
+        out.writeln(out.dim("  Start with `sudo tuntun service start` or `tuntun run`."));
+    }
 }
 
 fn print_status(

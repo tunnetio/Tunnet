@@ -6,13 +6,9 @@ use tuntun_core::{AgentIdentity, ManagedState, PersistedState, StatePaths};
 #[command(
     name = "tuntun",
     about = "TunTun - mesh networking, serve, and tunnel",
-    version = env!("CARGO_PKG_VERSION"),
-    disable_version_flag = true
+    version = env!("CARGO_PKG_VERSION")
 )]
 pub struct Cli {
-    /// Print version and exit
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
-    _version: bool,
     #[arg(long, env = "TUNTUN_STATE_DIR", global = true)]
     pub state_dir: Option<String>,
     #[arg(long, env = "TUNTUN_JSON_LOGS", global = true)]

@@ -20,8 +20,13 @@ pub struct CreateArgs {
     /// Auto-admit peers with a valid invite (no manual approval queue).
     #[arg(long)]
     pub open: bool,
-    #[arg(long)]
+    /// Network name (default: direct).
+    #[arg(long = "name")]
     pub network_name: Option<String>,
+    /// Shared passphrase for this network.
+    /// If omitted, a random secret is generated and printed.
+    #[arg(long)]
+    pub secret: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -155,6 +160,7 @@ pub async fn try_handle_join_on_auth_conn(
 
 pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
+    ensure_service_state_aligned(state_dir, &paths)?;
     paths.ensure()?;
     if let Ok(existing) = PersistedState::load(&paths) {
         anyhow::bail!(
@@ -173,9 +179,22 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         anyhow::bail!("invalid network name (3-32 lowercase alphanumeric/hyphen)");
     }
 
+    let network_secret = match args.secret {
+        Some(s) => {
+            if s.len() < 8 {
+                anyhow::bail!("--secret must be at least 8 characters");
+            }
+            s
+        }
+        None => {
+            let secret_bytes: [u8; 32] = rand::random();
+            let s = hex::encode(secret_bytes);
+            println!("Generated network secret (save it): {s}");
+            s
+        }
+    };
+
     let identity = AgentIdentity::generate();
-    let secret_bytes: [u8; 32] = rand::random();
-    let network_secret = hex::encode(secret_bytes);
     let topic_hash = topic_from_name_secret(&network_name, &network_secret);
     let network_id = network_id_from_topic(&topic_hash);
     let my_id = identity.endpoint_id_hex();
@@ -205,6 +224,7 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         "Created Direct network '{}'. endpoint_id={} ip={}",
         network_name, my_id, assigned_ipv4
     );
+    println!("State directory: {}", paths.dir.display());
     crate::service::reload_after_config(state_dir)?;
     if let Err(e) = crate::cmds::wait_until_agent(state_dir, 20).await {
         println!("Note: {e}");
@@ -213,6 +233,41 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         println!("Agent is up. Next: `tuntun invite` and share the code.");
     }
     Ok(())
+}
+
+/// When a system service is installed, create/join must write the same state dir
+/// the service reads — otherwise `systemctl` looks healthy while the CLI sees a
+/// different (offline) network.
+fn ensure_service_state_aligned(state_dir: Option<&str>, paths: &StatePaths) -> anyhow::Result<()> {
+    let probe = crate::service::probe();
+    if !probe.installed {
+        return Ok(());
+    }
+    let system = StatePaths::system_dir();
+    if paths.dir == system {
+        return Ok(());
+    }
+    if state_dir.is_some() {
+        // Explicit --state-dir / env: allow, but warn.
+        eprintln!(
+            "warning: writing to {} while the system service uses {}",
+            paths.dir.display(),
+            system.display()
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "a system service is installed and uses {}\n\
+         you are about to write to {} instead\n\n\
+         Re-run with sudo so both use the same directory:\n\
+           sudo tuntun create --name <name> [--secret <passphrase>]\n\n\
+         Or point both at one directory:\n\
+           sudo TUNTUN_STATE_DIR={} tuntun create ...\n\
+           sudo tuntun service restart",
+        system.display(),
+        paths.dir.display(),
+        system.display()
+    );
 }
 
 pub async fn run_invite(args: InviteArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
@@ -235,6 +290,7 @@ pub async fn run_invite(args: InviteArgs, state_dir: Option<&str>) -> anyhow::Re
 
 pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
+    ensure_service_state_aligned(state_dir, &paths)?;
     paths.ensure()?;
     if let Ok(existing) = PersistedState::load(&paths) {
         anyhow::bail!(

@@ -23,4 +23,4 @@ sudo tuntun update --version v0.3.1
 sudo tuntun update --restart
 ```
 
-Check the current version with `tuntun -v`.
+Check the current version with `tuntun --version`

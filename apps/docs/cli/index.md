@@ -42,4 +42,3 @@ The `tuntun` CLI is the primary interface for interacting with TunTun from the c
 | `tuntun firewall` | Manage the local Direct firewall |
 | `tuntun upgrade-to-managed` | Migrate from Direct to Managed |
 | `tuntun update` | Upgrade the agent from GitHub Releases |
-| `tuntun -v` | Print the installed version |
