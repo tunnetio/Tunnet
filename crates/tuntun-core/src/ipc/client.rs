@@ -99,11 +99,12 @@ pub fn discover_network_id(
     state_dir: Option<&str>,
 ) -> anyhow::Result<(Uuid, crate::state::PersistedState)> {
     let paths = crate::state::StatePaths::resolve(state_dir);
-    let persisted = crate::state::PersistedState::load(&paths).with_context(|| {
+    let persisted = crate::state::PersistedState::try_load(&paths)?.with_context(|| {
         format!(
-            "no agent state in {} - run `tuntun enroll` first",
+            "not connected to a network yet (no state in {}). \
+                 Use `tuntun create` for Direct or `tuntun enroll` for Managed",
             paths.dir.display()
         )
     })?;
-    Ok((persisted.network_id, persisted))
+    Ok((persisted.network_id(), persisted))
 }

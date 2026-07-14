@@ -1,3 +1,4 @@
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -11,12 +12,44 @@ pub struct StatePaths {
 }
 
 impl StatePaths {
+    pub fn system_dir() -> PathBuf {
+        #[cfg(unix)]
+        {
+            PathBuf::from("/var/lib/tuntun")
+        }
+        #[cfg(windows)]
+        {
+            let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| r"C:\ProgramData".into());
+            PathBuf::from(base).join("tuntun")
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            PathBuf::from("./tuntun-state")
+        }
+    }
+
     pub fn resolve(explicit: Option<&str>) -> Self {
         if let Some(p) = explicit {
             return Self {
                 dir: PathBuf::from(p),
             };
         }
+        if let Ok(p) = std::env::var("TUNTUN_STATE_DIR")
+            && !p.is_empty()
+        {
+            return Self {
+                dir: PathBuf::from(p),
+            };
+        }
+
+        let system = Self::system_dir();
+        if system.join("state.json").is_file() {
+            return Self { dir: system };
+        }
+        if running_as_service_user() {
+            return Self { dir: system };
+        }
+
         #[cfg(unix)]
         {
             if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
@@ -55,21 +88,111 @@ impl StatePaths {
     pub fn auth_file(&self) -> PathBuf {
         self.dir.join("auth.json")
     }
+    pub fn membership_file(&self) -> PathBuf {
+        self.dir.join("direct_membership.json")
+    }
+    pub fn firewall_file(&self) -> PathBuf {
+        self.dir.join("direct_firewall.json")
+    }
+    pub fn invites_file(&self) -> PathBuf {
+        self.dir.join("direct_invites.json")
+    }
+    pub fn pending_file(&self) -> PathBuf {
+        self.dir.join("direct_pending.json")
+    }
 
     pub fn ensure(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("mkdir {}", self.dir.display()))?;
         Ok(())
     }
+
+    pub fn clone_paths(&self) -> StatePaths {
+        StatePaths {
+            dir: self.dir.clone(),
+        }
+    }
 }
 
+fn running_as_service_user() -> bool {
+    #[cfg(unix)]
+    {
+        if std::env::var("USER").ok().as_deref() == Some("root") {
+            return true;
+        }
+        if std::env::var("HOME").ok().as_deref() == Some("/root") {
+            return true;
+        }
+        // systemd sets this when StateDirectory= is used.
+        if std::env::var("STATE_DIRECTORY").is_ok() {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if std::env::var("USERNAME")
+            .ok()
+            .is_some_and(|u| u.eq_ignore_ascii_case("SYSTEM"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Operating mode of this agent for the persisted network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeMode {
+    Managed,
+    Direct,
+}
+
+/// Managed-mode enrollment state (control plane).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedState {
+pub struct ManagedState {
     pub control_url: String,
     pub network_name: String,
     pub network_id: Uuid,
     pub organization_id: String,
     pub enrolled_at: DateTime<Utc>,
+}
+
+/// Direct-mode P2P network state (no control plane).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectState {
+    pub network_name: String,
+    /// Hex-encoded 32-byte network secret (PSK).
+    pub network_secret: String,
+    /// Hex topic id = blake3(network_name || secret).
+    pub topic_hash: String,
+    /// Deterministic UUID derived from topic_hash (for IPC / gossip topic helpers).
+    pub network_id: Uuid,
+    pub coordinator: bool,
+    /// Auto-admit valid invite codes without manual approval.
+    #[serde(default)]
+    pub open: bool,
+    pub assigned_ipv4: Ipv4Addr,
+    #[serde(default)]
+    pub collision_index: u8,
+    pub hostname: String,
+    /// Optional coordinator endpoint id (hex) known at join time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_endpoint_id: Option<String>,
+    /// iroh-docs write ticket (string). Set on create (coordinator) or join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_ticket: Option<String>,
+    /// iroh-docs namespace id (hex). Network document identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum PersistedState {
+    Managed(ManagedState),
+    Direct(DirectState),
 }
 
 impl PersistedState {
@@ -83,7 +206,72 @@ impl PersistedState {
     pub fn load(paths: &StatePaths) -> anyhow::Result<Self> {
         let s = std::fs::read(paths.state_file())
             .with_context(|| format!("read {}", paths.state_file().display()))?;
-        Ok(serde_json::from_slice(&s)?)
+        serde_json::from_slice(&s).context("parse state.json")
+    }
+
+    /// Load state if present; `Ok(None)` when no state file exists yet.
+    pub fn try_load(paths: &StatePaths) -> anyhow::Result<Option<Self>> {
+        if !paths.state_file().exists() {
+            return Ok(None);
+        }
+        Ok(Some(Self::load(paths)?))
+    }
+
+    pub fn mode(&self) -> NodeMode {
+        match self {
+            PersistedState::Managed(_) => NodeMode::Managed,
+            PersistedState::Direct(_) => NodeMode::Direct,
+        }
+    }
+
+    pub fn is_managed(&self) -> bool {
+        matches!(self, PersistedState::Managed(_))
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, PersistedState::Direct(_))
+    }
+
+    pub fn network_name(&self) -> &str {
+        match self {
+            PersistedState::Managed(m) => &m.network_name,
+            PersistedState::Direct(d) => &d.network_name,
+        }
+    }
+
+    pub fn network_id(&self) -> Uuid {
+        match self {
+            PersistedState::Managed(m) => m.network_id,
+            PersistedState::Direct(d) => d.network_id,
+        }
+    }
+
+    pub fn as_managed(&self) -> Option<&ManagedState> {
+        match self {
+            PersistedState::Managed(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn as_direct(&self) -> Option<&DirectState> {
+        match self {
+            PersistedState::Direct(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    pub fn require_managed(&self) -> anyhow::Result<&ManagedState> {
+        self.as_managed().context(
+            "this command requires Managed mode; this agent is in Direct mode \
+             (run `tuntun reset --yes` to switch)",
+        )
+    }
+
+    pub fn require_direct(&self) -> anyhow::Result<&DirectState> {
+        self.as_direct().context(
+            "this command requires Direct mode; this agent is in Managed mode \
+             (run `tuntun reset --yes` to switch)",
+        )
     }
 }
 
@@ -147,4 +335,46 @@ pub fn load_snapshot_cache(paths: &StatePaths) -> Option<tuntun_common::Endpoint
 pub fn key_file(paths: &StatePaths) -> &Path {
     // Convenience for load_from / save_to.
     Box::leak(paths.key_file().into_boxed_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tagged_direct_roundtrip() {
+        let s = PersistedState::Direct(DirectState {
+            network_name: "home".into(),
+            network_secret: "aa".repeat(32),
+            topic_hash: "bb".repeat(32),
+            network_id: Uuid::nil(),
+            coordinator: true,
+            open: true,
+            assigned_ipv4: "100.64.0.1".parse().unwrap(),
+            collision_index: 0,
+            hostname: "laptop".into(),
+            coordinator_endpoint_id: None,
+            doc_ticket: None,
+            namespace_id: None,
+            created_at: Utc::now(),
+        });
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let loaded: PersistedState = serde_json::from_slice(&bytes).unwrap();
+        assert!(loaded.is_direct());
+    }
+
+    #[test]
+    fn tagged_managed_roundtrip() {
+        let s = PersistedState::Managed(ManagedState {
+            control_url: "http://localhost:8080".into(),
+            network_name: "default".into(),
+            network_id: Uuid::nil(),
+            organization_id: "org".into(),
+            enrolled_at: Utc::now(),
+        });
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let loaded: PersistedState = serde_json::from_slice(&bytes).unwrap();
+        assert!(loaded.is_managed());
+        assert_eq!(loaded.network_name(), "default");
+    }
 }

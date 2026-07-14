@@ -6,12 +6,15 @@
 use std::sync::Arc;
 
 use iroh::Endpoint;
-use tun_rs::AsyncDevice;
 use tuntun_common::ws::ClientMsg;
 use tuntun_common::{RECORDING_ALPN, SEND_ALPN, SSH_ALPN, TUNNEL_ALPN};
+use tuntun_core::direct::{
+    AUTH_ALPN, AuthCache, DOCS_ALPN, DocsMembership, GOSSIP_ALPN, run_psk_handshake_server,
+};
 use tuntun_core::stream::{StreamHandler, TUNNEL_STREAM_ALPN, serve_stream_connection};
 use tuntun_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient};
 
+use crate::dataplane::TunSlot;
 use crate::metrics::AgentMetrics;
 use crate::recorder::{RecordingStore, serve_recording_connection};
 use crate::ssh::{SshServeDeps, SshSessionRegistry, serve_ssh_connection};
@@ -22,7 +25,7 @@ pub struct AcceptDeps {
     pub routes: RoutingTable,
     pub acl: AclEngine,
     pub metrics: AgentMetrics,
-    pub tun: Arc<AsyncDevice>,
+    pub tun: TunSlot,
     pub stream_handler: StreamHandler,
     pub ssh_sessions: SshSessionRegistry,
     pub cp_tx: Option<tokio::sync::mpsc::Sender<ClientMsg>>,
@@ -34,6 +37,10 @@ pub struct AcceptDeps {
     pub self_endpoint_id: String,
     pub recorder_enabled: bool,
     pub send: SendManager,
+    pub direct_auth: Option<AuthCache>,
+    pub network_secret: Option<String>,
+    pub state_dir: std::path::PathBuf,
+    pub docs: Option<DocsMembership>,
 }
 
 pub fn spawn(deps: AcceptDeps) {
@@ -55,6 +62,10 @@ pub fn spawn(deps: AcceptDeps) {
             let self_endpoint_id = deps.self_endpoint_id.clone();
             let recorder_enabled = deps.recorder_enabled;
             let send = deps.send.clone();
+            let direct_auth = deps.direct_auth.clone();
+            let network_secret = deps.network_secret.clone();
+            let state_dir = deps.state_dir.clone();
+            let docs = deps.docs.clone();
             tokio::spawn(async move {
                 let conn = match incoming.await {
                     Ok(c) => c,
@@ -64,10 +75,52 @@ pub fn spawn(deps: AcceptDeps) {
                     }
                 };
                 let alpn = conn.alpn();
-                if alpn == TUNNEL_STREAM_ALPN {
+                if alpn == AUTH_ALPN {
+                    if let (Some(auth), Some(secret)) =
+                        (direct_auth.clone(), network_secret.clone())
+                    {
+                        match run_psk_handshake_server(&conn, &secret, &self_endpoint_id, &auth)
+                            .await
+                        {
+                            Ok(_peer) => {
+                                if let Err(e) = crate::cmds_direct::try_handle_join_on_auth_conn(
+                                    &conn,
+                                    &state_dir,
+                                    docs.as_ref(),
+                                )
+                                .await
+                                {
+                                    tracing::debug!(?e, "post-auth join handle");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(?e, "direct auth handshake failed");
+                            }
+                        }
+                    } else {
+                        tracing::debug!("AUTH_ALPN ignored (not in Direct mode)");
+                    }
+                } else if alpn == DOCS_ALPN {
+                    if let Some(docs) = docs {
+                        docs.accept_docs(conn).await;
+                    } else {
+                        tracing::debug!("DOCS_ALPN ignored (not in Direct mode)");
+                    }
+                } else if alpn == GOSSIP_ALPN {
+                    if let Some(docs) = docs {
+                        docs.accept_gossip(conn).await;
+                    } else {
+                        tracing::debug!("GOSSIP_ALPN ignored (Direct docs not ready)");
+                    }
+                } else if alpn == TUNNEL_STREAM_ALPN {
                     serve_stream_connection(conn, stream_handler).await;
                 } else if alpn == TUNNEL_ALPN {
-                    serve_tunnel_connection(conn, tun, routes, acl, metrics).await;
+                    let Some(tun_dev) = tun.read().await.clone() else {
+                        tracing::debug!("TUNNEL_ALPN ignored (data plane down)");
+                        conn.close(1u32.into(), b"dataplane_down");
+                        return;
+                    };
+                    serve_tunnel_connection(conn, tun_dev, routes, acl, metrics).await;
                 } else if alpn == SSH_ALPN {
                     serve_ssh_connection(
                         conn,
@@ -105,6 +158,13 @@ pub fn spawn(deps: AcceptDeps) {
                 } else if alpn == SEND_ALPN {
                     send.handle_offer_connection(conn).await;
                 } else if alpn == iroh_blobs::ALPN {
+                    if let Some(auth) = direct_auth.as_ref() {
+                        let peer = format!("{}", conn.remote_id());
+                        if auth.contains(&peer) {
+                            send.handle_blobs_connection_trusted(conn).await;
+                            return;
+                        }
+                    }
                     send.handle_blobs_connection(conn).await;
                 } else {
                     tracing::debug!(

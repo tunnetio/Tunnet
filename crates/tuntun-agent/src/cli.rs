@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
-use tuntun_core::{AgentIdentity, PersistedState, StatePaths};
+use tuntun_core::{AgentIdentity, ManagedState, PersistedState, StatePaths};
 
 #[derive(Parser, Debug)]
 #[command(name = "tuntun", about = "TunTun - mesh networking, serve, and tunnel")]
@@ -19,12 +19,19 @@ pub enum Command {
     Enroll(EnrollArgs),
     /// Run the TunTun agent (requires root / admin for TUN)
     Run(RunArgs),
+    /// Bring TUN + DNS + routes up (daemon must be running)
+    Up,
+    /// Tear down TUN + DNS + routes; keep mesh alive
+    Down,
+    /// Install / control the OS service
+    #[command(subcommand)]
+    Service(ServiceCommand),
     /// Wipe local agent state
     Reset(ResetArgs),
 
     /// Show agent / network status
     Status(crate::cmds::StatusArgs),
-    /// Measure mesh RTT to a peer (QUIC, not ICMP)
+    /// Measure mesh RTT to a peer
     Ping(crate::cmds::PingArgs),
     /// PeerDNS status
     #[command(subcommand)]
@@ -56,6 +63,29 @@ pub enum Command {
     Login(crate::cmds_login::LoginArgs),
     /// Clear stored management tokens
     Logout(crate::cmds_login::LogoutArgs),
+
+    // --- Direct mode ---
+    /// Create a Direct (P2P) network - no control plane
+    Create(crate::cmds_direct::CreateArgs),
+    /// Join a Direct network with an invite code
+    Join(crate::cmds_direct::JoinArgs),
+    /// Create an invite code for a Direct network
+    Invite(crate::cmds_direct::InviteArgs),
+    /// List pending join requests (coordinator)
+    Requests(crate::cmds_direct::RequestsArgs),
+    /// Accept a pending join request
+    Accept(crate::cmds_direct::AcceptArgs),
+    /// Deny a pending join request
+    Deny(crate::cmds_direct::DenyArgs),
+    /// Kick a peer from a Direct network
+    Kick(crate::cmds_direct::KickArgs),
+    /// Connect directly to a contact id (2-peer ephemeral)
+    Connect(crate::cmds_direct::ConnectArgs),
+    /// Manage the local Direct firewall
+    #[command(subcommand)]
+    Firewall(crate::cmds_direct::FirewallCommand),
+    /// Upgrade a Direct network to Managed mode
+    UpgradeToManaged(crate::cmds_direct::UpgradeArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -92,6 +122,22 @@ pub struct EnrollArgs {
     pub wait_secs: u64,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Write systemd/launchd/Windows service unit (needs root/admin once)
+    Install,
+    /// Remove the OS service unit
+    Uninstall,
+    /// Start the daemon via the OS service manager
+    Start,
+    /// Stop the daemon completely
+    Stop,
+    /// Restart the daemon
+    Restart,
+    /// Show service status
+    Status,
+}
+
 #[derive(Args, Debug)]
 pub struct RunArgs {
     #[arg(long, env = "TUNTUN_IFNAME", default_value = "tuntun0")]
@@ -102,9 +148,10 @@ pub struct RunArgs {
     pub metrics_bind: String,
     #[arg(long, env = "TUNTUN_DISABLE_GOSSIP")]
     pub disable_gossip: bool,
-    /// Accept inbound session recordings (advertise `tuntun/recording/1`).
     #[arg(long, env = "TUNTUN_RECORDER")]
     pub recorder: bool,
+    #[arg(long, hide = true)]
+    pub service: bool,
     #[cfg(windows)]
     #[arg(long, env = "TUNTUN_WINTUN_FILE")]
     pub wintun_file: Option<String>,
@@ -135,6 +182,18 @@ fn paths(cli_state_dir: Option<&str>) -> StatePaths {
 pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
     paths.ensure()?;
+
+    if let Ok(existing) = PersistedState::load(&paths) {
+        if existing.is_direct() {
+            anyhow::bail!(
+                "agent is in Direct mode; run `tuntun reset --yes` before enrolling into Managed"
+            );
+        }
+        anyhow::bail!(
+            "already enrolled in Managed network '{}'; run `tuntun reset --yes` first",
+            existing.network_name()
+        );
+    }
 
     let token = args
         .token
@@ -207,13 +266,13 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
         "enrollment successful"
     );
 
-    let persisted = PersistedState {
+    let persisted = PersistedState::Managed(ManagedState {
         control_url: args.control_url,
         network_name: resp.network_name.clone(),
         network_id: resp.network_id,
         organization_id: resp.organization_id,
         enrolled_at: chrono::Utc::now(),
-    };
+    });
     identity.save_to(&paths.key_file())?;
     persisted.save(&paths)?;
     tuntun_core::state::save_snapshot_cache(&paths, &resp.snapshot)?;
@@ -224,6 +283,12 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
         membership.assigned_ipv4,
         resp.network_name,
     );
+    crate::service::reload_after_config(state_dir)?;
+    if let Err(e) = crate::cmds::wait_until_agent(state_dir, 20).await {
+        println!("Note: {e}");
+    } else {
+        println!("Agent is up. Bring the data plane online with `tuntun up` if needed.");
+    }
     Ok(())
 }
 
@@ -300,18 +365,54 @@ pub async fn run_reset(args: ResetArgs, state_dir: Option<&str>) -> anyhow::Resu
 
 pub async fn run_agent(args: RunArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
+    paths.ensure()?;
+
+    wait_for_network_state(&paths).await?;
+
     let identity = AgentIdentity::load_from(&paths.key_file()).with_context(|| {
         format!(
-            "no persisted identity in {}; run `tuntun enroll` first",
+            "no persisted identity in {}; run `tuntun enroll` or `tuntun create` first",
             paths.dir.display()
         )
     })?;
     let persisted = PersistedState::load(&paths)?;
-    tracing::info!(
-        endpoint_id = %identity.endpoint_id_hex(),
-        network = %persisted.network_name,
-        control = %persisted.control_url,
-        "starting agent",
-    );
+    match &persisted {
+        PersistedState::Managed(m) => {
+            tracing::info!(
+                endpoint_id = %identity.endpoint_id_hex(),
+                network = %m.network_name,
+                control = %m.control_url,
+                mode = "managed",
+                "starting agent",
+            );
+        }
+        PersistedState::Direct(d) => {
+            tracing::info!(
+                endpoint_id = %identity.endpoint_id_hex(),
+                network = %d.network_name,
+                mode = "direct",
+                "starting agent",
+            );
+        }
+    }
     crate::runtime::run(identity, persisted, paths, args).await
+}
+
+async fn wait_for_network_state(paths: &StatePaths) -> anyhow::Result<()> {
+    let mut logged = false;
+    loop {
+        if paths.key_file().is_file()
+            && let Ok(Some(_)) = PersistedState::try_load(paths)
+        {
+            return Ok(());
+        }
+        if !logged {
+            tracing::info!(
+                dir = %paths.dir.display(),
+                "agent idle - waiting for `tuntun create`, `tuntun enroll`, or `tuntun join`"
+            );
+            logged = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }

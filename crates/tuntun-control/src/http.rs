@@ -158,6 +158,15 @@ async fn enroll_inner(
         return Err((StatusCode::BAD_REQUEST, "hostname too long".into()));
     }
 
+    if let Some(meta) = &req.metadata
+        && meta.get("direct_upgrade").is_some()
+    {
+        tracing::info!(
+            endpoint_id = %req.endpoint_id,
+            "direct → managed upgrade enroll"
+        );
+    }
+
     let token = req
         .enrollment_token
         .as_deref()

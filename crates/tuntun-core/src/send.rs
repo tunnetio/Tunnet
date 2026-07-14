@@ -151,6 +151,16 @@ impl SendManager {
         let store = FsStore::load(&blobs_dir)
             .await
             .map_err(|e| anyhow::anyhow!("open FsStore: {e}"))?;
+        Self::from_store(store, pool, routes, acl, self_endpoint_id).await
+    }
+
+    pub async fn from_store(
+        store: FsStore,
+        pool: ConnPool,
+        routes: RoutingTable,
+        acl: AclEngine,
+        self_endpoint_id: String,
+    ) -> anyhow::Result<Self> {
         let blobs = BlobsProtocol::new(store.as_ref(), None);
         let mgr = Self {
             inner: Arc::new(SendInner {
@@ -980,6 +990,15 @@ impl SendManager {
             conn.close(1u32.into(), b"policy_deny");
             return;
         }
+        self.accept_blobs(conn).await;
+    }
+
+    /// Blobs accept without ACL (Direct PSK-authed peers / iroh-docs sync).
+    pub async fn handle_blobs_connection_trusted(&self, conn: Connection) {
+        self.accept_blobs(conn).await;
+    }
+
+    async fn accept_blobs(&self, conn: Connection) {
         if let Err(e) = self.inner.blobs.accept(conn).await {
             tracing::debug!(?e, "blobs accept ended");
         }

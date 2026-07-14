@@ -2,6 +2,7 @@ pub mod acl;
 pub mod acl_hook;
 pub mod control;
 pub mod coordinator;
+pub mod direct;
 pub mod dns_stub;
 pub mod identity;
 pub mod ipc;
@@ -28,7 +29,7 @@ pub use node::{CoreNode, CoreNodeConfig, KillSshHook};
 pub use routing::{PeerInfo, RoutingTable};
 pub use send::{SendConfig, SendManager, TransferDirection, TransferRecord, TransferStatus};
 pub use serve::{ServeAcl, ServeManager};
-pub use state::{CliAuthTokens, PersistedState, StatePaths};
+pub use state::{CliAuthTokens, DirectState, ManagedState, NodeMode, PersistedState, StatePaths};
 pub use stream::{
     StreamHandler, TUNNEL_STREAM_ALPN, dial_stream, serve_stream_acceptor, serve_stream_connection,
 };

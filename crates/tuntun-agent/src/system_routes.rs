@@ -32,6 +32,96 @@ pub fn apply(ifname: &str, profile: &DeviceProfile, remote_subnets: &[Ipv4Net], 
     }
 }
 
+/// Tear down system routes previously installed by [`apply`].
+pub fn unapply(ifname: &str, profile: &DeviceProfile, remote_subnets: &[Ipv4Net], has_exit: bool) {
+    for cidr in remote_subnets {
+        del_route(ifname, cidr);
+    }
+
+    match profile.split_tunnel_mode {
+        SplitTunnelMode::Include => {
+            for cidr in &profile.split_tunnel_cidrs {
+                del_route(ifname, cidr);
+            }
+        }
+        SplitTunnelMode::Exclude => {
+            if has_exit || profile.exit_node_endpoint_id.is_some() {
+                let default: Ipv4Net = "0.0.0.0/0".parse().expect("default");
+                del_route(ifname, &default);
+                if let Some(gw) = detect_default_gateway() {
+                    for cidr in &profile.split_tunnel_cidrs {
+                        del_route_via_gateway(cidr, gw);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn del_route(ifname: &str, cidr: &Ipv4Net) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("ip")
+            .args(["route", "del", &cidr.to_string(), "dev", ifname])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-net", &cidr.to_string()])
+            .status();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("netsh")
+            .args([
+                "interface",
+                "ipv4",
+                "delete",
+                "route",
+                &cidr.to_string(),
+                ifname,
+            ])
+            .status();
+    }
+    tracing::debug!(%cidr, ifname, "removed route via TUN");
+}
+
+fn del_route_via_gateway(cidr: &Ipv4Net, gateway: Ipv4Addr) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("ip")
+            .args([
+                "route",
+                "del",
+                &cidr.to_string(),
+                "via",
+                &gateway.to_string(),
+            ])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("route")
+            .args(["-n", "delete", "-net", &cidr.to_string()])
+            .status();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("route")
+            .args([
+                "delete",
+                &cidr.network().to_string(),
+                "mask",
+                &cidr.netmask().to_string(),
+                &gateway.to_string(),
+            ])
+            .status();
+    }
+    let _ = gateway;
+    tracing::debug!(%cidr, "removed excluded CIDR route");
+}
+
 fn add_route(ifname: &str, cidr: &Ipv4Net) {
     #[cfg(target_os = "linux")]
     {

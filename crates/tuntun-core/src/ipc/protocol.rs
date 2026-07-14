@@ -141,6 +141,50 @@ pub enum IpcRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pin_blobs: Option<bool>,
     },
+
+    /// Whether TUN + system DNS/routes are active.
+    DataPlaneStatus,
+    /// Bring TUN + DNS + routes up (daemon must already be running).
+    DataPlaneUp,
+    /// Tear down TUN + DNS + routes; keep mesh/docs/IPC alive.
+    DataPlaneDown,
+
+    /// Direct: create invite code (coordinator).
+    DirectInvite {
+        #[serde(default)]
+        reusable: bool,
+        #[serde(default = "default_invite_expires")]
+        expires: String,
+    },
+    DirectRequests,
+    DirectAccept {
+        peer_id: String,
+    },
+    DirectDeny {
+        peer_id: String,
+    },
+    DirectKick {
+        peer_id: String,
+    },
+    DirectFirewallShow,
+    DirectFirewallOff,
+    DirectFirewallAdd {
+        direction: String,
+        action: String,
+        #[serde(default = "default_fw_protocol")]
+        protocol: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+    },
+    DirectFirewallRemove {
+        index: usize,
+    },
+}
+
+fn default_invite_expires() -> String {
+    "24h".into()
 }
 
 fn default_ssh_list_limit() -> u32 {
@@ -155,6 +199,10 @@ fn default_ping_interval_ms() -> u64 {
 }
 fn default_https() -> String {
     "https".into()
+}
+
+fn default_fw_protocol() -> String {
+    "tcp".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,12 +258,45 @@ pub enum IpcResponse {
         transfers: Vec<TransferInfo>,
     },
     SendConfig(SendConfigInfo),
+    DataPlane {
+        up: bool,
+    },
+    DirectInvite {
+        code: String,
+    },
+    DirectPending {
+        requests: Vec<DirectPendingInfo>,
+    },
+    DirectFirewall {
+        enabled: bool,
+        rules: Vec<DirectFirewallRuleInfo>,
+    },
     Ok {
         message: String,
     },
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectPendingInfo {
+    pub endpoint_id: String,
+    pub hostname: String,
+    pub ipv4: String,
+    pub collision_index: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectFirewallRuleInfo {
+    pub index: usize,
+    pub direction: String,
+    pub action: String,
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

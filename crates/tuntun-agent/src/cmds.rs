@@ -4,6 +4,7 @@ use anyhow::Context;
 use clap::Args;
 use tuntun_core::ipc::protocol::{IpcRequest, IpcResponse, PingProbe, PingSummary, StatusInfo};
 use tuntun_core::ipc::{IpcClient, discover_network_id};
+use tuntun_core::{AgentIdentity, PersistedState, StatePaths};
 
 use crate::output::{self, Output};
 
@@ -82,22 +83,200 @@ async fn client(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
 
 pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
-    let resp = ipc
-        .request(IpcRequest::Status { peers: args.peers })
-        .await?;
-    let IpcResponse::Status(info) = resp else {
-        anyhow::bail!("unexpected response from agent");
+    let paths = StatePaths::resolve(args.state_dir.as_deref());
+    let service = crate::service::probe();
+
+    let Some(persisted) = PersistedState::try_load(&paths)? else {
+        let agent_running = service.active;
+        if out.json {
+            return out.print_json(&serde_json::json!({
+                "connected": false,
+                "agent_running": agent_running,
+                "service": {
+                    "installed": service.installed,
+                    "active": service.active,
+                    "state": service.state,
+                },
+            }));
+        }
+        print_system_header(&out, agent_running);
+        out.writeln(format!("  network    {}", out.dim("not connected")));
+        print_service_lines(&out, &service, agent_running);
+        if agent_running {
+            out.writeln(out.dim(
+                "  Idle - run `tuntun create` / `enroll` / `join` (agent will load automatically).",
+            ));
+        } else {
+            out.writeln(
+                out.dim(
+                    "  Use `tuntun create` for Direct mode or `tuntun enroll` for Managed mode.",
+                ),
+            );
+        }
+        return Ok(());
     };
-    if out.json {
-        return out.print_json(&info);
+
+    let mode = match persisted.mode() {
+        tuntun_core::NodeMode::Direct => "Direct",
+        tuntun_core::NodeMode::Managed => "Managed",
+    };
+    let ipc = IpcClient::for_network(persisted.network_id());
+    match ipc.request(IpcRequest::Status { peers: args.peers }).await {
+        Ok(IpcResponse::Status(info)) => {
+            if out.json {
+                let mut v = serde_json::to_value(&info)?;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("mode".into(), serde_json::json!(mode));
+                    obj.insert("agent_running".into(), serde_json::json!(true));
+                    obj.insert("connected".into(), serde_json::json!(true));
+                    obj.insert(
+                        "service".into(),
+                        serde_json::json!({
+                            "installed": service.installed,
+                            "active": service.active,
+                            "state": service.state,
+                        }),
+                    );
+                }
+                return out.print_json(&v);
+            }
+            print_status(&out, &info, mode, true, &service);
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("unexpected response from agent"),
+        Err(_) => {
+            let offline = offline_status(&paths, &persisted);
+            if out.json {
+                return out.print_json(&serde_json::json!({
+                    "connected": true,
+                    "agent_running": false,
+                    "mode": mode,
+                    "hostname": offline.hostname,
+                    "ip": offline.ip,
+                    "network_name": offline.network_name,
+                    "network_id": offline.network_id,
+                    "endpoint_id": offline.endpoint_id,
+                    "service": {
+                        "installed": service.installed,
+                        "active": service.active,
+                        "state": service.state,
+                    },
+                }));
+            }
+            print_offline_status(&out, &offline, mode, &service);
+            Ok(())
+        }
     }
-    print_status(&out, &info);
-    Ok(())
 }
 
-fn print_status(out: &Output, info: &StatusInfo) {
-    let online = out.online_dot(true);
+fn print_system_header(out: &Output, agent_running: bool) {
+    if agent_running {
+        out.writeln(format!(
+            "{}  {}",
+            out.online_dot(true),
+            out.bold("Agent running")
+        ));
+    } else {
+        out.writeln(format!(
+            "{}  {}",
+            out.online_dot(false),
+            out.bold("Agent not running")
+        ));
+    }
+}
+
+fn print_service_lines(out: &Output, service: &crate::service::ServiceProbe, agent_running: bool) {
+    let agent_label = if agent_running {
+        out.green("running")
+    } else {
+        out.yellow("not running")
+    };
+    out.writeln(format!("  agent      {agent_label}"));
+    let service_label = if !service.installed {
+        out.dim("not installed")
+    } else if service.active {
+        out.green(&service.state)
+    } else {
+        out.yellow(&service.state)
+    };
+    out.writeln(format!("  service    {service_label}"));
+}
+
+struct OfflineStatus {
+    hostname: String,
+    ip: String,
+    network_name: String,
+    network_id: String,
+    endpoint_id: String,
+}
+
+fn offline_status(paths: &StatePaths, persisted: &PersistedState) -> OfflineStatus {
+    let endpoint_id = AgentIdentity::load_from(&paths.key_file())
+        .map(|id| id.endpoint_id_hex())
+        .unwrap_or_default();
+    match persisted {
+        PersistedState::Direct(d) => OfflineStatus {
+            hostname: d.hostname.clone(),
+            ip: d.assigned_ipv4.to_string(),
+            network_name: d.network_name.clone(),
+            network_id: d.network_id.to_string(),
+            endpoint_id,
+        },
+        PersistedState::Managed(m) => {
+            let ip = tuntun_core::state::load_snapshot_cache(paths)
+                .and_then(|snap| {
+                    snap.memberships
+                        .into_iter()
+                        .find(|mem| mem.network_id == m.network_id)
+                        .map(|mem| mem.assigned_ipv4.to_string())
+                })
+                .unwrap_or_else(|| "-".into());
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "-".into());
+            OfflineStatus {
+                hostname,
+                ip,
+                network_name: m.network_name.clone(),
+                network_id: m.network_id.to_string(),
+                endpoint_id,
+            }
+        }
+    }
+}
+
+fn print_offline_status(
+    out: &Output,
+    info: &OfflineStatus,
+    mode: &str,
+    service: &crate::service::ServiceProbe,
+) {
+    out.writeln(format!(
+        "{} {}  {}  {}",
+        out.online_dot(false),
+        out.bold(&info.hostname),
+        out.cyan(&info.ip),
+        out.dim(&format!("· {}", info.network_name))
+    ));
+    out.writeln(format!("  mode       {mode}"));
+    if !info.endpoint_id.is_empty() {
+        out.writeln(format!(
+            "  endpoint   {}",
+            out.dim(&output::short_endpoint(&info.endpoint_id))
+        ));
+    }
+    print_service_lines(out, service, false);
+    out.writeln(out.dim("  Start with `sudo tuntun service start` or `tuntun run`."));
+}
+
+fn print_status(
+    out: &Output,
+    info: &StatusInfo,
+    mode: &str,
+    agent_running: bool,
+    service: &crate::service::ServiceProbe,
+) {
+    let online = out.online_dot(agent_running);
     out.writeln(format!(
         "{} {}  {}  {}",
         online,
@@ -105,10 +284,12 @@ fn print_status(out: &Output, info: &StatusInfo) {
         out.cyan(&info.ip),
         out.dim(&format!("· {}", info.network_name))
     ));
+    out.writeln(format!("  mode       {mode}"));
     out.writeln(format!(
         "  endpoint   {}",
         out.dim(&output::short_endpoint(&info.endpoint_id))
     ));
+    print_service_lines(out, service, agent_running);
     out.writeln(format!(
         "  peers      {} online / {} total",
         info.peers_online, info.peers_total
@@ -695,4 +876,57 @@ fn truncate(s: &str, max: usize) -> String {
 #[allow(dead_code)]
 pub async fn ensure_agent(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
     client(state_dir).await.context("agent IPC unavailable")
+}
+
+pub async fn run_up(state_dir: Option<&str>) -> anyhow::Result<()> {
+    let ipc = ipc_or_err(state_dir).await?;
+    match ipc.request(IpcRequest::DataPlaneUp).await? {
+        IpcResponse::Ok { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn run_down(state_dir: Option<&str>) -> anyhow::Result<()> {
+    let ipc = ipc_or_err(state_dir).await?;
+    match ipc.request(IpcRequest::DataPlaneDown).await? {
+        IpcResponse::Ok { message } => {
+            println!("{message}");
+            Ok(())
+        }
+        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
+}
+
+pub async fn ipc_or_err(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
+    let ipc = client(state_dir).await?;
+    if !ipc.path().exists() {
+        anyhow::bail!(
+            "agent not running (no IPC at {}); start with `sudo tuntun service start` or `tuntun run`",
+            ipc.path().display()
+        );
+    }
+    Ok(ipc)
+}
+
+pub async fn wait_until_agent(state_dir: Option<&str>, secs: u64) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut last_err = None;
+    while tokio::time::Instant::now() < deadline {
+        match ipc_or_err(state_dir).await {
+            Ok(_) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("agent did not become ready within {secs}s")))
+        .with_context(|| {
+            format!(
+                "agent not ready after {secs}s; check `systemctl status tuntun` / `tuntun status`"
+            )
+        })
 }

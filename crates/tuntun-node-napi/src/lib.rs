@@ -145,13 +145,13 @@ pub async fn enroll(cfg: EnrollConfig) -> Result<EnrollResult> {
         .find(|m| m.network_id == resp.network_id)
         .ok_or_else(|| Error::from_reason("enrolled network missing from snapshot"))?;
 
-    let persisted = PersistedState {
+    let persisted = PersistedState::Managed(tuntun_core::ManagedState {
         control_url: cfg.control_url,
         network_name: resp.network_name.clone(),
         network_id: resp.network_id,
         organization_id: resp.organization_id.clone(),
         enrolled_at: chrono::Utc::now(),
-    };
+    });
     identity.save_to(&paths.key_file()).map_err(err)?;
     persisted.save(&paths).map_err(err)?;
     tuntun_core::state::save_snapshot_cache(&paths, &resp.snapshot).map_err(err)?;
@@ -267,7 +267,7 @@ impl TunTunNode {
 
         #[cfg(unix)]
         {
-            let network_id = persisted.network_id;
+            let network_id = persisted.network_id();
             match coordinator::acquire(network_id).await.map_err(err)? {
                 Role::Client {
                     conn: _drop_conn,

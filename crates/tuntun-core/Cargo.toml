@@ -34,6 +34,12 @@ hickory-proto.workspace = true
 iroh.workspace = true
 iroh-gossip.workspace = true
 iroh-blobs.workspace = true
+iroh-docs.workspace = true
+
+hmac.workspace = true
+sha2.workspace = true
+blake3.workspace = true
+mainline = "7"
 
 rustls.workspace = true
 tokio-rustls.workspace = true
