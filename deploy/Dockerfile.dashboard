@@ -9,6 +9,7 @@ COPY packages/db/package.json packages/db/
 COPY packages/api/package.json packages/api/
 COPY packages/ip/package.json packages/ip/
 COPY packages/core/package.json packages/core/
+COPY packages/env/package.json packages/env/
 COPY apps/management/package.json apps/management/
 COPY apps/dashboard/package.json apps/dashboard/
 COPY crates/tuntun-node-napi/package.json crates/tuntun-node-napi/
@@ -23,12 +24,13 @@ RUN ls /src/node_modules/.bin/vite && echo "vite found"
 COPY packages/ packages/
 COPY apps/dashboard/ apps/dashboard/
 
-# Empty VITE_MANAGEMENT_API_URL: browser uses same origin; Nitro proxies /api to management.
-ARG VITE_MANAGEMENT_API_URL=
-ARG MANAGEMENT_API_URL=http://management:3000
+ARG MANAGEMENT_URL=http://management:3000
+ARG CONTROL_PLANE_URL=http://control:8080
+ARG DASHBOARD_URL=
 ENV NODE_ENV=production
-ENV VITE_MANAGEMENT_API_URL=${VITE_MANAGEMENT_API_URL}
-ENV MANAGEMENT_API_URL=${MANAGEMENT_API_URL}
+ENV MANAGEMENT_URL=${MANAGEMENT_URL}
+ENV CONTROL_PLANE_URL=${CONTROL_PLANE_URL}
+ENV DASHBOARD_URL=${DASHBOARD_URL}
 
 RUN cd apps/dashboard && bunx --bun vite build
 
@@ -36,8 +38,12 @@ FROM oven/bun:1-slim
 
 WORKDIR /app
 ENV NODE_ENV=production
-ARG MANAGEMENT_API_URL=http://management:3000
-ENV MANAGEMENT_API_URL=${MANAGEMENT_API_URL}
+ARG MANAGEMENT_URL=http://management:3000
+ARG CONTROL_PLANE_URL=http://control:8080
+ARG DASHBOARD_URL=
+ENV MANAGEMENT_URL=${MANAGEMENT_URL}
+ENV CONTROL_PLANE_URL=${CONTROL_PLANE_URL}
+ENV DASHBOARD_URL=${DASHBOARD_URL}
 
 COPY --from=builder /src/apps/dashboard/.output .output
 COPY --from=builder /src/node_modules node_modules

@@ -79,6 +79,14 @@ pub enum Command {
     /// Reload firewall / DNS / logging / keep-alive from `tuntun.toml` without dropping connections
     Reload(crate::cmds::ReloadArgs),
 
+    /// Manage machine labels
+    #[command(subcommand)]
+    Labels(crate::cmds_device::LabelsCommand),
+
+    /// Machine lifecycle settings
+    #[command(subcommand)]
+    Machine(crate::cmds_device::MachineCommand),
+
     // --- Direct mode ---
     /// Create a Direct (P2P) network - no control plane
     Create(crate::cmds_direct::CreateArgs),
@@ -128,7 +136,11 @@ pub enum RouteCommand {
 
 #[derive(Args, Debug)]
 pub struct EnrollArgs {
-    #[arg(long, env = "TUNTUN_CONTROL_URL")]
+    #[arg(
+        long,
+        env = "CONTROL_PLANE_URL",
+        default_value = "http://127.0.0.1:8080"
+    )]
     pub control_url: String,
     /// One-time enrollment token (primary path).
     #[arg(long, env = "TUNTUN_ENROLL_TOKEN", conflicts_with = "org")]
@@ -144,6 +156,15 @@ pub struct EnrollArgs {
     /// How long to wait for quick-enroll approval (seconds).
     #[arg(long, default_value_t = 600)]
     pub wait_secs: u64,
+    /// Comma-separated labels (key=value pairs)
+    #[arg(long, env = "TUNTUN_LABELS", conflicts_with = "labels_json")]
+    pub labels: Option<String>,
+    /// Labels as JSON object
+    #[arg(long, env = "TUNTUN_LABELS_JSON", conflicts_with = "labels")]
+    pub labels_json: Option<String>,
+    /// Auto-delete after inactivity (e.g. 3d, 12h, never)
+    #[arg(long, env = "TUNTUN_EXPIRES_IN")]
+    pub expires_in: Option<String>,
     /// Store secrets in plaintext (no TPM/Keychain/derived seal).
     #[arg(long, env = "TUNTUN_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
@@ -263,6 +284,13 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
 
     let (network_id, network_name) = parse_network_arg(args.network.as_deref())?;
 
+    let labels = match (&args.labels, &args.labels_json) {
+        (Some(csv), None) => Some(crate::cmds_device::parse_label_csv(csv)?),
+        (None, Some(json)) => Some(crate::cmds_device::parse_labels_json(json)?),
+        (None, None) => None,
+        _ => unreachable!("clap conflicts_with"),
+    };
+
     let mut resp = client
         .enroll(tuntun_common::EnrollRequest {
             enrollment_token: token,
@@ -274,6 +302,8 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
             os: std::env::consts::OS.to_string(),
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             metadata: Some(metadata),
+            labels,
+            expires_in: args.expires_in.clone(),
         })
         .await
         .context("enroll with control plane")?;
@@ -378,7 +408,7 @@ async fn wait_for_approval(
                     network_id,
                     network_name,
                     status: "active".into(),
-                    snapshot,
+                    snapshot: *snapshot,
                 });
             }
         }

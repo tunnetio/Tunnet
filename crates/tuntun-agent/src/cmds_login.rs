@@ -7,7 +7,7 @@ use tuntun_core::{CliAuthTokens, StatePaths};
 #[derive(Args, Debug)]
 pub struct LoginArgs {
     /// Management API base URL (e.g. http://localhost:3000)
-    #[arg(long, env = "TUNTUN_MANAGEMENT_URL")]
+    #[arg(long, env = "MANAGEMENT_URL")]
     pub management_url: Option<String>,
     #[arg(long, env = "TUNTUN_STATE_DIR")]
     pub state_dir: Option<String>,
@@ -64,9 +64,7 @@ pub async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
 
     let management_url = args
         .management_url
-        .or_else(|| std::env::var("TUNTUN_MANAGEMENT_URL").ok())
-        .or_else(|| std::env::var("TUNTUN_MANAGEMENT_PUBLIC_URL").ok())
-        .or_else(|| std::env::var("MANAGEMENT_API_PUBLIC_URL").ok())
+        .or_else(|| std::env::var("MANAGEMENT_URL").ok())
         .unwrap_or_else(|| "http://localhost:3000".into())
         .trim_end_matches('/')
         .to_string();

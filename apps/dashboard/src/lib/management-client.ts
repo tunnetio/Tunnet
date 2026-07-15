@@ -46,12 +46,15 @@ import {
   networkListResponse,
   networkMetricsResponse,
   networkSchema,
+  organizationSettingsResponse,
   organizationSsoProviderSchema,
   organizationTunnelSettingsSchema,
   type PatchDeviceBody,
+  type PatchDeviceLabelsBody,
   type PatchDeviceMembershipBody,
   type PatchHostnameRouteBody,
   type PatchNetworkBody,
+  type PatchOrganizationSettingsBody,
   type PatchOrganizationTunnelSettingsBody,
   type PatchPolicyBody,
   type PatchRelayBody,
@@ -61,9 +64,11 @@ import {
   type PatchTunnelBody,
   type PatchTunnelRoutingRuleBody,
   patchDeviceBody,
+  patchDeviceLabelsBody,
   patchDeviceMembershipBody,
   patchHostnameRouteBody,
   patchNetworkBody,
+  patchOrganizationSettingsBody,
   patchOrganizationTunnelSettingsBody,
   patchPolicyBody,
   patchRelayBody,
@@ -109,6 +114,7 @@ const serveDetailResponse = zod.object({ serve: serveSchema });
 const tunnelSettingsResponse = zod.object({
   settings: organizationTunnelSettingsSchema,
 });
+const orgSettingsResponse = organizationSettingsResponse;
 const ssoSettingsResponse = zod.object({
   provider: organizationSsoProviderSchema.nullable(),
 });
@@ -254,6 +260,17 @@ export function createManagementClient(orgId: string) {
         {
           method: "PATCH",
           body: JSON.stringify(patchDeviceBody.parse(body)),
+        },
+        deviceDetailSchema,
+      ),
+
+    patchDeviceLabels: (endpointId: string, body: PatchDeviceLabelsBody) =>
+      request(
+        orgId,
+        org(`/devices/${endpointId}/labels`),
+        {
+          method: "PATCH",
+          body: JSON.stringify(patchDeviceLabelsBody.parse(body)),
         },
         deviceDetailSchema,
       ),
@@ -805,6 +822,20 @@ export function createManagementClient(orgId: string) {
           body: JSON.stringify(patchOrganizationTunnelSettingsBody.parse(body)),
         },
         tunnelSettingsResponse,
+      ),
+
+    getOrgSettings: () =>
+      request(orgId, org("/settings"), {}, orgSettingsResponse),
+
+    updateOrgSettings: (body: PatchOrganizationSettingsBody) =>
+      request(
+        orgId,
+        org("/settings"),
+        {
+          method: "PATCH",
+          body: JSON.stringify(patchOrganizationSettingsBody.parse(body)),
+        },
+        orgSettingsResponse,
       ),
 
     listSshSessions: (opts?: { status?: string; limit?: number }) => {

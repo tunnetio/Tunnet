@@ -44,11 +44,6 @@ pub struct Args {
     #[arg(long, env = "TUNTUN_OTLP_ENDPOINT")]
     pub otlp_endpoint: Option<String>,
 
-    /// Public management URL used to build SSH re-auth browser links
-    /// (e.g. https://app.example.com or http://localhost:5173).
-    #[arg(long, env = "TUNTUN_MANAGEMENT_PUBLIC_URL")]
-    pub management_public_url: Option<String>,
-
     /// TTL (seconds) beyond which a device without heartbeats is evicted from its IP.
     #[arg(long, env = "TUNTUN_STALE_TTL_SECS", default_value_t = 90)]
     pub stale_ttl_secs: u64,

@@ -18,6 +18,7 @@ import { Route as AppIndexRouteImport } from './routes/app/index'
 import { Route as DeviceApproveRouteImport } from './routes/device/approve'
 import { Route as AuthSshRouteImport } from './routes/auth/ssh'
 import { Route as AppUsersRouteImport } from './routes/app/users'
+import { Route as AppOrganizationRouteImport } from './routes/app/organization'
 import { Route as AppOnboardingRouteImport } from './routes/app/onboarding'
 import { Route as AppLogsRouteImport } from './routes/app/logs'
 import { Route as AppAccessRouteImport } from './routes/app/access'
@@ -32,8 +33,6 @@ import { Route as AppRelaysIndexRouteImport } from './routes/app/relays/index'
 import { Route as AppNetworksIndexRouteImport } from './routes/app/networks/index'
 import { Route as AppMachinesIndexRouteImport } from './routes/app/machines/index'
 import { Route as AppTunnelsTunnelIdRouteImport } from './routes/app/tunnels/$tunnelId'
-import { Route as AppSettingsApiKeysRouteImport } from './routes/app/settings/api-keys'
-import { Route as AppSettingsAccountRouteImport } from './routes/app/settings/account'
 import { Route as AppServesServeIdRouteImport } from './routes/app/serves/$serveId'
 import { Route as AppRelaysRelayIdRouteImport } from './routes/app/relays/$relayId'
 import { Route as AppMachinesEndpointIdRouteImport } from './routes/app/machines/$endpointId'
@@ -88,6 +87,11 @@ const AuthSshRoute = AuthSshRouteImport.update({
 const AppUsersRoute = AppUsersRouteImport.update({
   id: '/users',
   path: '/users',
+  getParentRoute: () => AppRouteRoute,
+} as any)
+const AppOrganizationRoute = AppOrganizationRouteImport.update({
+  id: '/organization',
+  path: '/organization',
   getParentRoute: () => AppRouteRoute,
 } as any)
 const AppOnboardingRoute = AppOnboardingRouteImport.update({
@@ -161,16 +165,6 @@ const AppTunnelsTunnelIdRoute = AppTunnelsTunnelIdRouteImport.update({
   path: '/tunnels/$tunnelId',
   getParentRoute: () => AppRouteRoute,
 } as any)
-const AppSettingsApiKeysRoute = AppSettingsApiKeysRouteImport.update({
-  id: '/api-keys',
-  path: '/api-keys',
-  getParentRoute: () => AppSettingsRouteRoute,
-} as any)
-const AppSettingsAccountRoute = AppSettingsAccountRouteImport.update({
-  id: '/account',
-  path: '/account',
-  getParentRoute: () => AppSettingsRouteRoute,
-} as any)
 const AppServesServeIdRoute = AppServesServeIdRouteImport.update({
   id: '/serves/$serveId',
   path: '/serves/$serveId',
@@ -238,6 +232,7 @@ export interface FileRoutesByFullPath {
   '/app/access': typeof AppAccessRoute
   '/app/logs': typeof AppLogsRoute
   '/app/onboarding': typeof AppOnboardingRoute
+  '/app/organization': typeof AppOrganizationRoute
   '/app/users': typeof AppUsersRoute
   '/auth/ssh': typeof AuthSshRoute
   '/device/approve': typeof DeviceApproveRoute
@@ -247,8 +242,6 @@ export interface FileRoutesByFullPath {
   '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
   '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
   '/app/serves/$serveId': typeof AppServesServeIdRoute
-  '/app/settings/account': typeof AppSettingsAccountRoute
-  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
   '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
   '/app/machines/': typeof AppMachinesIndexRoute
   '/app/networks/': typeof AppNetworksIndexRoute
@@ -273,6 +266,7 @@ export interface FileRoutesByTo {
   '/app/access': typeof AppAccessRoute
   '/app/logs': typeof AppLogsRoute
   '/app/onboarding': typeof AppOnboardingRoute
+  '/app/organization': typeof AppOrganizationRoute
   '/app/users': typeof AppUsersRoute
   '/auth/ssh': typeof AuthSshRoute
   '/device/approve': typeof DeviceApproveRoute
@@ -281,8 +275,6 @@ export interface FileRoutesByTo {
   '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
   '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
   '/app/serves/$serveId': typeof AppServesServeIdRoute
-  '/app/settings/account': typeof AppSettingsAccountRoute
-  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
   '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
   '/app/machines': typeof AppMachinesIndexRoute
   '/app/networks': typeof AppNetworksIndexRoute
@@ -310,6 +302,7 @@ export interface FileRoutesById {
   '/app/access': typeof AppAccessRoute
   '/app/logs': typeof AppLogsRoute
   '/app/onboarding': typeof AppOnboardingRoute
+  '/app/organization': typeof AppOrganizationRoute
   '/app/users': typeof AppUsersRoute
   '/auth/ssh': typeof AuthSshRoute
   '/device/approve': typeof DeviceApproveRoute
@@ -319,8 +312,6 @@ export interface FileRoutesById {
   '/app/machines/$endpointId': typeof AppMachinesEndpointIdRoute
   '/app/relays/$relayId': typeof AppRelaysRelayIdRoute
   '/app/serves/$serveId': typeof AppServesServeIdRoute
-  '/app/settings/account': typeof AppSettingsAccountRoute
-  '/app/settings/api-keys': typeof AppSettingsApiKeysRoute
   '/app/tunnels/$tunnelId': typeof AppTunnelsTunnelIdRoute
   '/app/machines/': typeof AppMachinesIndexRoute
   '/app/networks/': typeof AppNetworksIndexRoute
@@ -349,6 +340,7 @@ export interface FileRouteTypes {
     | '/app/access'
     | '/app/logs'
     | '/app/onboarding'
+    | '/app/organization'
     | '/app/users'
     | '/auth/ssh'
     | '/device/approve'
@@ -358,8 +350,6 @@ export interface FileRouteTypes {
     | '/app/machines/$endpointId'
     | '/app/relays/$relayId'
     | '/app/serves/$serveId'
-    | '/app/settings/account'
-    | '/app/settings/api-keys'
     | '/app/tunnels/$tunnelId'
     | '/app/machines/'
     | '/app/networks/'
@@ -384,6 +374,7 @@ export interface FileRouteTypes {
     | '/app/access'
     | '/app/logs'
     | '/app/onboarding'
+    | '/app/organization'
     | '/app/users'
     | '/auth/ssh'
     | '/device/approve'
@@ -392,8 +383,6 @@ export interface FileRouteTypes {
     | '/app/machines/$endpointId'
     | '/app/relays/$relayId'
     | '/app/serves/$serveId'
-    | '/app/settings/account'
-    | '/app/settings/api-keys'
     | '/app/tunnels/$tunnelId'
     | '/app/machines'
     | '/app/networks'
@@ -420,6 +409,7 @@ export interface FileRouteTypes {
     | '/app/access'
     | '/app/logs'
     | '/app/onboarding'
+    | '/app/organization'
     | '/app/users'
     | '/auth/ssh'
     | '/device/approve'
@@ -429,8 +419,6 @@ export interface FileRouteTypes {
     | '/app/machines/$endpointId'
     | '/app/relays/$relayId'
     | '/app/serves/$serveId'
-    | '/app/settings/account'
-    | '/app/settings/api-keys'
     | '/app/tunnels/$tunnelId'
     | '/app/machines/'
     | '/app/networks/'
@@ -522,6 +510,13 @@ declare module '@tanstack/react-router' {
       path: '/users'
       fullPath: '/app/users'
       preLoaderRoute: typeof AppUsersRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/app/organization': {
+      id: '/app/organization'
+      path: '/organization'
+      fullPath: '/app/organization'
+      preLoaderRoute: typeof AppOrganizationRouteImport
       parentRoute: typeof AppRouteRoute
     }
     '/app/onboarding': {
@@ -622,20 +617,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppTunnelsTunnelIdRouteImport
       parentRoute: typeof AppRouteRoute
     }
-    '/app/settings/api-keys': {
-      id: '/app/settings/api-keys'
-      path: '/api-keys'
-      fullPath: '/app/settings/api-keys'
-      preLoaderRoute: typeof AppSettingsApiKeysRouteImport
-      parentRoute: typeof AppSettingsRouteRoute
-    }
-    '/app/settings/account': {
-      id: '/app/settings/account'
-      path: '/account'
-      fullPath: '/app/settings/account'
-      preLoaderRoute: typeof AppSettingsAccountRouteImport
-      parentRoute: typeof AppSettingsRouteRoute
-    }
     '/app/serves/$serveId': {
       id: '/app/serves/$serveId'
       path: '/serves/$serveId'
@@ -710,14 +691,10 @@ declare module '@tanstack/react-router' {
 }
 
 interface AppSettingsRouteRouteChildren {
-  AppSettingsAccountRoute: typeof AppSettingsAccountRoute
-  AppSettingsApiKeysRoute: typeof AppSettingsApiKeysRoute
   AppSettingsIndexRoute: typeof AppSettingsIndexRoute
 }
 
 const AppSettingsRouteRouteChildren: AppSettingsRouteRouteChildren = {
-  AppSettingsAccountRoute: AppSettingsAccountRoute,
-  AppSettingsApiKeysRoute: AppSettingsApiKeysRoute,
   AppSettingsIndexRoute: AppSettingsIndexRoute,
 }
 
@@ -753,6 +730,7 @@ interface AppRouteRouteChildren {
   AppAccessRoute: typeof AppAccessRoute
   AppLogsRoute: typeof AppLogsRoute
   AppOnboardingRoute: typeof AppOnboardingRoute
+  AppOrganizationRoute: typeof AppOrganizationRoute
   AppUsersRoute: typeof AppUsersRoute
   AppIndexRoute: typeof AppIndexRoute
   AppNetworksNetworkIdRouteRoute: typeof AppNetworksNetworkIdRouteRouteWithChildren
@@ -774,6 +752,7 @@ const AppRouteRouteChildren: AppRouteRouteChildren = {
   AppAccessRoute: AppAccessRoute,
   AppLogsRoute: AppLogsRoute,
   AppOnboardingRoute: AppOnboardingRoute,
+  AppOrganizationRoute: AppOrganizationRoute,
   AppUsersRoute: AppUsersRoute,
   AppIndexRoute: AppIndexRoute,
   AppNetworksNetworkIdRouteRoute: AppNetworksNetworkIdRouteRouteWithChildren,

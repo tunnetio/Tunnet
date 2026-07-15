@@ -54,16 +54,11 @@ pub async fn merge_device_metadata(
 ) -> anyhow::Result<()> {
     let enriched = enrich_metadata(hostname, agent_version, os, metadata);
 
-    sqlx::query(
-        "UPDATE devices \
-         SET metadata = metadata || $2::jsonb, \
-             last_seen = now() \
-         WHERE endpoint_id = $1",
-    )
-    .bind(endpoint_id)
-    .bind(enriched)
-    .execute(pool)
-    .await?;
+    sqlx::query(crate::device_expiry_sql::SLIDE_ON_METADATA)
+        .bind(endpoint_id)
+        .bind(enriched)
+        .execute(pool)
+        .await?;
 
     Ok(())
 }

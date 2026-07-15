@@ -41,26 +41,26 @@ function HealthCounter({
     <Link
       to={to}
       className={cn(
-        "rounded-lg border px-4 py-3 transition-colors hover:bg-secondary/40",
-        tone === "ok" && "border-border/60",
-        tone === "warn" && "border-amber-500/40",
-        tone === "bad" && "border-destructive/40",
+        "group rounded-xl border bg-card px-4 py-3.5 transition-colors hover:bg-secondary/50",
+        tone === "ok" && "border-border/70",
+        tone === "warn" && "border-amber-500/35",
+        tone === "bad" && "border-destructive/35",
       )}
     >
-      <p className="text-muted-foreground text-xs font-medium tracking-wide uppercase">
+      <p className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
         {label}
       </p>
       <p
         className={cn(
-          "mt-1 text-xl font-semibold tracking-tight",
+          "mt-1.5 text-2xl font-semibold tracking-tight tabular-nums",
           tone === "ok" && "text-foreground",
-          tone === "warn" && "text-amber-500",
+          tone === "warn" && "text-amber-600 dark:text-amber-400",
           tone === "bad" && "text-destructive",
         )}
       >
         {value}
       </p>
-      <p className="text-muted-foreground mt-0.5 text-xs">{detail}</p>
+      <p className="text-muted-foreground mt-1 text-xs">{detail}</p>
     </Link>
   );
 }

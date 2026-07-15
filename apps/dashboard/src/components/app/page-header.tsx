@@ -24,7 +24,7 @@ export function PageHeader({
         className,
       )}
     >
-      <div className={cn("min-w-0", dense ? "space-y-1" : "space-y-1.5")}>
+      <div className={cn("min-w-0", dense ? "space-y-0.5" : "space-y-1")}>
         <h1
           className={cn(
             "font-semibold tracking-tight text-balance",
@@ -37,7 +37,7 @@ export function PageHeader({
           <p
             className={cn(
               "text-muted-foreground max-w-2xl text-pretty",
-              dense ? "text-[13px] leading-relaxed" : "text-sm",
+              dense ? "text-[13px] leading-relaxed" : "text-sm leading-relaxed",
             )}
           >
             {description}
@@ -45,7 +45,9 @@ export function PageHeader({
         ) : null}
       </div>
       {actions ? (
-        <div className="flex shrink-0 items-center gap-2">{actions}</div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          {actions}
+        </div>
       ) : null}
     </div>
   );

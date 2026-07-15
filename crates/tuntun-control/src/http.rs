@@ -7,7 +7,7 @@ use axum::extract::{
 };
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -29,6 +29,18 @@ pub async fn serve(state: SharedState) -> anyhow::Result<()> {
         .route("/v1/enroll/status", post(enroll_status_handler))
         .route("/v1/register", post(register_handler))
         .route("/v1/poll", post(poll_handler))
+        .route(
+            "/v1/device/labels",
+            get(crate::device_handlers::get_device_labels_handler),
+        )
+        .route(
+            "/v1/device/labels",
+            patch(crate::device_handlers::patch_device_labels_handler),
+        )
+        .route(
+            "/v1/device/expiry",
+            patch(crate::device_handlers::patch_device_expiry_handler),
+        )
         .route("/v1/ws", get(ws_handler))
         .route(
             "/v1/relay/register",
@@ -206,6 +218,13 @@ async fn enroll_inner(
         .unwrap_or("agent")
         .to_string();
 
+    let expires_in = crate::device_handlers::resolve_enroll_expires_in(
+        &state.pool,
+        &organization_id,
+        req.expires_in.as_deref(),
+    )
+    .await?;
+
     let resp = crate::register::register_device(
         &state.pool,
         &state.policy_key,
@@ -218,6 +237,8 @@ async fn enroll_inner(
             agent_version: req.agent_version.clone(),
             device_type,
             metadata: req.metadata.clone(),
+            labels: req.labels.clone(),
+            expires_in,
             public_ip,
             membership_status,
         },
@@ -430,12 +451,16 @@ async fn enroll_status_inner(
                 organization_id,
                 network_id: req.network_id,
                 network_name,
-                snapshot,
+                snapshot: Box::new(snapshot),
             })
         }
         "suspended" => Err((
             StatusCode::FORBIDDEN,
             "device membership is suspended".into(),
+        )),
+        "expired" => Err((
+            StatusCode::FORBIDDEN,
+            "device expired; re-enroll required".into(),
         )),
         _ => Ok(EnrollStatusResponse::Rejected),
     }
@@ -456,7 +481,7 @@ async fn register_handler(State(state): State<SharedState>, req: Request<Body>) 
         return err(StatusCode::BAD_REQUEST, "endpoint_id mismatch");
     }
 
-    let _ = sqlx::query("UPDATE devices SET last_seen = now() WHERE endpoint_id = $1")
+    let _ = sqlx::query(crate::device_expiry_sql::SLIDE_ON_REGISTER)
         .bind(&auth.endpoint_id)
         .execute(&state.pool)
         .await;
@@ -517,7 +542,7 @@ async fn poll_handler(State(state): State<SharedState>, req: Request<Body>) -> R
         return err(StatusCode::BAD_REQUEST, "endpoint_id mismatch");
     }
 
-    let _ = sqlx::query("UPDATE devices SET last_seen = now() WHERE endpoint_id = $1")
+    let _ = sqlx::query(crate::device_expiry_sql::SLIDE_ON_REGISTER)
         .bind(&auth.endpoint_id)
         .execute(&state.pool)
         .await;
@@ -593,6 +618,14 @@ async fn ws_handler(
         Some(d) => d,
         None => return err(StatusCode::UNAUTHORIZED, "unknown device"),
     };
+
+    match crate::device_expiry::is_device_expired(&state.pool, &endpoint_id).await {
+        Ok(true) => {
+            return err(StatusCode::FORBIDDEN, "device expired; re-enroll required");
+        }
+        Ok(false) => {}
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")),
+    }
 
     let network_ids: Vec<uuid::Uuid> = match sqlx::query_scalar(
         "SELECT network_id FROM network_memberships WHERE endpoint_id = $1 AND status = 'active'",

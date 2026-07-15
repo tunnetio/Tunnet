@@ -36,7 +36,7 @@ enum Command {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
-    #[arg(long, env = "TUNTUN_CONTROL_URL")]
+    #[arg(long, env = "CONTROL_PLANE_URL")]
     control_url: Option<String>,
     /// Relay auth / registration token (Bearer)
     #[arg(long, env = "TUNTUN_RELAY_TOKEN")]
@@ -69,7 +69,7 @@ struct RunArgs {
 
 #[derive(Parser, Debug)]
 struct RegisterArgs {
-    #[arg(long, env = "TUNTUN_CONTROL_URL")]
+    #[arg(long, env = "CONTROL_PLANE_URL")]
     control_url: String,
     #[arg(long, env = "TUNTUN_RELAY_TOKEN")]
     token: String,

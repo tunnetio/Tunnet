@@ -507,6 +507,12 @@ pub struct StatusInfo {
     pub conntrack_entries: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_demand: Option<OnDemandStatusInfo>,
+    /// RFC3339 timestamp when this machine is deleted after inactivity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Seconds until `expires_at`, when auto-expiry is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

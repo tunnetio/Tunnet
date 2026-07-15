@@ -38,17 +38,9 @@ type ProofVerifyRow = (
     Option<chrono::DateTime<chrono::Utc>>,
 );
 
-fn management_base(state: &SharedState) -> String {
-    // Prefer explicit public URL; otherwise dashboard (redirects to management `/auth/ssh`).
-    state
-        .args
-        .management_public_url
-        .clone()
-        .or_else(|| std::env::var("TUNTUN_MANAGEMENT_PUBLIC_URL").ok())
-        .or_else(|| std::env::var("MANAGEMENT_WEB_ORIGIN").ok())
-        .or_else(|| std::env::var("MANAGEMENT_API_PUBLIC_URL").ok())
-        .or_else(|| std::env::var("TUNTUN_MANAGEMENT_URL").ok())
-        .unwrap_or_else(|| "http://localhost:5173".into())
+fn management_base(_state: &SharedState) -> String {
+    std::env::var("DASHBOARD_URL")
+        .unwrap_or_else(|_| "http://localhost:5173".into())
         .trim_end_matches('/')
         .to_string()
 }

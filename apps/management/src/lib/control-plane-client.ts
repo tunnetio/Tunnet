@@ -11,6 +11,7 @@ import {
   type ValidateNetworkResponse,
   validateNetworkResponse,
 } from "@tuntun/api/internal";
+import { getControlPlaneAdminUrl } from "@tuntun/env";
 import ky, { isHTTPError, type KyInstance } from "ky";
 
 const HDR_TIMESTAMP = "x-tuntun-timestamp";
@@ -18,11 +19,7 @@ const HDR_NONCE = "x-tuntun-nonce";
 const HDR_SIGNATURE = "x-tuntun-signature";
 
 function getAdminUrl(): string {
-  const url = process.env.CONTROL_PLANE_ADMIN_URL;
-  if (!url) {
-    throw new Error("CONTROL_PLANE_ADMIN_URL is not set");
-  }
-  return url.replace(/\/$/, "");
+  return getControlPlaneAdminUrl();
 }
 
 function getServiceSecret(): string {

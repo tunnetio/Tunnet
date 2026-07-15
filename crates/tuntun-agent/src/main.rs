@@ -2,6 +2,7 @@ mod accept;
 mod auto_update;
 mod cli;
 mod cmds;
+mod cmds_device;
 mod cmds_direct;
 mod cmds_login;
 mod cmds_send;
@@ -108,6 +109,12 @@ async fn main() -> anyhow::Result<()> {
         crate::cli::Command::Update(a) => crate::cmds_update::run(a).await,
         crate::cli::Command::Validate(a) => crate::cmds::run_validate(a).await,
         crate::cli::Command::Reload(a) => crate::cmds::run_reload(a).await,
+        crate::cli::Command::Labels(a) => {
+            crate::cmds_device::run_labels(a, cli.state_dir.as_deref()).await
+        }
+        crate::cli::Command::Machine(a) => {
+            crate::cmds_device::run_machine(a, cli.state_dir.as_deref()).await
+        }
         crate::cli::Command::Create(a) => {
             crate::cmds_direct::run_create(a, cli.state_dir.as_deref()).await
         }

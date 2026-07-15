@@ -30,7 +30,8 @@ export type MachinePresence =
   | "stale"
   | "offline"
   | "suspended"
-  | "pending";
+  | "pending"
+  | "expired";
 
 /** Agent heartbeats arrive every ~30s; allow one missed beat. */
 export const HEARTBEAT_ONLINE_MS = 45_000;
@@ -39,6 +40,7 @@ export function getMachinePresence(
   device: Pick<Device, "status" | "agentConnected" | "lastHeartbeatAt">,
   now = Date.now(),
 ): MachinePresence {
+  if (device.status === "expired") return "expired";
   if (device.status === "suspended") return "suspended";
   if (device.status === "pending") return "pending";
 

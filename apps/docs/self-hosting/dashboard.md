@@ -8,9 +8,9 @@ The dashboard (`apps/dashboard`) is a React SPA built with Vite, TanStack Query,
 docker compose up -d dashboard
 ```
 
-The dashboard image is built from `deploy/Dockerfile.dashboard`. At build time, Vite compiles the React app. The `VITE_MANAGEMENT_API_URL` build arg can be left empty - the dashboard then uses the same origin and the Nitro server proxies `/api` to the management service.
+The dashboard image is built from `deploy/Dockerfile.dashboard`. At build time, Vite compiles the React app with `MANAGEMENT_URL`, `CONTROL_PLANE_URL`, and optional `DASHBOARD_URL` from the root `.env` or Docker build args.
 
-At runtime, `MANAGEMENT_API_URL` tells the Nitro proxy where to reach the management server (default: `http://management:3000` in Docker).
+When `MANAGEMENT_URL` points at a different host than the dashboard, the Nitro server proxies `/api`, `/auth`, and `/.well-known` to the management service.
 
 ## Running manually
 
@@ -21,10 +21,11 @@ bun run dash:preview
 
 ## Configuration
 
-| Variable | Context | Description |
-|----------|---------|-------------|
-| `VITE_MANAGEMENT_API_URL` | Build arg | Management API URL baked into the frontend. Leave empty for same-origin proxy. |
-| `MANAGEMENT_API_URL` | Runtime env | Where the Nitro server proxies API requests (default: `http://management:3000`) |
+| Variable | Description |
+|----------|-------------|
+| `DASHBOARD_URL` | Dashboard public URL (enrollment commands, OAuth) |
+| `MANAGEMENT_URL` | Management API URL (browser client + Nitro proxy target) |
+| `CONTROL_PLANE_URL` | Control plane URL (shown in enroll/relay commands) |
 
 ## Pages
 

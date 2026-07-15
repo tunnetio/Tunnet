@@ -1,6 +1,7 @@
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { sso } from "@better-auth/sso";
 import { getDb, schema } from "@tuntun/db";
+import { getDashboardUrl, getManagementUrl } from "@tuntun/env";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import {
@@ -15,19 +16,11 @@ import { createDefaultNetwork } from "./lib/default-network";
 
 const db = getDb();
 
-const webOrigin = () =>
-  (process.env.MANAGEMENT_WEB_ORIGIN ?? "http://localhost:5173").replace(
-    /\/$/,
-    "",
-  );
+const dashboardOrigin = getDashboardUrl();
 
-const dashboardOrigin = webOrigin();
-
-/** Well-known first-party OAuth client IDs (public PKCE clients). */
 export const OAUTH_CLIENT_DASHBOARD = "tuntun-dashboard";
 export const OAUTH_CLIENT_CLI = "tuntun-cli";
 
-/** First-party OAuth clients cached in memory (skip consent). */
 export const TRUSTED_OAUTH_CLIENT_IDS = new Set<string>([
   OAUTH_CLIENT_DASHBOARD,
   OAUTH_CLIENT_CLI,
@@ -85,6 +78,7 @@ async function ssoTrustedOrigins(): Promise<string[]> {
 
 export const auth = betterAuth({
   appName: "TunTun Management",
+  baseURL: getManagementUrl(),
   database: drizzleAdapter(db, {
     provider: "pg",
     schema: {
@@ -190,11 +184,7 @@ export const auth = betterAuth({
 
 /** Ensure first-party OAuth clients exist (CLI + dashboard). */
 export async function ensureTrustedOAuthClients() {
-  const apiOrigin = (
-    process.env.TUNTUN_MANAGEMENT_PUBLIC_URL ??
-    process.env.MANAGEMENT_API_PUBLIC_URL ??
-    `http://localhost:${process.env.MANAGEMENT_PORT ?? 3000}`
-  ).replace(/\/$/, "");
+  const apiOrigin = getManagementUrl();
 
   const desired = [
     {

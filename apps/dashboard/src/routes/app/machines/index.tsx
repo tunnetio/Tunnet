@@ -2,7 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import type { ColumnDef, RowSelectionState } from "@tanstack/react-table";
 import { MoreHorizontalIcon, PlusIcon, Trash2Icon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { AddMachinePanel } from "@/components/app/add-machine-panel";
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
@@ -13,6 +13,11 @@ import { EmptyState } from "@/components/app/empty-state";
 import { EnrollmentTokenDialog } from "@/components/app/enrollment-token-dialog";
 import { LastSeenCell } from "@/components/app/last-seen-cell";
 import { MachineAddressPopover } from "@/components/app/machine-address-popover";
+import {
+  MachineExpiryDialog,
+  MachineLabelChips,
+  MachineLabelsEditor,
+} from "@/components/app/machine-labels";
 import { PageHeader } from "@/components/app/page-header";
 import { PageToolbar } from "@/components/app/page-toolbar";
 import { StatusBadge } from "@/components/app/status-badge";
@@ -39,12 +44,19 @@ import {
   usePresenceStream,
 } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
+import {
+  deriveInactivityLimitCompact,
+  type ExpiryDevice,
+  getExpiryUrgency,
+  matchesLabelSearch,
+} from "@/lib/machine-expiry";
 import type { AggregatedMachine } from "@/lib/machine-utils";
 import { getMachinePresence } from "@/lib/machine-utils";
 import { formatNetworkName } from "@/lib/network-utils";
 import {
   useDeviceMutations,
   useMachines,
+  useOrgSettings,
   useServes,
   useTunnels,
 } from "@/lib/queries/management";
@@ -60,6 +72,18 @@ function MachinesPage() {
   const { data: role } = useMemberRole(orgId);
   const isAdmin = isAdminRole(role);
   const { data: machines, isPending } = useMachines(orgId);
+  const { data: orgSettings } = useOrgSettings(orgId);
+
+  const withOrgExpiry = useCallback(
+    (machine: AggregatedMachine): ExpiryDevice => ({
+      ...machine,
+      orgAutoCleanupEnabled: orgSettings?.machines.autoCleanup.enabled ?? false,
+      orgInactivityAfter:
+        orgSettings?.machines.autoCleanup.inactivityAfter ?? null,
+    }),
+    [orgSettings],
+  );
+
   const { data: tunnels } = useTunnels(orgId);
   const { data: serves } = useServes(orgId);
   const deviceMutations = useDeviceMutations(orgId);
@@ -72,7 +96,7 @@ function MachinesPage() {
   }, [orgId, machines, queryClient]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<
-    "all" | "online" | "offline" | "pending"
+    "all" | "online" | "offline" | "pending" | "expired"
   >("all");
   const [enrollOpen, setEnrollOpen] = useState(false);
   const [tunnelOpen, setTunnelOpen] = useState(false);
@@ -89,6 +113,12 @@ function MachinesPage() {
   } | null>(null);
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [confirmBulkRemove, setConfirmBulkRemove] = useState(false);
+  const [labelsEditor, setLabelsEditor] = useState<AggregatedMachine | null>(
+    null,
+  );
+  const [expiryEditor, setExpiryEditor] = useState<AggregatedMachine | null>(
+    null,
+  );
 
   const tunnelCounts = useMemo(() => {
     const map = new Map<string, number>();
@@ -114,25 +144,34 @@ function MachinesPage() {
   const filtered = useMemo(() => {
     const now = Date.now();
     let list = machines ?? [];
-    if (statusFilter !== "all") {
+    if (statusFilter === "all") {
+      list = list.filter((m) => getMachinePresence(m, now) !== "expired");
+    } else {
       list = list.filter((m) => {
         const presence = getMachinePresence(m, now);
         if (statusFilter === "pending") return presence === "pending";
         if (statusFilter === "online") return presence === "online";
-        return presence !== "online" && presence !== "pending";
+        if (statusFilter === "expired") return presence === "expired";
+        return (
+          presence !== "online" &&
+          presence !== "pending" &&
+          presence !== "expired"
+        );
       });
     }
     const q = search.trim().toLowerCase();
     if (!q) return list;
-    return list.filter(
-      (m) =>
+    return list.filter((m) => {
+      if (matchesLabelSearch(m.labels, q)) return true;
+      return (
         m.name.toLowerCase().includes(q) ||
         m.hostname.toLowerCase().includes(q) ||
         m.networkName.toLowerCase().includes(q) ||
         m.assignedIp.includes(q) ||
         (m.tenantIpv6?.includes(q) ?? false) ||
-        (m.os?.toLowerCase().includes(q) ?? false),
-    );
+        (m.os?.toLowerCase().includes(q) ?? false)
+      );
+    });
   }, [machines, search, statusFilter]);
 
   const selectedMachines = useMemo(() => {
@@ -154,14 +193,24 @@ function MachinesPage() {
         header: "Machine",
         cell: ({ row }) => {
           const machine = row.original;
+          const urgency = getExpiryUrgency(withOrgExpiry(machine));
           return (
-            <Link
-              to="/app/machines/$endpointId"
-              params={{ endpointId: machine.endpointId }}
-              className="font-medium hover:underline"
-            >
-              {machine.name}
-            </Link>
+            <div className="min-w-0 space-y-1.5 py-0.5">
+              <Link
+                to="/app/machines/$endpointId"
+                params={{ endpointId: machine.endpointId }}
+                className={
+                  urgency === "warning"
+                    ? "font-medium text-amber-600 hover:underline dark:text-amber-400"
+                    : urgency === "critical"
+                      ? "font-medium text-destructive hover:underline"
+                      : "font-medium hover:underline"
+                }
+              >
+                {machine.name}
+              </Link>
+              <MachineLabelChips labels={machine.labels} max={3} empty={null} />
+            </div>
           );
         },
       },
@@ -312,6 +361,16 @@ function MachinesPage() {
                             Create serve
                           </DropdownMenuItem>
                           <DropdownMenuItem
+                            onClick={() => setLabelsEditor(machine)}
+                          >
+                            Edit labels
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => setExpiryEditor(machine)}
+                          >
+                            Set expiry
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
                             onClick={() =>
                               void deviceMutations.updateMembership
                                 .mutateAsync({
@@ -367,6 +426,7 @@ function MachinesPage() {
       orgId,
       serveCounts,
       tunnelCounts,
+      withOrgExpiry,
     ],
   );
 
@@ -408,7 +468,7 @@ function MachinesPage() {
           setSearch(value);
           setRowSelection({});
         }}
-        searchPlaceholder="Search by name, network, IP, OS..."
+        searchPlaceholder="Search name, labels, network, IP..."
         count={filtered.length}
         countLabel={filtered.length === 1 ? "machine" : "machines"}
         filters={
@@ -416,7 +476,12 @@ function MachinesPage() {
             value={statusFilter}
             onValueChange={(value) =>
               setStatusFilter(
-                (value as "all" | "online" | "offline" | "pending") ?? "all",
+                (value as
+                  | "all"
+                  | "online"
+                  | "offline"
+                  | "pending"
+                  | "expired") ?? "all",
               )
             }
           >
@@ -428,6 +493,7 @@ function MachinesPage() {
               <SelectItem value="online">Online</SelectItem>
               <SelectItem value="offline">Offline</SelectItem>
               <SelectItem value="pending">Pending</SelectItem>
+              <SelectItem value="expired">Expired</SelectItem>
             </SelectContent>
           </Select>
         }
@@ -551,6 +617,36 @@ function MachinesPage() {
               err instanceof Error ? err.message : "Failed to remove machines",
             );
           }
+        }}
+      />
+
+      <MachineLabelsEditor
+        open={labelsEditor !== null}
+        onOpenChange={(open) => !open && setLabelsEditor(null)}
+        labels={labelsEditor?.labels ?? {}}
+        loading={deviceMutations.updateLabels.isPending}
+        onSave={async (patch) => {
+          if (!labelsEditor) return;
+          await deviceMutations.updateLabels.mutateAsync({
+            endpointId: labelsEditor.endpointId,
+            body: patch,
+          });
+        }}
+      />
+
+      <MachineExpiryDialog
+        open={expiryEditor !== null}
+        onOpenChange={(open) => !open && setExpiryEditor(null)}
+        current={
+          expiryEditor ? deriveInactivityLimitCompact(expiryEditor) : null
+        }
+        loading={deviceMutations.update.isPending}
+        onSave={async (expiresIn) => {
+          if (!expiryEditor) return;
+          await deviceMutations.update.mutateAsync({
+            endpointId: expiryEditor.endpointId,
+            body: { expiresIn },
+          });
         }}
       />
     </>

@@ -1,9 +1,13 @@
-import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
-import { NavTabs } from "@/components/app/nav-tabs";
+import { AppSidebar } from "@/components/app/app-sidebar";
 import { OrgSwitcher } from "@/components/app/org-switcher";
-import { UserMenu } from "@/components/app/user-menu";
+import { Separator } from "@/components/ui/separator";
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
 import { usePresenceStream } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
 
@@ -16,33 +20,22 @@ export function AppShell({ children }: AppShellProps) {
   usePresenceStream(activeOrg?.id);
 
   return (
-    <div className="bg-background flex min-h-dvh flex-col">
-      <header className="border-border/60 bg-background sticky top-0 z-40 border-b">
-        <div className="mx-auto flex h-12 max-w-[1400px] items-center justify-between gap-4 px-4 sm:px-6">
-          <div className="flex min-w-0 items-center gap-4">
-            <Link
-              to="/app"
-              className="text-foreground flex shrink-0 items-center gap-2 font-medium tracking-tight"
-            >
-              <img
-                src="/logo.png"
-                alt="Tuntun"
-                className="h-6 w-6 rounded-md"
-              />
-              <span className="hidden sm:inline">TunTun</span>
-            </Link>
-            <div className="bg-border hidden h-4 w-px sm:block" />
+    <SidebarProvider className="h-svh overflow-hidden">
+      <AppSidebar />
+      <SidebarInset className="min-h-0 overflow-hidden">
+        <header className="z-30 flex h-14 shrink-0 items-center gap-3 border-b border-border/80 bg-background px-4 sm:px-6">
+          <SidebarTrigger className="-ml-1 text-muted-foreground hover:text-foreground" />
+          <Separator orientation="vertical" className="hidden h-5 sm:block" />
+          <div className="flex min-w-0 flex-1 items-center">
             <OrgSwitcher />
           </div>
-          <UserMenu />
-        </div>
-        <div className="mx-auto max-w-[1400px] px-4 sm:px-6">
-          <NavTabs />
-        </div>
-      </header>
-      <main className="mx-auto w-full max-w-[1400px] flex-1 space-y-6 px-4 py-6 sm:px-6 sm:py-8">
-        {children}
-      </main>
-    </div>
+        </header>
+        <main className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto w-full max-w-[1400px] space-y-6 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+            {children}
+          </div>
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
   );
 }

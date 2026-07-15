@@ -8,7 +8,7 @@ use clap::Parser;
 pub struct Config {
     #[arg(
         long,
-        env = "TUNTUN_CONTROL_URL",
+        env = "CONTROL_PLANE_URL",
         default_value = "http://127.0.0.1:8080"
     )]
     pub control_url: String,

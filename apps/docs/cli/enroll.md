@@ -13,7 +13,7 @@ sudo tuntun enroll --control-url <URL> --org <SLUG>
 
 | Option | Env | Description |
 |--------|-----|-------------|
-| `--control-url` | `TUNTUN_CONTROL_URL` | Control plane URL (required) |
+| `--control-url` | `CONTROL_PLANE_URL` | Control plane URL (required) |
 | `--token` | `TUNTUN_ENROLL_TOKEN` | One-time enrollment token |
 | `--org` | `TUNTUN_ORG_SLUG` | Organization slug (quick enroll, requires approval) |
 | `--network` | `TUNTUN_NETWORK` | Network ID or name (defaults to "default") |

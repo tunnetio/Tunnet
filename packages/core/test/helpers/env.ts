@@ -27,11 +27,11 @@ export async function resolveTestEnv(): Promise<TestEnv | null> {
 
   const managementUrl =
     process.env.TUNTUN_TEST_MANAGEMENT_URL ??
-    process.env.TUNTUN_MANAGEMENT_URL ??
+    process.env.MANAGEMENT_URL ??
     "http://127.0.0.1:3000";
   const controlUrl =
     process.env.TUNTUN_TEST_CONTROL_URL ??
-    process.env.TUNTUN_CONTROL_URL ??
+    process.env.CONTROL_PLANE_URL ??
     "http://127.0.0.1:8080";
 
   const orgOverride = process.env.TUNTUN_TEST_ORG_ID;

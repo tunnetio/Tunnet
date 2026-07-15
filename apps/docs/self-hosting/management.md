@@ -26,11 +26,7 @@ bun run management:start
 |----------|---------|-------------|
 | `DATABASE_URL` | - | PostgreSQL connection string (required) |
 | `BETTER_AUTH_SECRET` | - | Auth signing secret, 32+ chars (required) |
-| `BETTER_AUTH_URL` | - | Public URL of management or dashboard (required) |
-| `MANAGEMENT_PORT` | `3000` | Listen port |
-| `MANAGEMENT_WEB_ORIGIN` | `http://localhost:5173` | Dashboard origin for CORS |
-| `CONTROL_PLANE_ADMIN_URL` | `http://127.0.0.1:9091` | Control plane admin API |
+| `DASHBOARD_URL` | `http://localhost:5173` | Dashboard origin for CORS and OAuth |
+| `MANAGEMENT_URL` | `http://localhost:3000` | Public management API URL (listen port derived from this) |
+| `CONTROL_PLANE_URL` | `http://localhost:8080` | Control plane URL (admin API derived on port 9091) |
 | `TUNTUN_SERVICE_SECRET` | - | Internal API shared secret (must match control plane) |
-| `TUNTUN_MANAGEMENT_URL` | - | Management URL (for internal resolution) |
-| `TUNTUN_CONTROL_URL` | - | Control plane URL |
-| `TUNTUN_MANAGEMENT_PUBLIC_URL` | - | Public URL for enrollment tokens |

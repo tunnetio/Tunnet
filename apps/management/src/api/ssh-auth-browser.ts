@@ -1,22 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { schema } from "@tuntun/db";
+import { getDashboardUrl, getManagementUrl } from "@tuntun/env";
 import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 
 import { auth } from "../auth";
 import { db } from "../lib/db";
 
-const webOrigin = () =>
-  (process.env.MANAGEMENT_WEB_ORIGIN ?? "http://localhost:5173").replace(
-    /\/$/,
-    "",
-  );
-const apiOrigin = () =>
-  (
-    process.env.TUNTUN_MANAGEMENT_PUBLIC_URL ??
-    process.env.MANAGEMENT_API_PUBLIC_URL ??
-    `http://localhost:${process.env.MANAGEMENT_PORT ?? 3000}`
-  ).replace(/\/$/, "");
+const webOrigin = () => getDashboardUrl();
+const apiOrigin = () => getManagementUrl();
 
 function htmlPage(title: string, body: string) {
   return new Response(

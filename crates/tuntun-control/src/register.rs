@@ -1,5 +1,6 @@
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use tuntun_common::EnrollResponse;
 use uuid::Uuid;
 
@@ -12,6 +13,8 @@ pub struct RegisterDeviceParams {
     pub agent_version: String,
     pub device_type: String,
     pub metadata: Option<serde_json::Value>,
+    pub labels: Option<HashMap<String, String>>,
+    pub expires_in: Option<String>,
     pub public_ip: Option<std::net::IpAddr>,
     /// `"active"` (token/SDK) or `"pending"` (quick enroll).
     pub membership_status: String,
@@ -114,13 +117,28 @@ pub async fn register_device(
         params.metadata.clone(),
     );
 
+    let labels_json =
+        crate::device_labels::labels_to_json(&params.labels.clone().unwrap_or_default());
+
     sqlx::query(
-        "INSERT INTO devices (endpoint_id, organization_id, tenant_ipv6, type, name, metadata) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO devices (endpoint_id, organization_id, tenant_ipv6, type, name, metadata, labels, inactivity_ttl, expired_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::interval, NULL) \
          ON CONFLICT (endpoint_id) DO UPDATE \
          SET metadata = devices.metadata || EXCLUDED.metadata, \
              type = EXCLUDED.type, \
              name = EXCLUDED.name, \
+             labels = CASE \
+               WHEN EXCLUDED.labels = '{}'::jsonb THEN devices.labels \
+               ELSE EXCLUDED.labels \
+             END, \
+             inactivity_ttl = CASE \
+               WHEN $8::interval IS NOT NULL THEN $8::interval \
+               ELSE devices.inactivity_ttl \
+             END, \
+             expired_at = CASE \
+               WHEN $8::interval IS NOT NULL THEN NULL \
+               ELSE devices.expired_at \
+             END, \
              last_seen = now()",
     )
     .bind(&params.endpoint_id)
@@ -129,6 +147,8 @@ pub async fn register_device(
     .bind(&params.device_type)
     .bind(&params.hostname)
     .bind(initial_metadata)
+    .bind(labels_json)
+    .bind(params.expires_in.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -326,6 +346,8 @@ fn empty_pending_snapshot() -> tuntun_common::EndpointSnapshot {
         ipv6_peers: vec![],
         org_policy: tuntun_common::policy::PolicyBundle::default(),
         org_ca_pem: None,
+        labels: std::collections::HashMap::new(),
+        expires_at: None,
         version: 0,
     }
 }

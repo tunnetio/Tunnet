@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 import { deviceStatusSchema } from "./common";
+import { expiresInInputSchema } from "./duration";
 
 export const deviceMetadataSchema = z
   .object({
@@ -15,6 +16,22 @@ export const deviceMetadataSchema = z
     reportedAt: z.string().optional(),
   })
   .catchall(z.unknown());
+
+export const deviceLabelsSchema = z.record(
+  z.string().min(1).max(63),
+  z.string().max(253),
+);
+
+/** Merge patch: `null` or `""` deletes the key. */
+export const deviceLabelsResponse = z.object({
+  labels: deviceLabelsSchema,
+});
+
+export const patchDeviceLabelsBody = z
+  .record(z.string().min(1).max(63), z.union([z.string().max(253), z.null()]))
+  .refine((obj) => Object.keys(obj).length > 0, {
+    message: "At least one label must be provided",
+  });
 
 export const deviceMembershipSchema = z.object({
   networkId: z.string().uuid(),
@@ -45,6 +62,9 @@ export const deviceSchema = z.object({
   firstSeen: z.string().datetime(),
   lastSeen: z.string().datetime(),
   status: deviceStatusSchema,
+  labels: deviceLabelsSchema,
+  inactivityTtl: z.string().nullable(),
+  expiredAt: z.string().datetime().nullable(),
 });
 
 export const deviceDetailSchema = z.object({
@@ -62,6 +82,9 @@ export const deviceDetailSchema = z.object({
   lastHeartbeatAt: z.string().datetime().nullable(),
   firstSeen: z.string().datetime(),
   lastSeen: z.string().datetime(),
+  labels: deviceLabelsSchema,
+  inactivityTtl: z.string().nullable(),
+  expiredAt: z.string().datetime().nullable(),
   memberships: z.array(deviceMembershipSchema),
 });
 
@@ -69,10 +92,18 @@ export const patchDeviceBody = z
   .object({
     name: z.string().trim().min(1).max(253).optional(),
     ipv6Enabled: z.boolean().optional(),
+    /** Per-machine inactivity TTL override; `never` / null clears override. */
+    expiresIn: expiresInInputSchema.optional(),
   })
-  .refine((body) => body.name !== undefined || body.ipv6Enabled !== undefined, {
-    message: "At least one field must be provided",
-  });
+  .refine(
+    (body) =>
+      body.name !== undefined ||
+      body.ipv6Enabled !== undefined ||
+      body.expiresIn !== undefined,
+    {
+      message: "At least one field must be provided",
+    },
+  );
 
 export const patchDeviceMembershipBody = z.object({
   status: z.enum(["active", "suspended"]),
@@ -109,10 +140,12 @@ export type DeleteDevicesBody = z.infer<typeof deleteDevicesBody>;
 export type DeleteDevicesResponse = z.infer<typeof deleteDevicesResponse>;
 
 export type DeviceMetadata = z.infer<typeof deviceMetadataSchema>;
+export type DeviceLabels = z.infer<typeof deviceLabelsSchema>;
 export type DeviceMembership = z.infer<typeof deviceMembershipSchema>;
 export type Device = z.infer<typeof deviceSchema>;
 export type DeviceDetail = z.infer<typeof deviceDetailSchema>;
 export type PatchDeviceBody = z.infer<typeof patchDeviceBody>;
+export type PatchDeviceLabelsBody = z.infer<typeof patchDeviceLabelsBody>;
 export type PatchDeviceMembershipBody = z.infer<
   typeof patchDeviceMembershipBody
 >;

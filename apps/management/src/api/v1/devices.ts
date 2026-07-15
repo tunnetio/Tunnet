@@ -1,6 +1,7 @@
 import {
   deleteDevicesBody,
   patchDeviceBody,
+  patchDeviceLabelsBody,
   patchDeviceMembershipBody,
 } from "@tuntun/api/management";
 import { schema } from "@tuntun/db";
@@ -8,7 +9,12 @@ import { and, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
 import { writeAudit } from "../../lib/audit";
 import { db } from "../../lib/db";
-import { applyDevicePatch, getDeviceInOrg } from "../../lib/device";
+import {
+  applyDeviceLabelsPatch,
+  applyDevicePatch,
+  getDeviceInOrg,
+  getDeviceLabelsInOrg,
+} from "../../lib/device";
 import { bumpNetworkAndNotify, bumpOrgAndNotify } from "../../lib/notify";
 import { removeDeviceMembership } from "../../lib/remove-device-membership";
 import { serializeDevice } from "../../lib/serialize-device";
@@ -43,6 +49,10 @@ async function listDevicesOnNetwork(networkId: string) {
       lastHeartbeatAt: schema.devices.lastHeartbeatAt,
       firstSeen: schema.networkMemberships.firstSeen,
       lastSeen: schema.networkMemberships.lastSeen,
+      deviceLastSeen: schema.devices.lastSeen,
+      labels: schema.devices.labels,
+      inactivityTtl: schema.devices.inactivityTtl,
+      expiredAt: schema.devices.expiredAt,
       status: schema.networkMemberships.status,
     })
     .from(schema.networkMemberships)
@@ -83,6 +93,18 @@ export const devicesRoutes = new Elysia()
       return device;
     },
   )
+  .get(
+    "/organizations/:orgId/devices/:endpointId/labels",
+    async ({ authContext, params }) => {
+      const auth = getAuth({ authContext });
+      const labels = await getDeviceLabelsInOrg(
+        params.endpointId,
+        auth.organizationId,
+      );
+      if (!labels) return notFound("Device not found");
+      return { labels };
+    },
+  )
   .group("", (app) =>
     app
       .use(requireAdmin)
@@ -112,6 +134,42 @@ export const devicesRoutes = new Elysia()
             if (parsed.ipv6Enabled !== undefined) {
               await bumpOrgAndNotify(tx, auth.organizationId);
             }
+
+            if (parsed.expiresIn !== undefined) {
+              await bumpOrgAndNotify(tx, auth.organizationId);
+            }
+
+            return row;
+          });
+
+          if (!updated) return notFound("Device not found");
+          return updated;
+        },
+      )
+      .patch(
+        "/organizations/:orgId/devices/:endpointId/labels",
+        async ({ authContext, params, body }) => {
+          const auth = getAuth({ authContext });
+          const parsed = patchDeviceLabelsBody.parse(body);
+
+          const updated = await db.transaction(async (tx) => {
+            const row = await applyDeviceLabelsPatch(
+              tx,
+              params.endpointId,
+              auth.organizationId,
+              parsed,
+            );
+            if (!row) return null;
+
+            await writeAudit(tx, {
+              organizationId: auth.organizationId,
+              actor: auth.user.id,
+              action: "device.labels_updated",
+              target: row.endpointId,
+              metadata: parsed,
+            });
+
+            await bumpOrgAndNotify(tx, auth.organizationId);
 
             return row;
           });
@@ -178,6 +236,8 @@ export const devicesRoutes = new Elysia()
             name: row.device.name,
             metadata: row.device.metadata,
             type: row.device.type,
+            labels: row.device.labels,
+            expiresAt: row.device.expiresAt,
             assignedIp: row.membership.assignedIp,
             publicIp: row.device.publicIp,
             tenantIpv6: row.device.tenantIpv6,
@@ -277,6 +337,8 @@ export const devicesRoutes = new Elysia()
               name: row.device.name,
               metadata: row.device.metadata,
               type: row.device.type,
+              labels: row.device.labels,
+              expiresAt: row.device.expiresAt,
               assignedIp: row.membership.assignedIp,
               publicIp: row.device.publicIp,
               tenantIpv6: row.device.tenantIpv6,

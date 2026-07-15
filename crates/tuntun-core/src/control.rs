@@ -214,6 +214,51 @@ impl SignedClient {
         Ok(serde_json::from_str(&text)?)
     }
 
+    async fn do_patch<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &(impl serde::Serialize + ?Sized),
+    ) -> anyhow::Result<T> {
+        let url = format!("{}{}", self.base, path);
+        let json = serde_json::to_vec(body)?;
+        let (ts, sig) = self.sign("PATCH", path, &json);
+        let resp = self
+            .http
+            .request(Method::PATCH, &url)
+            .header(HDR_ENDPOINT_ID, HeaderValue::from_str(&self.endpoint_id)?)
+            .header(HDR_TIMESTAMP, HeaderValue::from_str(&ts.to_string())?)
+            .header(HDR_SIGNATURE, HeaderValue::from_str(&sig)?)
+            .header("content-type", "application/json")
+            .body(json)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("PATCH {} => {status}: {text}", path);
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub async fn get_device_labels(
+        &self,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.do_get("/v1/device/labels").await
+    }
+
+    pub async fn patch_device_labels(
+        &self,
+        patch: &std::collections::HashMap<String, Option<String>>,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        self.do_patch("/v1/device/labels", patch).await
+    }
+
+    pub async fn patch_device_expiry(&self, expires_in: Option<&str>) -> anyhow::Result<()> {
+        let body = serde_json::json!({ "expires_in": expires_in });
+        let _: serde_json::Value = self.do_patch("/v1/device/expiry", &body).await?;
+        Ok(())
+    }
+
     pub async fn register(
         &self,
         hostname: &str,

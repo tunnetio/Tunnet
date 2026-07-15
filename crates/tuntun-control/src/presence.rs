@@ -107,16 +107,11 @@ pub async fn mark_agent_connected(
 
     let pg_ip = public_ip.map(ip_to_pg);
 
-    sqlx::query(
-        "UPDATE devices \
-         SET agent_connected = true, connected_at = now(), last_heartbeat_at = now(), last_seen = now(), \
-             public_ip = COALESCE($2, public_ip) \
-         WHERE endpoint_id = $1",
-    )
-    .bind(endpoint_id)
-    .bind(pg_ip)
-    .execute(pool)
-    .await?;
+    sqlx::query(crate::device_expiry_sql::SLIDE_ON_CONNECT)
+        .bind(endpoint_id)
+        .bind(pg_ip)
+        .execute(pool)
+        .await?;
 
     sqlx::query("UPDATE network_memberships SET last_seen = now() WHERE endpoint_id = $1")
         .bind(endpoint_id)
@@ -172,14 +167,10 @@ pub async fn mark_agent_disconnected(pool: &PgPool, endpoint_id: &str) -> anyhow
 }
 
 pub async fn record_heartbeat(pool: &PgPool, endpoint_id: &str) -> anyhow::Result<()> {
-    sqlx::query(
-        "UPDATE devices \
-         SET last_heartbeat_at = now(), last_seen = now() \
-         WHERE endpoint_id = $1 AND agent_connected",
-    )
-    .bind(endpoint_id)
-    .execute(pool)
-    .await?;
+    sqlx::query(crate::device_expiry_sql::SLIDE_ON_HEARTBEAT)
+        .bind(endpoint_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

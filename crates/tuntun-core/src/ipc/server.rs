@@ -864,6 +864,16 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
             )
         })
         .unwrap_or((None, None));
+    let mut expires_at = None;
+    let mut expires_in_secs = None;
+    if let Some(snap) = crate::state::load_snapshot_cache(&state.node.paths)
+        && let Some(at) = snap.expires_at
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&at)
+    {
+        let remaining = (dt.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+        expires_at = Some(at);
+        expires_in_secs = Some(remaining.max(0) as u64);
+    }
     StatusInfo {
         ip: state.node.self_ipv4.to_string(),
         hostname: state.hostname.clone(),
@@ -905,6 +915,8 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
             packets_buffered: od.packets_buffered,
             packets_dropped_timeout: od.packets_dropped_timeout,
         }),
+        expires_at,
+        expires_in_secs,
     }
 }
 

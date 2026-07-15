@@ -12,6 +12,15 @@ import { CreateTunnelDialog } from "@/components/app/create-tunnel-dialog";
 import { EmptyState } from "@/components/app/empty-state";
 import { EntityStatus } from "@/components/app/entity-status";
 import { LastSeenCell } from "@/components/app/last-seen-cell";
+import {
+  MachineExpiryCountdown,
+  MachineExpirySettings,
+} from "@/components/app/machine-expiry-display";
+import {
+  MachineExpiryDialog,
+  MachineLabelChips,
+  MachineLabelsEditor,
+} from "@/components/app/machine-labels";
 import { MachineRoutesPanel } from "@/components/app/machine-routes-panel";
 import { PageHeader } from "@/components/app/page-header";
 import { StatusBadge } from "@/components/app/status-badge";
@@ -37,14 +46,17 @@ import {
   usePresenceStream,
 } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
+import { deriveInactivityLimitCompact } from "@/lib/machine-expiry";
 import {
   useDevice,
   useDeviceMutations,
   useDeviceSshAuth,
+  useOrgSettings,
   useServes,
   useSshSessions,
   useTunnels,
 } from "@/lib/queries/management";
+import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/machines/$endpointId")({
   component: MachineDetailPage,
@@ -62,6 +74,51 @@ function DetailRow({
       <span className="text-muted-foreground shrink-0 text-sm">{label}</span>
       <div className="min-w-0 text-right text-sm">{children}</div>
     </div>
+  );
+}
+
+function SettingsSection({
+  title,
+  description,
+  children,
+  footer,
+  danger,
+}: {
+  title: string;
+  description?: string;
+  children: ReactNode;
+  footer?: ReactNode;
+  danger?: boolean;
+}) {
+  return (
+    <section
+      className={cn(
+        "overflow-hidden rounded-xl border bg-card",
+        danger ? "border-destructive/25" : "border-border/80",
+      )}
+    >
+      <div className="border-b border-border/70 px-5 py-4">
+        <h2
+          className={cn(
+            "text-sm font-semibold tracking-tight",
+            danger && "text-destructive",
+          )}
+        >
+          {title}
+        </h2>
+        {description ? (
+          <p className="text-muted-foreground mt-1 text-sm leading-relaxed">
+            {description}
+          </p>
+        ) : null}
+      </div>
+      <div className="px-5 py-5">{children}</div>
+      {footer ? (
+        <div className="bg-muted/30 border-t border-border/70 px-5 py-3">
+          {footer}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -103,11 +160,9 @@ function SystemTab({ metadata }: { metadata: DeviceMetadata }) {
 
   if (entries.length === 0) {
     return (
-      <Card>
-        <CardContent className="text-muted-foreground py-10 text-center text-sm">
-          System information will appear after the agent connects.
-        </CardContent>
-      </Card>
+      <div className="text-muted-foreground rounded-xl border border-dashed px-6 py-12 text-center text-sm">
+        System information will appear after the agent connects.
+      </div>
     );
   }
 
@@ -131,18 +186,20 @@ function SystemTab({ metadata }: { metadata: DeviceMetadata }) {
   ];
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">System information</CardTitle>
-      </CardHeader>
-      <CardContent>
+    <section className="overflow-hidden rounded-xl border border-border/80 bg-card">
+      <div className="border-b border-border/70 px-5 py-4">
+        <h2 className="text-sm font-semibold tracking-tight">
+          System information
+        </h2>
+      </div>
+      <div className="px-5">
         {sorted.map(([key, value]) => (
           <DetailRow key={key} label={METADATA_LABELS[key] ?? key}>
             {formatMetadataValue(key, value)}
           </DetailRow>
         ))}
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   );
 }
 
@@ -273,12 +330,15 @@ function MachineDetailPage() {
     isError,
     error,
   } = useDevice(orgId, endpointId);
+  const { data: orgSettings } = useOrgSettings(orgId);
   const deviceMutations = useDeviceMutations(orgId);
   const { data: tunnels } = useTunnels(orgId);
   const { data: serves } = useServes(orgId);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [createTunnelOpen, setCreateTunnelOpen] = useState(false);
   const [createServeOpen, setCreateServeOpen] = useState(false);
+  const [labelsOpen, setLabelsOpen] = useState(false);
+  const [expiryOpen, setExpiryOpen] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const queryClient = useQueryClient();
   usePresenceStream(orgId);
@@ -325,6 +385,9 @@ function MachineDetailPage() {
       firstSeen: membership.firstSeen,
       lastSeen: membership.lastSeen,
       status: membership.status,
+      labels: device.labels,
+      inactivityTtl: device.inactivityTtl,
+      expiredAt: device.expiredAt,
     };
   }, [device, membership, networkId]);
 
@@ -384,19 +447,40 @@ function MachineDetailPage() {
         }
       />
 
-      <Tabs defaultValue="overview" className="gap-4">
-        <TabsList variant="line">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="networking">Networking</TabsTrigger>
-          <TabsTrigger value="routes">Routes</TabsTrigger>
-          <TabsTrigger value="tunnels">Tunnels</TabsTrigger>
-          <TabsTrigger value="serves">Serves</TabsTrigger>
-          <TabsTrigger value="ssh">SSH</TabsTrigger>
-          <TabsTrigger value="system">System</TabsTrigger>
-          {isAdmin ? (
-            <TabsTrigger value="settings">Settings</TabsTrigger>
-          ) : null}
-        </TabsList>
+      <Tabs defaultValue="overview" className="gap-5">
+        <div className="border-b border-border/70">
+          <TabsList
+            variant="line"
+            className="h-auto w-full justify-start gap-0 overflow-x-auto overflow-y-hidden rounded-none bg-transparent p-0"
+          >
+            <TabsTrigger value="overview" className="rounded-none px-3">
+              Overview
+            </TabsTrigger>
+            <TabsTrigger value="networking" className="rounded-none px-3">
+              Networking
+            </TabsTrigger>
+            <TabsTrigger value="routes" className="rounded-none px-3">
+              Routes
+            </TabsTrigger>
+            <TabsTrigger value="tunnels" className="rounded-none px-3">
+              Tunnels
+            </TabsTrigger>
+            <TabsTrigger value="serves" className="rounded-none px-3">
+              Serves
+            </TabsTrigger>
+            <TabsTrigger value="ssh" className="rounded-none px-3">
+              SSH
+            </TabsTrigger>
+            <TabsTrigger value="system" className="rounded-none px-3">
+              System
+            </TabsTrigger>
+            {isAdmin ? (
+              <TabsTrigger value="settings" className="rounded-none px-3">
+                Settings
+              </TabsTrigger>
+            ) : null}
+          </TabsList>
+        </div>
 
         <TabsContent value="overview">
           <div className="grid gap-4 lg:grid-cols-2">
@@ -438,6 +522,28 @@ function MachineDetailPage() {
                     })}
                   </DetailRow>
                 )}
+                <DetailRow label="Expiry">
+                  <MachineExpiryCountdown
+                    device={{
+                      ...device,
+                      orgAutoCleanupEnabled:
+                        orgSettings?.machines.autoCleanup.enabled ?? false,
+                      orgInactivityAfter:
+                        orgSettings?.machines.autoCleanup.inactivityAfter ??
+                        null,
+                    }}
+                  />
+                </DetailRow>
+                {Object.keys(device.labels).length > 0 ? (
+                  <DetailRow label="Labels">
+                    <MachineLabelChips
+                      labels={device.labels}
+                      max={8}
+                      empty={null}
+                      className="justify-end"
+                    />
+                  </DetailRow>
+                ) : null}
               </CardContent>
             </Card>
 
@@ -651,29 +757,14 @@ function MachineDetailPage() {
         </TabsContent>
 
         {isAdmin ? (
-          <TabsContent value="settings">
+          <TabsContent value="settings" className="mt-0">
             <div className="mx-auto flex max-w-2xl flex-col gap-4">
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Name</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="machine-name">Display name</Label>
-                    <Input
-                      id="machine-name"
-                      value={nameDraft}
-                      onChange={(e) => setNameDraft(e.target.value)}
-                      maxLength={253}
-                      placeholder={device.metadata.hostname}
-                    />
-                    <p className="text-muted-foreground text-xs leading-relaxed">
-                      Defaults to the machine hostname (
-                      {device.metadata.hostname}). Changing it does not affect
-                      the reported hostname.
-                    </p>
-                  </div>
+              <SettingsSection
+                title="Profile"
+                description="Display name used across the dashboard and CLI."
+                footer={
                   <Button
+                    size="sm"
                     disabled={
                       deviceMutations.update.isPending ||
                       nameDraft.trim().length === 0 ||
@@ -689,66 +780,126 @@ function MachineDetailPage() {
                         .catch((err: Error) => toast.error(err.message))
                     }
                   >
-                    Save name
+                    {deviceMutations.update.isPending
+                      ? "Saving..."
+                      : "Save name"}
                   </Button>
-                </CardContent>
-              </Card>
+                }
+              >
+                <div className="space-y-2">
+                  <Label htmlFor="machine-name">Display name</Label>
+                  <Input
+                    id="machine-name"
+                    value={nameDraft}
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    maxLength={253}
+                    placeholder={device.metadata.hostname}
+                  />
+                  <p className="text-muted-foreground text-xs leading-relaxed">
+                    Defaults to hostname{" "}
+                    <span className="font-mono">
+                      {device.metadata.hostname}
+                    </span>
+                    . Changing it does not affect the reported hostname.
+                  </p>
+                </div>
+              </SettingsSection>
 
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-base">Connectivity</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="space-y-1">
-                      <Label htmlFor="ipv6-routing" className="text-sm">
-                        IPv6 routing
-                      </Label>
-                      <p className="text-muted-foreground text-xs leading-relaxed">
-                        When enabled, this machine routes traffic on its tenant
-                        IPv6 address ({device.tenantIpv6}). Disabling stops IPv6
-                        routing without releasing the address.
-                      </p>
-                    </div>
-                    <Switch
-                      id="ipv6-routing"
-                      checked={device.ipv6Enabled}
-                      disabled={deviceMutations.update.isPending}
-                      onCheckedChange={(checked) => {
-                        void deviceMutations.update
-                          .mutateAsync({
-                            endpointId,
-                            body: { ipv6Enabled: checked },
-                          })
-                          .then(() =>
-                            toast.success(
-                              checked
-                                ? "IPv6 routing enabled"
-                                : "IPv6 routing disabled",
-                            ),
-                          )
-                          .catch((err: Error) => toast.error(err.message));
-                      }}
-                    />
+              <SettingsSection
+                title="Labels"
+                description="Key/value tags for search and grouping."
+                footer={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setLabelsOpen(true)}
+                  >
+                    Edit labels
+                  </Button>
+                }
+              >
+                <MachineLabelChips
+                  labels={device.labels}
+                  max={20}
+                  empty="No labels yet"
+                />
+              </SettingsSection>
+
+              <SettingsSection
+                title="Connectivity"
+                description="Network protocol options for this machine."
+              >
+                <div className="bg-muted/25 flex items-start justify-between gap-4 rounded-lg border border-border/70 px-4 py-3.5">
+                  <div className="min-w-0 space-y-1">
+                    <Label
+                      htmlFor="ipv6-routing"
+                      className="text-sm font-medium"
+                    >
+                      IPv6 routing
+                    </Label>
+                    <p className="text-muted-foreground text-xs leading-relaxed">
+                      Route traffic on tenant IPv6{" "}
+                      <span className="font-mono">{device.tenantIpv6}</span>.
+                      Disabling stops routing without releasing the address.
+                    </p>
                   </div>
-                </CardContent>
-              </Card>
+                  <Switch
+                    id="ipv6-routing"
+                    checked={device.ipv6Enabled}
+                    disabled={deviceMutations.update.isPending}
+                    className="mt-0.5 shrink-0"
+                    onCheckedChange={(checked) => {
+                      void deviceMutations.update
+                        .mutateAsync({
+                          endpointId,
+                          body: { ipv6Enabled: checked },
+                        })
+                        .then(() =>
+                          toast.success(
+                            checked
+                              ? "IPv6 routing enabled"
+                              : "IPv6 routing disabled",
+                          ),
+                        )
+                        .catch((err: Error) => toast.error(err.message));
+                    }}
+                  />
+                </div>
+              </SettingsSection>
+
+              <SettingsSection
+                title="Auto-expiry"
+                description="Remove this machine after a period of inactivity."
+                footer={
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setExpiryOpen(true)}
+                    disabled={deviceMutations.update.isPending}
+                  >
+                    {device.inactivityTtl ? "Change expiry" : "Set expiry"}
+                  </Button>
+                }
+              >
+                <MachineExpirySettings
+                  device={{
+                    ...device,
+                    orgAutoCleanupEnabled:
+                      orgSettings?.machines.autoCleanup.enabled ?? false,
+                    orgInactivityAfter:
+                      orgSettings?.machines.autoCleanup.inactivityAfter ?? null,
+                  }}
+                />
+              </SettingsSection>
 
               {membership && networkId ? (
-                <Card>
-                  <CardHeader>
-                    <CardTitle className="text-base">
-                      {membership.networkName}
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    <p className="text-muted-foreground text-sm">
-                      Control whether this machine can participate on this
-                      network.
-                    </p>
+                <SettingsSection
+                  title="Network membership"
+                  description={`Control participation on ${membership.networkName}.`}
+                  footer={
                     <Button
                       variant="outline"
-                      className="w-full"
+                      size="sm"
                       disabled={deviceMutations.updateMembership.isPending}
                       onClick={() =>
                         void deviceMutations.updateMembership
@@ -768,31 +919,41 @@ function MachineDetailPage() {
                         ? "Suspend on this network"
                         : "Activate on this network"}
                     </Button>
-                  </CardContent>
-                </Card>
+                  }
+                >
+                  <div className="flex items-center justify-between gap-4 text-sm">
+                    <span className="text-muted-foreground">Status</span>
+                    <Badge
+                      variant={
+                        membership.status === "active" ? "default" : "secondary"
+                      }
+                    >
+                      {membership.status}
+                    </Badge>
+                  </div>
+                </SettingsSection>
               ) : null}
 
               {membership && networkId ? (
-                <Card className="border-destructive/30">
-                  <CardHeader>
-                    <CardTitle className="text-base text-destructive">
-                      Danger zone
-                    </CardTitle>
-                  </CardHeader>
-                  <CardContent className="space-y-4">
-                    <p className="text-muted-foreground text-sm">
-                      Remove this machine from {membership.networkName}. If it
-                      has no other network memberships, the device record is
-                      deleted.
-                    </p>
+                <SettingsSection
+                  title="Danger zone"
+                  description={`Remove this machine from ${membership.networkName}. If it has no other memberships, the device record is deleted.`}
+                  danger
+                  footer={
                     <Button
                       variant="destructive"
+                      size="sm"
                       onClick={() => setConfirmRemove(true)}
                     >
                       Remove machine
                     </Button>
-                  </CardContent>
-                </Card>
+                  }
+                >
+                  <p className="text-muted-foreground text-sm leading-relaxed">
+                    This cannot be undone from the dashboard. The agent must
+                    re-enroll to join again.
+                  </p>
+                </SettingsSection>
               ) : null}
             </div>
           </TabsContent>
@@ -845,6 +1006,32 @@ function MachineDetailPage() {
           />
         </>
       ) : null}
+
+      <MachineLabelsEditor
+        open={labelsOpen}
+        onOpenChange={setLabelsOpen}
+        labels={device.labels}
+        loading={deviceMutations.updateLabels.isPending}
+        onSave={async (patch) => {
+          await deviceMutations.updateLabels.mutateAsync({
+            endpointId,
+            body: patch,
+          });
+        }}
+      />
+
+      <MachineExpiryDialog
+        open={expiryOpen}
+        onOpenChange={setExpiryOpen}
+        current={deriveInactivityLimitCompact(device)}
+        loading={deviceMutations.update.isPending}
+        onSave={async (expiresIn) => {
+          await deviceMutations.update.mutateAsync({
+            endpointId,
+            body: { expiresIn },
+          });
+        }}
+      />
     </>
   );
 }

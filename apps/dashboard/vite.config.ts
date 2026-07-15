@@ -1,17 +1,18 @@
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { devtools } from "@tanstack/devtools-vite";
-
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import { getManagementUrl } from "@tuntun/env";
 
 import viteReact from "@vitejs/plugin-react";
 import { nitro } from "nitro/vite";
 import { defineConfig } from "vite";
 
-const managementApiUrl = process.env.MANAGEMENT_API_URL?.replace(/\/$/, "");
+const managementApiUrl = getManagementUrl();
 
 const config = defineConfig({
   envDir: path.resolve(import.meta.dirname, "../.."),
+  envPrefix: ["VITE_", "DASHBOARD_", "MANAGEMENT_", "CONTROL_PLANE_"],
   resolve: { tsconfigPaths: true },
   plugins: [
     devtools(),

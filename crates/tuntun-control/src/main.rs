@@ -4,6 +4,10 @@ mod auth;
 mod ca_crypto;
 mod config;
 mod db;
+mod device_expiry;
+mod device_expiry_sql;
+mod device_handlers;
+mod device_labels;
 mod device_metadata;
 mod enrollment;
 mod entity_notify;
@@ -111,6 +115,19 @@ async fn main() -> anyhow::Result<()> {
             ticker.tick().await;
             if let Err(e) = tunnels::expire_tunnels(&ttl_state).await {
                 tracing::warn!(?e, "expire_tunnels failed");
+            }
+        }
+    });
+
+    let expiry_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            if let Err(e) =
+                device_expiry::run_cleanup(&expiry_state.pool, &expiry_state.ws_hub).await
+            {
+                tracing::warn!(?e, "device auto-cleanup failed");
             }
         }
     });

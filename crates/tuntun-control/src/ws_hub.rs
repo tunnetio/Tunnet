@@ -74,6 +74,26 @@ impl WsHub {
         }
     }
 
+    /// Kick a connected agent: send ForceReenroll and drop the subscription.
+    pub async fn disconnect(&self, endpoint_id: &str, reason: &str) {
+        self.push_to(
+            endpoint_id,
+            ServerMsg::ForceReenroll {
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+        if self.inner.subs.remove(endpoint_id).is_some() {
+            // Clean network index entries for this endpoint.
+            for entry in self.inner.by_network.iter() {
+                entry.value().remove(endpoint_id);
+            }
+            self.metrics.ws_connected_dec();
+            self.metrics
+                .devices_online_set(self.inner.subs.len() as i64);
+        }
+    }
+
     pub async fn notify_network_changed(
         &self,
         network_id: Uuid,

@@ -50,8 +50,9 @@ The `docker-compose.yml` sets sensible defaults for local development. For produ
 | `TUNTUN_SERVICE_SECRET` | control, management | Set to a random string of at least 32 characters. Must match on both services. |
 | `BETTER_AUTH_SECRET` | management | Set to a random string of at least 32 characters. |
 | `POSTGRES_PASSWORD` | postgres | Change from the default `tuntun`. |
-| `BETTER_AUTH_URL` | management | Set to your public dashboard URL (e.g., `https://tuntun.example.com`). |
-| `MANAGEMENT_WEB_ORIGIN` | management | Set to your public dashboard origin for CORS. |
+| `DASHBOARD_URL` | management, dashboard, control | Public dashboard URL (CORS, OAuth, SSH browser auth). |
+| `MANAGEMENT_URL` | management, dashboard | Public management API URL. |
+| `CONTROL_PLANE_URL` | management, dashboard, control | Control plane URL for agents. |
 
 You can set these in a `.env` file next to `docker-compose.yml`:
 
@@ -96,7 +97,7 @@ Uses `oven/bun:1` for building - copies all workspace `package.json` files for l
 
 ### Dockerfile.dashboard
 
-Uses `oven/bun:1` for building - installs dependencies with the full workspace graph, then runs `bunx --bun vite build` in `apps/dashboard`. The build accepts `VITE_MANAGEMENT_API_URL` and `MANAGEMENT_API_URL` as build args. The runtime stage uses `oven/bun:1-slim` and serves the Nitro output. Exposes port 3000 (mapped to 5173 in compose).
+Uses `oven/bun:1` for building - installs dependencies with the full workspace graph, then runs `bunx --bun vite build` in `apps/dashboard`. The build accepts `MANAGEMENT_URL`, `CONTROL_PLANE_URL`, and `DASHBOARD_URL` as build args. The runtime stage uses `oven/bun:1-slim` and serves the Nitro output. Exposes port 3000 (mapped to 5173 in compose).
 
 ### Dockerfile.relay
 

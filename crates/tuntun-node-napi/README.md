@@ -75,8 +75,8 @@ await node.close();
 
 | Variable | Purpose |
 | --- | --- |
-| `TUNTUN_CONTROL_URL` | Control plane URL (used by `TunTunNode.create()` if not passed in config) |
-| `TUNTUN_MANAGEMENT_URL` | Management API URL for API-key enrollment |
+| `CONTROL_PLANE_URL` | Control plane URL (used by `TunTunNode.create()` if not passed in config) |
+| `MANAGEMENT_URL` | Management API URL for API-key enrollment |
 | `TUNTUN_STATE_DIR` | Directory for persisted identity and state |
 
 If `stateDir` is not set in config, state defaults to the platform XDG/state location.

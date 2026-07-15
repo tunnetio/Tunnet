@@ -46,6 +46,8 @@ services:
       - "9091:9091"
     environment:
       DATABASE_URL: postgres://tuntun:tuntun@postgres:5432/tuntun
+      DASHBOARD_URL: "http://localhost:5173"
+      CONTROL_PLANE_URL: "http://control:8080"
       TUNTUN_BIND: "0.0.0.0:8080"
       TUNTUN_ADMIN_BIND: "0.0.0.0:9091"
       TUNTUN_SERVICE_SECRET: "${TUNTUN_SERVICE_SECRET:-change-me-to-a-random-secret-at-least-32-chars}"
@@ -73,14 +75,10 @@ services:
     environment:
       DATABASE_URL: postgres://tuntun:tuntun@postgres:5432/tuntun
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:-change-me-to-a-random-secret-at-least-32-chars}"
-      BETTER_AUTH_URL: "http://localhost:5173"
-      MANAGEMENT_PORT: "3000"
-      MANAGEMENT_WEB_ORIGIN: "http://localhost:5173"
-      TUNTUN_MANAGEMENT_PUBLIC_URL: "http://localhost:3000"
-      CONTROL_PLANE_ADMIN_URL: "http://control:9091"
+      DASHBOARD_URL: "http://localhost:5173"
+      MANAGEMENT_URL: "http://localhost:3000"
+      CONTROL_PLANE_URL: "http://control:8080"
       TUNTUN_SERVICE_SECRET: "${TUNTUN_SERVICE_SECRET:-change-me-to-a-random-secret-at-least-32-chars}"
-      TUNTUN_MANAGEMENT_URL: "http://management:3000"
-      TUNTUN_CONTROL_URL: "http://control:8080"
     healthcheck:
       test:
         [
@@ -98,7 +96,8 @@ services:
       context: .
       dockerfile: deploy/Dockerfile.dashboard
       args:
-        MANAGEMENT_API_URL: "http://management:3000"
+        MANAGEMENT_URL: "http://management:3000"
+        CONTROL_PLANE_URL: "http://control:8080"
     restart: unless-stopped
     depends_on:
       management:
@@ -106,7 +105,9 @@ services:
     ports:
       - "5173:3000"
     environment:
-      MANAGEMENT_API_URL: "http://management:3000"
+      DASHBOARD_URL: "http://localhost:5173"
+      MANAGEMENT_URL: "http://management:3000"
+      CONTROL_PLANE_URL: "http://control:8080"
 
 volumes:
   pgdata:

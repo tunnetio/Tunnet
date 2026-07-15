@@ -9,20 +9,22 @@ export const Route = createFileRoute("/device/")({
   }),
   beforeLoad: async ({ search }) => {
     const session = await getSession();
-    const accountPath = search.user_code
-      ? `/app/settings/account?user_code=${encodeURIComponent(search.user_code)}`
-      : "/app/settings/account";
+    const settingsPath = search.user_code
+      ? `/app/settings?user_code=${encodeURIComponent(search.user_code)}`
+      : "/app/settings";
 
     if (!session) {
       throw redirect({
         to: "/login",
-        search: { redirect: accountPath },
+        search: { redirect: settingsPath },
       });
     }
 
     throw redirect({
-      to: "/app/settings/account",
-      search: search.user_code ? { user_code: search.user_code } : {},
+      to: "/app/settings",
+      search: search.user_code
+        ? { user_code: search.user_code }
+        : { user_code: undefined },
     });
   },
 });

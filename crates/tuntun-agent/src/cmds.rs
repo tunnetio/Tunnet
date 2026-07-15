@@ -360,6 +360,12 @@ fn print_status(
         info.agent_version,
         info.snapshot_version
     ));
+    if let Some(secs) = info.expires_in_secs {
+        out.writeln(format!(
+            "  expiry     {} remaining",
+            output::format_uptime(secs)
+        ));
+    }
 
     if let Some(peers) = &info.peers {
         out.writeln("");

@@ -120,6 +120,17 @@ pub async fn authenticate_with_limit(
         ));
     }
 
+    if crate::device_expiry::is_device_expired(&state.pool, &endpoint_id)
+        .await
+        .unwrap_or(true)
+    {
+        state.metrics.auth_failure("expired_device");
+        return Err(AuthError(
+            StatusCode::FORBIDDEN,
+            "device expired; re-enroll required",
+        ));
+    }
+
     let vk = tuntun_common::signing::verifying_key_from_hex(&endpoint_id)
         .map_err(|_| AuthError(StatusCode::BAD_REQUEST, "invalid pubkey"))?;
 

@@ -13,14 +13,10 @@ Create a `.env` file in the repository root:
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/tuntun
 BETTER_AUTH_SECRET=a-long-random-string-at-least-32-characters
-BETTER_AUTH_URL=http://localhost:3000
-MANAGEMENT_PORT=3000
-MANAGEMENT_WEB_ORIGIN=http://localhost:5173
-VITE_MANAGEMENT_API_URL=http://localhost:3000
-CONTROL_PLANE_ADMIN_URL=http://127.0.0.1:9091
+DASHBOARD_URL=http://localhost:5173
+MANAGEMENT_URL=http://localhost:3000
+CONTROL_PLANE_URL=http://127.0.0.1:8080
 TUNTUN_SERVICE_SECRET=a-long-random-string-at-least-32-characters
-TUNTUN_MANAGEMENT_URL=http://localhost:3000
-TUNTUN_CONTROL_URL=http://127.0.0.1:8080
 ```
 
 ## 2. Start the stack

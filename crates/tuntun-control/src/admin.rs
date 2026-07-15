@@ -232,6 +232,8 @@ async fn register_device_handler(
             agent_version: parsed.agent_version,
             device_type: parsed.device_type,
             metadata: parsed.metadata,
+            labels: None,
+            expires_in: None,
             public_ip: None,
             membership_status: "active".into(),
         },

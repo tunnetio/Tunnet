@@ -121,7 +121,11 @@ pub enum PolicyCommand {
 
 #[derive(Args, Debug)]
 pub struct UpgradeArgs {
-    #[arg(long, env = "TUNTUN_CONTROL_URL")]
+    #[arg(
+        long,
+        env = "CONTROL_PLANE_URL",
+        default_value = "http://127.0.0.1:8080"
+    )]
     pub control_url: String,
     #[arg(long, env = "TUNTUN_ENROLL_TOKEN")]
     pub token: Option<String>,
@@ -940,6 +944,8 @@ pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::
                 "direct_upgrade": import,
                 "system": meta,
             })),
+            labels: None,
+            expires_in: None,
         })
         .await
         .context("enroll into Managed during upgrade")?;

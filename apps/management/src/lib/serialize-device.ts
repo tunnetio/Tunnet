@@ -1,5 +1,5 @@
 import { formatIp } from "@tuntun/ip";
-
+import { normalizeDeviceLabels } from "./device-labels";
 import {
   deviceAgentVersion,
   deviceDisplayName,
@@ -21,6 +21,10 @@ export function serializeDevice(row: {
   type?: string;
   name?: string | null;
   metadata: unknown;
+  labels?: unknown;
+  inactivityTtl?: string | null;
+  expiredAt?: Date | null;
+  deviceLastSeen?: Date;
   assignedIp: string;
   publicIp: string | null;
   tenantIpv6: string;
@@ -33,6 +37,8 @@ export function serializeDevice(row: {
   lastSeen: Date;
   status: string;
 }) {
+  const labels = normalizeDeviceLabels(row.labels);
+
   return {
     endpointId: row.endpointId,
     organizationId: row.organizationId,
@@ -53,7 +59,10 @@ export function serializeDevice(row: {
     lastHeartbeatAt: toIso(row.lastHeartbeatAt),
     firstSeen: toIso(row.firstSeen)!,
     lastSeen: toIso(row.lastSeen)!,
-    status: row.status as "active" | "suspended" | "pending",
+    status: row.status as "active" | "suspended" | "pending" | "expired",
+    labels,
+    inactivityTtl: row.inactivityTtl ?? null,
+    expiredAt: toIso(row.expiredAt),
   };
 }
 

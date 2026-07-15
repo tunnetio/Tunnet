@@ -31,6 +31,13 @@ const cidr = customType<{ data: string; driverData: string }>({
   },
 });
 
+/** PostgreSQL `interval` as a human-readable string (e.g. `"3 days"`). */
+const pgInterval = customType<{ data: string; driverData: string }>({
+  dataType() {
+    return "interval";
+  },
+});
+
 const id = () => uuid("id").primaryKey().default(sql`uuidv7()`);
 
 export const policyActionValues = ["allow", "deny"] as const;
@@ -111,6 +118,11 @@ export const devices = pgTable(
     type: text("type").notNull().default("agent"),
     name: text("name").notNull().default(""),
     metadata: jsonb("metadata").notNull().default({}),
+    labels: jsonb("labels").notNull().default({}),
+    /** Per-machine inactivity TTL override; null inherits org auto-cleanup policy. */
+    inactivityTtl: pgInterval("inactivity_ttl"),
+    /** Set when soft-expired; used for soft_then_hard grace purge. */
+    expiredAt: timestamp("expired_at", { withTimezone: true }),
   },
   (table) => [
     check(
@@ -125,6 +137,7 @@ export const devices = pgTable(
     index("devices_by_organization_idx").on(table.organizationId),
     index("devices_by_last_seen_idx").on(table.lastSeen),
     index("devices_by_agent_connected_idx").on(table.agentConnected),
+    index("devices_by_expired_at_idx").on(table.expiredAt),
   ],
 );
 
@@ -157,7 +170,7 @@ export const networkMemberships = pgTable(
     ),
     check(
       "network_memberships_status_check",
-      sql`${table.status} IN ('active', 'suspended', 'pending')`,
+      sql`${table.status} IN ('active', 'suspended', 'pending', 'expired')`,
     ),
     index("network_memberships_by_network_idx").on(table.networkId),
     index("network_memberships_by_last_seen_idx").on(table.lastSeen),

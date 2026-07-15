@@ -1,37 +1,53 @@
+import {
+  getControlPlaneUrl as getControlPlaneUrlFromEnv,
+  getManagementUrl as getManagementUrlFromEnv,
+} from "@tuntun/env";
+
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/$/, "");
 }
 
-/**
- * Management API base URL.
- *
- * - Dev: `VITE_MANAGEMENT_API_URL` (browser and SSR both hit localhost:3000).
- * - Docker/prod: dashboard proxies `/api` to management; browser uses same origin,
- *   SSR uses `MANAGEMENT_API_URL` on the internal network.
- */
+function readBinding(
+  key: "MANAGEMENT_URL" | "CONTROL_PLANE_URL" | "DASHBOARD_URL",
+  fallback: string,
+): string {
+  const fromClient = import.meta.env[key];
+  if (typeof fromClient === "string" && fromClient.trim()) {
+    return stripTrailingSlash(fromClient.trim());
+  }
+
+  if (typeof process !== "undefined") {
+    const fromProcess = process.env[key]?.trim();
+    if (fromProcess) {
+      return stripTrailingSlash(fromProcess);
+    }
+  }
+
+  return fallback;
+}
+
 export function getManagementApiUrl(): string {
-  const configured = import.meta.env.VITE_MANAGEMENT_API_URL;
+  const configured = readBinding("MANAGEMENT_URL", "");
   if (configured) {
-    return stripTrailingSlash(configured);
+    return configured;
   }
 
   if (typeof window !== "undefined") {
     return window.location.origin;
   }
 
-  const internal = process.env.MANAGEMENT_API_URL;
-  if (internal) {
-    return stripTrailingSlash(internal);
-  }
-
-  return "http://localhost:3000";
+  return getManagementUrlFromEnv();
 }
 
-/** Public control-plane URL agents/relays dial (falls back to management host). */
 export function getControlPlaneUrl(): string {
-  const url =
-    import.meta.env.VITE_CONTROL_PLANE_URL ??
-    import.meta.env.VITE_MANAGEMENT_API_URL;
-  if (!url) return "https://cp.example.com";
-  return url.replace(/\/$/, "");
+  const configured = readBinding("CONTROL_PLANE_URL", "");
+  if (configured) {
+    return configured;
+  }
+
+  return getControlPlaneUrlFromEnv();
+}
+
+export function getDashboardUrl(): string {
+  return readBinding("DASHBOARD_URL", "http://localhost:5173");
 }

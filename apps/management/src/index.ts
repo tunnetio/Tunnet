@@ -3,6 +3,7 @@ import {
   oauthProviderOpenIdConfigMetadata,
 } from "@better-auth/oauth-provider";
 import { cors } from "@elysiajs/cors";
+import { getDashboardUrl, getManagementPort } from "@tuntun/env";
 import { Elysia } from "elysia";
 
 import { cliAuthRoutes } from "./api/cli-auth";
@@ -11,8 +12,8 @@ import { apiV1 } from "./api/v1";
 import { auth, ensureTrustedOAuthClients } from "./auth";
 import { repairStrippedMeshCidrs } from "./lib/repair-mesh-cidrs";
 
-const port = Number(process.env.MANAGEMENT_PORT ?? 3000);
-const webOrigin = process.env.MANAGEMENT_WEB_ORIGIN ?? "http://localhost:5173";
+const port = getManagementPort();
+const webOrigin = getDashboardUrl();
 
 await repairStrippedMeshCidrs().catch((err) => {
   console.error("mesh CIDR repair failed:", err);

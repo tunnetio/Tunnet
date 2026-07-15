@@ -78,4 +78,6 @@ export const queryKeys = {
     [...queryKeys.org(orgId), "internal-ca"] as const,
   tunnelSettings: (orgId: string) =>
     [...queryKeys.org(orgId), "tunnel-settings"] as const,
+  orgSettings: (orgId: string) =>
+    [...queryKeys.org(orgId), "org-settings"] as const,
 };

@@ -8,13 +8,41 @@ use uuid::Uuid;
 
 use crate::pg_inet::{self, PgIp};
 
+type EndpointRow = (
+    String,
+    bool,
+    i64,
+    serde_json::Value,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
 pub async fn build_endpoint_snapshot(
     pool: &PgPool,
     policy_key: &ed25519_dalek::SigningKey,
     endpoint_id: &str,
 ) -> anyhow::Result<EndpointSnapshot> {
-    let endpoint_row: Option<(String, bool, i64)> = sqlx::query_as(
-        "SELECT e.organization_id, e.ipv6_enabled, o.snapshot_version \
+    let endpoint_row: Option<EndpointRow> = sqlx::query_as(
+        "SELECT e.organization_id, e.ipv6_enabled, o.snapshot_version, e.labels, \
+           CASE \
+             WHEN e.expired_at IS NOT NULL THEN e.expired_at \
+             WHEN COALESCE( \
+               e.inactivity_ttl, \
+               CASE \
+                 WHEN COALESCE((o.settings->'machines'->'autoCleanup'->>'enabled')::boolean, false) \
+                 THEN (o.settings->'machines'->'autoCleanup'->>'inactivityAfter')::interval \
+                 ELSE NULL \
+               END \
+             ) IS NOT NULL \
+             THEN e.last_seen + COALESCE( \
+               e.inactivity_ttl, \
+               CASE \
+                 WHEN COALESCE((o.settings->'machines'->'autoCleanup'->>'enabled')::boolean, false) \
+                 THEN (o.settings->'machines'->'autoCleanup'->>'inactivityAfter')::interval \
+                 ELSE NULL \
+               END \
+             ) \
+             ELSE NULL \
+           END \
          FROM devices e \
          JOIN organization o ON o.id = e.organization_id \
          WHERE e.endpoint_id = $1",
@@ -23,8 +51,9 @@ pub async fn build_endpoint_snapshot(
     .fetch_optional(pool)
     .await?;
 
-    let (organization_id, ipv6_enabled, org_version) =
+    let (organization_id, ipv6_enabled, org_version, labels_value, expires_at) =
         endpoint_row.ok_or_else(|| anyhow::anyhow!("endpoint not found"))?;
+    let labels = crate::device_labels::normalize_labels(&labels_value);
     let tenant_ipv6 = if ipv6_enabled {
         Some(tuntun_common::ipv6::derive_tenant_ipv6(endpoint_id)?)
     } else {
@@ -120,6 +149,8 @@ pub async fn build_endpoint_snapshot(
         ipv6_peers,
         org_policy,
         org_ca_pem,
+        labels,
+        expires_at: expires_at.map(|t| t.to_rfc3339()),
         version: org_version as u64,
     })
 }

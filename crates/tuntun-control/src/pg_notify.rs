@@ -9,11 +9,21 @@ use uuid::Uuid;
 use crate::ws_hub::WsHub;
 
 pub const CHANNEL: &str = "tuntun:network_changed";
+pub const ORG_CHANNEL: &str = "tuntun:org_changed";
 
 pub async fn emit_network_changed(pool: &PgPool, network_id: Uuid) -> anyhow::Result<()> {
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(CHANNEL)
         .bind(network_id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn emit_org_changed(pool: &PgPool, organization_id: &str) -> anyhow::Result<()> {
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(ORG_CHANNEL)
+        .bind(organization_id)
         .execute(pool)
         .await?;
     Ok(())

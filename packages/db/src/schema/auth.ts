@@ -40,6 +40,8 @@ export const organization = pgTable(
       .notNull()
       .default(0),
     quickEnrollEnabled: boolean("quick_enroll_enabled").notNull().default(true),
+    /** Org-level product settings (machine auto-cleanup, etc.). */
+    settings: jsonb("settings").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),

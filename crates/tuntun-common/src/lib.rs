@@ -1,3 +1,4 @@
+pub mod duration;
 pub mod ipv6;
 pub mod policy;
 pub mod recording;
@@ -8,6 +9,7 @@ pub mod ssh;
 pub mod ws;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use uuid::Uuid;
 
@@ -53,6 +55,10 @@ pub struct EnrollRequest {
     pub agent_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in: Option<String>,
 }
 
 fn default_enroll_status() -> String {
@@ -88,7 +94,7 @@ pub enum EnrollStatusResponse {
         organization_id: String,
         network_id: Uuid,
         network_name: String,
-        snapshot: EndpointSnapshot,
+        snapshot: Box<EndpointSnapshot>,
     },
     Rejected,
 }
@@ -315,6 +321,12 @@ pub struct EndpointSnapshot {
     /// Org internal CA root cert (PEM) so agents can verify peer Serve TLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_ca_pem: Option<String>,
+    /// User-defined key-value labels on this machine.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// When this machine is deleted if it stays inactive (RFC3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub version: u64,
 }
 

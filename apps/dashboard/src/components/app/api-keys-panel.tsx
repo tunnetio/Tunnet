@@ -1,5 +1,4 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import {
   API_KEY_SCOPES,
@@ -9,10 +8,10 @@ import {
 import { PlusIcon, TrashIcon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
+
 import { ConfirmDialog } from "@/components/app/confirm-dialog";
 import { CopyField } from "@/components/app/copy-field";
 import { DataTable } from "@/components/app/data-table";
-import { PageHeader } from "@/components/app/page-header";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -32,10 +31,6 @@ import { createManagementClient } from "@/lib/management-client";
 import { useApiKeys, useNetworks } from "@/lib/queries/management";
 import { queryKeys } from "@/lib/query-keys";
 
-export const Route = createFileRoute("/app/settings/api-keys")({
-  component: ApiKeysPage,
-});
-
 function formatNetworkAccess(
   apiKey: ApiKey,
   networkNames: Map<string, string>,
@@ -52,7 +47,7 @@ function formatNetworkAccess(
   return names;
 }
 
-function ApiKeysPage() {
+export function ApiKeysPanel() {
   const { data: activeOrg } = useActiveOrganization();
   const orgId = activeOrg?.id;
   const { data: role } = useMemberRole(orgId);
@@ -144,18 +139,14 @@ function ApiKeysPage() {
 
   return (
     <>
-      <PageHeader
-        title="API keys"
-        description="Programmatic access to the management API."
-        actions={
-          isAdmin ? (
-            <Button onClick={() => setCreateOpen(true)}>
-              <PlusIcon className="mr-2 size-4" />
-              Create key
-            </Button>
-          ) : null
-        }
-      />
+      <div className="mb-4 flex justify-end">
+        {isAdmin ? (
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <PlusIcon className="mr-1.5 size-4" />
+            Create key
+          </Button>
+        ) : null}
+      </div>
 
       {isPending ? (
         <Skeleton className="h-48 w-full" />

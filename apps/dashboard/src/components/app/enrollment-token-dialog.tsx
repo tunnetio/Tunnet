@@ -20,6 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { getControlPlaneUrl } from "@/lib/env";
 import { createManagementClient } from "@/lib/management-client";
 import { useNetworks } from "@/lib/queries/management";
 import { queryKeys } from "@/lib/query-keys";
@@ -95,7 +96,7 @@ export function EnrollmentTokenDialog({
             <CopyField label="Enrollment token" value={token} />
             <CopyField
               label="Install command"
-              value={`tuntun-agent enroll --token ${token}`}
+              value={`tuntun enroll --token ${token} --control-url ${getControlPlaneUrl()}`}
             />
             <p className="text-muted-foreground text-xs">
               This token is shown only once. Copy it before closing.

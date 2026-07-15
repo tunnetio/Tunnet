@@ -2,8 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { LogOutIcon, UserIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Button } from "@/components/ui/button";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -13,7 +12,9 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { signOut, useSession } from "@/lib/auth-client";
+import { cn } from "@/lib/utils";
 
 function initials(name: string | undefined, email: string) {
   if (name?.trim()) {
@@ -27,7 +28,7 @@ function initials(name: string | undefined, email: string) {
   return email.slice(0, 2).toUpperCase();
 }
 
-export function UserMenu() {
+export function UserMenu({ className }: { className?: string }) {
   const { data: session } = useSession();
   const user = session?.user;
 
@@ -48,16 +49,37 @@ export function UserMenu() {
     <DropdownMenu>
       <DropdownMenuTrigger
         render={
-          <Button variant="ghost" size="icon" className="rounded-full">
-            <Avatar className="size-8">
-              <AvatarFallback className="text-xs">
-                {initials(user.name, user.email)}
-              </AvatarFallback>
+          <SidebarMenuButton
+            size="lg"
+            tooltip={user.name || user.email}
+            className={cn(
+              "data-open:bg-sidebar-accent data-open:text-sidebar-accent-foreground",
+              className,
+            )}
+          >
+            <Avatar className="size-8 rounded-lg">
+              {user.image ? (
+                <AvatarImage src={user.image} alt={user.name ?? user.email} />
+              ) : null}
+              <AvatarFallback>{initials(user.name, user.email)}</AvatarFallback>
             </Avatar>
-          </Button>
+            <div className="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
+              <span className="truncate font-medium">
+                {user.name || "Account"}
+              </span>
+              <span className="text-muted-foreground truncate text-xs">
+                {user.email}
+              </span>
+            </div>
+          </SidebarMenuButton>
         }
       />
-      <DropdownMenuContent align="end" className="w-56">
+      <DropdownMenuContent
+        side="top"
+        align="start"
+        sideOffset={8}
+        className="min-w-56"
+      >
         <DropdownMenuGroup>
           <DropdownMenuLabel className="font-normal">
             <div className="flex flex-col space-y-1">
@@ -68,9 +90,13 @@ export function UserMenu() {
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
-          <DropdownMenuItem render={<Link to="/app/settings/account" />}>
+          <DropdownMenuItem
+            render={
+              <Link to="/app/settings" search={{ user_code: undefined }} />
+            }
+          >
             <UserIcon className="mr-2 size-4" />
-            Account
+            Settings
           </DropdownMenuItem>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />

@@ -9,6 +9,7 @@ COPY packages/db/package.json packages/db/
 COPY packages/api/package.json packages/api/
 COPY packages/ip/package.json packages/ip/
 COPY packages/core/package.json packages/core/
+COPY packages/env/package.json packages/env/
 COPY apps/management/package.json apps/management/
 COPY apps/dashboard/package.json apps/dashboard/
 COPY crates/tuntun-node-napi/package.json crates/tuntun-node-napi/
@@ -26,8 +27,6 @@ COPY --from=builder /src/node_modules node_modules
 COPY --from=builder /src/packages packages
 COPY --from=builder /src/apps/management apps/management
 COPY --from=builder /src/package.json package.json
-
-ENV MANAGEMENT_PORT=3000
 
 EXPOSE 3000
 

@@ -1,6 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 
-/** Old approve links → Account settings (dialog). */
+/** Old approve links → user settings (CLI authorize dialog). */
 export const Route = createFileRoute("/device/approve")({
   validateSearch: (search: Record<string, unknown>) => ({
     user_code:
@@ -8,8 +8,10 @@ export const Route = createFileRoute("/device/approve")({
   }),
   beforeLoad: async ({ search }) => {
     throw redirect({
-      to: "/app/settings/account",
-      search: search.user_code ? { user_code: search.user_code } : {},
+      to: "/app/settings",
+      search: search.user_code
+        ? { user_code: search.user_code }
+        : { user_code: undefined },
     });
   },
 });

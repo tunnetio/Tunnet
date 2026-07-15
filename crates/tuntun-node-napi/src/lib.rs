@@ -99,7 +99,7 @@ pub async fn enroll(cfg: EnrollConfig) -> Result<EnrollResult> {
         let management_url = cfg
             .management_url
             .clone()
-            .or_else(|| std::env::var("TUNTUN_MANAGEMENT_URL").ok())
+            .or_else(|| std::env::var("MANAGEMENT_URL").ok())
             .ok_or_else(|| {
                 Error::from_reason("management_url is required for API key enrolment")
             })?;
@@ -133,6 +133,8 @@ pub async fn enroll(cfg: EnrollConfig) -> Result<EnrollResult> {
                 os: std::env::consts::OS.to_string(),
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
                 metadata: Some(metadata.clone()),
+                labels: None,
+                expires_in: None,
             })
             .await
             .map_err(err)?
@@ -203,7 +205,7 @@ impl TunTunNode {
                     let control_url = cfg
                         .control_url
                         .clone()
-                        .or_else(|| std::env::var("TUNTUN_CONTROL_URL").ok())
+                        .or_else(|| std::env::var("CONTROL_PLANE_URL").ok())
                         .ok_or_else(|| {
                             Error::from_reason("control_url is required for API key enrolment")
                         })?;

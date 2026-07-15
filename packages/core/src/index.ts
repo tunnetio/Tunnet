@@ -10,9 +10,9 @@ import {
 export type { EnrollConfig, EnrollResult, NodeConfig, PeerJs as Peer };
 
 export interface CreateNodeOptions extends NodeConfig {
-  /** Control plane URL (post-enrolment). Falls back to `TUNTUN_CONTROL_URL`. */
+  /** Control plane URL (post-enrolment). Falls back to `CONTROL_PLANE_URL`. */
   controlUrl?: string;
-  /** Management API URL for API-key enrolment. Falls back to `TUNTUN_MANAGEMENT_URL`. */
+  /** Management API URL for API-key enrolment. Falls back to `MANAGEMENT_URL`. */
   managementUrl?: string;
   apiKey?: string;
   organizationId?: string;

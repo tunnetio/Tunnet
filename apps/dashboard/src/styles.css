@@ -169,5 +169,5 @@ body {
 }
 
 .panel {
-  @apply rounded-lg border border-border/70 bg-card;
+  @apply rounded-xl border border-border/70 bg-card;
 }

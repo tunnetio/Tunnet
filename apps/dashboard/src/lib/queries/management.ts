@@ -374,6 +374,24 @@ export function useDeviceMutations(orgId: string | undefined) {
       },
       onSuccess: (_data, { endpointId }) => invalidateDevice(endpointId),
     }),
+    updateLabels: useMutation({
+      mutationFn: async ({
+        endpointId,
+        body,
+      }: {
+        endpointId: string;
+        body: Parameters<
+          ReturnType<typeof createManagementClient>["patchDeviceLabels"]
+        >[1];
+      }) => {
+        if (!orgId) throw new Error("No organization");
+        return createManagementClient(orgId).patchDeviceLabels(
+          endpointId,
+          body,
+        );
+      },
+      onSuccess: (_data, { endpointId }) => invalidateDevice(endpointId),
+    }),
     updateMembership: useMutation({
       mutationFn: async ({
         networkId,
@@ -769,6 +787,19 @@ export function useTunnelSettings(orgId: string | undefined) {
   });
 }
 
+export function useOrgSettings(orgId: string | undefined) {
+  return useQuery({
+    queryKey: orgId ? queryKeys.orgSettings(orgId) : ["org-settings"],
+    enabled: Boolean(orgId),
+    queryFn: async () => {
+      const { settings } = await createManagementClient(
+        orgId!,
+      ).getOrgSettings();
+      return settings;
+    },
+  });
+}
+
 export function useRelayMutations(orgId: string | undefined) {
   const queryClient = useQueryClient();
   const invalidate = () => {
@@ -1046,6 +1077,29 @@ export function useTunnelSettingsMutations(orgId: string | undefined) {
         if (orgId) {
           void queryClient.invalidateQueries({
             queryKey: queryKeys.tunnelSettings(orgId),
+          });
+        }
+      },
+    }),
+  };
+}
+
+export function useOrgSettingsMutations(orgId: string | undefined) {
+  const queryClient = useQueryClient();
+  return {
+    update: useMutation({
+      mutationFn: async (
+        body: Parameters<
+          ReturnType<typeof createManagementClient>["updateOrgSettings"]
+        >[0],
+      ) => {
+        if (!orgId) throw new Error("No organization");
+        return createManagementClient(orgId).updateOrgSettings(body);
+      },
+      onSuccess: () => {
+        if (orgId) {
+          void queryClient.invalidateQueries({
+            queryKey: queryKeys.orgSettings(orgId),
           });
         }
       },
