@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use iroh::{Endpoint, EndpointId};
-use iroh_gossip::{Gossip, TopicId, api::Event};
+use iroh_gossip::net::Gossip;
+use iroh_gossip::{TopicId, api::Event};
 use serde::{Deserialize, Serialize};
 
 use futures_util::StreamExt;

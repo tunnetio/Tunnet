@@ -8,6 +8,7 @@ pub mod dns_stub;
 pub mod identity;
 pub mod ipc;
 pub mod iroh_pool;
+pub mod mdns_relay;
 pub mod node;
 pub mod ping;
 pub mod recording;

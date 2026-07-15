@@ -140,13 +140,20 @@ impl Default for LoggingSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MdnsSection {
+    /// iroh LAN address lookup (Direct mode).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Cross-LAN mDNS/DNS-SD service relay over the mesh.
+    #[serde(default, rename = "service-relay")]
+    pub service_relay: bool,
 }
 
 impl Default for MdnsSection {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            service_relay: false,
+        }
     }
 }
 

@@ -54,6 +54,8 @@ pub struct CoreNodeConfig {
     pub on_kill_ssh: Option<KillSshHook>,
     /// Enable mDNS LAN address lookup (Direct default: true).
     pub enable_mdns: bool,
+    /// Advertise/run shared iroh-gossip (Managed needs this for presence + service relay).
+    pub enable_gossip: bool,
     /// Keep all peer connections open (Managed default: true; Direct default: false = on-demand).
     pub keep_alive: bool,
 }
@@ -69,6 +71,7 @@ impl Default for CoreNodeConfig {
             kind: "sdk",
             on_kill_ssh: None,
             enable_mdns: true,
+            enable_gossip: true,
             keep_alive: true,
         }
     }
@@ -94,6 +97,8 @@ pub struct CoreNode {
     pub direct_auth: Option<AuthCache>,
     /// Per-network Direct runtime (empty in Managed).
     pub direct: HashMap<Uuid, DirectNetworkRuntime>,
+    /// Shared agent Gossip (Managed). Direct uses [`DocsMembership::gossip`] instead.
+    pub gossip: Option<iroh_gossip::net::Gossip>,
 }
 
 impl CoreNode {
@@ -150,7 +155,7 @@ impl CoreNode {
         paths: StatePaths,
         cfg: CoreNodeConfig,
     ) -> anyhow::Result<Self> {
-        let alpns = build_alpns(&cfg, false);
+        let alpns = build_alpns(&cfg, false, cfg.enable_gossip);
 
         let my_id_hex = identity.endpoint_id_hex();
         let signed = SignedClient::new(
@@ -262,6 +267,14 @@ impl CoreNode {
 
         let _ = persisted;
         pool.set_keep_alive(cfg.keep_alive);
+
+        let gossip = if cfg.enable_gossip {
+            tracing::info!("Managed shared Gossip enabled");
+            Some(iroh_gossip::net::Gossip::builder().spawn(endpoint.clone()))
+        } else {
+            None
+        };
+
         Ok(Self {
             identity,
             persisted: PersistedState::Managed(managed),
@@ -278,6 +291,7 @@ impl CoreNode {
             signed: Some(signed),
             direct_auth: None,
             direct: HashMap::new(),
+            gossip,
         })
     }
 
@@ -292,7 +306,7 @@ impl CoreNode {
             anyhow::bail!("no Direct networks joined");
         }
 
-        let alpns = build_alpns(&cfg, true);
+        let alpns = build_alpns(&cfg, true, true);
         let my_id_hex = identity.endpoint_id_hex();
         let primary = &networks[0];
         let self_ipv4 = if primary.assigned_ipv4.is_unspecified() {
@@ -477,7 +491,18 @@ impl CoreNode {
             signed: None,
             direct_auth: Some(auth),
             direct: direct_runtimes,
+            // Direct features use DocsMembership::gossip() (primary network).
+            gossip: None,
         })
+    }
+
+    /// Shared Gossip for presence / service-relay topics.
+    /// Direct: primary network docs gossip. Managed: agent-owned gossip.
+    pub fn shared_gossip(&self) -> Option<iroh_gossip::net::Gossip> {
+        if let Some(g) = &self.gossip {
+            return Some(g.clone());
+        }
+        self.docs().map(|d| d.gossip())
     }
 
     pub fn endpoint_id_hex(&self) -> String {
@@ -495,7 +520,7 @@ impl CoreNode {
     }
 }
 
-fn build_alpns(cfg: &CoreNodeConfig, direct: bool) -> Vec<Vec<u8>> {
+fn build_alpns(cfg: &CoreNodeConfig, direct: bool, enable_gossip: bool) -> Vec<Vec<u8>> {
     let mut alpns: Vec<Vec<u8>> = vec![TUNNEL_STREAM_ALPN.to_vec()];
     if cfg.advertise_datagram_alpn {
         alpns.push(TUNNEL_ALPN.to_vec());
@@ -510,6 +535,8 @@ fn build_alpns(cfg: &CoreNodeConfig, direct: bool) -> Vec<Vec<u8>> {
         alpns.push(AUTH_ALPN.to_vec());
         alpns.push(iroh_gossip::ALPN.to_vec());
         alpns.push(iroh_docs::ALPN.to_vec());
+    } else if enable_gossip {
+        alpns.push(iroh_gossip::ALPN.to_vec());
     }
     alpns
 }

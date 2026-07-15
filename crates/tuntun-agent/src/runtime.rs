@@ -63,6 +63,8 @@ pub async fn run(
         None
     };
 
+    let agent_cfg = tuntun_core::TunTunConfig::load(&paths).unwrap_or_default();
+
     let node = CoreNode::bootstrap(
         identity,
         persisted,
@@ -75,7 +77,8 @@ pub async fn run(
             advertise_recording_alpn: args.recorder,
             kind: "agent",
             on_kill_ssh,
-            enable_mdns: !args.no_mdns,
+            enable_mdns: agent_cfg.mdns.enabled && !args.no_mdns,
+            enable_gossip: !args.disable_gossip || agent_cfg.mdns.service_relay,
             keep_alive: if is_direct { args.keep_alive } else { true },
         },
     )
@@ -185,6 +188,7 @@ pub async fn run(
         firewalls,
         spoofs,
         dgram_pool: dgram_pool.clone(),
+        agent_gossip: node.gossip.clone(),
     });
 
     let dns_bind = tuntun_core::dns_stub::bind_addr(dns_cfg.magic_ip);
@@ -279,23 +283,50 @@ pub async fn run(
     crate::sd_notify::status("running");
 
     if !args.disable_gossip {
-        let gossip = iroh_gossip::Gossip::builder().spawn(node.endpoint.clone());
-        let peers: Vec<iroh::EndpointId> = node
-            .routes
-            .peers()
-            .iter()
-            .take(5)
-            .filter_map(|p| p.endpoint_hex.parse().ok())
-            .collect();
-        let topic = tuntun_common::network_topic_hex(&network_id);
-        let ep = node.endpoint.clone();
-        let hostname = hostname.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::gossip_presence::spawn(ep, gossip, topic, peers, hostname).await
-            {
-                tracing::warn!(?e, "gossip presence disabled");
-            }
-        });
+        if let Some(gossip) = node.shared_gossip() {
+            let peers: Vec<iroh::EndpointId> = node
+                .routes
+                .peers()
+                .iter()
+                .take(5)
+                .filter_map(|p| p.endpoint_hex.parse().ok())
+                .collect();
+            let topic = tuntun_common::network_topic_hex(&network_id);
+            let ep = node.endpoint.clone();
+            let hostname = hostname.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::gossip_presence::spawn(ep, gossip, topic, peers, hostname).await
+                {
+                    tracing::warn!(?e, "gossip presence disabled");
+                }
+            });
+        } else {
+            tracing::warn!("gossip presence skipped (no shared Gossip)");
+        }
+    }
+
+    if agent_cfg.mdns.service_relay {
+        if let Some(gossip) = node.shared_gossip() {
+            let peers: Vec<iroh::EndpointId> = node
+                .routes
+                .peers()
+                .iter()
+                .take(5)
+                .filter_map(|p| p.endpoint_hex.parse().ok())
+                .collect();
+            let topic = tuntun_common::mdns_relay_topic_hex(&network_id);
+            let _mdns_task = tuntun_core::mdns_relay::spawn(tuntun_core::mdns_relay::SpawnConfig {
+                gossip,
+                topic_hex: topic,
+                bootstrap: peers,
+                mesh_ip: node.self_ipv4,
+                endpoint_id: node.endpoint_id_hex(),
+                routes: node.routes.clone(),
+            });
+        } else {
+            tracing::warn!("mDNS service relay skipped (no shared Gossip)");
+        }
     }
 
     #[cfg(unix)]

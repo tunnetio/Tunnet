@@ -369,3 +369,11 @@ pub fn validate_network_name(s: &str) -> bool {
 pub fn network_topic_hex(id: &uuid::Uuid) -> String {
     hex::encode(blake3::hash(id.as_bytes()).as_bytes())
 }
+
+/// Gossip topic for mDNS/DNS-SD service relay records on a network.
+pub fn mdns_relay_topic_hex(id: &uuid::Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(id.as_bytes());
+    hasher.update(b"mdns-relay");
+    hex::encode(hasher.finalize().as_bytes())
+}

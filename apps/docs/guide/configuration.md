@@ -62,6 +62,7 @@ format = "text"
 
 [mdns]
 enabled = true
+service-relay = false
 
 [update]
 enabled = false
@@ -132,6 +133,7 @@ You can also manage rules with `tuntun firewall`. Edits to TOML take effect afte
 | Key | Description |
 |-----|-------------|
 | `enabled` | LAN address discovery via mDNS (Direct mode) |
+| `service-relay` | Relay LAN DNS-SD services across the mesh (default `false`) |
 
 ### `[update]`
 

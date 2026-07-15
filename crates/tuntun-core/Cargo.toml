@@ -49,6 +49,7 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 aes-gcm = "0.10"
 zeroize = { version = "1.9.0", features = ["std", "derive"] }
+mdns-sd = "0.20.1"
 
 [dev-dependencies]
 tempfile = "3"

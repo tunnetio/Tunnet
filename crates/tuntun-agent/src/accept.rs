@@ -47,6 +47,8 @@ pub struct AcceptDeps {
     pub firewalls: HashMap<Uuid, FirewallEngine>,
     pub spoofs: HashMap<Uuid, SpoofTracker>,
     pub dgram_pool: ConnPool,
+    /// Managed-mode shared Gossip (None in Direct — use docs gossip).
+    pub agent_gossip: Option<iroh_gossip::net::Gossip>,
 }
 
 pub fn spawn(deps: AcceptDeps) {
@@ -75,6 +77,7 @@ pub fn spawn(deps: AcceptDeps) {
             let firewalls = deps.firewalls.clone();
             let spoofs = deps.spoofs.clone();
             let dgram_pool = deps.dgram_pool.clone();
+            let agent_gossip = deps.agent_gossip.clone();
             tokio::spawn(async move {
                 let conn = match incoming.await {
                     Ok(c) => c,
@@ -137,8 +140,12 @@ pub fn spawn(deps: AcceptDeps) {
                         d.accept_gossip(conn).await;
                     } else if let Some((_, d)) = docs.iter().next() {
                         d.accept_gossip(conn).await;
+                    } else if let Some(g) = agent_gossip {
+                        if let Err(e) = g.handle_connection(conn).await {
+                            tracing::debug!(?e, "agent gossip accept ended");
+                        }
                     } else {
-                        tracing::debug!("GOSSIP_ALPN ignored (Direct docs not ready)");
+                        tracing::debug!("GOSSIP_ALPN ignored (no gossip handler)");
                     }
                 } else if alpn == TUNNEL_STREAM_ALPN {
                     serve_stream_connection(conn, stream_handler).await;
