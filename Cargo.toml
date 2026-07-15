@@ -62,7 +62,7 @@ ed25519-dalek = { version = "=3.0.0-rc.0", features = ["rand_core"] }
 hmac = "0.13"
 sha2 = "0.11"
 blake3 = "1"
-toml = "0.8"
+toml = { version = "1", features = ["preserve_order"] }
 bs58 = "0.5"
 iroh-mdns-address-lookup = "0.4"
 argon2 = "0.5"
@@ -99,7 +99,7 @@ iroh-blobs = "0.103"
 iroh-docs = "0.101"
 tun-rs = { version = "2", features = ["async_tokio"] }
 portable-pty = "0.9"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # napi-rs v3
 napi = { version = "3", features = [

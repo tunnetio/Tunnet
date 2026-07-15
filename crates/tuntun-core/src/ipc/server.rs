@@ -1775,7 +1775,8 @@ async fn direct_policy_set(
     toml_str: &str,
 ) -> anyhow::Result<String> {
     let direct = require_direct_coord(state, network)?;
-    let file: PolicyFile = toml::from_str(toml_str).context("parse policy toml")?;
+    let file: PolicyFile =
+        crate::agent_config::parse_toml(toml_str).context("parse policy toml")?;
     let Some(docs) = state.node.docs_for(direct.network_id) else {
         anyhow::bail!("docs membership not ready");
     };

@@ -184,6 +184,20 @@ impl Default for UpdateSection {
     }
 }
 
+pub fn parse_toml<T: for<'de> Deserialize<'de>>(s: &str) -> Result<T, toml::de::Error> {
+    let de = match toml::Deserializer::parse(s) {
+        Ok(de) => de,
+        Err(mut err) => {
+            err.set_input(Some(s));
+            return Err(err);
+        }
+    };
+    T::deserialize(de).map_err(|mut err| {
+        err.set_input(Some(s));
+        err
+    })
+}
+
 fn default_true() -> bool {
     true
 }
@@ -220,7 +234,7 @@ impl TunTunConfig {
     pub fn load_path(path: &Path) -> anyhow::Result<Self> {
         let s =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        toml::from_str(&s).with_context(|| format!("parse {}", path.display()))
+        parse_toml(&s).with_context(|| format!("parse {}", path.display()))
     }
 
     pub fn try_load(paths: &StatePaths) -> anyhow::Result<Option<Self>> {
