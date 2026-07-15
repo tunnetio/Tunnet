@@ -21,19 +21,12 @@ pub fn configure(dns_ip: Ipv4Addr, suffix: &str) -> anyhow::Result<DnsGuard> {
     {
         let _ = (dns_ip, suffix);
         tracing::warn!("PeerDNS system configuration unsupported on this OS");
-        Ok(DnsGuard::noop())
+        Ok(DnsGuard { _restore: None })
     }
 }
 
 pub struct DnsGuard {
     _restore: Option<Box<dyn FnOnce() + Send>>,
-}
-
-impl DnsGuard {
-    #[allow(dead_code)]
-    fn noop() -> Self {
-        Self { _restore: None }
-    }
 }
 
 impl Drop for DnsGuard {
@@ -85,7 +78,7 @@ mod linux {
         }
         let existing = fs::read_to_string(&resolv).unwrap_or_default();
         if existing.contains(&format!("nameserver {dns_ip}")) {
-            return Ok(DnsGuard::noop());
+            return Ok(DnsGuard { _restore: None });
         }
         let mut new_content = format!("# TunTun PeerDNS\nnameserver {dns_ip}\n");
         new_content.push_str(&existing);

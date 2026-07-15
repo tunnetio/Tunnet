@@ -151,7 +151,7 @@ mod macos_keychain {
     use super::*;
     use anyhow::Context;
     use security_framework::passwords::{
-        delete_generic_password, find_generic_password, set_generic_password,
+        delete_generic_password, get_generic_password, set_generic_password,
     };
 
     const SERVICE: &str = "com.tuntun.agent";
@@ -164,8 +164,8 @@ mod macos_keychain {
     }
 
     pub fn load() -> anyhow::Result<[u8; 32]> {
-        let (data, _) = find_generic_password(None, SERVICE, ACCOUNT)
-            .context("Keychain find_generic_password")?;
+        let data =
+            get_generic_password(SERVICE, ACCOUNT).context("Keychain get_generic_password")?;
         if data.len() != 32 {
             bail!("Keychain DEK wrong length");
         }
