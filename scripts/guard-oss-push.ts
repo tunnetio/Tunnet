@@ -5,24 +5,16 @@ function normalizeUrl(url: string): string {
 function isPrivateRemote(remoteName: string, remoteUrl: string): boolean {
   if (remoteName === "private") return true;
   const normalized = normalizeUrl(remoteUrl);
-  return (
-    normalized.includes("tunnet-cloud") || normalized.includes("tunnet-cloud")
-  );
+  return normalized.includes("tunnet-cloud");
 }
 
 function isOssRemote(remoteName: string, remoteUrl: string): boolean {
   if (isPrivateRemote(remoteName, remoteUrl)) return false;
   const normalized = normalizeUrl(remoteUrl);
-  if (remoteName === "origin" || remoteName === "public") {
-    return (
-      normalized.endsWith("/tunnet") ||
-      normalized.includes("github.com/tunnetio/tunnet") ||
-      normalized.endsWith("/tunnet") ||
-      normalized.includes("github.com/tunnetio/tunnet")
-    );
-  }
   return (
-    normalized.endsWith("tunnetio/tunnet") ||
+    remoteName === "origin" ||
+    remoteName === "public" ||
+    normalized.endsWith("/tunnet") ||
     normalized.includes("github.com/tunnetio/tunnet")
   );
 }
@@ -58,20 +50,9 @@ if (!remoteName) {
 
 const url = await getRemoteUrl(remoteName).catch(() => "");
 
+// Full-tree private remote: allow native push (Sync / sync:private).
 if (isPrivateRemote(remoteName, url)) {
-  if (process.env.TUNNET_ALLOW_PRIVATE_PUSH === "1") {
-    process.exit(0);
-  }
-  console.error(
-    [
-      "",
-      `Refusing push to private remote (${remoteName}).`,
-      "Full-tree updates go through:  bun run sync:private",
-      "Default `git push` publishes filtered OSS to origin only.",
-      "",
-    ].join("\n"),
-  );
-  process.exit(1);
+  process.exit(0);
 }
 
 if (!isOssRemote(remoteName, url)) {
@@ -87,7 +68,7 @@ console.log(
 );
 
 const push = Bun.spawn(
-  ["bun", "run", "scripts/push-oss.ts", `--remote=${remoteName}`],
+  ["bun", "run", "scripts/push-oss.ts", `--remote=${remoteName}`, "--force"],
   { stdout: "inherit", stderr: "inherit" },
 );
 const code = await push.exited;

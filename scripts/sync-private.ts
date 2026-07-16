@@ -24,7 +24,5 @@ const branch = "main";
 const { stdout: url } = await git(["remote", "get-url", remote]);
 const { stdout: sha } = await git(["rev-parse", "--short", "HEAD"]);
 console.log(`Pushing full tree ${sha} to ${remote} (${url})`);
-await git(["push", remote, `HEAD:${branch}`], {
-  env: { TUNNET_ALLOW_PRIVATE_PUSH: "1" },
-});
+await git(["push", remote, `HEAD:${branch}`]);
 console.log(`Pushed to ${remote}/${branch}`);

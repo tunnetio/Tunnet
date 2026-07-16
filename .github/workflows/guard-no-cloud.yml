@@ -1,0 +1,27 @@
+name: Guard no cloud/
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  no-cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fail if cloud/ is present
+        run: |
+          if git ls-tree -r --name-only HEAD | grep -E '^cloud(/|$)'; then
+            echo "::error::cloud/ must not appear on the public repository"
+            git ls-tree -r --name-only HEAD | grep -E '^cloud(/|$)' || true
+            exit 1
+          fi
+          if git log --all --name-only --pretty=format: -- cloud | grep -q .; then
+            echo "::error::cloud/ found in git history on the public repository"
+            exit 1
+          fi
+          echo "OK: no cloud/ in tree or history"

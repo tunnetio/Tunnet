@@ -1,0 +1,28 @@
+#!/bin/sh
+# Block merging OSS-filtered history (no cloud/) into full-tree main (has cloud/).
+# That is what VS Code "Sync" does when origin/main is a filtered mirror — and it
+# re-introduces cloud/ on the next push.
+if ! git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  exit 0
+fi
+
+local_cloud=$(git ls-tree -d --name-only HEAD cloud 2>/dev/null || true)
+theirs_cloud=$(git ls-tree -d --name-only MERGE_HEAD cloud 2>/dev/null || true)
+
+if [ -n "$local_cloud" ] && [ -z "$theirs_cloud" ]; then
+  cat >&2 <<'EOF'
+
+Refusing merge of public (OSS-filtered) history into local full-tree main.
+That merge re-leaks cloud/ on the next push to origin.
+
+  Publish to public (no cloud/):  git push origin
+                                  (or: bun run push:oss)
+  Update private full tree:       bun run sync:private
+
+Do not use Sync/Pull against origin — histories are intentionally different.
+
+EOF
+  exit 1
+fi
+
+exit 0

@@ -1,6 +1,6 @@
 /**
  * Publish a filtered mirror of HEAD to the OSS remote (no cloud/).
- * Prefer `git push` (origin) which runs this via the pre-push hook.
+ * Prefer `git push origin` which runs this via the pre-push hook.
  *
  * Usage:
  *   bun run scripts/push-oss.ts
@@ -36,23 +36,15 @@ async function git(
   return { code, stdout: stdout.trim(), stderr: stderr.trim() };
 }
 
-async function rewindPastSyncCommits(cwd: string): Promise<void> {
-  let sha = (await git(["rev-parse", "HEAD"], { cwd })).stdout;
-  for (let i = 0; i < 50; i++) {
-    const { stdout: subject } = await git(["log", "-1", "--format=%s", sha], {
-      cwd,
-    });
-    if (!subject.startsWith("sync:")) {
-      break;
-    }
-    const parent = await git(["rev-parse", `${sha}^`], {
-      cwd,
-      allowFail: true,
-    });
-    if (parent.code !== 0 || !parent.stdout) break;
-    sha = parent.stdout;
-  }
-  await git(["reset", "--hard", sha], { cwd });
+async function remoteTipHasCloud(cwd: string): Promise<boolean> {
+  const { code, stdout } = await git(["ls-tree", "-r", "--name-only", "HEAD"], {
+    cwd,
+    allowFail: true,
+  });
+  if (code !== 0) return false;
+  return stdout
+    .split("\n")
+    .some((line) => line === "cloud" || line.startsWith("cloud/"));
 }
 
 async function main() {
@@ -74,12 +66,17 @@ async function main() {
       { allowFail: true },
     );
 
+    let mustForce = force;
     if (clone.code !== 0) {
       console.log("OSS branch missing or empty; initializing fresh clone...");
       await git(["init", "-b", branch], { cwd: tmp });
       await git(["remote", "add", "origin", remoteUrl], { cwd: tmp });
-    } else if (force) {
-      await rewindPastSyncCommits(tmp);
+      mustForce = true;
+    } else if (await remoteTipHasCloud(tmp)) {
+      console.log(
+        "Remote tip contains cloud/ — force-publishing a clean filtered tip.",
+      );
+      mustForce = true;
     }
 
     await git(["rm", "-rf", "--ignore-unmatch", "."], {
@@ -120,7 +117,7 @@ async function main() {
     await git(["commit", "-m", message], { cwd: tmp });
 
     const pushArgs = ["push", "origin", `HEAD:${branch}`];
-    if (force) pushArgs.push("--force");
+    if (mustForce) pushArgs.push("--force");
     await git(pushArgs, { cwd: tmp });
     console.log(`Pushed filtered tree to ${remote}/${branch}`);
   } finally {

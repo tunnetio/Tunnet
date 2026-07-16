@@ -15,7 +15,4 @@ pre-commit:
       glob: "**/*.rs"
       run: cargo clippy --workspace --all-targets -- -D warnings
 
-pre-push:
-  jobs:
-    - name: oss-filtered-push
-      run: bun run scripts/guard-oss-push.ts {remote}
+# pre-push OSS guard lives in .githooks/pre-push (always on; ignores LEFTHOOK=0).

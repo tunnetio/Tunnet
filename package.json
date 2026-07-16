@@ -8,6 +8,7 @@
     "crates/tunnet-node-napi"
   ],
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks && git config pull.ff only",
     "management:dev": "bun --env-file=.env --filter @tunnet/management dev",
     "management:start": "bun --env-file=.env --filter @tunnet/management start",
     "dash:dev": "bun --env-file=.env --filter @tunnet/dashboard dev",

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Block finishing a merge of OSS-filtered history into full-tree main.
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  local_cloud=$(git ls-tree -d --name-only HEAD cloud 2>/dev/null || true)
+  theirs_cloud=$(git ls-tree -d --name-only MERGE_HEAD cloud 2>/dev/null || true)
+  if [ -n "$local_cloud" ] && [ -z "$theirs_cloud" ]; then
+    cat >&2 <<'EOF'
+
+Refusing merge of public (OSS-filtered) history into local full-tree main.
+Abort with:  git merge --abort
+
+  Publish to public (no cloud/):  git push origin
+  Update private full tree:       bun run sync:private
+
+EOF
+    exit 1
+  fi
+fi
+
+# Delegate to lefthook for formatting/lint; OSS safety lives in pre-push.
+if [ "$LEFTHOOK" = "0" ]; then
+  exit 0
+fi
+
+dir=$(git rev-parse --show-toplevel)
+cd "$dir" || exit 1
+
+if command -v bun >/dev/null 2>&1; then
+  bunx lefthook run pre-commit "$@"
+  exit $?
+fi
+
+exit 0
