@@ -1,0 +1,14 @@
+{
+  "name": "@tuntun/cloud-dashboard-impl",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.tsx"
+  },
+  "peerDependencies": {
+    "@tanstack/react-router": "*",
+    "react": "*",
+    "react-dom": "*"
+  }
+}

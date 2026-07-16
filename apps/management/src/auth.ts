@@ -13,6 +13,7 @@ import {
 import { eq } from "drizzle-orm";
 
 import { createDefaultNetwork } from "./lib/default-network";
+import { getEntitlements } from "./lib/entitlements";
 
 const db = getDb();
 
@@ -31,6 +32,18 @@ export const TRUSTED_OAUTH_CLIENT_IDS = new Set<string>([
     ? [process.env.TUNTUN_OAUTH_DASHBOARD_CLIENT_ID]
     : []),
 ]);
+
+async function canUserCreateOrganization(user: {
+  id: string;
+}): Promise<boolean> {
+  const entitlements = await getEntitlements();
+  if (entitlements.multiOrganization) return true;
+
+  const memberships = await db.query.member.findMany({
+    where: eq(schema.member.userId, user.id),
+  });
+  return memberships.length === 0;
+}
 
 async function ssoTrustedOrigins(): Promise<string[]> {
   const origins = new Set<string>([dashboardOrigin]);
@@ -122,7 +135,8 @@ export const auth = betterAuth({
   },
   plugins: [
     organization({
-      allowUserToCreateOrganization: true,
+      allowUserToCreateOrganization: async (user) =>
+        canUserCreateOrganization(user),
       schema: {
         organization: {
           additionalFields: {

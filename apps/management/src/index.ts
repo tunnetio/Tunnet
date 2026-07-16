@@ -10,6 +10,7 @@ import { cliAuthRoutes } from "./api/cli-auth";
 import { sshAuthBrowserRoutes } from "./api/ssh-auth-browser";
 import { apiV1 } from "./api/v1";
 import { auth, ensureTrustedOAuthClients } from "./auth";
+import { getEntitlements } from "./lib/entitlements";
 import { repairStrippedMeshCidrs } from "./lib/repair-mesh-cidrs";
 
 const port = getManagementPort();
@@ -22,6 +23,11 @@ await repairStrippedMeshCidrs().catch((err) => {
 await ensureTrustedOAuthClients().catch((err) => {
   console.warn("oauth client bootstrap failed:", err);
 });
+
+const entitlements = await getEntitlements();
+console.log(
+  `[entitlements] tier=${entitlements.tier} multiOrganization=${entitlements.multiOrganization}`,
+);
 
 const oauthAuthServerMetadata = oauthProviderAuthServerMetadata(auth);
 const openIdConfigMetadata = oauthProviderOpenIdConfigMetadata(auth);

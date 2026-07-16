@@ -5,6 +5,7 @@ import { auditRoutes } from "./audit";
 import { deviceProfilesRoutes } from "./device-profiles";
 import { devicesRoutes } from "./devices";
 import { enrollmentTokensRoutes } from "./enrollment-tokens";
+import { entitlementsRoutes } from "./entitlements";
 import { hostnameRoutesRoutes } from "./hostname-routes";
 import { internalCaRoutes } from "./internal-ca";
 import { networksRoutes } from "./networks";
@@ -25,6 +26,7 @@ import { tunnelSettingsRoutes } from "./tunnel-settings";
 import { tunnelsRoutes } from "./tunnels";
 
 export const apiV1 = new Elysia({ prefix: "/api/v1" })
+  .use(entitlementsRoutes)
   .use(networksRoutes)
   .use(devicesRoutes)
   .use(presenceRoutes)

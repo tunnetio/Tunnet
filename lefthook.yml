@@ -14,3 +14,8 @@ pre-commit:
     - name: rust-clippy
       glob: "**/*.rs"
       run: cargo clippy --workspace --all-targets -- -D warnings
+
+pre-push:
+  jobs:
+    - name: block-cloud-to-public
+      run: bun run scripts/guard-public-push.ts {remote}

@@ -6,6 +6,7 @@ export * from "./device-profiles";
 export * from "./devices";
 export * from "./duration";
 export * from "./enrollment-tokens";
+export * from "./entitlements";
 export * from "./hostname-routes";
 export * from "./internal-ca";
 export * from "./networks";

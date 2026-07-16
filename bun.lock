@@ -37,7 +37,9 @@
         "@tanstack/react-table": "^8.21.3",
         "@tanstack/router-plugin": "^1.168.20",
         "@tuntun/api": "workspace:*",
+        "@tuntun/cloud-dashboard": "workspace:*",
         "@tuntun/db": "workspace:*",
+        "@tuntun/entitlements": "workspace:*",
         "@tuntun/env": "workspace:*",
         "asciinema-player": "^3.17.0",
         "better-auth": "^1.6.23",
@@ -87,7 +89,9 @@
         "@elysiajs/cors": "^1.4.2",
         "@peculiar/x509": "^2.0.0",
         "@tuntun/api": "workspace:*",
+        "@tuntun/cloud-management": "workspace:*",
         "@tuntun/db": "workspace:*",
+        "@tuntun/entitlements": "workspace:*",
         "@tuntun/env": "workspace:*",
         "@tuntun/ip": "workspace:*",
         "argon2": "^0.44.0",
@@ -126,9 +130,24 @@
         "zod": "^4.4.3",
       },
     },
+    "packages/cloud-stubs/dashboard": {
+      "name": "@tuntun/cloud-dashboard",
+      "version": "0.0.0",
+      "peerDependencies": {
+        "@tanstack/react-router": "*",
+        "react": "*",
+      },
+    },
+    "packages/cloud-stubs/management": {
+      "name": "@tuntun/cloud-management",
+      "version": "0.0.0",
+      "dependencies": {
+        "@tuntun/entitlements": "workspace:*",
+      },
+    },
     "packages/core": {
       "name": "@tuntun/core",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "dependencies": {
         "@tuntundev/sdk": "workspace:*",
       },
@@ -151,6 +170,10 @@
       "devDependencies": {
         "drizzle-kit": "^0.31.10",
       },
+    },
+    "packages/entitlements": {
+      "name": "@tuntun/entitlements",
+      "version": "0.0.0",
     },
     "packages/env": {
       "name": "@tuntun/env",
@@ -864,6 +887,10 @@
 
     "@tuntun/api": ["@tuntun/api@workspace:packages/api"],
 
+    "@tuntun/cloud-dashboard": ["@tuntun/cloud-dashboard@workspace:packages/cloud-stubs/dashboard"],
+
+    "@tuntun/cloud-management": ["@tuntun/cloud-management@workspace:packages/cloud-stubs/management"],
+
     "@tuntun/core": ["@tuntun/core@workspace:packages/core"],
 
     "@tuntun/dashboard": ["@tuntun/dashboard@workspace:apps/dashboard"],
@@ -871,6 +898,8 @@
     "@tuntun/db": ["@tuntun/db@workspace:packages/db"],
 
     "@tuntun/docs": ["@tuntun/docs@workspace:apps/docs"],
+
+    "@tuntun/entitlements": ["@tuntun/entitlements@workspace:packages/entitlements"],
 
     "@tuntun/env": ["@tuntun/env@workspace:packages/env"],
 

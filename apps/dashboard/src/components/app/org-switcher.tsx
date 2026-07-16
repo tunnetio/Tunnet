@@ -19,6 +19,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { useEntitlements } from "@/hooks/use-entitlements";
 import {
   authClient,
   useActiveOrganization,
@@ -33,6 +34,8 @@ export function OrgSwitcher() {
   const queryClient = useQueryClient();
   const { data: organizations, isPending } = useListOrganizations();
   const { data: activeOrganization } = useActiveOrganization();
+  const { data: entitlements } = useEntitlements();
+  const multiOrg = entitlements?.multiOrganization ?? false;
 
   async function switchOrg(organizationId: string) {
     const { error } = await authClient.organization.setActive({
@@ -50,6 +53,16 @@ export function OrgSwitcher() {
     }
     setOpen(false);
     toast.success("Organization switched");
+  }
+
+  if (!multiOrg) {
+    return (
+      <span className="truncate px-2 text-sm font-medium">
+        {isPending
+          ? "Loading..."
+          : (activeOrganization?.name ?? "Organization")}
+      </span>
+    );
   }
 
   return (
