@@ -1,6 +1,7 @@
 import { oauthProviderClient } from "@better-auth/oauth-provider/client";
 import { ssoClient } from "@better-auth/sso/client";
 import {
+  adminClient,
   deviceAuthorizationClient,
   inferOrgAdditionalFields,
   organizationClient,
@@ -15,6 +16,7 @@ export const authClient = createAuthClient({
     credentials: "include",
   },
   plugins: [
+    adminClient(),
     organizationClient({
       schema: inferOrgAdditionalFields({
         organization: {

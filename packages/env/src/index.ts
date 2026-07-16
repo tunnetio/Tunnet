@@ -43,14 +43,3 @@ export function getControlPlaneAdminUrl(
   url.port = String(CONTROL_PLANE_ADMIN_PORT);
   return stripTrailingSlash(url.toString());
 }
-
-export {
-  cloudDashboardPath,
-  cloudManagementPath,
-  getRepoRoot,
-  hasCloudPackages,
-  resolveCloudDashboardRoot,
-  resolveCloudManagementRoot,
-  stubDashboardPath,
-  stubManagementPath,
-} from "./cloud-paths.ts";

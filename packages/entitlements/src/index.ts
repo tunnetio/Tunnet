@@ -1,63 +1,65 @@
 export type LicenseTier = "community" | "cloud" | "enterprise";
 
+/** Tiers that require a signed license certificate. */
+export type PaidTier = Exclude<LicenseTier, "community">;
+
 export type Entitlements = {
   tier: LicenseTier;
-  /** Allow creating and switching between multiple organizations. */
   multiOrganization: boolean;
-  /** SaaS marketing landing at `/` (requires cloud/ dashboard package). */
+  /** SaaS marketing landing (needs private `cloud/` packages). */
   cloudLanding: boolean;
+  /** Public signup + org invitations. */
+  openSignUp: boolean;
+  /** Unix seconds; null when community / no active license. */
+  licenseExpiresAt: number | null;
 };
 
-export type EntitlementOverrides = Partial<Entitlements> & {
-  tier?: LicenseTier;
-};
+const FEATURES = {
+  community: {
+    tier: "community",
+    multiOrganization: false,
+    cloudLanding: false,
+    openSignUp: false,
+  },
+  cloud: {
+    tier: "cloud",
+    multiOrganization: true,
+    cloudLanding: true,
+    openSignUp: true,
+  },
+  enterprise: {
+    tier: "enterprise",
+    multiOrganization: false,
+    cloudLanding: false,
+    openSignUp: false,
+  },
+} as const satisfies Record<
+  LicenseTier,
+  Omit<Entitlements, "licenseExpiresAt">
+>;
 
 export const COMMUNITY_ENTITLEMENTS: Entitlements = {
-  tier: "community",
-  multiOrganization: false,
-  cloudLanding: false,
+  ...FEATURES.community,
+  licenseExpiresAt: null,
 };
-
-/** Cloud license: multi-org + marketing landing. */
-export const CLOUD_ENTITLEMENTS: Entitlements = {
-  tier: "cloud",
-  multiOrganization: true,
-  cloudLanding: true,
-};
-
-/** Enterprise license: no extra product features yet. */
-export const ENTERPRISE_ENTITLEMENTS: Entitlements = {
-  tier: "enterprise",
-  multiOrganization: false,
-  cloudLanding: false,
-};
-
-export function entitlementsForTier(tier: LicenseTier): Entitlements {
-  switch (tier) {
-    case "cloud":
-      return { ...CLOUD_ENTITLEMENTS };
-    case "enterprise":
-      return { ...ENTERPRISE_ENTITLEMENTS };
-    default:
-      return { ...COMMUNITY_ENTITLEMENTS };
-  }
-}
-
-export function mergeEntitlements(
-  base: Entitlements,
-  overrides: EntitlementOverrides | null | undefined,
-): Entitlements {
-  if (!overrides) return base;
-  return {
-    ...base,
-    ...overrides,
-    tier: overrides.tier ?? base.tier,
-  };
-}
 
 export function parseLicenseTier(value: unknown): LicenseTier | null {
   if (value === "community" || value === "cloud" || value === "enterprise") {
     return value;
   }
   return null;
+}
+
+export function isPaidTier(value: unknown): value is PaidTier {
+  return value === "cloud" || value === "enterprise";
+}
+
+export function entitlementsForTier(
+  tier: LicenseTier,
+  licenseExpiresAt: number | null = null,
+): Entitlements {
+  return {
+    ...FEATURES[tier],
+    licenseExpiresAt: tier === "community" ? null : licenseExpiresAt,
+  };
 }

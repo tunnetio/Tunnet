@@ -71,7 +71,8 @@ function AcceptInvitationPage() {
           <CardHeader>
             <CardTitle>Sign in required</CardTitle>
             <CardDescription>
-              Sign in to accept this organization invitation.
+              Sign in or create an account with the invited email, then return
+              here to join the organization.
             </CardDescription>
           </CardHeader>
           <CardContent>

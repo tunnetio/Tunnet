@@ -16,3 +16,6 @@ todos.json
 *.key
 **/.vitepress/cache/
 **/.vitepress/dist/
+license.json
+.secrets/
+scripts/sign-license.ts

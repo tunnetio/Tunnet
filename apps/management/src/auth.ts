@@ -5,6 +5,7 @@ import { getDashboardUrl, getManagementUrl } from "@tuntun/env";
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import {
+  admin,
   bearer,
   deviceAuthorization,
   jwt,
@@ -18,6 +19,8 @@ import { getEntitlements } from "./lib/entitlements";
 const db = getDb();
 
 const dashboardOrigin = getDashboardUrl();
+const entitlements = await getEntitlements();
+const disablePublicSignUp = !entitlements.openSignUp;
 
 export const OAUTH_CLIENT_DASHBOARD = "tuntun-dashboard";
 export const OAUTH_CLIENT_CLI = "tuntun-cli";
@@ -36,13 +39,25 @@ export const TRUSTED_OAUTH_CLIENT_IDS = new Set<string>([
 async function canUserCreateOrganization(user: {
   id: string;
 }): Promise<boolean> {
-  const entitlements = await getEntitlements();
-  if (entitlements.multiOrganization) return true;
+  const current = await getEntitlements();
+  if (current.multiOrganization) return true;
 
   const memberships = await db.query.member.findMany({
     where: eq(schema.member.userId, user.id),
   });
   return memberships.length === 0;
+}
+
+async function hasReachedOrganizationLimit(user: {
+  id: string;
+}): Promise<boolean> {
+  const current = await getEntitlements();
+  if (current.multiOrganization) return false;
+
+  const memberships = await db.query.member.findMany({
+    where: eq(schema.member.userId, user.id),
+  });
+  return memberships.length >= 1;
 }
 
 async function ssoTrustedOrigins(): Promise<string[]> {
@@ -116,6 +131,7 @@ export const auth = betterAuth({
   },
   emailAndPassword: {
     enabled: true,
+    disableSignUp: disablePublicSignUp,
   },
   disabledPaths: ["/token"],
   trustedOrigins: async (request) => {
@@ -134,9 +150,14 @@ export const auth = betterAuth({
     return base;
   },
   plugins: [
+    admin({
+      defaultRole: "user",
+      adminRoles: ["admin"],
+    }),
     organization({
       allowUserToCreateOrganization: async (user) =>
         canUserCreateOrganization(user),
+      organizationLimit: async (user) => hasReachedOrganizationLimit(user),
       schema: {
         organization: {
           additionalFields: {
@@ -150,6 +171,14 @@ export const auth = betterAuth({
         },
       },
       organizationHooks: {
+        beforeCreateInvitation: async () => {
+          const current = await getEntitlements();
+          if (!current.openSignUp) {
+            throw new Error(
+              "Invitations require cloud signup. Create users from the admin panel instead.",
+            );
+          }
+        },
         afterCreateOrganization: async ({ organization, user }) => {
           await createDefaultNetwork(organization.id, user.id);
         },

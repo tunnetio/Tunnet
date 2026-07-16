@@ -11,6 +11,7 @@ import { internalCaRoutes } from "./internal-ca";
 import { networksRoutes } from "./networks";
 import { nodeGroupsRoutes } from "./node-groups";
 import { orgSettingsRoutes } from "./org-settings";
+import { orgUsersRoutes } from "./org-users";
 import { policiesRoutes } from "./policies";
 import { presenceRoutes } from "./presence";
 import { relaysRoutes } from "./relays";
@@ -46,6 +47,7 @@ export const apiV1 = new Elysia({ prefix: "/api/v1" })
   .use(tunnelsRoutes)
   .use(tunnelSettingsRoutes)
   .use(orgSettingsRoutes)
+  .use(orgUsersRoutes)
   .use(ssoSettingsRoutes)
   .use(internalCaRoutes)
   .use(servesRoutes)

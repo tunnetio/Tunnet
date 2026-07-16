@@ -2,7 +2,8 @@ import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import { devtools } from "@tanstack/devtools-vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
-import { getManagementUrl, resolveCloudDashboardRoot } from "@tuntun/env";
+import { getManagementUrl } from "@tuntun/env";
+import { resolveCloudDashboardRoot } from "@tuntun/env/cloud-paths";
 
 import viteReact from "@vitejs/plugin-react";
 import { nitro } from "nitro/vite";

@@ -10,7 +10,6 @@ import {
   unique,
 } from "drizzle-orm/pg-core";
 
-/** Better Auth string[] fields - stored as Postgres text[]. */
 const textArray = (name: string) => text(name).array();
 
 export const user = pgTable("user", {
@@ -26,6 +25,10 @@ export const user = pgTable("user", {
     .defaultNow()
     .$onUpdate(() => new Date())
     .notNull(),
+  role: text("role").default("user"),
+  banned: boolean("banned").default(false),
+  banReason: text("ban_reason"),
+  banExpires: timestamp("ban_expires", { withTimezone: true }),
 });
 
 export const organization = pgTable(
@@ -71,6 +74,8 @@ export const session = pgTable(
       () => organization.id,
       { onDelete: "set null" },
     ),
+    /** Better Auth admin plugin — set when impersonating. */
+    impersonatedBy: text("impersonated_by"),
   },
   (table) => [
     index("session_user_id_idx").on(table.userId),

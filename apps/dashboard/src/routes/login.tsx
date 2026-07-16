@@ -13,7 +13,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { getSession } from "@/lib/auth.functions";
+import { useEntitlements } from "@/hooks/use-entitlements";
+import { getEntitlements, getSession } from "@/lib/auth.functions";
 import { authClient, signIn, signUp } from "@/lib/auth-client";
 
 export const Route = createFileRoute("/login")({
@@ -22,7 +23,10 @@ export const Route = createFileRoute("/login")({
   }),
   beforeLoad: async ({ search }) => {
     const session = await getSession();
-    if (!session) return;
+    if (!session) {
+      const entitlements = await getEntitlements();
+      return { entitlements };
+    }
     if (search.redirect?.startsWith("/")) {
       throw redirect({ href: search.redirect });
     }
@@ -34,6 +38,20 @@ export const Route = createFileRoute("/login")({
 function LoginPage() {
   const navigate = useNavigate();
   const { redirect: redirectTo } = Route.useSearch();
+  const routeEntitlements = Route.useRouteContext({
+    select: (ctx) =>
+      "entitlements" in ctx
+        ? (
+            ctx as {
+              entitlements?: { openSignUp?: boolean };
+            }
+          ).entitlements
+        : undefined,
+  });
+  const { data: liveEntitlements } = useEntitlements();
+  const entitlements = liveEntitlements ?? routeEntitlements;
+  const showSignup = Boolean(entitlements?.openSignUp);
+
   const [loading, setLoading] = useState(false);
   const [ssoLoading, setSsoLoading] = useState(false);
 
@@ -103,6 +121,8 @@ function LoginPage() {
     }
   }
 
+  const tabCount = showSignup ? 3 : 2;
+
   return (
     <div className="bg-background flex min-h-screen items-center justify-center p-4">
       <Card className="w-full max-w-sm">
@@ -114,10 +134,17 @@ function LoginPage() {
         </CardHeader>
         <CardContent>
           <Tabs defaultValue="signin">
-            <TabsList className="grid w-full grid-cols-3">
+            <TabsList
+              className="grid w-full"
+              style={{
+                gridTemplateColumns: `repeat(${tabCount}, minmax(0, 1fr))`,
+              }}
+            >
               <TabsTrigger value="signin">Sign in</TabsTrigger>
               <TabsTrigger value="sso">SSO</TabsTrigger>
-              <TabsTrigger value="signup">Create</TabsTrigger>
+              {showSignup ? (
+                <TabsTrigger value="signup">Create</TabsTrigger>
+              ) : null}
             </TabsList>
             <TabsContent value="signin">
               <form
@@ -180,46 +207,48 @@ function LoginPage() {
                 </Button>
               </form>
             </TabsContent>
-            <TabsContent value="signup">
-              <form
-                className="space-y-4 pt-2"
-                onSubmit={(e) => void handleSignUp(e)}
-              >
-                <div className="space-y-2">
-                  <Label htmlFor="signup-name">Name</Label>
-                  <Input
-                    id="signup-name"
-                    name="name"
-                    required
-                    autoComplete="name"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="signup-email">Email</Label>
-                  <Input
-                    id="signup-email"
-                    name="email"
-                    type="email"
-                    required
-                    autoComplete="email"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="signup-password">Password</Label>
-                  <Input
-                    id="signup-password"
-                    name="password"
-                    type="password"
-                    required
-                    minLength={8}
-                    autoComplete="new-password"
-                  />
-                </div>
-                <Button type="submit" className="w-full" disabled={loading}>
-                  {loading ? "Creating account..." : "Create account"}
-                </Button>
-              </form>
-            </TabsContent>
+            {showSignup ? (
+              <TabsContent value="signup">
+                <form
+                  className="space-y-4 pt-2"
+                  onSubmit={(e) => void handleSignUp(e)}
+                >
+                  <div className="space-y-2">
+                    <Label htmlFor="signup-name">Name</Label>
+                    <Input
+                      id="signup-name"
+                      name="name"
+                      required
+                      autoComplete="name"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="signup-email">Email</Label>
+                    <Input
+                      id="signup-email"
+                      name="email"
+                      type="email"
+                      required
+                      autoComplete="email"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="signup-password">Password</Label>
+                    <Input
+                      id="signup-password"
+                      name="password"
+                      type="password"
+                      required
+                      minLength={8}
+                      autoComplete="new-password"
+                    />
+                  </div>
+                  <Button type="submit" className="w-full" disabled={loading}>
+                    {loading ? "Creating account..." : "Create account"}
+                  </Button>
+                </form>
+              </TabsContent>
+            ) : null}
           </Tabs>
         </CardContent>
       </Card>

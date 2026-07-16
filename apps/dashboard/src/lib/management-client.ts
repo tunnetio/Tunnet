@@ -122,7 +122,7 @@ const routingRuleDetailResponse = zod.object({
   routingRule: tunnelRoutingRuleSchema,
 });
 
-class ManagementApiError extends Error {
+export class ManagementApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
@@ -918,6 +918,22 @@ export function createManagementClient(orgId: string) {
         },
         endpointSendSettingsSchema,
       ),
+
+    createUser: (body: {
+      email: string;
+      password: string;
+      name: string;
+      role?: "member" | "admin";
+    }) =>
+      request(orgId, org("/users"), {
+        method: "POST",
+        body: JSON.stringify(body),
+      }) as Promise<{
+        id: string;
+        email: string;
+        name: string;
+        role: string;
+      }>,
   };
 }
 

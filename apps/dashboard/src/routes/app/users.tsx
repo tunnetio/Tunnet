@@ -41,8 +41,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useEntitlements } from "@/hooks/use-entitlements";
 import { isAdminRole, useMemberRole } from "@/hooks/use-member-role";
 import { authClient, useActiveOrganization } from "@/lib/auth-client";
+import {
+  createManagementClient,
+  ManagementApiError,
+} from "@/lib/management-client";
 import { queryKeys } from "@/lib/query-keys";
 import {
   formatMemberRole,
@@ -62,13 +67,20 @@ function UsersPage() {
   const orgId = activeOrg?.id;
   const { data: role } = useMemberRole(orgId);
   const isAdmin = isAdminRole(role);
+  const { data: entitlements } = useEntitlements();
+  /** Cloud: invite + signup. Community/enterprise: admin createUser only. */
+  const cloudInvites = Boolean(entitlements?.openSignUp);
+  const canCreateUsers = !cloudInvites;
   const queryClient = useQueryClient();
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const [removeMemberId, setRemoveMemberId] = useState<string | null>(null);
   const [cancelInviteId, setCancelInviteId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [view, setView] = useState<ViewFilter>("members");
   const [roleFilter, setRoleFilter] = useState<RoleFilter>("all");
+
+  const showingInvitations = cloudInvites && view === "invitations";
 
   const { data: membersData, isPending: membersPending } = useQuery({
     queryKey: orgId ? queryKeys.members(orgId) : ["members"],
@@ -84,7 +96,7 @@ function UsersPage() {
 
   const { data: invitations, isPending: invitationsPending } = useQuery({
     queryKey: orgId ? queryKeys.invitations(orgId) : ["invitations"],
-    enabled: Boolean(orgId),
+    enabled: Boolean(orgId) && cloudInvites,
     queryFn: async () => {
       const { data, error } = await authClient.organization.listInvitations({
         query: { organizationId: orgId! },
@@ -99,9 +111,11 @@ function UsersPage() {
       void queryClient.invalidateQueries({
         queryKey: queryKeys.members(orgId),
       });
-      void queryClient.invalidateQueries({
-        queryKey: queryKeys.invitations(orgId),
-      });
+      if (cloudInvites) {
+        void queryClient.invalidateQueries({
+          queryKey: queryKeys.invitations(orgId),
+        });
+      }
     }
   }
 
@@ -294,7 +308,6 @@ function UsersPage() {
     [isAdmin],
   );
 
-  const showingInvitations = view === "invitations";
   const isPending = showingInvitations ? invitationsPending : membersPending;
   const rowCount = showingInvitations
     ? filteredInvitations.length
@@ -348,13 +361,27 @@ function UsersPage() {
     <>
       <PageHeader
         title="Users"
-        description="Manage organization members and invitations."
+        description={
+          cloudInvites
+            ? "Manage organization members and invitations."
+            : "Manage organization members."
+        }
         actions={
           isAdmin ? (
-            <Button onClick={() => setInviteOpen(true)}>
-              <PlusIcon className="mr-2 size-4" />
-              Invite user
-            </Button>
+            <div className="flex items-center gap-2">
+              {cloudInvites ? (
+                <Button onClick={() => setInviteOpen(true)}>
+                  <MailIcon className="mr-2 size-4" />
+                  Invite
+                </Button>
+              ) : null}
+              {canCreateUsers ? (
+                <Button onClick={() => setCreateOpen(true)}>
+                  <PlusIcon className="mr-2 size-4" />
+                  Create user
+                </Button>
+              ) : null}
+            </div>
           ) : null
         }
       />
@@ -368,18 +395,20 @@ function UsersPage() {
         countLabel={countLabel}
         filters={
           <>
-            <Select
-              value={view}
-              onValueChange={(value) => setView(value as ViewFilter)}
-            >
-              <SelectTrigger className="w-[140px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="members">Members</SelectItem>
-                <SelectItem value="invitations">Invitations</SelectItem>
-              </SelectContent>
-            </Select>
+            {cloudInvites ? (
+              <Select
+                value={view}
+                onValueChange={(value) => setView(value as ViewFilter)}
+              >
+                <SelectTrigger className="w-[140px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="members">Members</SelectItem>
+                  <SelectItem value="invitations">Invitations</SelectItem>
+                </SelectContent>
+              </Select>
+            ) : null}
             {!showingInvitations ? (
               <Select
                 value={roleFilter}
@@ -418,11 +447,17 @@ function UsersPage() {
               ? "Invite someone to join your organization."
               : search || roleFilter !== "all"
                 ? "Try adjusting your search or filters."
-                : "Invite your team to get started."
+                : canCreateUsers
+                  ? "Create a user account to get started."
+                  : "Invite your team to get started."
           }
           action={
             isAdmin && !showingInvitations ? (
-              <Button onClick={() => setInviteOpen(true)}>Invite user</Button>
+              cloudInvites ? (
+                <Button onClick={() => setInviteOpen(true)}>Invite</Button>
+              ) : canCreateUsers ? (
+                <Button onClick={() => setCreateOpen(true)}>Create user</Button>
+              ) : undefined
             ) : undefined
           }
         />
@@ -440,12 +475,23 @@ function UsersPage() {
         />
       )}
 
-      <InviteDialog
-        orgId={orgId}
-        open={inviteOpen}
-        onOpenChange={setInviteOpen}
-        onSuccess={invalidate}
-      />
+      {cloudInvites ? (
+        <InviteDialog
+          orgId={orgId}
+          open={inviteOpen}
+          onOpenChange={setInviteOpen}
+          onSuccess={invalidate}
+        />
+      ) : null}
+
+      {canCreateUsers ? (
+        <CreateUserDialog
+          orgId={orgId}
+          open={createOpen}
+          onOpenChange={setCreateOpen}
+          onSuccess={invalidate}
+        />
+      ) : null}
 
       <ConfirmDialog
         open={removeMemberId !== null}
@@ -471,27 +517,29 @@ function UsersPage() {
         }}
       />
 
-      <ConfirmDialog
-        open={cancelInviteId !== null}
-        onOpenChange={(open) => !open && setCancelInviteId(null)}
-        title="Cancel invitation"
-        description="This invitation will no longer be valid."
-        confirmLabel="Cancel invitation"
-        destructive
-        onConfirm={async () => {
-          if (!cancelInviteId) return;
-          const { error } = await authClient.organization.cancelInvitation({
-            invitationId: cancelInviteId,
-          });
-          if (error) {
-            toast.error(error.message ?? "Failed to cancel invitation");
-            return;
-          }
-          toast.success("Invitation cancelled");
-          setCancelInviteId(null);
-          invalidate();
-        }}
-      />
+      {cloudInvites ? (
+        <ConfirmDialog
+          open={cancelInviteId !== null}
+          onOpenChange={(open) => !open && setCancelInviteId(null)}
+          title="Cancel invitation"
+          description="This invitation will no longer be valid."
+          confirmLabel="Cancel invitation"
+          destructive
+          onConfirm={async () => {
+            if (!cancelInviteId) return;
+            const { error } = await authClient.organization.cancelInvitation({
+              invitationId: cancelInviteId,
+            });
+            if (error) {
+              toast.error(error.message ?? "Failed to cancel invitation");
+              return;
+            }
+            toast.success("Invitation cancelled");
+            setCancelInviteId(null);
+            invalidate();
+          }}
+        />
+      ) : null}
     </>
   );
 }
@@ -539,6 +587,9 @@ function InviteDialog({
             <DialogTitle>Invite user</DialogTitle>
           </DialogHeader>
           <div className="space-y-4 py-4">
+            <p className="text-muted-foreground text-sm">
+              Send an email invitation. They can sign up or sign in to join.
+            </p>
             <div className="space-y-2">
               <Label htmlFor="invite-email">Email</Label>
               <Input
@@ -576,6 +627,130 @@ function InviteDialog({
             <Button type="submit" disabled={loading}>
               <MailIcon className="mr-2 size-4" />
               {loading ? "Sending..." : "Send invitation"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CreateUserDialog({
+  orgId,
+  open,
+  onOpenChange,
+  onSuccess,
+}: {
+  orgId: string | undefined;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSuccess: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [memberRole, setMemberRole] = useState<"member" | "admin">("member");
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!orgId) return;
+    setLoading(true);
+    try {
+      const client = createManagementClient(orgId);
+      await client.createUser({
+        name: name.trim(),
+        email: email.trim(),
+        password,
+        role: memberRole,
+      });
+      toast.success("User created");
+      setName("");
+      setEmail("");
+      setPassword("");
+      onOpenChange(false);
+      onSuccess();
+    } catch (err) {
+      toast.error(
+        err instanceof ManagementApiError || err instanceof Error
+          ? err.message
+          : "Failed to create user",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <form onSubmit={(e) => void handleSubmit(e)}>
+          <DialogHeader>
+            <DialogTitle>Create user</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <p className="text-muted-foreground text-sm">
+              Creates an account and adds them to this organization. Share the
+              password securely.
+            </p>
+            <div className="space-y-2">
+              <Label htmlFor="create-name">Name</Label>
+              <Input
+                id="create-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="create-email">Email</Label>
+              <Input
+                id="create-email"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="create-password">Password</Label>
+              <Input
+                id="create-password"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+                minLength={8}
+                autoComplete="new-password"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Role</Label>
+              <Select
+                value={memberRole}
+                onValueChange={(v) => setMemberRole(v as "member" | "admin")}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="member">Member</SelectItem>
+                  <SelectItem value="admin">Admin</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+            >
+              Cancel
+            </Button>
+            <Button type="submit" disabled={loading}>
+              <PlusIcon className="mr-2 size-4" />
+              {loading ? "Creating..." : "Create user"}
             </Button>
           </DialogFooter>
         </form>
