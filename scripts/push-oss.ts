@@ -18,12 +18,17 @@ const branch = "main";
 
 async function git(
   args: string[],
-  opts: { cwd?: string; allowFail?: boolean } = {},
+  opts: {
+    cwd?: string;
+    allowFail?: boolean;
+    env?: Record<string, string>;
+  } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(["git", ...args], {
     cwd: opts.cwd,
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...process.env, ...opts.env },
   });
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
@@ -101,7 +106,10 @@ async function main() {
 
     const pushArgs = ["push", "origin", `HEAD:${branch}`];
     if (mustForce) pushArgs.push("--force");
-    await git(pushArgs, { cwd: tmp });
+    await git(pushArgs, {
+      cwd: tmp,
+      env: { TUNNET_OSS_INTERNAL_PUSH: "1" },
+    });
     console.log(`Pushed filtered tree to ${remote}/${branch}`);
   } finally {
     await rm(tmp, { recursive: true, force: true });

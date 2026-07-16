@@ -1,11 +1,12 @@
 #!/bin/sh
 # Always enforce OSS filtering for origin. Do NOT honor LEFTHOOK=0 here —
 # VS Code/Cursor Sync and some tooling set that and would re-leak cloud/.
+# Stdin (ref updates) must reach the script — use `bun` not `bun run`.
 remote="$1"
 
 if [ -z "$remote" ]; then
   exit 0
 fi
 
-bun run scripts/guard-oss-push.ts "$remote"
+bun "$(git rev-parse --show-toplevel)/scripts/guard-oss-push.ts" "$remote"
 exit $?
