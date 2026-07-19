@@ -325,9 +325,15 @@ impl CoreNode {
 
         debug_assert_eq!(format!("{}", endpoint.id()), my_id_hex);
 
-        match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
-            Ok(()) => tracing::info!("endpoint online"),
-            Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+        // Don't block control-plane WS / IPC readiness on relay bring-up.
+        {
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(10), ep.online()).await {
+                    Ok(()) => tracing::info!("endpoint online"),
+                    Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+                }
+            });
         }
 
         #[cfg(feature = "serve")]
@@ -483,9 +489,14 @@ impl CoreNode {
             .await
             .context("bind iroh endpoint (direct)")?;
 
-        match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
-            Ok(()) => tracing::info!("direct endpoint online"),
-            Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+        {
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(10), ep.online()).await {
+                    Ok(()) => tracing::info!("direct endpoint online"),
+                    Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+                }
+            });
         }
 
         #[cfg(feature = "serve")]

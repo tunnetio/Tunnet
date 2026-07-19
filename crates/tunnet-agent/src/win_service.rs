@@ -63,8 +63,8 @@ fn run_service() -> anyhow::Result<()> {
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .context("RegisterServiceCtrlHandler")?;
 
-    // Stay in StartPending until local IPC is bound. Reporting Running earlier
-    // made `tunnet status` race and show "agent not running" right after start.
+    // Stay in StartPending until local IPC is bound (signaled via on_ready).
+    // TUN/SSH continue after Running so `tunnet service start` returns promptly.
     status_handle
         .set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -72,7 +72,7 @@ fn run_service() -> anyhow::Result<()> {
             controls_accepted: ServiceControlAccept::empty(),
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 1,
-            wait_hint: Duration::from_secs(60),
+            wait_hint: Duration::from_secs(30),
             process_id: None,
         })
         .context("report StartPending")?;
@@ -136,7 +136,7 @@ fn run_service() -> anyhow::Result<()> {
                         controls_accepted: ServiceControlAccept::empty(),
                         exit_code: ServiceExitCode::Win32(0),
                         checkpoint,
-                        wait_hint: Duration::from_secs(60),
+                        wait_hint: Duration::from_secs(30),
                         process_id: None,
                     });
                 }
@@ -441,11 +441,8 @@ fn wait_for_running(
                 service_log_path().display()
             );
         }
-        let sleep = status
-            .wait_hint
-            .min(Duration::from_secs(2))
-            .max(Duration::from_millis(200));
-        std::thread::sleep(sleep);
+        // Poll quickly; SCM wait_hint is often 30–60s and would stall the CLI.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

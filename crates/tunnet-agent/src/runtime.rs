@@ -181,6 +181,36 @@ pub async fn run(
         )
     };
 
+    // Bind IPC and signal service readiness before TUN/SSH bring-up. Control-plane
+    // presence can already be Online while wintun/SSH still start; `service start`
+    // should not wait on that work.
+    let peer_dns_active = Arc::new(AtomicBool::new(false));
+    let (data_plane, cmd_rx) = DataPlaneHandle::new(8);
+    let ipc_state = Arc::new(AgentIpcState {
+        node: node.clone(),
+        hostname: hostname.clone(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at,
+        dns_upstream: dns_cfg.upstream.iter().map(|ip| ip.to_string()).collect(),
+        synthetic_base: dns_cfg.synthetic_base.to_string(),
+        magic_ip: dns_cfg.magic_ip.to_string(),
+        peer_dns_active: peer_dns_active.clone(),
+        peer_rtt: Arc::new(dashmap::DashMap::new()),
+        serves: node.serves.clone(),
+        tunnels: node.tunnels.clone(),
+        send: node.send.clone(),
+        data_plane: data_plane.clone(),
+    });
+    let _ipc_task = spawn_ipc_server(ipc_state)
+        .await
+        .context("start agent IPC server")?;
+    if let Some(tx) = on_ready.take() {
+        let _ = tx.send(());
+    }
+
+    #[cfg(unix)]
+    crate::sd_notify::status("running");
+
     let tun = Arc::new(build_tun(
         &args.ifname,
         assigned_ipv4,
@@ -343,7 +373,7 @@ pub async fn run(
             None
         }
     };
-    let peer_dns_active = Arc::new(AtomicBool::new(dns_guard.is_some()));
+    peer_dns_active.store(dns_guard.is_some(), std::sync::atomic::Ordering::Relaxed);
 
     if !is_direct
         && let Some(snap) = tunnet_core::state::load_snapshot_cache(&node.paths)
@@ -382,10 +412,9 @@ pub async fn run(
         metrics.clone(),
     );
 
-    let (data_plane, cmd_rx) = DataPlaneHandle::new(8);
     let initial = build_initial_plane(tun, dns_guard, outbound, &node, is_direct, network_id);
     spawn_controller(ControllerSpawn {
-        handle: data_plane.clone(),
+        handle: data_plane,
         cmd_rx,
         tun_slot,
         node: node.clone(),
@@ -405,31 +434,6 @@ pub async fn run(
         initial,
         ingress,
     });
-
-    let ipc_state = Arc::new(AgentIpcState {
-        node: node.clone(),
-        hostname: hostname.clone(),
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at,
-        dns_upstream: dns_cfg.upstream.iter().map(|ip| ip.to_string()).collect(),
-        synthetic_base: dns_cfg.synthetic_base.to_string(),
-        magic_ip: dns_cfg.magic_ip.to_string(),
-        peer_dns_active,
-        peer_rtt: Arc::new(dashmap::DashMap::new()),
-        serves: node.serves.clone(),
-        tunnels: node.tunnels.clone(),
-        send: node.send.clone(),
-        data_plane,
-    });
-    let _ipc_task = spawn_ipc_server(ipc_state)
-        .await
-        .context("start agent IPC server")?;
-    if let Some(tx) = on_ready.take() {
-        let _ = tx.send(());
-    }
-
-    #[cfg(unix)]
-    crate::sd_notify::status("running");
 
     if !args.disable_gossip {
         if let Some(gossip) = node.shared_gossip() {
