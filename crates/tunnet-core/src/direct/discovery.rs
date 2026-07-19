@@ -8,9 +8,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::Endpoint;
 use mainline::{Dht, Id};
 use parking_lot::Mutex;
 use tokio::sync::watch;
+use uuid::Uuid;
+
+use super::auth::{AUTH_ALPN, AuthCache, run_psk_handshake_client};
 
 /// Compute topic hash hex from network name + secret hex.
 pub fn topic_from_name_secret(network_name: &str, secret_hex: &str) -> String {
@@ -90,6 +94,65 @@ pub fn spawn_discovery(
         peers,
         _shutdown: shutdown_tx,
     }
+}
+
+pub fn spawn_seed_auth(
+    endpoint: Endpoint,
+    auth: AuthCache,
+    network_id: Uuid,
+    network_secret: String,
+    self_endpoint_hex: String,
+    seed_peers: Vec<String>,
+) {
+    let seeds: Vec<String> = seed_peers
+        .into_iter()
+        .filter(|p| p != &self_endpoint_hex)
+        .collect();
+    if seeds.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(20));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First attempt immediately.
+        tick.tick().await;
+        loop {
+            for seed in &seeds {
+                if auth.contains_network(seed, network_id) {
+                    continue;
+                }
+                let Ok(peer) = seed.parse::<iroh::EndpointId>() else {
+                    tracing::warn!(%seed, "invalid seed endpoint id");
+                    continue;
+                };
+                match endpoint.connect(peer, AUTH_ALPN).await {
+                    Ok(conn) => {
+                        match run_psk_handshake_client(
+                            &conn,
+                            network_id,
+                            &network_secret,
+                            &self_endpoint_hex,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                auth.insert(seed.clone(), network_id);
+                                tracing::info!(%seed, "seed AUTH ok");
+                                conn.close(0u32.into(), b"auth_ok");
+                            }
+                            Err(e) => {
+                                tracing::debug!(?e, %seed, "seed AUTH handshake failed");
+                                conn.close(401u32.into(), b"auth_failed");
+                            }
+                        }
+                    }
+                    Err(e) => tracing::debug!(?e, %seed, "seed AUTH dial failed"),
+                }
+            }
+            tick.tick().await;
+        }
+    });
 }
 
 fn topic_to_info_hash(topic_hash_hex: &str) -> Id {

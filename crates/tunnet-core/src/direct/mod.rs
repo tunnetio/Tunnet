@@ -41,7 +41,7 @@ pub use auth::{
 };
 pub use contact::{contact_id_from_endpoint, contact_id_from_hex, is_contact_id, parse_contact_id};
 #[cfg(feature = "direct")]
-pub use discovery::{DiscoveryHandle, spawn_discovery, topic_from_name_secret};
+pub use discovery::{DiscoveryHandle, spawn_discovery, spawn_seed_auth, topic_from_name_secret};
 pub use firewall::{
     EvalResult, FirewallConfig, FirewallEngine, FirewallRule, FirewallStats, PacketDirection,
     default_firewall, firewall_to_policy,

@@ -789,15 +789,18 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
     let peers = peer_lites(state);
     let peers_total = peers.len();
     let peers_online = peers.iter().filter(|p| p.online.unwrap_or(false)).count();
-    let relay_status = if state.tunnels.list().is_empty() {
-        "disconnected"
-    } else {
-        "connected"
-    };
     let mode = if state.node.persisted.is_direct() {
         "direct"
     } else {
         "managed"
+    };
+    // Reverse tunnels (Managed), not iroh relay — N/A in Direct mode.
+    let relay_status = if mode == "direct" {
+        "n/a"
+    } else if state.tunnels.list().is_empty() {
+        "disconnected"
+    } else {
+        "connected"
     };
     // Mesh datagram pool owns on-demand / keep-alive path state.
     let pool = &state.node.tunnel_pool;

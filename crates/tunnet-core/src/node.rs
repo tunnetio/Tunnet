@@ -25,7 +25,7 @@ use crate::control::{SignedClient, basic_metadata};
 #[cfg(feature = "direct")]
 use crate::direct::{
     AUTH_ALPN, AuthCache, DirectAuthHook, DocsBootstrap, DocsMembership, MembershipEntry,
-    derive_ipv4, firewall_to_policy, spawn_discovery,
+    derive_ipv4, firewall_to_policy, spawn_discovery, spawn_seed_auth,
 };
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
@@ -597,7 +597,16 @@ impl CoreNode {
                     seeds.push(m.endpoint_id);
                 }
             }
-            let _discovery = spawn_discovery(direct.topic_hash.clone(), my_id_hex.clone(), seeds);
+            let _discovery =
+                spawn_discovery(direct.topic_hash.clone(), my_id_hex.clone(), seeds.clone());
+            spawn_seed_auth(
+                endpoint.clone(),
+                auth.clone(),
+                direct.network_id,
+                direct.network_secret.clone(),
+                my_id_hex.clone(),
+                seeds,
+            );
 
             direct_runtimes.insert(
                 direct.network_id,

@@ -28,6 +28,44 @@ impl StatePaths {
         }
     }
 
+    /// Per-user state dir (used before a system service is installed).
+    pub fn user_dir() -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+                return Some(PathBuf::from(xdg).join("tunnet"));
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                return Some(PathBuf::from(home).join(".local/state/tunnet"));
+            }
+            None
+        }
+        #[cfg(windows)]
+        {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|base| PathBuf::from(base).join("tunnet"))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    }
+
+    /// Well-known state directories that may hold enrollment (machine + user).
+    /// Used by `tunnet reset` so a service install cannot resurrect wiped state.
+    pub fn default_state_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        let system = Self::system_dir();
+        dirs.push(system.clone());
+        if let Some(user) = Self::user_dir()
+            && user != system
+        {
+            dirs.push(user);
+        }
+        dirs
+    }
+
     pub fn resolve(explicit: Option<&str>) -> Self {
         if let Some(p) = explicit {
             return Self {
@@ -54,23 +92,14 @@ impl StatePaths {
 
         #[cfg(unix)]
         {
-            if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-                return Self {
-                    dir: PathBuf::from(xdg).join("tunnet"),
-                };
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                return Self {
-                    dir: PathBuf::from(home).join(".local/state/tunnet"),
-                };
+            if let Some(user) = Self::user_dir() {
+                return Self { dir: user };
             }
         }
         #[cfg(windows)]
         {
-            if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-                return Self {
-                    dir: PathBuf::from(appdata).join("tunnet"),
-                };
+            if let Some(user) = Self::user_dir() {
+                return Self { dir: user };
             }
         }
         Self {

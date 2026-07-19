@@ -489,15 +489,37 @@ async fn wait_for_approval(
 }
 
 pub async fn run_reset(args: ResetArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
-    let paths = paths(state_dir);
+    // Only `--state-dir` limits the wipe to one path. A machine-wide
+    // TUNNET_STATE_DIR (set by service install) must not skip the user profile
+    // copy, or `service start` will migrate it back into ProgramData.
+    let targets: Vec<std::path::PathBuf> = if state_dir.is_some() {
+        vec![paths(state_dir).dir]
+    } else {
+        let mut dirs = tunnet_core::StatePaths::default_state_dirs();
+        let current = paths(None).dir;
+        if !dirs.contains(&current) {
+            dirs.push(current);
+        }
+        dirs
+    };
+
     if !args.yes {
-        eprintln!("Re-run with --yes to actually wipe {}", paths.dir.display());
+        eprintln!("Re-run with --yes to wipe:");
+        for dir in &targets {
+            eprintln!("  {}", dir.display());
+        }
         return Ok(());
     }
-    if paths.dir.exists() {
-        std::fs::remove_dir_all(&paths.dir)?;
-        println!("Wiped {}", paths.dir.display());
-    } else {
+
+    let mut wiped_any = false;
+    for dir in &targets {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+            println!("Wiped {}", dir.display());
+            wiped_any = true;
+        }
+    }
+    if !wiped_any {
         println!("Nothing to wipe.");
     }
     Ok(())

@@ -113,6 +113,25 @@ fn preferred_network(auth: &Option<AuthCache>, peer: &str) -> Option<Uuid> {
         .and_then(|a| a.networks_for(peer).into_iter().next())
 }
 
+/// Pick which Direct network should handle an inbound docs/gossip connection.
+///
+/// Prefer AuthCache (peer already PSK-authenticated). If the peer is unknown yet
+/// (ticket sync before AUTH), fall back to the sole joined network so membership
+/// can bootstrap — otherwise docs never sync and peers stay at 0/0.
+fn docs_for_peer<'a>(
+    auth: &Option<AuthCache>,
+    docs: &'a HashMap<Uuid, DocsMembership>,
+    peer: &str,
+) -> Option<&'a DocsMembership> {
+    if let Some(nid) = preferred_network(auth, peer) {
+        return docs.get(&nid);
+    }
+    if docs.len() == 1 {
+        return docs.values().next();
+    }
+    None
+}
+
 #[derive(Clone)]
 struct TunnelHandler {
     tun: TunSlot,
@@ -240,16 +259,13 @@ impl fmt::Debug for DocsHandler {
 impl ProtocolHandler for DocsHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = format!("{}", conn.remote_id());
-        let preferred = preferred_network(&self.direct_auth, &peer);
-        if let Some(nid) = preferred
-            && let Some(d) = self.docs.get(&nid)
-        {
+        if let Some(d) = docs_for_peer(&self.direct_auth, &self.docs, &peer) {
             d.accept_docs(conn).await;
         } else {
             tracing::debug!(
                 %peer,
-                preferred = ?preferred,
-                "DOCS_ALPN skipped (no preferred network docs)"
+                networks = self.docs.len(),
+                "DOCS_ALPN skipped (no network mapping for peer)"
             );
         }
         Ok(())
@@ -272,10 +288,7 @@ impl fmt::Debug for GossipHandler {
 impl ProtocolHandler for GossipHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let peer = format!("{}", conn.remote_id());
-        let preferred = preferred_network(&self.direct_auth, &peer);
-        if let Some(nid) = preferred
-            && let Some(d) = self.docs.get(&nid)
-        {
+        if let Some(d) = docs_for_peer(&self.direct_auth, &self.docs, &peer) {
             d.accept_gossip(conn).await;
         } else if let Some(g) = &self.agent_gossip {
             if let Err(e) = g.handle_connection(conn).await {
@@ -284,8 +297,8 @@ impl ProtocolHandler for GossipHandler {
         } else {
             tracing::debug!(
                 %peer,
-                preferred = ?preferred,
-                "GOSSIP_ALPN skipped (no preferred network / agent gossip)"
+                networks = self.docs.len(),
+                "GOSSIP_ALPN skipped (no network mapping / agent gossip)"
             );
         }
         Ok(())

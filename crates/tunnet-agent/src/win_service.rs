@@ -314,7 +314,8 @@ pub(crate) fn migrate_user_state_into_system(system: PathBuf) -> anyhow::Result<
     }
 
     println!(
-        "Migrating agent state from {} → {}",
+        "Migrating agent state from {} → {}\n\
+         (restoring a previous enrollment from the user profile)",
         user.display(),
         system.display()
     );

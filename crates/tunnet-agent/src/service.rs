@@ -127,9 +127,7 @@ pub fn start(state_dir: Option<&str>) -> anyhow::Result<()> {
             .unwrap_or(false)
         {
             println!("Service is running.");
-            println!(
-                "Next: `tunnet create` or `tunnet enroll` if this host is not on a network yet."
-            );
+            print_post_start_hint(state_dir);
         } else {
             println!("Service start issued; check status with: systemctl status tunnet");
         }
@@ -189,8 +187,37 @@ pub fn start(state_dir: Option<&str>) -> anyhow::Result<()> {
         crate::win_service::ensure_wintun_present()?;
         crate::win_service::start_and_wait()?;
         println!("Service is running.");
+        print_post_start_hint(state_dir);
     }
     Ok(())
+}
+
+fn print_post_start_hint(state_dir: Option<&str>) {
+    let paths = tunnet_core::StatePaths::resolve(state_dir);
+    match tunnet_core::PersistedState::try_load(&paths) {
+        Ok(Some(tunnet_core::PersistedState::Direct { networks })) => {
+            let names: Vec<_> = networks.iter().map(|n| n.network_name.as_str()).collect();
+            println!(
+                "Direct network{}: {}. Check with `tunnet status`.",
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", ")
+            );
+        }
+        Ok(Some(tunnet_core::PersistedState::Managed(m))) => {
+            println!(
+                "Enrolled in Managed network '{}'. Check with `tunnet status`.",
+                m.network_name
+            );
+        }
+        Ok(None) => {
+            println!(
+                "Next: `tunnet create`, `tunnet join`, or `tunnet enroll` if this host is not on a network yet."
+            );
+        }
+        Err(e) => {
+            tracing::debug!(?e, "could not load state for post-start hint");
+        }
+    }
 }
 
 pub fn stop(_state_dir: Option<&str>) -> anyhow::Result<()> {
