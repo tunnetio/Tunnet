@@ -141,7 +141,10 @@ pub fn spawn_ws_processor(
             })
             .await;
 
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Don't fire immediately; WS connect already slides last_heartbeat_at.
+        heartbeat.tick().await;
         loop {
             tokio::select! {
                 Some(msg) = ws.rx.recv() => {

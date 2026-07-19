@@ -174,17 +174,22 @@ pub async fn mark_agent_disconnected(pool: &PgPool, endpoint_id: &str) -> anyhow
 }
 
 pub async fn record_heartbeat(pool: &PgPool, endpoint_id: &str) -> anyhow::Result<()> {
-    sqlx::query(crate::device_expiry_sql::SLIDE_ON_HEARTBEAT)
+    let result = sqlx::query(crate::device_expiry_sql::SLIDE_ON_HEARTBEAT)
         .bind(endpoint_id)
         .execute(pool)
         .await?;
 
-    // Peer snapshots filter on membership last_seen; keep it sliding with heartbeats
-    // so online agents do not disappear from each other's ipv4_peers after 5 minutes.
     sqlx::query("UPDATE network_memberships SET last_seen = now() WHERE endpoint_id = $1")
         .bind(endpoint_id)
         .execute(pool)
         .await?;
+
+    // Push fresh lastHeartbeatAt to dashboard SSE so "last seen" stays current.
+    if result.rows_affected() > 0
+        && let Some(device) = load_device(pool, endpoint_id).await?
+    {
+        emit_presence_changed(pool, &device.organization_id, endpoint_id).await?;
+    }
     Ok(())
 }
 

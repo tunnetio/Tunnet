@@ -16,10 +16,9 @@ import { sessionPlugin } from "./middleware/session";
 
 function isOnline(
   agentConnected: boolean,
-  lastHeartbeatAt: Date | null,
+  _lastHeartbeatAt: Date | null,
 ): boolean {
-  if (!agentConnected || !lastHeartbeatAt) return false;
-  return Date.now() - lastHeartbeatAt.getTime() < 45_000;
+  return agentConnected;
 }
 
 function safeFormatCidr(value: string): string | null {

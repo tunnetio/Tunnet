@@ -22,10 +22,10 @@ async function getNetworkInOrg(networkId: string, organizationId: string) {
 
 function isOnline(
   agentConnected: boolean,
-  lastHeartbeatAt: Date | null,
+  _lastHeartbeatAt: Date | null,
 ): boolean {
-  if (!agentConnected || !lastHeartbeatAt) return false;
-  return Date.now() - lastHeartbeatAt.getTime() < 45_000;
+  // Trust control-plane WS session flag; heartbeats keep it alive server-side.
+  return agentConnected;
 }
 
 export const topologyRoutes = new Elysia()

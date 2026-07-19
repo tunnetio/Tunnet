@@ -33,21 +33,22 @@ export type MachinePresence =
   | "pending"
   | "expired";
 
-/** Agent heartbeats arrive every ~30s; allow one missed beat. */
-export const HEARTBEAT_ONLINE_MS = 45_000;
+/** Server clears `agentConnected` after ~90s without heartbeat; trust that flag. */
+export const HEARTBEAT_ONLINE_MS = 90_000;
 
 export function getMachinePresence(
   device: Pick<Device, "status" | "agentConnected" | "lastHeartbeatAt">,
-  now = Date.now(),
+  _now = Date.now(),
 ): MachinePresence {
   if (device.status === "expired") return "expired";
   if (device.status === "suspended") return "suspended";
   if (device.status === "pending") return "pending";
 
-  if (device.agentConnected && device.lastHeartbeatAt) {
-    const heartbeatAge = now - new Date(device.lastHeartbeatAt).getTime();
-    if (heartbeatAge < HEARTBEAT_ONLINE_MS) return "online";
-    return "stale";
+  // Active control-plane WebSocket session. Do not age into "stale" from a
+  // frozen lastHeartbeatAt in the browser — heartbeats used to update only
+  // the DB, so the UI falsely showed Stale ~45s after page load.
+  if (device.agentConnected) {
+    return "online";
   }
 
   return "offline";

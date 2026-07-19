@@ -20,6 +20,7 @@ pub const SLIDE_ON_CONNECT: &str = concat!(
 );
 
 pub const SLIDE_ON_HEARTBEAT: &str = concat!(
-    "UPDATE devices SET last_seen = now(), last_heartbeat_at = now() ",
-    "WHERE endpoint_id = $1 AND agent_connected AND expired_at IS NULL"
+    "UPDATE devices SET last_seen = now(), last_heartbeat_at = now(), ",
+    "agent_connected = true ",
+    "WHERE endpoint_id = $1 AND expired_at IS NULL"
 );
