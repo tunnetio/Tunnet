@@ -140,6 +140,12 @@ impl ProtocolHandler for TunnelHandler {
             return Ok(());
         }
         let peer = conn.remote_id();
+        // Install into pool first so outbound send and ingress share one QUIC conn.
+        if !self.dgram_pool.adopt(peer, conn.clone()).await {
+            tracing::debug!(%peer, "accept superseded by live dial; closing");
+            conn.close(0u32.into(), b"superseded");
+            return Ok(());
+        }
         if !self.ingress.try_spawn(peer, {
             let conn = conn.clone();
             let tun = self.tun.clone();
@@ -165,7 +171,6 @@ impl ProtocolHandler for TunnelHandler {
                 .await;
             }
         }) {
-            self.dgram_pool.adopt(peer, conn).await;
             tracing::debug!(%peer, "accept ingress skipped (reader already active)");
         }
         Ok(())

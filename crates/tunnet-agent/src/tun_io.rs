@@ -230,7 +230,12 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
     metrics.active_conns_inc();
     if let Some(p) = &pool {
         p.touch_peer(remote_id);
-        p.adopt(remote_id, conn.clone()).await;
+        // Canonical install usually happened in accept/dial; keep pool in sync.
+        if !p.adopt(remote_id, conn.clone()).await {
+            tracing::debug!(%remote_id, "ingress conn not canonical; exiting reader");
+            metrics.active_conns_dec();
+            return;
+        }
     }
     // Prefer network from auth cache; fall back to route table peer.
     let inbound_network = direct_auth

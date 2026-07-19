@@ -216,18 +216,45 @@ impl ConnPool {
         }
     }
 
-    /// Prefer an accepted connection for outbound sends when we have no live dial.
-    /// Does not start a datagram reader (accept path already reads).
-    pub async fn adopt(&self, peer: EndpointId, conn: Connection) {
+    /// Install an accepted tunnel connection as the peer's live conn when none exists.
+    ///
+    /// Returns whether `conn` is (or already was) the canonical live connection.
+    /// If a *different* live dial already won the race, returns `false` and leaves
+    /// the pool unchanged — caller should close `conn` and not start a reader.
+    pub async fn adopt(&self, peer: EndpointId, conn: Connection) -> bool {
         let slot = self.slot(peer);
         let mut guard = slot.lock().await;
-        if guard.live_conn().is_some() {
+        if let Some(existing) = guard.live_conn() {
+            if existing.stable_id() == conn.stable_id() {
+                guard.touch();
+                return true;
+            }
+            // Dial already installed a live connection — keep it.
             guard.touch();
-            return;
+            return false;
         }
         guard.conn = Some(conn);
         guard.state = PeerConnState::Connected;
         guard.touch();
+        true
+    }
+
+    /// Close every default-ALPN peer connection (e.g. data plane down).
+    pub async fn close_all(&self) {
+        let peers: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for (peer, slot) in peers {
+            let mut g = slot.lock().await;
+            if let Some(c) = g.conn.take() {
+                c.close(0u32.into(), b"dataplane_down");
+            }
+            g.state = PeerConnState::Suspended;
+            g.drop_buf();
+            tracing::debug!(%peer, "closed tunnel pool connection");
+        }
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -447,24 +474,40 @@ impl ConnPool {
                         .store(latency_us, Ordering::Relaxed);
                 }
 
-                let buffered = {
+                let (canonical, buffered, fire_hook) = {
                     let mut guard = slot.lock().await;
-                    guard.conn = Some(conn.clone());
-                    guard.state = PeerConnState::Connected;
-                    guard.touch();
-                    if let Some(tx) = guard.dial_waiters.take() {
-                        let _ = tx.send(Ok(conn.clone()));
+                    // Accept may have installed a live conn while we dialed.
+                    // Prefer that connection so send and ingress stay on one QUIC path.
+                    if let Some(existing) = guard.live_conn() {
+                        let existing = existing.clone();
+                        if let Some(tx) = guard.dial_waiters.take() {
+                            let _ = tx.send(Ok(existing.clone()));
+                        }
+                        let buffered = guard.take_buf();
+                        drop(guard);
+                        conn.close(0u32.into(), b"superseded");
+                        (existing, buffered, false)
+                    } else {
+                        guard.conn = Some(conn.clone());
+                        guard.state = PeerConnState::Connected;
+                        guard.touch();
+                        if let Some(tx) = guard.dial_waiters.take() {
+                            let _ = tx.send(Ok(conn.clone()));
+                        }
+                        let buffered = guard.take_buf();
+                        (conn, buffered, true)
                     }
-                    guard.take_buf()
                 };
 
                 for pkt in buffered {
-                    if let Err(e) = send_datagram(&conn, pkt).await {
+                    if let Err(e) = send_datagram(&canonical, pkt).await {
                         tracing::warn!(%peer, ?e, "flush buffered datagram failed");
                     }
                 }
-                self.fire_tunnel_hook(peer, conn.clone());
-                Ok(conn)
+                if fire_hook {
+                    self.fire_tunnel_hook(peer, canonical.clone());
+                }
+                Ok(canonical)
             }
             Err(err) => {
                 self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);

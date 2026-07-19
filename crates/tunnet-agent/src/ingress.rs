@@ -51,6 +51,17 @@ impl IngressRegistry {
         true
     }
 
+    /// Abort any existing reader and start a new one (dial installed a new canonical conn).
+    pub fn force_spawn<F>(&self, peer: EndpointId, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Some((_, h)) = self.readers.remove(&peer) {
+            h.abort();
+        }
+        self.spawn_inner(peer, fut);
+    }
+
     fn spawn_inner<F>(&self, peer: EndpointId, fut: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,

@@ -87,7 +87,16 @@ pub fn spawn_controller(spawn: ControllerSpawn) {
                 )
                 .await
             } else {
-                bring_down(&handle, &tun_slot, &cfg, &peer_dns_active, &state, &ingress).await
+                bring_down(
+                    &handle,
+                    &tun_slot,
+                    &cfg,
+                    &peer_dns_active,
+                    &state,
+                    &ingress,
+                    &node.tunnel_pool,
+                )
+                .await
             };
             let _ = reply.send(result.map_err(|e| e.to_string()));
         }
@@ -143,6 +152,7 @@ async fn bring_down(
     peer_dns_active: &std::sync::atomic::AtomicBool,
     state: &Mutex<Option<LivePlane>>,
     ingress: &IngressRegistry,
+    tunnel_pool: &tunnet_core::ConnPool,
 ) -> anyhow::Result<()> {
     if !handle.is_up() {
         return Ok(());
@@ -153,6 +163,7 @@ async fn bring_down(
     };
     live.outbound.abort();
     ingress.abort_all();
+    tunnel_pool.close_all().await;
     crate::system_routes::unapply(
         &cfg.ifname,
         &live.device_profile,

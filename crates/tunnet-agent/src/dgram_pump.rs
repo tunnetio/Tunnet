@@ -18,6 +18,10 @@ use crate::tun_io::{InboundDeps, serve_tunnel_connection};
 /// The accept path only pumps accepted sockets. With keep-alive, reverse traffic
 /// often arrives on the dialed connection - without this, ICMP/TCP replies never
 /// reach the local TUN even though `tunnet ping` (streams) works.
+///
+/// The pool never replaces a live accepted conn with a dialed one (see
+/// [`ConnPool::get_alpn`]), so when this hook runs the dialed conn is canonical
+/// and we must own the ingress reader for it.
 #[allow(clippy::too_many_arguments)]
 pub fn install_dialer_datagram_pump(
     pool: &ConnPool,
@@ -41,8 +45,8 @@ pub fn install_dialer_datagram_pump(
         let direct_auth = direct_auth.clone();
         let pool = pool_for_hook.clone();
         let ingress = ingress.clone();
-        if !ingress.try_spawn(peer, async move {
-            // Bail if data plane is down.
+        // Dial installed a new canonical conn — replace any stale reader.
+        ingress.force_spawn(peer, async move {
             if tun_slot.read().await.device.is_none() {
                 return;
             }
@@ -58,8 +62,6 @@ pub fn install_dialer_datagram_pump(
                 direct_auth,
             })
             .await;
-        }) {
-            tracing::debug!(%peer, "dialer ingress skipped (reader already active)");
-        }
+        });
     }));
 }
