@@ -19,6 +19,15 @@ use crate::metrics::AgentMetrics;
 use crate::ssh_nat;
 
 const OUTBOUND_QUEUE_CAP: usize = 1024;
+const PRIORITY_QUEUE_CAP: usize = 256;
+
+#[derive(Clone, Copy)]
+enum OutPriority {
+    /// ICMP / small latency-sensitive packets — drained first, may wait on CC.
+    Latency,
+    /// Bulk TCP/UDP — never blocks the worker on datagram congestion.
+    Bulk,
+}
 
 pub fn build_tun(
     ifname: &str,
@@ -80,22 +89,41 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
         metrics,
     } = deps;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(EndpointId, Bytes)>(OUTBOUND_QUEUE_CAP);
+    let (prio_tx, mut prio_rx) =
+        tokio::sync::mpsc::channel::<(EndpointId, Bytes)>(PRIORITY_QUEUE_CAP);
+    let (bulk_tx, mut bulk_rx) =
+        tokio::sync::mpsc::channel::<(EndpointId, Bytes)>(OUTBOUND_QUEUE_CAP);
 
     let worker_pool = pool.clone();
     let worker_metrics = metrics.clone();
     let worker = tokio::spawn(async move {
-        while let Some((peer, payload)) = rx.recv().await {
+        loop {
+            // Prefer latency packets so iperf flood cannot stall ICMP.
+            let (peer, payload, latency) = tokio::select! {
+                biased;
+                Some((peer, payload)) = prio_rx.recv() => (peer, payload, true),
+                Some((peer, payload)) = bulk_rx.recv() => (peer, payload, false),
+                else => break,
+            };
             let n = payload.len() as u64;
-            match worker_pool.send_or_buffer(peer, payload).await {
+            let result = if latency {
+                worker_pool.send_or_buffer_priority(peer, payload).await
+            } else {
+                worker_pool.send_or_buffer(peer, payload).await
+            };
+            match result {
                 Ok(()) => {
                     worker_metrics.packets_inc("out");
                     worker_metrics.bytes_add("out", n);
                     worker_pool.record_bytes_out(peer, n);
                 }
                 Err(e) => {
-                    tracing::warn!(%peer, ?e, "send/buffer failed");
-                    worker_metrics.dropped_inc("send_failed");
+                    tracing::debug!(%peer, ?e, latency, "send/buffer failed");
+                    worker_metrics.dropped_inc(if latency {
+                        "send_failed_prio"
+                    } else {
+                        "send_failed_bulk"
+                    });
                 }
             }
         }
@@ -175,11 +203,24 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 }
             }
 
+            let priority = match parsed.protocol {
+                tunnet_common::policy::Protocol::Icmp => OutPriority::Latency,
+                // Very small packets are often ACKs / DNS / control — keep them responsive.
+                _ if packet.len() <= 128 => OutPriority::Latency,
+                _ => OutPriority::Bulk,
+            };
             let payload = Bytes::copy_from_slice(packet);
+            let tx = match priority {
+                OutPriority::Latency => &prio_tx,
+                OutPriority::Bulk => &bulk_tx,
+            };
             match tx.try_send((peer.endpoint, payload)) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    metrics.dropped_inc("outbound_queue_full");
+                    metrics.dropped_inc(match priority {
+                        OutPriority::Latency => "prio_queue_full",
+                        OutPriority::Bulk => "outbound_queue_full",
+                    });
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     anyhow::bail!("outbound send worker closed");
@@ -189,7 +230,8 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     }
     .await;
 
-    drop(tx);
+    drop(prio_tx);
+    drop(bulk_tx);
     let _ = worker.await;
     read_result
 }

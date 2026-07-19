@@ -548,14 +548,46 @@ impl ConnPool {
     }
 
     /// Send a packet, buffering + reconnecting when the peer is suspended (on-demand).
+    ///
+    /// When `latency_sensitive` is true, waits for datagram buffer space so ICMP
+    /// is not dropped under load. Bulk traffic uses a non-blocking send and may
+    /// be dropped when the QUIC datagram buffer is full.
     pub async fn send_or_buffer(&self, peer: EndpointId, packet: Bytes) -> anyhow::Result<()> {
+        self.send_or_buffer_inner(peer, packet, false).await
+    }
+
+    pub async fn send_or_buffer_priority(
+        &self,
+        peer: EndpointId,
+        packet: Bytes,
+    ) -> anyhow::Result<()> {
+        self.send_or_buffer_inner(peer, packet, true).await
+    }
+
+    async fn send_or_buffer_inner(
+        &self,
+        peer: EndpointId,
+        packet: Bytes,
+        latency_sensitive: bool,
+    ) -> anyhow::Result<()> {
         let slot = self.slot(peer);
         {
             let mut guard = slot.lock().await;
             if let Some(c) = guard.live_conn() {
                 guard.touch();
                 drop(guard);
-                return send_datagram(&c, packet).await;
+                if latency_sensitive {
+                    return send_datagram(&c, packet).await;
+                }
+                match try_send_datagram(&c, packet)? {
+                    true => return Ok(()),
+                    false => {
+                        self.metrics
+                            .packets_dropped_timeout
+                            .fetch_add(1, Ordering::Relaxed);
+                        anyhow::bail!("datagram send buffer full for {peer}");
+                    }
+                }
             }
             if guard.conn.is_some() {
                 guard.conn = None;
@@ -719,6 +751,28 @@ pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<(
     conn.send_datagram(packet)
         .context("send_datagram (packet too big or unsupported)")?;
     Ok(())
+}
+
+/// Best-effort datagram send: never blocks the caller on congestion.
+///
+/// Used for bulk TUN traffic so a flooded connection cannot stall ICMP/latency
+/// packets sharing the outbound worker. Returns `Ok(false)` when the datagram
+/// was dropped due to a full send buffer.
+pub fn try_send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<bool> {
+    if conn.datagram_send_buffer_space() == 0 {
+        return Ok(false);
+    }
+    match conn.send_datagram(packet) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("congest") || msg.contains("buffer") || msg.contains("TooLarge") {
+                Ok(false)
+            } else {
+                Err(e).context("send_datagram")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

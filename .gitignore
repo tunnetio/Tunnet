@@ -21,3 +21,4 @@ license.json
 scripts/sign-license.ts
 hack
 .cursor/
+bench-results/

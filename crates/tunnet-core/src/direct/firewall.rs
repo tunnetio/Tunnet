@@ -1,10 +1,11 @@
 //! Userspace stateful firewall for Direct mode.
 //!
-//! Secure-by-default with conntrack for return traffic:
+//! Defaults (authenticated mesh peers):
 //! - Outbound: allow all (opens flow)
-//! - Inbound ICMP echo: allow
-//! - Inbound TCP/UDP: deny unless conntrack or explicit rule
-//! - Local rules override suggested (coordinator) rules
+//! - Inbound from a known mesh peer: allow all (QUIC already gated by PSK/AuthCache)
+//! - Inbound without a peer identity: ICMP echo only; TCP/UDP deny
+//!
+//! Restrict further with local ACL rules (`tunnet firewall`).
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -554,7 +555,7 @@ impl FirewallEngine {
         }
 
         // 3) Default policy
-        let default = default_policy(direction, &view);
+        let default = default_policy(direction, &view, peer_endpoint_hex);
         self.apply_action(default, direction, packet, &view)
     }
 
@@ -751,12 +752,21 @@ fn peer_matches(
     }
 }
 
-fn default_policy(direction: PacketDirection, view: &PacketView) -> FirewallAction {
+fn default_policy(
+    direction: PacketDirection,
+    view: &PacketView,
+    peer_endpoint_hex: Option<&str>,
+) -> FirewallAction {
     match direction {
         PacketDirection::Outbound => FirewallAction::Allow,
         PacketDirection::Inbound => {
+            // Mesh peer identity is only set after QUIC auth (DirectAuthHook /
+            // AuthCache). Match Tailscale/ZeroTier: allow all between authenticated
+            // peers; lock down with local firewall rules when needed.
+            if peer_endpoint_hex.is_some() {
+                return FirewallAction::Allow;
+            }
             if view.protocol == Protocol::Icmp && (view.icmp_type == 8 || view.icmp_type == 0) {
-                // echo request/reply
                 FirewallAction::Allow
             } else {
                 FirewallAction::Deny
@@ -1095,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_tcp_denied_without_conntrack() {
+    fn inbound_tcp_allowed_from_authenticated_peer() {
         let e = engine();
         let p = tcp_syn(
             Ipv4Addr::new(100, 64, 0, 2),
@@ -1105,6 +1115,21 @@ mod tests {
         );
         assert!(matches!(
             e.evaluate(PacketDirection::Inbound, &p, Some("peer"), None, None),
+            EvalResult::Allow
+        ));
+    }
+
+    #[test]
+    fn inbound_tcp_denied_without_peer_identity() {
+        let e = engine();
+        let p = tcp_syn(
+            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(100, 64, 0, 1),
+            443,
+            12345,
+        );
+        assert!(matches!(
+            e.evaluate(PacketDirection::Inbound, &p, None, None, None),
             EvalResult::Deny
         ));
     }
