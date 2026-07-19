@@ -1,127 +1,57 @@
-name: CI
+name: "CodeQL Advanced"
 
 on:
   push:
-    branches: [main]
+    branches: ["main"]
+    paths-ignore:
+      - "apps/docs/**"
+      - "**.md"
   pull_request:
-    branches: [main]
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-env:
-  RUST_TOOLCHAIN: "1.97"
-  CARGO_TERM_COLOR: always
+    branches: ["main"]
+    paths-ignore:
+      - "apps/docs/**"
+      - "**.md"
+  schedule:
+    - cron: "28 20 * * 5"
 
 jobs:
-  detect-changes:
-    name: Detect Changes
+  analyze:
+    name: Analyze (${{ matrix.language }})
     runs-on: [self-host-linux]
-    outputs:
-      typescript: ${{ steps.filter.outputs.typescript }}
-      rust: ${{ steps.filter.outputs.rust }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            typescript:
-              - '**/*.{js,ts,jsx,tsx,json,jsonc,css,mjs,cjs}'
-              - 'bun.lockb'
-              - 'package.json'
-            rust:
-              - '**/*.rs'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
 
-  lint-ts:
-    name: Lint TypeScript
-    needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.typescript == 'true' }}
-    runs-on: [self-host-linux]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          cache: bun
-      - run: bun install --frozen-lockfile
-      - run: bun run check
-
-  test-ts:
-    name: Test TypeScript
-    needs: [detect-changes, lint-ts]
-    if: ${{ needs.detect-changes.outputs.typescript == 'true' }}
-    runs-on: [self-host-linux]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-        with:
-          cache: bun
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: swatinem/rust-cache@v2
-
-      - run: bun install --frozen-lockfile
-      - run: bun run test
-
-  lint-rs:
-    name: Lint Rust
-    needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.rust == 'true' }}
-    runs-on: [self-host-linux]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy, rustfmt
-
-      - uses: swatinem/rust-cache@v2
-
-      - run: cargo fmt -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  features-rs:
-    name: Feature Matrix (tunnet-core)
-    needs: detect-changes
-    if: ${{ needs.detect-changes.outputs.rust == 'true' }}
-    runs-on: [self-host-linux]
     strategy:
       fail-fast: false
       matrix:
-        features:
-          - "--no-default-features --features managed"
-          - "--no-default-features --features direct"
-          - "--all-features"
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js v24
+        uses: actions/setup-node@v4
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: swatinem/rust-cache@v2
-      - run: cargo check -p tunnet-core ${{ matrix.features }}
-      - run: cargo check -p tunnet --features managed
+          node-version: "24"
 
-  test-rs:
-    name: Test Rust
-    needs: [detect-changes, lint-rs]
-    if: ${{ needs.detect-changes.outputs.rust == 'true' }}
-    runs-on: [self-host-linux]
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config: |
+            paths-ignore:
+              - 'apps/docs/**'
 
-      - uses: swatinem/rust-cache@v2
-
-      - run: cargo test --workspace
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{matrix.language}}"
