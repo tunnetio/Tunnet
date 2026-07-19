@@ -197,6 +197,7 @@ impl ProtocolHandler for AuthHandler {
         let (Some(auth), Some(resolver)) = (self.direct_auth.clone(), self.secret_resolver.clone())
         else {
             tracing::debug!("AUTH_ALPN ignored (not in Direct mode)");
+            conn.close(0u32.into(), b"not_direct");
             return Ok(());
         };
         match run_psk_handshake_server(&conn, resolver, &self.self_endpoint_id, &auth).await {
@@ -207,14 +208,17 @@ impl ProtocolHandler for AuthHandler {
                     &self.state_dir,
                     docs_ref,
                     &self.self_endpoint_id,
+                    network_id,
                 )
                 .await
                 {
-                    tracing::debug!(?e, "post-auth handle");
+                    tracing::warn!(?e, %network_id, "post-auth handle failed");
                 }
+                conn.close(0u32.into(), b"done");
             }
             Err(e) => {
                 tracing::debug!(?e, "direct auth handshake failed");
+                conn.close(401u32.into(), b"auth_failed");
             }
         }
         Ok(())

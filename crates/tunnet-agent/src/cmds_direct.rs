@@ -198,33 +198,68 @@ fn hostname_arg(explicit: Option<String>) -> String {
         .unwrap_or_else(|| "tunnet-node".into())
 }
 
+async fn write_post_auth_response(
+    send: &mut iroh::endpoint::SendStream,
+    resp: &[u8],
+) -> anyhow::Result<()> {
+    let len = (resp.len() as u32).to_be_bytes();
+    send.write_all(&len).await?;
+    send.write_all(resp).await?;
+    send.finish()?;
+    // Ensure the peer can finish reading before this connection is torn down.
+    let _ = send.stopped().await;
+    Ok(())
+}
+
+fn post_auth_deny(reason: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "accepted": false,
+        "reason": reason,
+        "status": "denied",
+    }))
+    .unwrap_or_else(|_| b"{\"accepted\":false,\"reason\":\"internal\"}".to_vec())
+}
+
 pub async fn try_handle_post_auth(
     conn: &iroh::endpoint::Connection,
     state_dir: &std::path::Path,
     docs: Option<&DocsMembership>,
     self_endpoint_id: &str,
+    network_id: uuid::Uuid,
 ) -> anyhow::Result<()> {
     let paths = StatePaths {
         dir: state_dir.to_path_buf(),
     };
     let policy = SealPolicy::from_env_and_flag(false);
+
+    // Client opens a bi after PSK; wait briefly.
+    let (mut send, mut recv) =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(e)) => anyhow::bail!("accept post-auth stream: {e}"),
+            Err(_) => anyhow::bail!("timed out waiting for post-auth stream from peer"),
+        };
+
     let Ok((_identity, persisted, _)) = load_agent(&paths, policy) else {
+        write_post_auth_response(&mut send, &post_auth_deny("coordinator_state_unavailable"))
+            .await?;
         return Ok(());
     };
-    let Ok(direct) = persisted.require_direct_network(None) else {
+    let Some(direct) = persisted.direct_by_id(network_id) else {
+        write_post_auth_response(&mut send, &post_auth_deny("unknown_network")).await?;
         return Ok(());
     };
 
-    // Client opens a bi after PSK; wait briefly.
-    let Ok(Ok((mut send, mut recv))) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await
-    else {
-        return Ok(());
-    };
     let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
+    if let Err(e) = recv.read_exact(&mut len_buf).await {
+        write_post_auth_response(&mut send, &post_auth_deny("bad_request"))
+            .await
+            .ok();
+        anyhow::bail!("read post-auth length: {e}");
+    }
     let n = u32::from_be_bytes(len_buf) as usize;
     if n > 64 * 1024 {
+        write_post_auth_response(&mut send, &post_auth_deny("request_too_large")).await?;
         anyhow::bail!("post-auth request too large");
     }
     let mut body = vec![0u8; n];
@@ -237,6 +272,7 @@ pub async fn try_handle_post_auth(
         "join_request" if direct.coordinator => {
             handle_join_request_bytes(&paths, direct, docs, &body).await?
         }
+        "join_request" => post_auth_deny("not_coordinator"),
         "connect_request" => {
             let allowlist = tunnet_core::direct::connect::load_allowlist_from_dir(state_dir);
             let (_accepted, resp_bytes) = tunnet_core::direct::connect::handle_inbound_connect(
@@ -261,12 +297,10 @@ pub async fn try_handle_post_auth(
             }
             return Ok(());
         }
-        _ => return Ok(()),
+        _ => post_auth_deny("unknown_request"),
     };
 
-    let len = (resp.len() as u32).to_be_bytes();
-    send.write_all(&len).await?;
-    send.write_all(&resp).await?;
+    write_post_auth_response(&mut send, &resp).await?;
     Ok(())
 }
 
@@ -438,61 +472,77 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         .await
         .context("bind join endpoint")?;
 
-    let coord: iroh::EndpointId = invite
-        .coordinator
-        .parse()
-        .context("invalid coordinator endpoint id in invite")?;
-    let conn = endpoint
-        .connect(coord, AUTH_ALPN)
-        .await
-        .context("connect to coordinator")?;
-    run_psk_handshake_client(&conn, network_id, &invite.secret, &my_id)
-        .await
-        .context("PSK auth with coordinator")?;
+    let join_result = async {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await {
+            Ok(()) => tracing::info!("join endpoint online"),
+            Err(_) => tracing::warn!("relay not ready yet; attempting join connect anyway"),
+        }
 
-    // Send join request over the same connection.
-    let (mut send, mut recv) = conn.open_bi().await?;
-    let req = serde_json::json!({
-        "type": "join_request",
-        "endpoint_id": my_id,
-        "hostname": hostname,
-        "ipv4": assigned_ipv4.to_string(),
-        "collision_index": collision_index,
-        "invite_id": invite.invite_id,
-    });
-    let bytes = serde_json::to_vec(&req)?;
-    let len = (bytes.len() as u32).to_be_bytes();
-    send.write_all(&len).await?;
-    send.write_all(&bytes).await?;
+        let coord: iroh::EndpointId = invite
+            .coordinator
+            .parse()
+            .context("invalid coordinator endpoint id in invite")?;
+        let conn = endpoint
+            .connect(coord, AUTH_ALPN)
+            .await
+            .context("connect to coordinator")?;
+        run_psk_handshake_client(&conn, network_id, &invite.secret, &my_id)
+            .await
+            .context("PSK auth with coordinator")?;
 
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let n = u32::from_be_bytes(len_buf) as usize;
-    let mut body = vec![0u8; n];
-    recv.read_exact(&mut body).await?;
-    let resp: serde_json::Value = serde_json::from_slice(&body)?;
-    if resp.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
-        let reason = resp
-            .get("reason")
+        // Send join request over the same connection.
+        let (mut send, mut recv) = conn.open_bi().await.context("open join stream")?;
+        let req = serde_json::json!({
+            "type": "join_request",
+            "endpoint_id": my_id,
+            "hostname": hostname,
+            "ipv4": assigned_ipv4.to_string(),
+            "collision_index": collision_index,
+            "invite_id": invite.invite_id,
+            "reusable": invite.reusable,
+        });
+        let bytes = serde_json::to_vec(&req)?;
+        let len = (bytes.len() as u32).to_be_bytes();
+        send.write_all(&len).await.context("write join request")?;
+        send.write_all(&bytes).await.context("write join request")?;
+        send.finish().context("finish join request")?;
+
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf)
+            .await
+            .context("read join response (is the coordinator agent running `tunnet run`?)")?;
+        let n = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; n];
+        recv.read_exact(&mut body)
+            .await
+            .context("read join response body")?;
+        let resp: serde_json::Value = serde_json::from_slice(&body)?;
+        if resp.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
+            let reason = resp
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("denied");
+            anyhow::bail!("join denied: {reason}");
+        }
+        if let Some(ip) = resp.get("ipv4").and_then(|v| v.as_str()) {
+            assigned_ipv4 = ip.parse().unwrap_or(assigned_ipv4);
+        }
+        if let Some(ci) = resp.get("collision_index").and_then(|v| v.as_u64()) {
+            collision_index = ci as u8;
+        }
+        let doc_ticket = resp
+            .get("doc_ticket")
             .and_then(|v| v.as_str())
-            .unwrap_or("denied");
-        anyhow::bail!("join denied: {reason}");
+            .map(str::to_string)
+            .context(
+                "coordinator did not return a doc_ticket (is `tunnet run` up on the coordinator?)",
+            )?;
+        Ok::<_, anyhow::Error>(doc_ticket)
     }
-    if let Some(ip) = resp.get("ipv4").and_then(|v| v.as_str()) {
-        assigned_ipv4 = ip.parse().unwrap_or(assigned_ipv4);
-    }
-    if let Some(ci) = resp.get("collision_index").and_then(|v| v.as_u64()) {
-        collision_index = ci as u8;
-    }
-    let doc_ticket = resp
-        .get("doc_ticket")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .context(
-            "coordinator did not return a doc_ticket (is `tunnet run` up on the coordinator?)",
-        )?;
+    .await;
 
     endpoint.close().await;
+    let doc_ticket = join_result?;
 
     let mut networks = existing_networks;
     networks.push(DirectState {
@@ -569,11 +619,25 @@ pub async fn handle_join_request_bytes(
         .get("invite_id")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let reusable = req
+        .get("reusable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let approved = load_approved(paths).unwrap_or_default();
     let pre_approved = approved.iter().any(|id| id == &endpoint_id);
 
-    if !direct.open && !pre_approved && invite_id.is_none() {
+    let issued =
+        tunnet_core::direct::admin::load_invite_ids(paths, direct.network_id).unwrap_or_default();
+    let invite_ok = invite_id.as_ref().is_some_and(|id| issued.contains(id));
+
+    if !direct.open && !pre_approved && !invite_ok {
+        if invite_id.is_some() {
+            return Ok(serde_json::to_vec(&serde_json::json!({
+                "accepted": false,
+                "reason": "invalid_or_used_invite",
+            }))?);
+        }
         push_pending(
             paths,
             direct.network_id,
@@ -621,6 +685,13 @@ pub async fn handle_join_request_bytes(
         let mut ids = approved;
         ids.retain(|id| id != &endpoint_id);
         let _ = save_approved(paths, &ids);
+    }
+
+    // Consume one-time invites after a successful ticket issue.
+    if !reusable && let Some(id) = invite_id.as_ref() {
+        let mut ids = issued;
+        ids.remove(id);
+        let _ = tunnet_core::direct::admin::save_invite_ids(paths, direct.network_id, &ids);
     }
 
     let _ = (hostname,); // joiner publishes hostname itself via docs
