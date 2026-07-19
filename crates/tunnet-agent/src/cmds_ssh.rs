@@ -3,8 +3,7 @@
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
 use tokio::io::AsyncWriteExt;
-use tunnet_core::ipc::IpcClient;
-use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse};
+use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse, format_ipc_error};
 use tunnet_core::state::StatePaths;
 
 use crate::ssh::known_hosts_path;
@@ -108,7 +107,10 @@ pub async fn run_ssh(args: SshArgs) -> anyhow::Result<()> {
 }
 
 async fn ipc_request(_state_dir: Option<&str>, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    IpcClient::connect().request(req).await
+    crate::cmds::ipc_or_err(_state_dir)
+        .await?
+        .request(req)
+        .await
 }
 
 async fn run_sessions(
@@ -145,7 +147,7 @@ async fn run_sessions(
             }
             Ok(())
         }
-        IpcResponse::Error { message } => bail!("{message}"),
+        IpcResponse::Error { code, message } => bail!("{}", format_ipc_error(&code, &message)),
         other => bail!("unexpected IPC response: {other:?}"),
     }
 }
@@ -172,7 +174,7 @@ async fn run_recordings(limit: u32, state_dir: Option<String>) -> anyhow::Result
             }
             Ok(())
         }
-        IpcResponse::Error { message } => bail!("{message}"),
+        IpcResponse::Error { code, message } => bail!("{}", format_ipc_error(&code, &message)),
         other => bail!("unexpected IPC response: {other:?}"),
     }
 }
@@ -187,7 +189,7 @@ async fn run_play(session_id: String, state_dir: Option<String>) -> anyhow::Resu
     .await?;
     let cast = match resp {
         IpcResponse::SshCast { cast_text, .. } => cast_text,
-        IpcResponse::Error { message } => bail!("{message}"),
+        IpcResponse::Error { code, message } => bail!("{}", format_ipc_error(&code, &message)),
         other => bail!("unexpected IPC response: {other:?}"),
     };
     play_cast(&cast).await

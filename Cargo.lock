@@ -8134,6 +8134,7 @@ dependencies = [
  "chrono",
  "clap",
  "hex",
+ "iroh",
  "metrics",
  "metrics-exporter-prometheus",
  "serde",
@@ -8150,24 +8151,13 @@ dependencies = [
 name = "tunnet-node-napi"
 version = "0.7.0"
 dependencies = [
- "anyhow",
- "bytes",
- "chrono",
- "futures-util",
- "hex",
- "iroh",
- "iroh-blobs",
  "napi",
  "napi-build",
  "napi-derive",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tunnet-common",
- "tunnet-core",
- "uuid",
+ "tunnet",
 ]
 
 [[package]]

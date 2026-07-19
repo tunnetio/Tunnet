@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use anyhow::Context;
-use tunnet_common::TUNNEL_ALPN;
 use tunnet_core::direct::SecretResolver;
 use tunnet_core::ipc::{AgentIpcState, DataPlaneHandle, spawn_ipc_server};
 use tunnet_core::{CoreNode, CoreNodeConfig};
@@ -13,9 +12,10 @@ use uuid::Uuid;
 use crate::accept::AcceptDeps;
 use crate::cli::RunArgs;
 use crate::dataplane::{
-    ControllerSpawn, DataPlaneConfig, TunSlot, build_initial_plane, spawn_controller,
+    ControllerSpawn, DataPlaneConfig, TunSlot, TunSlotState, build_initial_plane, spawn_controller,
     spawn_outbound,
 };
+use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::recorder::{RecordingStore, recordings_dir};
 use crate::tun_io::build_tun;
@@ -106,9 +106,12 @@ pub async fn run(
             enable_mdns: agent_cfg.effective_mdns_default() && !args.no_mdns,
             enable_gossip: !args.disable_gossip || agent_cfg.effective_service_relay(),
             keep_alive: if is_direct { args.keep_alive } else { true },
+            effective_config: Some(config_store.clone()),
         },
     )
     .await?;
+
+    let config_store = node.effective_config.clone();
 
     if let Some(posture) = posture_runtime {
         if let Some(tx) = node.serves.client_tx() {
@@ -188,7 +191,11 @@ pub async fn run(
     )?);
     crate::system_firewall::configure(&args.ifname);
     let _ = crate::magic_dns::ensure_magic_dns_addr(&args.ifname, dns_cfg.magic_ip);
-    let tun_slot: TunSlot = Arc::new(tokio::sync::RwLock::new(Some(tun.clone())));
+    let tun_slot: TunSlot = Arc::new(tokio::sync::RwLock::new(TunSlotState {
+        device: Some(tun.clone()),
+        generation: 0,
+    }));
+    let ingress = IngressRegistry::new();
 
     crate::forward::ensure_ip_forwarding(!node.routes.advertised_subnets().is_empty());
 
@@ -203,9 +210,8 @@ pub async fn run(
         tracing::info!("session recorder enabled (ALPN tunnet/recording/1)");
     }
 
-    let stream_handler = crate::stream_proxy::stream_handler(node.routes.clone());
-    let dgram_pool =
-        tunnet_core::ConnPool::with_shared_policy(node.endpoint.clone(), TUNNEL_ALPN, &node.pool);
+    let stream_handler = tunnet_core::stream_handler(node.routes.clone());
+    let dgram_pool = node.tunnel_pool.clone();
 
     let firewalls: HashMap<_, _> = node
         .direct
@@ -227,6 +233,7 @@ pub async fn run(
         spoofs.clone(),
         metrics.clone(),
         node.direct_auth.clone(),
+        ingress.clone(),
     );
 
     let docs_map: HashMap<_, _> = node
@@ -303,7 +310,7 @@ pub async fn run(
         }
     }
 
-    crate::accept::spawn(AcceptDeps {
+    let _router = crate::accept::spawn(AcceptDeps {
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
         acl: node.acl.clone(),
@@ -324,6 +331,7 @@ pub async fn run(
         spoofs,
         dgram_pool: dgram_pool.clone(),
         agent_gossip: node.gossip.clone(),
+        ingress: ingress.clone(),
     });
 
     let dns_bind = tunnet_core::dns_stub::bind_addr(dns_cfg.magic_ip);
@@ -395,6 +403,7 @@ pub async fn run(
         },
         peer_dns_active: peer_dns_active.clone(),
         initial,
+        ingress,
     });
 
     let ipc_state = Arc::new(AgentIpcState {

@@ -45,7 +45,7 @@ export function getMachinePresence(
   if (device.status === "pending") return "pending";
 
   // Active control-plane WebSocket session. Do not age into "stale" from a
-  // frozen lastHeartbeatAt in the browser — heartbeats used to update only
+  // frozen lastHeartbeatAt in the browser - heartbeats used to update only
   // the DB, so the UI falsely showed Stale ~45s after page load.
   if (device.agentConnected) {
     return "online";

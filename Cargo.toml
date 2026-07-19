@@ -18,8 +18,8 @@ members = [
 [workspace.package]
 version = "0.7.0"
 edition = "2024"
-rust-version = "1.96"
-license = "Apache-2.0"
+rust-version = "1.97"
+license = "AGPL-3.0"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -128,7 +128,6 @@ napi-build = "2"
 # Local
 tunnet-common = { version = "0.7.0", path = "crates/tunnet-common" }
 tunnet-core = { version = "0.7.0", path = "crates/tunnet-core" }
-tunnet = { version = "0.2.0", path = "crates/tunnet" }
 tunnet-posture = { version = "0.7.0", path = "crates/tunnet-posture" }
 tunnet-policy-engine = { version = "0.7.0", path = "crates/tunnet-policy-engine" }
 yaml_serde = "0.10.4"

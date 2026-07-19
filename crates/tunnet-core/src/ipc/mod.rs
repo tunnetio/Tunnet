@@ -1,4 +1,4 @@
-//! Agent IPC v2 - local request/response protocol for the Tunnet CLI.
+//! Agent IPC v3 - local request/response protocol for the Tunnet CLI.
 //!
 //! See [`protocol`] for wire types, [`server`] for the agent-side listener,
 //! and [`client`] for CLI usage.

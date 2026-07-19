@@ -206,7 +206,13 @@ async fn soft_expire_device(
         .await;
 
     for (network_id,) in memberships {
-        pg_notify::emit_network_changed(pool, network_id).await?;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM networks WHERE id = $1")
+            .bind(network_id)
+            .fetch_one(pool)
+            .await?;
+        ws_hub
+            .notify_peer_left(network_id, endpoint_id, version as u64)
+            .await;
     }
     pg_notify::emit_org_changed(pool, organization_id).await?;
 
@@ -276,7 +282,13 @@ async fn hard_delete_device(
     .await;
 
     for (network_id,) in memberships {
-        pg_notify::emit_network_changed(pool, network_id).await?;
+        let version: i64 = sqlx::query_scalar("SELECT version FROM networks WHERE id = $1")
+            .bind(network_id)
+            .fetch_one(pool)
+            .await?;
+        ws_hub
+            .notify_peer_left(network_id, endpoint_id, version as u64)
+            .await;
     }
     pg_notify::emit_org_changed(pool, organization_id).await?;
 

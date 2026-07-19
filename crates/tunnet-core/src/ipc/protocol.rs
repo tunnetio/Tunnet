@@ -1,4 +1,4 @@
-//! Agent IPC v2 - newline-delimited JSON request/response over a local socket.
+//! Agent IPC v3 - newline-delimited JSON request/response over a local socket.
 //!
 //! Every `tunnet <subcommand>` that is not bootstrap (`enroll` / `reset`) talks
 //! to the running agent through this protocol. The agent owns CoreNode; the CLI
@@ -9,19 +9,25 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version - bump when breaking request/response shapes.
-pub const IPC_VERSION: u32 = 2;
+pub const IPC_VERSION: u32 = 3;
+
+/// Structured IPC error codes for actionable CLI messaging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcErrorCode {
+    /// Client-side only: agent IPC socket unreachable.
+    AgentNotRunning,
+    DataPlaneDown,
+    NotEnrolled,
+    NotFound,
+    Denied,
+    InvalidRequest,
+    Internal,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IpcRequest {
-    /// Legacy: open a bidirectional byte stream to a peer:port (FD handoff).
-    OpenStream {
-        host: String,
-        port: u16,
-    },
-    /// Legacy: list mesh peers.
-    ListPeers,
-
     /// Agent + network health summary. When `peers` is true, include peer table.
     Status {
         #[serde(default)]
@@ -281,9 +287,6 @@ fn default_true() -> bool {
 #[allow(clippy::large_enum_variant)]
 pub enum IpcResponse {
     Ready,
-    Peers {
-        peers: Vec<PeerLite>,
-    },
     Status(StatusInfo),
     DnsStatus(DnsStatusInfo),
     Routes(RoutesInfo),
@@ -365,8 +368,28 @@ pub enum IpcResponse {
         message: String,
     },
     Error {
+        code: IpcErrorCode,
         message: String,
     },
+}
+
+/// Format an IPC error for CLI display.
+pub fn format_ipc_error(code: &IpcErrorCode, message: &str) -> String {
+    match code {
+        IpcErrorCode::AgentNotRunning => {
+            "agent is not running (start with `tunnet up` / service)".into()
+        }
+        IpcErrorCode::DataPlaneDown => {
+            format!("{message} (bring data plane up with `tunnet up`)")
+        }
+        IpcErrorCode::NotEnrolled => {
+            format!("{message} (enroll or join a network first)")
+        }
+        IpcErrorCode::NotFound => message.to_string(),
+        IpcErrorCode::Denied => message.to_string(),
+        IpcErrorCode::InvalidRequest => message.to_string(),
+        IpcErrorCode::Internal => message.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -676,4 +699,16 @@ pub struct SendConfigInfo {
 /// Convenience: self IPv4 as string for status.
 pub fn ip_str(ip: Ipv4Addr) -> String {
     ip.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_agent_not_running() {
+        let msg = format_ipc_error(&IpcErrorCode::AgentNotRunning, "ignored");
+        assert!(msg.contains("agent is not running"));
+        assert!(msg.contains("tunnet up"));
+    }
 }

@@ -23,6 +23,9 @@ pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUFFER_PACKETS: usize = 64;
 pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
+type DialResult = Result<Connection, Arc<str>>;
+type DialWaiters = tokio::sync::broadcast::Sender<DialResult>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnState {
     Connected,
@@ -56,6 +59,8 @@ struct PeerSlot {
     peer_keep_alive: bool,
     buffer: VecDeque<Bytes>,
     buffer_bytes: usize,
+    /// Shared dial in flight: first waiter dials, others subscribe and await the result.
+    dial_waiters: Option<DialWaiters>,
 }
 
 impl PeerSlot {
@@ -67,6 +72,7 @@ impl PeerSlot {
             peer_keep_alive: false,
             buffer: VecDeque::new(),
             buffer_bytes: 0,
+            dial_waiters: None,
         }
     }
 
@@ -95,6 +101,13 @@ impl PeerSlot {
         self.buffer.clear();
         self.buffer_bytes = 0;
         n
+    }
+
+    fn live_conn(&self) -> Option<Connection> {
+        self.conn
+            .as_ref()
+            .filter(|c| c.close_reason().is_none())
+            .cloned()
     }
 }
 
@@ -174,8 +187,11 @@ impl ConnPool {
     }
 
     /// Create a pool that shares keep-alive / idle policy with `other` (different ALPN).
+    ///
+    /// Does **not** spawn an idle sweeper - only [`Self::new`] owns the sweeper for a
+    /// given policy Arc.
     pub fn with_shared_policy(endpoint: Endpoint, alpn: &'static [u8], other: &ConnPool) -> Self {
-        let pool = Self {
+        Self {
             endpoint,
             alpn,
             entries: Arc::new(DashMap::new()),
@@ -185,9 +201,7 @@ impl ConnPool {
             bytes_in: other.bytes_in.clone(),
             bytes_out: other.bytes_out.clone(),
             tunnel_hook: Arc::new(Mutex::new(None)),
-        };
-        pool.spawn_idle_sweeper();
-        pool
+        }
     }
 
     /// Register a hook invoked whenever this pool dials a tunnel connection.
@@ -207,9 +221,7 @@ impl ConnPool {
     pub async fn adopt(&self, peer: EndpointId, conn: Connection) {
         let slot = self.slot(peer);
         let mut guard = slot.lock().await;
-        if let Some(existing) = guard.conn.as_ref()
-            && existing.close_reason().is_none()
-        {
+        if guard.live_conn().is_some() {
             guard.touch();
             return;
         }
@@ -341,30 +353,120 @@ impl ConnPool {
         }
 
         let slot = self.slot(peer);
+        let mut waiter_rx = None;
+        let mut am_dialer = false;
         {
             let mut guard = slot.lock().await;
-            if let Some(c) = guard.conn.clone() {
-                if c.close_reason().is_none() {
-                    guard.touch();
-                    guard.state = PeerConnState::Connected;
-                    return Ok(c);
-                }
+            if let Some(c) = guard.live_conn() {
+                guard.touch();
+                guard.state = PeerConnState::Connected;
+                return Ok(c);
+            }
+            if guard.conn.is_some() {
                 tracing::info!(%peer, "cached connection dead, reconnecting");
                 guard.conn = None;
             }
-            guard.state = PeerConnState::Reconnecting;
+            if let Some(tx) = &guard.dial_waiters {
+                waiter_rx = Some(tx.subscribe());
+            } else {
+                let (tx, _) = tokio::sync::broadcast::channel(1);
+                guard.dial_waiters = Some(tx);
+                guard.state = PeerConnState::Reconnecting;
+                am_dialer = true;
+            }
         }
+
+        if let Some(mut rx) = waiter_rx {
+            match rx.recv().await {
+                Ok(Ok(c)) => return Ok(c),
+                Ok(Err(e)) => anyhow::bail!("{e}"),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let guard = slot.lock().await;
+                    if let Some(c) = guard.live_conn() {
+                        return Ok(c);
+                    }
+                    // Dialer vanished without a result - retry as dialer.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let guard = slot.lock().await;
+                    if let Some(c) = guard.live_conn() {
+                        return Ok(c);
+                    }
+                }
+            }
+            // Fall through: become dialer if nobody else is dialing.
+            let mut guard = slot.lock().await;
+            if let Some(c) = guard.live_conn() {
+                return Ok(c);
+            }
+            if guard.dial_waiters.is_some() {
+                drop(guard);
+                return Box::pin(self.get_alpn(peer, alpn)).await;
+            }
+            let (tx, _) = tokio::sync::broadcast::channel(1);
+            guard.dial_waiters = Some(tx);
+            guard.state = PeerConnState::Reconnecting;
+            am_dialer = true;
+        }
+
+        debug_assert!(am_dialer);
+        let _ = am_dialer;
 
         let start = Instant::now();
         self.metrics
             .reconnect_attempts
             .fetch_add(1, Ordering::Relaxed);
         tracing::info!(%peer, alpn = %String::from_utf8_lossy(alpn), "dialing peer");
-        let conn = match tokio::time::timeout(RECONNECT_TIMEOUT, self.endpoint.connect(peer, alpn))
-            .await
+        let dial_result: Result<Connection, Arc<str>> = match tokio::time::timeout(
+            RECONNECT_TIMEOUT,
+            self.endpoint.connect(peer, alpn),
+        )
+        .await
         {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(e)) => Err(Arc::from(format!("connect to {peer}: {e}"))),
+            Err(_) => Err(Arc::from(format!("reconnect to {peer} timed out"))),
+        };
+
+        match dial_result {
+            Ok(conn) => {
+                let latency_us = start.elapsed().as_micros() as u64;
+                self.metrics
+                    .reconnect_success
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .reconnect_latency_sum_us
+                    .fetch_add(latency_us, Ordering::Relaxed);
+                let max = self
+                    .metrics
+                    .reconnect_latency_max_us
+                    .load(Ordering::Relaxed);
+                if latency_us > max {
+                    self.metrics
+                        .reconnect_latency_max_us
+                        .store(latency_us, Ordering::Relaxed);
+                }
+
+                let buffered = {
+                    let mut guard = slot.lock().await;
+                    guard.conn = Some(conn.clone());
+                    guard.state = PeerConnState::Connected;
+                    guard.touch();
+                    if let Some(tx) = guard.dial_waiters.take() {
+                        let _ = tx.send(Ok(conn.clone()));
+                    }
+                    guard.take_buf()
+                };
+
+                for pkt in buffered {
+                    if let Err(e) = send_datagram(&conn, pkt).await {
+                        tracing::warn!(%peer, ?e, "flush buffered datagram failed");
+                    }
+                }
+                self.fire_tunnel_hook(peer, conn.clone());
+                Ok(conn)
+            }
+            Err(err) => {
                 self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
                 let mut guard = slot.lock().await;
                 let dropped = guard.drop_buf();
@@ -372,52 +474,12 @@ impl ConnPool {
                     .packets_dropped_timeout
                     .fetch_add(dropped as u64, Ordering::Relaxed);
                 guard.state = PeerConnState::Suspended;
-                return Err(e).with_context(|| format!("connect to {peer}"));
-            }
-            Err(_) => {
-                self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
-                let mut guard = slot.lock().await;
-                let dropped = guard.drop_buf();
-                self.metrics
-                    .packets_dropped_timeout
-                    .fetch_add(dropped as u64, Ordering::Relaxed);
-                guard.state = PeerConnState::Suspended;
-                anyhow::bail!("reconnect to {peer} timed out");
-            }
-        };
-
-        let latency_us = start.elapsed().as_micros() as u64;
-        self.metrics
-            .reconnect_success
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .reconnect_latency_sum_us
-            .fetch_add(latency_us, Ordering::Relaxed);
-        let max = self
-            .metrics
-            .reconnect_latency_max_us
-            .load(Ordering::Relaxed);
-        if latency_us > max {
-            self.metrics
-                .reconnect_latency_max_us
-                .store(latency_us, Ordering::Relaxed);
-        }
-
-        let buffered = {
-            let mut guard = slot.lock().await;
-            guard.conn = Some(conn.clone());
-            guard.state = PeerConnState::Connected;
-            guard.touch();
-            guard.take_buf()
-        };
-
-        for pkt in buffered {
-            if let Err(e) = send_datagram(&conn, pkt) {
-                tracing::warn!(%peer, ?e, "flush buffered datagram failed");
+                if let Some(tx) = guard.dial_waiters.take() {
+                    let _ = tx.send(Err(err.clone()));
+                }
+                anyhow::bail!("{err}")
             }
         }
-        self.fire_tunnel_hook(peer, conn.clone());
-        Ok(conn)
     }
 
     async fn get_extra(&self, peer: EndpointId, alpn: &'static [u8]) -> anyhow::Result<Connection> {
@@ -447,12 +509,12 @@ impl ConnPool {
         let slot = self.slot(peer);
         {
             let mut guard = slot.lock().await;
-            if let Some(c) = guard.conn.clone() {
-                if c.close_reason().is_none() {
-                    guard.touch();
-                    drop(guard);
-                    return send_datagram(&c, packet);
-                }
+            if let Some(c) = guard.live_conn() {
+                guard.touch();
+                drop(guard);
+                return send_datagram(&c, packet).await;
+            }
+            if guard.conn.is_some() {
                 guard.conn = None;
                 guard.state = PeerConnState::Suspended;
             }
@@ -466,7 +528,7 @@ impl ConnPool {
             self.metrics
                 .packets_buffered
                 .fetch_add(1, Ordering::Relaxed);
-            if guard.state == PeerConnState::Reconnecting {
+            if guard.state == PeerConnState::Reconnecting || guard.dial_waiters.is_some() {
                 return Ok(());
             }
             guard.state = PeerConnState::Reconnecting;
@@ -481,7 +543,7 @@ impl ConnPool {
             && let Ok(mut g) = slot.try_lock()
         {
             g.touch();
-            if g.conn.is_some() {
+            if g.live_conn().is_some() {
                 g.state = PeerConnState::Connected;
             }
         }
@@ -492,12 +554,46 @@ impl ConnPool {
         self.extra.retain(|(p, _), _| *p != peer);
     }
 
+    /// True only if the peer slot has a connection with no close reason.
+    /// If the slot mutex is held, returns true tentatively (likely mid-dial/send).
     pub fn has_live(&self, peer: EndpointId) -> bool {
-        self.entries.contains_key(&peer)
+        let Some(slot) = self.entries.get(&peer) else {
+            return false;
+        };
+        match slot.try_lock() {
+            Ok(g) => g.live_conn().is_some(),
+            Err(_) => true,
+        }
     }
 
     pub fn has_any_live(&self) -> bool {
-        !self.entries.is_empty()
+        self.entries.iter().any(|e| match e.value().try_lock() {
+            Ok(g) => g.live_conn().is_some(),
+            Err(_) => true,
+        })
+    }
+
+    /// Counts live on-demand slots plus aggregated byte counters for heartbeats.
+    pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
+        let active_conns = self
+            .entries
+            .iter()
+            .filter(|e| match e.value().try_lock() {
+                Ok(g) => g.live_conn().is_some(),
+                Err(_) => true,
+            })
+            .count() as u32;
+        let bytes_rx: u64 = self
+            .bytes_in
+            .iter()
+            .map(|e| e.value().load(Ordering::Relaxed))
+            .sum();
+        let bytes_tx: u64 = self
+            .bytes_out
+            .iter()
+            .map(|e| e.value().load(Ordering::Relaxed))
+            .sum();
+        (active_conns, bytes_tx, bytes_rx)
     }
 
     pub fn keep_alive_global(&self) -> bool {
@@ -551,7 +647,7 @@ impl ConnPool {
                 state: g.state.as_str().into(),
                 keep_alive: keep_alive || g.peer_keep_alive,
                 last_activity_secs_ago: g.last_activity.elapsed().as_secs(),
-                live: g.conn.is_some(),
+                live: g.live_conn().is_some(),
                 path: "unknown".into(),
             },
             Err(_) => PeerConnSnapshot {
@@ -569,8 +665,56 @@ impl ConnPool {
     }
 }
 
-pub fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
+/// Send a datagram, waiting for buffer space when congested instead of dropping.
+pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
+    if conn.datagram_send_buffer_space() == 0 {
+        conn.send_datagram_wait(packet)
+            .await
+            .context("send_datagram_wait (datagram buffer full or connection closed)")?;
+        return Ok(());
+    }
     conn.send_datagram(packet)
         .context("send_datagram (packet too big or unsupported)")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    async fn bind_endpoint() -> Endpoint {
+        Endpoint::builder(iroh::endpoint::presets::N0)
+            .bind()
+            .await
+            .expect("bind test endpoint")
+    }
+
+    #[tokio::test]
+    async fn has_live_false_without_entry() {
+        let ep = bind_endpoint().await;
+        let pool = ConnPool::new(ep, b"test/alpn");
+        let peer = SecretKey::generate().public();
+        assert!(!pool.has_live(peer));
+    }
+
+    #[tokio::test]
+    async fn concurrent_get_coalesce_failure() {
+        let ep = bind_endpoint().await;
+        let pool = ConnPool::new(ep, b"test/alpn");
+        let peer = SecretKey::generate().public();
+
+        let p1 = pool.clone();
+        let p2 = pool.clone();
+        let (r1, r2) = tokio::join!(p1.get(peer), p2.get(peer));
+        assert!(r1.is_err(), "expected dial failure");
+        assert!(r2.is_err(), "expected dial failure");
+        // Both should observe the same coalesced failure path (no live conn left).
+        assert!(!pool.has_live(peer));
+        assert_eq!(
+            pool.on_demand_stats().reconnect_fail,
+            1,
+            "only one dialer should record the failure"
+        );
+    }
 }

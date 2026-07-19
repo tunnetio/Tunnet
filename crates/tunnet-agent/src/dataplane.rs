@@ -7,17 +7,23 @@ use anyhow::Context;
 use ipnet::Ipv4Net;
 use parking_lot::Mutex;
 use tun_rs::AsyncDevice;
-use tunnet_common::{DeviceProfile, DnsConfig, TUNNEL_ALPN};
+use tunnet_common::{DeviceProfile, DnsConfig};
 use tunnet_core::ipc::dataplane::DataPlaneCmdRx;
 use tunnet_core::ipc::{DataPlaneHandle, recv_cmd};
 use tunnet_core::{AclEngine, ConnPool, CoreNode, RoutingTable};
 use uuid::Uuid;
 
+use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsGuard;
 use crate::tun_io::{build_tun, run_outbound};
 
-pub type TunSlot = Arc<tokio::sync::RwLock<Option<Arc<AsyncDevice>>>>;
+pub struct TunSlotState {
+    pub device: Option<Arc<AsyncDevice>>,
+    pub generation: u64,
+}
+
+pub type TunSlot = Arc<tokio::sync::RwLock<TunSlotState>>;
 
 pub struct DataPlaneConfig {
     pub ifname: String,
@@ -50,6 +56,7 @@ pub struct ControllerSpawn {
     pub cfg: DataPlaneConfig,
     pub peer_dns_active: Arc<std::sync::atomic::AtomicBool>,
     pub initial: LivePlane,
+    pub ingress: IngressRegistry,
 }
 
 /// Spawns the data-plane controller that listens for up/down IPC commands.
@@ -63,6 +70,7 @@ pub fn spawn_controller(spawn: ControllerSpawn) {
         cfg,
         peer_dns_active,
         initial,
+        ingress,
     } = spawn;
     let state = Arc::new(Mutex::new(Some(initial)));
     tokio::spawn(async move {
@@ -79,7 +87,7 @@ pub fn spawn_controller(spawn: ControllerSpawn) {
                 )
                 .await
             } else {
-                bring_down(&handle, &tun_slot, &cfg, &peer_dns_active, &state).await
+                bring_down(&handle, &tun_slot, &cfg, &peer_dns_active, &state, &ingress).await
             };
             let _ = reply.send(result.map_err(|e| e.to_string()));
         }
@@ -134,6 +142,7 @@ async fn bring_down(
     cfg: &DataPlaneConfig,
     peer_dns_active: &std::sync::atomic::AtomicBool,
     state: &Mutex<Option<LivePlane>>,
+    ingress: &IngressRegistry,
 ) -> anyhow::Result<()> {
     if !handle.is_up() {
         return Ok(());
@@ -143,6 +152,7 @@ async fn bring_down(
         return Ok(());
     };
     live.outbound.abort();
+    ingress.abort_all();
     crate::system_routes::unapply(
         &cfg.ifname,
         &live.device_profile,
@@ -153,7 +163,8 @@ async fn bring_down(
     peer_dns_active.store(false, std::sync::atomic::Ordering::SeqCst);
     {
         let mut slot = tun_slot.write().await;
-        *slot = None;
+        slot.device = None;
+        slot.generation = slot.generation.wrapping_add(1);
     }
     drop(live.tun);
     handle.set_up(false);
@@ -185,7 +196,8 @@ async fn bring_up(
     let _ = crate::magic_dns::ensure_magic_dns_addr(&cfg.ifname, cfg.dns_cfg.magic_ip);
     {
         let mut slot = tun_slot.write().await;
-        *slot = Some(tun.clone());
+        slot.device = Some(tun.clone());
+        slot.generation = slot.generation.wrapping_add(1);
     }
 
     let dns_guard = match crate::system_dns::configure(cfg.dns_cfg.magic_ip, &cfg.dns_cfg.suffix) {
@@ -211,26 +223,10 @@ async fn bring_up(
         .iter()
         .map(|(id, rt)| (*id, rt.firewall.clone()))
         .collect();
-    let spoofs: std::collections::HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-    let dgram_pool = ConnPool::with_shared_policy(node.endpoint.clone(), TUNNEL_ALPN, &node.pool);
-    crate::dgram_pump::install_dialer_datagram_pump(
-        &dgram_pool,
-        tun_slot.clone(),
-        node.routes.clone(),
-        node.acl.clone(),
-        firewalls.clone(),
-        spoofs,
-        metrics.clone(),
-        node.direct_auth.clone(),
-    );
     let outbound = spawn_outbound(
         tun.clone(),
         node.routes.clone(),
-        dgram_pool,
+        node.tunnel_pool.clone(),
         node.acl.clone(),
         firewalls,
         metrics.clone(),
@@ -275,5 +271,9 @@ pub fn spawn_outbound(
 
 #[allow(dead_code)]
 pub async fn tun_or_err(slot: &TunSlot) -> anyhow::Result<Arc<AsyncDevice>> {
-    slot.read().await.clone().context("data plane is down")
+    slot.read()
+        .await
+        .device
+        .clone()
+        .context("data plane is down")
 }

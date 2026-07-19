@@ -31,15 +31,14 @@ pub fn grace_map() -> PostureGraceMap {
 }
 
 #[derive(sqlx::FromRow)]
-struct OrgPostureSettingsRow {
-    mode: String,
-    grace_period_minutes: i32,
-    recheck_on_fail_seconds: i32,
-    notify_user: bool,
-    notify_admin: bool,
-    auto_reauthorize: bool,
-    #[allow(dead_code)]
-    default_src_posture: sqlx::types::Json<Vec<String>>,
+pub(crate) struct OrgPostureSettingsRow {
+    pub mode: String,
+    pub grace_period_minutes: i32,
+    pub recheck_on_fail_seconds: i32,
+    pub notify_user: bool,
+    pub notify_admin: bool,
+    pub auto_reauthorize: bool,
+    pub default_src_posture: sqlx::types::Json<Vec<String>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -335,7 +334,7 @@ async fn load_inherited_posture_definitions(
     Ok(by_name.into_values().collect())
 }
 
-async fn load_settings_row(
+pub(crate) async fn load_settings_row(
     pool: &PgPool,
     organization_id: &str,
     network_id: Option<Uuid>,
@@ -372,7 +371,7 @@ fn mode_rank(mode: &str) -> u8 {
     }
 }
 
-fn to_enforcement(row: OrgPostureSettingsRow) -> PostureEnforcementConfig {
+pub(crate) fn to_enforcement(row: OrgPostureSettingsRow) -> PostureEnforcementConfig {
     PostureEnforcementConfig {
         mode: row.mode,
         grace_period_minutes: row.grace_period_minutes.max(0) as u32,

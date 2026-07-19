@@ -12,6 +12,23 @@ pub const SSH_INTERNAL_PORT: u16 = 30022;
 
 const IPPROTO_TCP: u8 = 6;
 
+/// True when inbound SSH NAT would rewrite this packet (read-only peek).
+pub fn needs_inbound_rewrite(packet: &[u8], self_ip: Ipv4Addr) -> bool {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = (packet[0] & 0x0f) as usize * 4;
+    if packet.len() < ihl + 4 || packet[9] != IPPROTO_TCP {
+        return false;
+    }
+    let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+    if dst != self_ip {
+        return false;
+    }
+    let dport = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+    dport == SSH_EXTERNAL_PORT
+}
+
 /// Rewrite inbound mesh packet: `dst==self && dport==22` → `dport=30022`.
 /// Returns true if the packet was rewritten.
 pub fn rewrite_inbound(packet: &mut [u8], self_ip: Ipv4Addr) -> bool {

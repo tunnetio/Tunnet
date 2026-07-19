@@ -311,6 +311,8 @@ impl RoutingTable {
     }
 
     /// Resolve a PeerDNS name to an IPv4 address (peer mesh IP or synthetic).
+    /// Pure: does not mutate `dynamic_synth`. For wildcard hostname routes the
+    /// caller should [`Self::remember_dns_synth`] so dataplane lookup works.
     pub fn resolve_dns_a(&self, name: &str) -> Option<Ipv4Addr> {
         let tables = self.inner.load();
         let suffix = format!(".{}", tables.dns_suffix);
@@ -352,14 +354,42 @@ impl RoutingTable {
         }
 
         for host in [bare, peer_name] {
-            if let Some(info) = self.lookup_hostname_route(host) {
-                let synth = synthetic_ip_for(host);
-                self.dynamic_synth.insert(synth, info.peer.clone());
-                return Some(synth);
+            if self.lookup_hostname_route(host).is_some() {
+                return Some(synthetic_ip_for(host));
             }
         }
 
         None
+    }
+
+    /// Cache a synthetic IP → peer mapping for a hostname (wildcard routes).
+    /// Survives [`Self::rebuild`] because `dynamic_synth` lives outside the tables Arc.
+    pub fn remember_dns_synth(&self, name: &str, ip: Ipv4Addr) {
+        let tables = self.inner.load();
+        let suffix = format!(".{}", tables.dns_suffix);
+        let lower = name.trim_end_matches('.').to_ascii_lowercase();
+        let bare = lower
+            .strip_suffix(&suffix)
+            .unwrap_or(lower.as_str())
+            .trim_end_matches('.');
+        let network_suffix = if tables.network_name.is_empty() {
+            None
+        } else {
+            Some(format!(".{}", tables.network_name))
+        };
+        let peer_name = network_suffix
+            .as_ref()
+            .and_then(|s| bare.strip_suffix(s.as_str()))
+            .unwrap_or(bare);
+
+        for host in [bare, peer_name] {
+            if let Some(info) = self.lookup_hostname_route(host)
+                && synthetic_ip_for(host) == ip
+            {
+                self.dynamic_synth.insert(ip, info.peer.clone());
+                return;
+            }
+        }
     }
 
     /// Reverse lookup: mesh IP → `hostname[.network].suffix`.
@@ -450,6 +480,54 @@ impl RoutingTable {
     pub fn remove_network(&self, network_id: Uuid) {
         self.slices.lock().remove(&network_id);
         self.rebuild(None);
+    }
+
+    /// Apply a peer membership delta for one network without replacing routes/policy.
+    pub fn apply_peer_delta(
+        &self,
+        network_id: Uuid,
+        added: &[PeerEntry],
+        removed: &[String],
+        version: u64,
+        self_endpoint_id: &str,
+        network_name: &str,
+    ) {
+        {
+            let mut slices = self.slices.lock();
+            let Some(slice) = slices.get_mut(&network_id) else {
+                tracing::debug!(
+                    %network_id,
+                    "apply_peer_delta skipped: no network slice (await full snapshot)"
+                );
+                return;
+            };
+
+            if !network_name.is_empty() {
+                slice.network_name = network_name.to_ascii_lowercase();
+            }
+
+            let removed_set: std::collections::HashSet<&str> =
+                removed.iter().map(String::as_str).collect();
+            slice.peers.retain(|p| {
+                p.endpoint_id != self_endpoint_id && !removed_set.contains(p.endpoint_id.as_str())
+            });
+
+            for peer in added {
+                if peer.endpoint_id == self_endpoint_id {
+                    continue;
+                }
+                if let Some(existing) = slice
+                    .peers
+                    .iter_mut()
+                    .find(|p| p.endpoint_id == peer.endpoint_id)
+                {
+                    *existing = peer.clone();
+                } else {
+                    slice.peers.push(peer.clone());
+                }
+            }
+        }
+        self.rebuild(Some(version));
     }
 
     fn rebuild(&self, version: Option<u64>) {
@@ -634,7 +712,8 @@ impl RoutingTable {
         subnets.sort_by_key(|subnet| std::cmp::Reverse(subnet.0.prefix_len()));
         hostname_wildcards.sort_by_key(|route| std::cmp::Reverse(route.hostname.len()));
 
-        self.dynamic_synth.clear();
+        // Keep dynamic_synth across rebuild - it lives outside the tables Arc so
+        // wildcard DNS answers survive membership/policy refreshes.
         self.inner.store(Arc::new(Tables {
             by_ip,
             by_network_ip,
@@ -917,8 +996,95 @@ mod tests {
             Some("10.7.0.5".parse().unwrap())
         );
         let synth = table.resolve_dns_a("wiki.internal.tunnet").unwrap();
+        table.remember_dns_synth("wiki.internal.tunnet", synth);
         assert_eq!(synth.octets()[0], 100);
         assert_eq!(synth.octets()[1], 100);
+        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+    }
+
+    #[test]
+    fn apply_peer_delta_add_and_remove() {
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let peer_a = "b".repeat(64);
+        let peer_b = "c".repeat(64);
+        let nid = Uuid::nil();
+        table.replace(
+            &[peer(&peer_a, "10.7.0.5", "alice")],
+            &[],
+            &[],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            nid,
+            &self_id,
+            1,
+        );
+        assert!(table.lookup_endpoint(&peer_a).is_some());
+        assert!(table.lookup_endpoint(&peer_b).is_none());
+
+        table.apply_peer_delta(
+            nid,
+            &[peer(&peer_b, "10.7.0.6", "bob")],
+            &[],
+            2,
+            &self_id,
+            "office",
+        );
+        assert_eq!(table.version(), 2);
+        assert!(table.lookup_endpoint(&peer_b).is_some());
+
+        table.apply_peer_delta(
+            nid,
+            &[],
+            std::slice::from_ref(&peer_a),
+            3,
+            &self_id,
+            "office",
+        );
+        assert_eq!(table.version(), 3);
+        assert!(table.lookup_endpoint(&peer_a).is_none());
+        assert!(table.lookup_endpoint(&peer_b).is_some());
+    }
+
+    #[test]
+    fn dynamic_synth_survives_rebuild() {
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let gw = "b".repeat(64);
+        let nid = Uuid::nil();
+        table.replace(
+            &[peer(&gw, "10.7.0.5", "gw")],
+            &[],
+            &[HostnameRoute {
+                hostname: "internal".into(),
+                via_endpoint_id: gw.clone(),
+                via_ip: "10.7.0.5".parse().unwrap(),
+                is_wildcard: true,
+                target_ip: None,
+            }],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            nid,
+            &self_id,
+            1,
+        );
+        let synth = table.resolve_dns_a("api.internal.tunnet").unwrap();
+        table.remember_dns_synth("api.internal.tunnet", synth);
+        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+
+        // Rebuild via peer delta must keep dynamic_synth.
+        table.apply_peer_delta(
+            nid,
+            &[peer(&"d".repeat(64), "10.7.0.7", "dave")],
+            &[],
+            2,
+            &self_id,
+            "office",
+        );
         assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
     }
 

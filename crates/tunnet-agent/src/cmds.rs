@@ -3,7 +3,9 @@
 use anyhow::Context;
 use clap::Args;
 use tunnet_core::ipc::IpcClient;
-use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse, PingProbe, PingSummary, StatusInfo};
+use tunnet_core::ipc::protocol::{
+    IpcErrorCode, IpcRequest, IpcResponse, PingProbe, PingSummary, StatusInfo, format_ipc_error,
+};
 use tunnet_core::{PersistedState, StatePaths};
 
 use crate::output::{self, Output};
@@ -93,6 +95,15 @@ pub struct NetcheckArgs {
 
 async fn client(_state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
     Ok(IpcClient::connect())
+}
+
+/// Connect to the agent IPC socket, or return a clear "agent not running" error.
+pub async fn ipc_or_err(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
+    let ipc = client(state_dir).await?;
+    if !tunnet_core::ipc::endpoint_reachable(ipc.path()).await {
+        anyhow::bail!("{}", format_ipc_error(&IpcErrorCode::AgentNotRunning, ""));
+    }
+    Ok(ipc)
 }
 
 pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
@@ -362,7 +373,7 @@ fn print_status(
         if loopback {
             out.writeln(format!(
                 "             {}",
-                out.yellow("loopback URL — remote VMs must enroll with the host LAN/public URL")
+                out.yellow("loopback URL - remote VMs must enroll with the host LAN/public URL")
             ));
         }
         if let Some(err) = &cp.last_error
@@ -391,7 +402,7 @@ fn print_status(
             out.writeln(format!(
                 "  control    {} {}",
                 out.yellow(url),
-                out.yellow("(loopback — remote VMs cannot reach this)")
+                out.yellow("(loopback - remote VMs cannot reach this)")
             ));
         } else {
             out.writeln(format!("  control    {url}"));
@@ -455,7 +466,7 @@ fn print_status(
 
 pub async fn run_ping(args: PingArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let interval_ms = (args.interval * 1000.0).max(50.0) as u64;
 
     if !out.json {
@@ -486,8 +497,8 @@ pub async fn run_ping(args: PingArgs) -> anyhow::Result<()> {
                 IpcResponse::PingSummary(s) => {
                     summary = Some(s);
                 }
-                IpcResponse::Error { message } if !out.json => {
-                    out.writeln(out.red(&format!("  {message}")));
+                IpcResponse::Error { code, message } if !out.json => {
+                    out.writeln(out.red(&format!("  {}", format_ipc_error(&code, &message))));
                 }
                 _ => {}
             }
@@ -523,7 +534,7 @@ pub async fn run_ping(args: PingArgs) -> anyhow::Result<()> {
 
 pub async fn run_dns_status(args: DnsStatusArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc.request(IpcRequest::DnsStatus).await?;
     let IpcResponse::DnsStatus(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -577,21 +588,23 @@ pub async fn run_validate(args: ValidateArgs) -> anyhow::Result<()> {
 }
 
 pub async fn run_reload(args: ReloadArgs) -> anyhow::Result<()> {
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc.request(IpcRequest::Reload).await?;
     match resp {
         IpcResponse::Ok { message } => {
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
 
 pub async fn run_route_list(args: RouteListArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc.request(IpcRequest::RouteList).await?;
     let IpcResponse::Routes(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -666,7 +679,7 @@ pub async fn run_route_list(args: RouteListArgs) -> anyhow::Result<()> {
 
 pub async fn run_route_add(args: RouteAddArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc
         .request(IpcRequest::RouteAdd {
             cidr: args.cidr,
@@ -692,7 +705,7 @@ pub async fn run_route_add(args: RouteAddArgs) -> anyhow::Result<()> {
 
 pub async fn run_diag(args: DiagArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc.request(IpcRequest::Diag).await?;
     let IpcResponse::Diag(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -737,7 +750,7 @@ pub async fn run_diag(args: DiagArgs) -> anyhow::Result<()> {
 
 pub async fn run_netcheck(args: NetcheckArgs) -> anyhow::Result<()> {
     let out = Output::new(args.json);
-    let ipc = client(args.state_dir.as_deref()).await?;
+    let ipc = ipc_or_err(args.state_dir.as_deref()).await?;
     let resp = ipc.request(IpcRequest::Netcheck).await?;
     let IpcResponse::Netcheck(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -822,7 +835,7 @@ async fn run_serve_start(
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc
         .request(IpcRequest::ServeStart {
             port,
@@ -849,7 +862,7 @@ async fn run_serve_start(
 
 async fn run_serve_status(json: bool, state_dir: Option<&str>) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc.request(IpcRequest::ServeStatus).await?;
     let IpcResponse::Serves { serves } = resp else {
         anyhow::bail!("unexpected response");
@@ -875,7 +888,7 @@ async fn run_serve_status(json: bool, state_dir: Option<&str>) -> anyhow::Result
 
 async fn run_serve_off(port: u16, json: bool, state_dir: Option<&str>) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc.request(IpcRequest::ServeOff { port }).await?;
     let IpcResponse::Serve(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -964,7 +977,7 @@ async fn run_tunnel_start(
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc
         .request(IpcRequest::TunnelStart {
             port,
@@ -989,7 +1002,7 @@ async fn run_tunnel_start(
 
 async fn run_tunnel_status(json: bool, state_dir: Option<&str>) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc.request(IpcRequest::TunnelStatus).await?;
     let IpcResponse::Tunnels { tunnels } = resp else {
         anyhow::bail!("unexpected response");
@@ -1016,7 +1029,7 @@ async fn run_tunnel_status(json: bool, state_dir: Option<&str>) -> anyhow::Resul
 
 async fn run_tunnel_off(port: u16, json: bool, state_dir: Option<&str>) -> anyhow::Result<()> {
     let out = Output::new(json);
-    let ipc = client(state_dir).await?;
+    let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc.request(IpcRequest::TunnelOff { port }).await?;
     let IpcResponse::Tunnel(info) = resp else {
         anyhow::bail!("unexpected response");
@@ -1056,7 +1069,7 @@ fn fmt_bytes(n: u64) -> String {
 /// Shared helper kept for future serve/tunnel CLI modules.
 #[allow(dead_code)]
 pub async fn ensure_agent(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
-    client(state_dir).await.context("agent IPC unavailable")
+    ipc_or_err(state_dir).await
 }
 
 pub async fn run_up(state_dir: Option<&str>) -> anyhow::Result<()> {
@@ -1066,7 +1079,9 @@ pub async fn run_up(state_dir: Option<&str>) -> anyhow::Result<()> {
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -1078,20 +1093,11 @@ pub async fn run_down(state_dir: Option<&str>) -> anyhow::Result<()> {
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
-}
-
-pub async fn ipc_or_err(state_dir: Option<&str>) -> anyhow::Result<IpcClient> {
-    let ipc = client(state_dir).await?;
-    if !tunnet_core::ipc::endpoint_reachable(ipc.path()).await {
-        anyhow::bail!(
-            "agent not running (no IPC at {}); start with `tunnet service start` or `tunnet run`",
-            ipc.path().display()
-        );
-    }
-    Ok(ipc)
 }
 
 pub async fn wait_until_agent(state_dir: Option<&str>, secs: u64) -> anyhow::Result<()> {

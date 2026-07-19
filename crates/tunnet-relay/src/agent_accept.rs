@@ -1,11 +1,13 @@
 //! Accept agent QUIC connections (RELAY_ALPN) and register reverse tunnels.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tunnet_common::RELAY_ALPN;
 use tunnet_common::relay::RelayCtrl;
@@ -13,30 +15,41 @@ use tunnet_common::{PortMapping, RedirectRule};
 
 use crate::registry::{TunnelRegistry, TunnelSlot};
 
-pub fn spawn_acceptor(endpoint: Endpoint, registry: TunnelRegistry, auth_tokens: AuthStore) {
-    tokio::spawn(async move {
-        tracing::info!("relay QUIC acceptor started");
-        while let Some(incoming) = endpoint.accept().await {
-            let registry = registry.clone();
-            let auth = auth_tokens.clone();
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(?e, "relay handshake failed");
-                        return;
-                    }
-                };
-                if conn.alpn() != RELAY_ALPN {
-                    tracing::debug!(alpn = ?conn.alpn(), "ignoring non-relay ALPN");
-                    return;
-                }
-                if let Err(e) = handle_agent(conn, registry, auth).await {
-                    tracing::debug!(?e, "agent session ended");
-                }
-            });
+/// Spawn the relay ALPN router. Keep the returned [`Router`] alive.
+pub fn spawn_acceptor(
+    endpoint: Endpoint,
+    registry: TunnelRegistry,
+    auth_tokens: AuthStore,
+) -> Router {
+    let handler = RelayHandler {
+        registry,
+        auth: auth_tokens,
+    };
+    tracing::info!("relay QUIC acceptor started");
+    Router::builder(endpoint)
+        .accept(RELAY_ALPN, handler)
+        .spawn()
+}
+
+#[derive(Clone)]
+struct RelayHandler {
+    registry: TunnelRegistry,
+    auth: AuthStore,
+}
+
+impl fmt::Debug for RelayHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayHandler").finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for RelayHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        if let Err(e) = handle_agent(conn, self.registry.clone(), self.auth.clone()).await {
+            tracing::debug!(?e, "agent session ended");
         }
-    });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -112,6 +112,8 @@ pub struct CoreNodeConfig {
     pub enable_gossip: bool,
     /// Keep all peer connections open (Managed default: true; Direct default: false = on-demand).
     pub keep_alive: bool,
+    /// Optional pre-seeded effective config store (agent shares this with policy hooks).
+    pub effective_config: Option<crate::EffectiveConfigStore>,
 }
 
 impl Default for CoreNodeConfig {
@@ -130,6 +132,7 @@ impl Default for CoreNodeConfig {
             enable_mdns: true,
             enable_gossip: true,
             keep_alive: true,
+            effective_config: None,
         }
     }
 }
@@ -139,7 +142,12 @@ pub struct CoreNode {
     pub identity: AgentIdentity,
     pub persisted: PersistedState,
     pub endpoint: Endpoint,
+    /// Stream pool (`TUNNEL_STREAM_ALPN`).
     pub pool: ConnPool,
+    /// Datagram tunnel pool (`TUNNEL_ALPN`), shares keep-alive policy with [`Self::pool`].
+    pub tunnel_pool: ConnPool,
+    /// Live effective agent config (local TOML + remote org policy).
+    pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
     pub acl: AclEngine,
     pub version: Arc<ArcSwap<u64>>,
@@ -168,18 +176,6 @@ pub struct CoreNode {
 }
 
 impl CoreNode {
-    /// First Direct network docs (compat helper).
-    #[cfg(feature = "direct")]
-    pub fn docs(&self) -> Option<&DocsMembership> {
-        self.direct.values().next().map(|r| &r.docs)
-    }
-
-    /// First Direct network firewall (compat helper).
-    #[cfg(feature = "direct")]
-    pub fn firewall(&self) -> Option<&crate::direct::FirewallEngine> {
-        self.direct.values().next().map(|r| &r.firewall)
-    }
-
     #[cfg(feature = "direct")]
     pub fn firewall_for(&self, network_id: Uuid) -> Option<&crate::direct::FirewallEngine> {
         self.direct.get(&network_id).map(|r| &r.firewall)
@@ -191,13 +187,21 @@ impl CoreNode {
     }
 
     #[cfg(feature = "direct")]
-    pub fn spoof_tracker(&self) -> Option<&crate::direct::SpoofTracker> {
-        self.direct.values().next().map(|r| &r.spoof_tracker)
+    pub fn spoof_for(&self, network_id: Uuid) -> Option<&crate::direct::SpoofTracker> {
+        self.direct.get(&network_id).map(|r| &r.spoof_tracker)
+    }
+
+    /// Docs for the primary Direct network (explicit network_id, never arbitrary first).
+    #[cfg(feature = "direct")]
+    pub fn primary_docs(&self) -> Option<&DocsMembership> {
+        let nid = self.persisted.primary_network_id()?;
+        self.docs_for(nid)
     }
 
     #[cfg(feature = "direct")]
-    pub fn spoof_for(&self, network_id: Uuid) -> Option<&crate::direct::SpoofTracker> {
-        self.direct.get(&network_id).map(|r| &r.spoof_tracker)
+    pub fn primary_firewall(&self) -> Option<&crate::direct::FirewallEngine> {
+        let nid = self.persisted.primary_network_id()?;
+        self.firewall_for(nid)
     }
 
     /// Bootstrap based on persisted mode.
@@ -329,6 +333,8 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
+        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        let effective_config = cfg.effective_config.clone().unwrap_or_default();
         #[cfg(feature = "tunnel")]
         let tunnels = TunnelManager::new(pool.clone());
         #[cfg(feature = "send")]
@@ -372,6 +378,7 @@ impl CoreNode {
             cfg.on_kill_ssh.clone(),
             cfg.posture_hooks.clone(),
             cfg.agent_config_hooks.clone(),
+            Some(tunnel_pool.clone()),
         );
         spawn_poll_fallback(
             signed.clone(),
@@ -400,6 +407,8 @@ impl CoreNode {
             persisted: PersistedState::Managed(managed),
             endpoint,
             pool,
+            tunnel_pool,
+            effective_config,
             routes,
             acl,
             version,
@@ -482,6 +491,8 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(self_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
+        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        let effective_config = cfg.effective_config.clone().unwrap_or_default();
         pool.set_keep_alive(cfg.keep_alive);
         #[cfg(feature = "tunnel")]
         let tunnels = TunnelManager::new(pool.clone());
@@ -611,6 +622,8 @@ impl CoreNode {
             },
             endpoint,
             pool,
+            tunnel_pool,
+            effective_config,
             routes,
             acl,
             version,
@@ -641,7 +654,7 @@ impl CoreNode {
         }
         #[cfg(feature = "direct")]
         {
-            self.docs().map(|d| d.gossip())
+            self.primary_docs().map(|d| d.gossip())
         }
         #[cfg(not(feature = "direct"))]
         {

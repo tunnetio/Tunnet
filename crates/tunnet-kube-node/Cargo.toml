@@ -25,3 +25,4 @@ metrics-exporter-prometheus.workspace = true
 hex.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+iroh.workspace = true

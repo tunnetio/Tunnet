@@ -227,7 +227,7 @@ pub fn stop(_state_dir: Option<&str>) -> anyhow::Result<()> {
 pub fn restart(state_dir: Option<&str>) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        // Stop+wait then start+wait — avoid sc's 1056 "already running" race.
+        // Stop+wait then start+wait - avoid sc's 1056 "already running" race.
         let _ = state_dir;
         println!("Restarting tunnet service…");
         crate::win_service::stop_and_wait()?;

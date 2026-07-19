@@ -38,17 +38,6 @@ struct PostureDefinitionRow {
     assertions: sqlx::types::Json<Vec<String>>,
 }
 
-#[derive(sqlx::FromRow)]
-struct OrgPostureSettingsRow {
-    mode: String,
-    grace_period_minutes: i32,
-    recheck_on_fail_seconds: i32,
-    notify_user: bool,
-    notify_admin: bool,
-    auto_reauthorize: bool,
-    default_src_posture: sqlx::types::Json<Vec<String>>,
-}
-
 pub async fn load_network_bundle(
     pool: &PgPool,
     signing_key: &SigningKey,
@@ -160,29 +149,14 @@ async fn load_posture_metadata(
         }
     }
 
-    let org_settings: Option<OrgPostureSettingsRow> = sqlx::query_as(
-        "SELECT mode, grace_period_minutes, recheck_on_fail_seconds, notify_user, \
-                notify_admin, auto_reauthorize, default_src_posture \
-         FROM posture_org_settings \
-         WHERE organization_id = $1 AND network_id IS NULL",
-    )
-    .bind(organization_id)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None);
-
-    let net_settings: Option<OrgPostureSettingsRow> = if let Some(nid) = network_id {
-        sqlx::query_as(
-            "SELECT mode, grace_period_minutes, recheck_on_fail_seconds, notify_user, \
-                    notify_admin, auto_reauthorize, default_src_posture \
-             FROM posture_org_settings \
-             WHERE organization_id = $1 AND network_id = $2",
-        )
-        .bind(organization_id)
-        .bind(nid)
-        .fetch_optional(pool)
+    let org_settings = crate::posture::load_settings_row(pool, organization_id, None)
         .await
-        .unwrap_or(None)
+        .unwrap_or(None);
+
+    let net_settings = if let Some(nid) = network_id {
+        crate::posture::load_settings_row(pool, organization_id, Some(nid))
+            .await
+            .unwrap_or(None)
     } else {
         None
     };
@@ -191,17 +165,10 @@ async fn load_posture_metadata(
     let settings = net_settings.or(org_settings);
 
     let (default_src_posture, posture_enforcement) = match settings {
-        Some(s) => (
-            s.default_src_posture.0,
-            Some(PostureEnforcementConfig {
-                mode: s.mode,
-                grace_period_minutes: s.grace_period_minutes.max(0) as u32,
-                recheck_on_fail_secs: s.recheck_on_fail_seconds.max(0) as u64,
-                notify_user: s.notify_user,
-                notify_admin: s.notify_admin,
-                auto_reauthorize: s.auto_reauthorize,
-            }),
-        ),
+        Some(s) => {
+            let default_src_posture = s.default_src_posture.0.clone();
+            (default_src_posture, Some(crate::posture::to_enforcement(s)))
+        }
         None => (Vec::new(), None),
     };
 

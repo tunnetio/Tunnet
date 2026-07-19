@@ -475,7 +475,7 @@ async fn load_ipv4_peers(
     _network_name: &str,
 ) -> anyhow::Result<Vec<PeerEntry>> {
     // Mesh routing must include every active member. Dashboard presence
-    // (`agent_connected`) is separate — gating peers on WS heartbeat made one
+    // (`agent_connected`) is separate - gating peers on WS heartbeat made one
     // offline agent wipe the other side's routes (0 total peers).
     let peer_rows: Vec<(String, String, PgIp, Option<String>)> = sqlx::query_as(
         "SELECT e.endpoint_id, \

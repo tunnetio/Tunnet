@@ -157,6 +157,7 @@ async fn handle_query(
         match qtype {
             RecordType::A => {
                 if let Some(ip) = routes.resolve_dns_a(&name_str) {
+                    routes.remember_dns_synth(&name_str, ip);
                     let rr = Record::from_rdata(qname.clone(), TTL_SECS, RData::A(A(ip)));
                     response.add_answer(rr);
                     response.metadata.response_code = ResponseCode::NoError;

@@ -27,7 +27,7 @@ resources:
 # Org credentials Secret (create before install, or set createCredentialsSecret).
 credentials:
   secretName: tunnet-operator-credentials
-  # When true, chart creates an empty Secret shell — fill keys after install.
+  # When true, chart creates an empty Secret shell - fill keys after install.
   create: false
   apiKey: ""
   orgId: ""

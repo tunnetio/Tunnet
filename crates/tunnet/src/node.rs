@@ -109,10 +109,7 @@ impl TunnetNodeBuilder {
     }
 }
 
-/// A handle to the local overlay.
-///
-/// Depending on whether this process won the coordinator race, this is either a full
-/// coordinator (owning the iroh endpoint) or a lightweight client relaying via UDS / named pipe.
+/// A running Tunnet mesh node (coordinator or multi-process client).
 pub struct TunnetNode {
     inner: Arc<NodeInner>,
 }
@@ -122,6 +119,7 @@ enum NodeInner {
         node: Arc<CoreNode>,
         listener_rx: Mutex<Option<mpsc::Receiver<InboundConnection>>>,
         _sock_path: PathBuf,
+        _router: iroh::protocol::Router,
     },
     #[cfg(any(unix, windows))]
     Client {
@@ -282,12 +280,13 @@ impl TunnetNode {
             .map_err(Error::from_anyhow)?;
         let node = Arc::new(node);
         let (tx, rx) = mpsc::channel(64);
-        spawn_stream_acceptor(node.clone(), tx);
+        let router = spawn_stream_acceptor(node.clone(), tx);
         Ok(Self {
             inner: Arc::new(NodeInner::Coordinator {
                 node,
                 listener_rx: Mutex::new(Some(rx)),
                 _sock_path: sock_path,
+                _router: router,
             }),
         })
     }
@@ -567,10 +566,13 @@ fn resolve_peer(node: &CoreNode, host: &str) -> Option<Arc<tunnet_core::PeerInfo
         .or_else(|| node.routes.lookup_endpoint(host))
 }
 
-fn spawn_stream_acceptor(node: Arc<CoreNode>, inbound_tx: mpsc::Sender<InboundConnection>) {
-    let ep = node.endpoint.clone();
-    #[cfg(feature = "send")]
-    let send_mgr = node.send.clone();
+fn spawn_stream_acceptor(
+    node: Arc<CoreNode>,
+    inbound_tx: mpsc::Sender<InboundConnection>,
+) -> iroh::protocol::Router {
+    use iroh::protocol::Router;
+    use tunnet_core::StreamProtocolHandler;
+
     let routes = node.routes.clone();
     let handler: tunnet_core::stream::StreamHandler = Arc::new(move |accepted| {
         let tx = inbound_tx.clone();
@@ -591,35 +593,69 @@ fn spawn_stream_acceptor(node: Arc<CoreNode>, inbound_tx: mpsc::Sender<InboundCo
                 .await;
         })
     });
-    tokio::spawn(async move {
-        tracing::info!("SDK unified ALPN acceptor started");
-        while let Some(incoming) = ep.accept().await {
-            let handler = handler.clone();
-            #[cfg(feature = "send")]
-            let send_mgr = send_mgr.clone();
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(?e, "handshake");
-                        return;
-                    }
-                };
-                let alpn = conn.alpn();
-                if alpn == tunnet_core::TUNNEL_STREAM_ALPN {
-                    tunnet_core::serve_stream_connection(conn, handler).await;
-                } else {
-                    #[cfg(feature = "send")]
-                    {
-                        if alpn == tunnet_common::SEND_ALPN {
-                            send_mgr.handle_offer_connection(conn).await;
-                        } else if alpn == iroh_blobs::ALPN {
-                            send_mgr.handle_blobs_connection(conn).await;
-                        }
-                    }
-                }
-            });
+
+    let builder = Router::builder(node.endpoint.clone()).accept(
+        tunnet_core::TUNNEL_STREAM_ALPN,
+        StreamProtocolHandler::new(handler),
+    );
+
+    #[cfg(feature = "send")]
+    let builder = {
+        use iroh::protocol::{AcceptError, ProtocolHandler};
+
+        #[derive(Clone)]
+        struct SendOfferHandler {
+            send: tunnet_core::SendManager,
         }
-        tracing::error!("SDK ALPN acceptor exited");
-    });
+        impl std::fmt::Debug for SendOfferHandler {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("SendOfferHandler").finish_non_exhaustive()
+            }
+        }
+        impl ProtocolHandler for SendOfferHandler {
+            async fn accept(
+                &self,
+                conn: iroh::endpoint::Connection,
+            ) -> std::result::Result<(), AcceptError> {
+                self.send.handle_offer_connection(conn).await;
+                Ok(())
+            }
+        }
+
+        #[derive(Clone)]
+        struct BlobsHandler {
+            send: tunnet_core::SendManager,
+        }
+        impl std::fmt::Debug for BlobsHandler {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("BlobsHandler").finish_non_exhaustive()
+            }
+        }
+        impl ProtocolHandler for BlobsHandler {
+            async fn accept(
+                &self,
+                conn: iroh::endpoint::Connection,
+            ) -> std::result::Result<(), AcceptError> {
+                self.send.handle_blobs_connection(conn).await;
+                Ok(())
+            }
+        }
+
+        builder
+            .accept(
+                tunnet_common::SEND_ALPN,
+                SendOfferHandler {
+                    send: node.send.clone(),
+                },
+            )
+            .accept(
+                iroh_blobs::ALPN,
+                BlobsHandler {
+                    send: node.send.clone(),
+                },
+            )
+    };
+
+    tracing::info!("SDK unified ALPN acceptor started");
+    builder.spawn()
 }

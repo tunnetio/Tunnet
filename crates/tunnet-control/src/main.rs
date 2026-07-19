@@ -1,5 +1,4 @@
 mod admin;
-mod agent_config;
 mod audit;
 mod auth;
 mod ca_crypto;
@@ -10,13 +9,13 @@ mod device_expiry_sql;
 mod device_handlers;
 mod device_labels;
 mod device_metadata;
-mod enrollment;
 mod entity_notify;
 mod ha;
 mod http;
 mod ip_alloc;
 mod metrics;
 mod observability;
+mod org_agent_policy;
 mod pg_inet;
 mod pg_notify;
 mod policy_store;
@@ -30,7 +29,9 @@ mod snapshot;
 mod ssh;
 mod ssh_auth;
 mod state;
+mod token_hash;
 mod tunnels;
+mod ws;
 mod ws_hub;
 
 use std::sync::Arc;
@@ -134,14 +135,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let admin_state = AdminState {
-        pool: state.pool.clone(),
-        ws_hub: state.ws_hub.clone(),
-        service_auth: state.service_auth.clone(),
-        policy_key: state.policy_key.clone(),
-        listen_connected: state.listen_connected.clone(),
-        version: env!("CARGO_PKG_VERSION"),
-    };
+    let admin_state = AdminState::new(state.clone(), env!("CARGO_PKG_VERSION"));
     let admin_bind = args.admin_bind.clone();
     tokio::spawn(async move {
         if let Err(e) = admin::serve(&admin_bind, admin_state).await {

@@ -190,7 +190,7 @@ async fn run(cfg: RunConfig) -> anyhow::Result<()> {
         tracing::warn!("open-auth enabled - accepting first-seen tokens (dev only)");
     }
 
-    agent_accept::spawn_acceptor(endpoint.clone(), registry.clone(), auth.clone());
+    let _router = agent_accept::spawn_acceptor(endpoint.clone(), registry.clone(), auth.clone());
 
     let (cert_pem, key_pem) = load_tls_material(&cfg, &state_dir).await?;
     let cert_valid_until = https::cert_valid_until(&cert_pem);

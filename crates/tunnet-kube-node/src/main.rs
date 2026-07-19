@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use tunnet_common::RedirectRule;
 use tunnet_core::{
     AgentIdentity, CoreNode, CoreNodeConfig, PeerInfo, PersistedState, SealPolicy, SignedClient,
-    StatePaths, StreamHandler, dial_stream, load_agent, serve_stream_connection, stream_handler,
+    StatePaths, StreamHandler, dial_stream, load_agent, stream_handler,
 };
 
 #[derive(Parser, Debug)]
@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Connector(_) => stream_handler(node.routes.clone()),
         _ => noop_stream_handler(),
     };
-    spawn_unified_acceptor(node.clone(), stream_handler);
+    let _router = spawn_unified_acceptor(node.clone(), stream_handler);
 
     match &mode {
         Mode::Connector(args) => setup_connector(node.as_ref(), args).await?,
@@ -437,32 +437,35 @@ fn noop_stream_handler() -> StreamHandler {
     })
 }
 
-fn spawn_unified_acceptor(node: Arc<CoreNode>, handler: StreamHandler) {
-    let endpoint = node.endpoint.clone();
-    let send_mgr = node.send.clone();
-    tokio::spawn(async move {
-        tracing::info!("unified ALPN acceptor started");
-        while let Some(incoming) = endpoint.accept().await {
-            let handler = handler.clone();
-            let send_mgr = send_mgr.clone();
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(?e, "handshake");
-                        return;
-                    }
-                };
-                let alpn = conn.alpn();
-                if alpn == tunnet_core::TUNNEL_STREAM_ALPN {
-                    serve_stream_connection(conn, handler).await;
-                } else if alpn == tunnet_common::SEND_ALPN {
-                    send_mgr.handle_offer_connection(conn).await;
-                }
-            });
+fn spawn_unified_acceptor(node: Arc<CoreNode>, handler: StreamHandler) -> iroh::protocol::Router {
+    use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+    use tunnet_core::StreamProtocolHandler;
+
+    #[derive(Clone)]
+    struct SendOfferHandler {
+        send: tunnet_core::SendManager,
+    }
+    impl std::fmt::Debug for SendOfferHandler {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SendOfferHandler").finish_non_exhaustive()
         }
-        tracing::error!("ALPN acceptor exited");
-    });
+    }
+    impl ProtocolHandler for SendOfferHandler {
+        async fn accept(&self, conn: iroh::endpoint::Connection) -> Result<(), AcceptError> {
+            self.send.handle_offer_connection(conn).await;
+            Ok(())
+        }
+    }
+
+    let stream = StreamProtocolHandler::new(handler);
+    let send = SendOfferHandler {
+        send: node.send.clone(),
+    };
+    tracing::info!("unified ALPN acceptor started");
+    Router::builder(node.endpoint.clone())
+        .accept(tunnet_core::TUNNEL_STREAM_ALPN, stream)
+        .accept(tunnet_common::SEND_ALPN, send)
+        .spawn()
 }
 
 async fn setup_connector(node: &CoreNode, args: &ConnectorArgs) -> anyhow::Result<()> {

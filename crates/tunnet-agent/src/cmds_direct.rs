@@ -9,7 +9,7 @@ use tunnet_core::direct::{
     AUTH_ALPN, DocsMembership, MembershipEntry, decode_invite, derive_ipv4, load_approved,
     network_id_from_topic, run_psk_handshake_client, save_approved, topic_from_name_secret,
 };
-use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse};
+use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse, format_ipc_error};
 use tunnet_core::{
     AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, load_agent, persist_agent,
 };
@@ -386,7 +386,9 @@ pub async fn run_invite(args: InviteArgs, state_dir: Option<&str>) -> anyhow::Re
             println!("{code}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -648,7 +650,9 @@ pub async fn run_requests(args: RequestsArgs, state_dir: Option<&str>) -> anyhow
             }
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -666,7 +670,9 @@ pub async fn run_accept(args: AcceptArgs, state_dir: Option<&str>) -> anyhow::Re
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -684,7 +690,9 @@ pub async fn run_deny(args: DenyArgs, state_dir: Option<&str>) -> anyhow::Result
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -702,7 +710,9 @@ pub async fn run_kick(args: KickArgs, state_dir: Option<&str>) -> anyhow::Result
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -744,7 +754,9 @@ pub async fn run_connect(args: ConnectArgs, state_dir: Option<&str>) -> anyhow::
             println!("Restart the agent (`tunnet run`) for the new identity to take effect.");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -809,7 +821,9 @@ pub async fn run_firewall(cmd: FirewallCommand, state_dir: Option<&str>) -> anyh
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -840,7 +854,9 @@ pub async fn run_policy(cmd: PolicyCommand, state_dir: Option<&str>) -> anyhow::
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -858,7 +874,9 @@ pub async fn run_keep_alive(args: KeepAliveArgs, state_dir: Option<&str>) -> any
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }
@@ -989,7 +1007,9 @@ pub async fn run_override_ip(args: OverrideIpArgs, state_dir: Option<&str>) -> a
             println!("{message}");
             Ok(())
         }
-        IpcResponse::Error { message } => anyhow::bail!("{message}"),
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message))
+        }
         other => anyhow::bail!("unexpected response: {other:?}"),
     }
 }

@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use super::protocol::{IpcRequest, IpcResponse};
+use super::protocol::{IpcErrorCode, IpcRequest, IpcResponse, format_ipc_error};
 use super::transport::{self, default_ipc_path};
 
 pub struct IpcClient {
@@ -35,12 +35,9 @@ impl IpcClient {
 
     /// Send a request and read a single response line.
     pub async fn request(&self, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-        let stream = transport::connect(&self.path).await.with_context(|| {
-            format!(
-                "cannot connect to agent IPC at {} - is the agent running?",
-                self.path.display()
-            )
-        })?;
+        let stream = transport::connect(&self.path)
+            .await
+            .map_err(|_| anyhow::anyhow!(format_ipc_error(&IpcErrorCode::AgentNotRunning, "")))?;
         let (read, mut write) = stream.split();
         let mut buf = serde_json::to_vec(&req)?;
         buf.push(b'\n');
@@ -55,8 +52,8 @@ impl IpcClient {
         }
         let resp: IpcResponse = serde_json::from_str(line.trim())
             .with_context(|| format!("bad IPC response: {}", line.trim()))?;
-        if let IpcResponse::Error { message } = &resp {
-            bail!("{message}");
+        if let IpcResponse::Error { code, message } = &resp {
+            bail!("{}", format_ipc_error(code, message));
         }
         Ok(resp)
     }
@@ -68,12 +65,9 @@ impl IpcClient {
         req: IpcRequest,
         mut on_response: impl FnMut(IpcResponse) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        let stream = transport::connect(&self.path).await.with_context(|| {
-            format!(
-                "cannot connect to agent IPC at {} - is the agent running?",
-                self.path.display()
-            )
-        })?;
+        let stream = transport::connect(&self.path)
+            .await
+            .map_err(|_| anyhow::anyhow!(format_ipc_error(&IpcErrorCode::AgentNotRunning, "")))?;
         let (read, mut write) = stream.split();
         let mut buf = serde_json::to_vec(&req)?;
         buf.push(b'\n');

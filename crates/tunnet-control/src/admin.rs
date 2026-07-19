@@ -1,27 +1,37 @@
+use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ed25519_dalek::SigningKey;
 use serde::Serialize;
-use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::service_auth::{ServiceAuth, ServiceAuthError};
-use crate::ws_hub::WsHub;
+use crate::service_auth::ServiceAuthError;
+use crate::state::AppState;
 
+/// Thin admin API state: shared `AppState` plus build version for health.
 #[derive(Clone)]
 pub struct AdminState {
-    pub pool: PgPool,
-    pub ws_hub: WsHub,
-    pub service_auth: ServiceAuth,
-    pub policy_key: SigningKey,
-    pub listen_connected: Arc<AtomicBool>,
+    pub app: Arc<AppState>,
     pub version: &'static str,
+}
+
+impl AdminState {
+    pub fn new(app: Arc<AppState>, version: &'static str) -> Self {
+        Self { app, version }
+    }
+}
+
+impl Deref for AdminState {
+    type Target = AppState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.app
+    }
 }
 
 #[derive(Serialize)]

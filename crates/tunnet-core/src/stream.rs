@@ -1,11 +1,13 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use bytes::{BufMut, BytesMut};
+use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId};
+use iroh::protocol::{AcceptError, ProtocolHandler};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const TUNNEL_STREAM_ALPN: &[u8] = b"tunnet/stream/1";
@@ -115,30 +117,30 @@ pub async fn serve_stream_connection(conn: Connection, handler: StreamHandler) {
     }
 }
 
-/// Standalone accept loop for SDK / single-ALPN endpoints.
-pub async fn serve_stream_acceptor(
-    endpoint: Endpoint,
+/// [`ProtocolHandler`] for [`TUNNEL_STREAM_ALPN`].
+#[derive(Clone)]
+pub struct StreamProtocolHandler {
     handler: StreamHandler,
-) -> anyhow::Result<()> {
-    tracing::info!("SDK stream acceptor started");
-    while let Some(incoming) = endpoint.accept().await {
-        let handler = handler.clone();
-        tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(?e, "handshake");
-                    return;
-                }
-            };
-            let alpn = conn.alpn();
-            if alpn != TUNNEL_STREAM_ALPN {
-                return;
-            }
-            serve_stream_connection(conn, handler).await;
-        });
+}
+
+impl StreamProtocolHandler {
+    pub fn new(handler: StreamHandler) -> Self {
+        Self { handler }
     }
-    Ok(())
+}
+
+impl fmt::Debug for StreamProtocolHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamProtocolHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for StreamProtocolHandler {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        serve_stream_connection(connection, self.handler.clone()).await;
+        Ok(())
+    }
 }
 
 pub async fn splice_bidirectional<R, W>(

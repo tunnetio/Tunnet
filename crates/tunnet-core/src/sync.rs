@@ -33,7 +33,7 @@ fn parse_policy_vk(hex_key: Option<&str>) -> Option<VerifyingKey> {
 }
 
 /// Verify org + network bundle signatures, then merge into the effective ACL.
-/// On bad signature: keep last-good bundle (do not replace).
+/// On bad signature: keep last-good routes and ACL (do not replace).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_membership(
     membership: &NetworkMembershipSnapshot,
@@ -47,6 +47,28 @@ pub fn apply_membership(
     self_hostname: &str,
     known_hosts_dir: Option<&std::path::Path>,
 ) {
+    // Verify policy signatures BEFORE mutating routes/ACL.
+    if let Some(vk) = parse_policy_vk(policy_verifying_key) {
+        if let Err(e) = verify_policy_bundle_signature(&membership.policy, &vk) {
+            tracing::warn!(
+                ?e,
+                "network policy signature invalid; keeping previous routes+ACL"
+            );
+            return;
+        }
+        if let Err(e) = verify_policy_bundle_signature(org_policy, &vk) {
+            tracing::warn!(
+                ?e,
+                "org policy signature invalid; keeping previous routes+ACL"
+            );
+            return;
+        }
+    } else if !membership.policy.signature.is_empty() || !org_policy.signature.is_empty() {
+        tracing::debug!(
+            "policy verifying key missing; applying merged policy without signature check"
+        );
+    }
+
     // Control plane excludes this endpoint from ipv4_peers (no mesh self-route).
     // Inject self so PeerDNS can resolve our own hostname → assigned mesh IP.
     let hostname = if !membership.self_hostname.is_empty() {
@@ -79,23 +101,6 @@ pub fn apply_membership(
         membership.version,
     );
 
-    if let Some(vk) = parse_policy_vk(policy_verifying_key) {
-        if let Err(e) = verify_policy_bundle_signature(&membership.policy, &vk) {
-            tracing::warn!(?e, "network policy signature invalid; keeping previous ACL");
-            version.store(Arc::new(org_version));
-            return;
-        }
-        if let Err(e) = verify_policy_bundle_signature(org_policy, &vk) {
-            tracing::warn!(?e, "org policy signature invalid; keeping previous ACL");
-            version.store(Arc::new(org_version));
-            return;
-        }
-    } else if !membership.policy.signature.is_empty() || !org_policy.signature.is_empty() {
-        tracing::debug!(
-            "policy verifying key missing; applying merged policy without signature check"
-        );
-    }
-
     let merged = merge_policy_bundles(org_policy, &membership.policy);
     acl.replace_bundle(merged);
     acl.replace_self_tags(membership.self_tags.clone());
@@ -106,6 +111,26 @@ pub fn apply_membership(
     {
         tracing::debug!(?e, "known_hosts sync skipped");
     }
+}
+
+/// Apply a peer-only SnapshotDelta (no policy / route table replace).
+pub fn apply_delta(
+    routes: &RoutingTable,
+    version: &Arc<ArcSwap<u64>>,
+    delta: &tunnet_common::SnapshotDelta,
+    self_endpoint_id: &str,
+    network_id: Uuid,
+    network_name: &str,
+) {
+    routes.apply_peer_delta(
+        network_id,
+        &delta.added,
+        &delta.removed,
+        delta.version,
+        self_endpoint_id,
+        network_name,
+    );
+    version.store(Arc::new(delta.version));
 }
 
 pub struct SyncHandles {
@@ -130,6 +155,7 @@ pub fn spawn_ws_processor(
     on_kill_ssh: Option<crate::node::KillSshHook>,
     posture_hooks: Option<crate::node::PostureHooks>,
     agent_config_hooks: Option<crate::node::AgentConfigHooks>,
+    tunnel_pool: Option<crate::iroh_pool::ConnPool>,
 ) {
     tokio::spawn(async move {
         let _ = ws
@@ -198,9 +224,21 @@ pub fn spawn_ws_processor(
                             }
                         }
                         ServerMsg::Delta(delta) => {
-                            tracing::info!(v = delta.version, added = delta.added.len(),
-                                removed = delta.removed.len(), "delta received");
-                            version.store(Arc::new(delta.version));
+                            tracing::info!(
+                                v = delta.version,
+                                added = delta.added.len(),
+                                removed = delta.removed.len(),
+                                "delta received"
+                            );
+                            let network_name = routes.network_name();
+                            apply_delta(
+                                &routes,
+                                &version,
+                                &delta,
+                                &self_endpoint_id,
+                                network_id,
+                                &network_name,
+                            );
                         }
                         ServerMsg::Policy(bundle) => acl.replace_bundle(bundle),
                         ServerMsg::ForceReenroll { reason } => {
@@ -565,8 +603,14 @@ pub fn spawn_ws_processor(
                     }
                 }
                 _ = heartbeat.tick() => {
+                    let (active_conns, bytes_tx, bytes_rx) = tunnel_pool
+                        .as_ref()
+                        .map(|p| p.heartbeat_counters())
+                        .unwrap_or((0, 0, 0));
                     let _ = ws.tx.send(ClientMsg::Heartbeat {
-                        active_conns: 0, bytes_tx: 0, bytes_rx: 0,
+                        active_conns,
+                        bytes_tx,
+                        bytes_rx,
                     }).await;
                 }
             }
@@ -624,4 +668,48 @@ pub fn spawn_poll_fallback(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use std::sync::Arc;
+    use tunnet_common::SnapshotDelta;
+
+    #[test]
+    fn apply_delta_bumps_version() {
+        let routes = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let peer_a = "b".repeat(64);
+        let nid = Uuid::nil();
+        routes.replace(
+            &[],
+            &[],
+            &[],
+            &[],
+            &tunnet_common::DeviceProfile::default(),
+            &tunnet_common::DnsConfig::default(),
+            "office",
+            nid,
+            &self_id,
+            1,
+        );
+        let version = Arc::new(ArcSwap::from_pointee(1u64));
+        let delta = SnapshotDelta {
+            added: vec![tunnet_common::PeerEntry {
+                ip: "10.7.0.5".parse().unwrap(),
+                endpoint_id: peer_a.clone(),
+                hostname: "alice".into(),
+                tags: vec![],
+                ssh_host_key: None,
+            }],
+            removed: vec![],
+            version: 42,
+        };
+        apply_delta(&routes, &version, &delta, &self_id, nid, "office");
+        assert_eq!(**version.load(), 42);
+        assert_eq!(routes.version(), 42);
+        assert!(routes.lookup_endpoint(&peer_a).is_some());
+    }
 }

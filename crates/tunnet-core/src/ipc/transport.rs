@@ -191,7 +191,7 @@ fn create_server_pipe(
 
     // SYSTEM + Administrators + Authenticated Users: full access.
     // GRGW alone is not enough for CreateFile(GENERIC_READ|GENERIC_WRITE) on
-    // named pipes under Local System — user CLIs get Access Denied.
+    // named pipes under Local System - user CLIs get Access Denied.
     let sddl = w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)");
     let mut sd = PSECURITY_DESCRIPTOR::default();
     unsafe {

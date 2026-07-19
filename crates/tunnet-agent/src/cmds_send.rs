@@ -2,8 +2,7 @@
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
-use tunnet_core::ipc::IpcClient;
-use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse};
+use tunnet_core::ipc::protocol::{IpcRequest, IpcResponse, format_ipc_error};
 
 use crate::output::Output;
 
@@ -151,8 +150,11 @@ pub async fn run(args: SendArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ipc_req(_state_dir: &Option<String>, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    IpcClient::connect().request(req).await
+async fn ipc_req(state_dir: &Option<String>, req: IpcRequest) -> anyhow::Result<IpcResponse> {
+    crate::cmds::ipc_or_err(state_dir.as_deref())
+        .await?
+        .request(req)
+        .await
 }
 
 fn print_resp(out: &Output, resp: IpcResponse) -> anyhow::Result<()> {
@@ -198,8 +200,8 @@ fn print_resp(out: &Output, resp: IpcResponse) -> anyhow::Result<()> {
             println!("pin_blobs:  {}", c.pin_blobs);
         }
         IpcResponse::Ok { message } => println!("{message}"),
-        IpcResponse::Error { message } => {
-            anyhow::bail!("{message}");
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{}", format_ipc_error(&code, &message));
         }
         other => {
             if out.json {

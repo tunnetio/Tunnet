@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::dataplane::DataPlaneHandle;
 use super::protocol::{
-    DnsStatusInfo, ExitNodeRouteInfo, HostnameRouteInfo, IpcRequest, IpcResponse,
+    DnsStatusInfo, ExitNodeRouteInfo, HostnameRouteInfo, IpcErrorCode, IpcRequest, IpcResponse,
     OnDemandStatusInfo, PeerLite, RoutesInfo, SshRecordingInfo, SshSessionInfo, StatusInfo,
     SubnetRouteInfo,
 };
@@ -14,6 +14,53 @@ use crate::serve::ServeManager;
 use crate::tunnel::TunnelManager;
 use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+fn err(code: IpcErrorCode, message: impl Into<String>) -> IpcResponse {
+    IpcResponse::Error {
+        code,
+        message: message.into(),
+    }
+}
+
+fn err_anyhow(e: impl std::fmt::Display) -> IpcResponse {
+    let message = e.to_string();
+    err(classify_ipc_error(&message), message)
+}
+
+fn classify_ipc_error(message: &str) -> IpcErrorCode {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("not found")
+        || lower.contains("no peer")
+        || lower.contains("no pending")
+        || lower.contains("missing")
+    {
+        IpcErrorCode::NotFound
+    } else if lower.contains("denied")
+        || lower.contains("unauthorized")
+        || lower.contains("only the coordinator")
+        || lower.contains("permission")
+        || lower.contains("reject")
+    {
+        IpcErrorCode::Denied
+    } else if lower.contains("not enrolled")
+        || lower.contains("requires managed")
+        || lower.contains("requires direct")
+        || lower.contains("no direct networks")
+        || lower.contains("not connected to a network")
+    {
+        IpcErrorCode::NotEnrolled
+    } else if lower.contains("data plane") {
+        IpcErrorCode::DataPlaneDown
+    } else if lower.contains("invalid")
+        || lower.contains("must be")
+        || lower.contains("parse")
+        || lower.contains("usage:")
+    {
+        IpcErrorCode::InvalidRequest
+    } else {
+        IpcErrorCode::Internal
+    }
+}
 
 /// Live agent state shared with the IPC server.
 pub struct AgentIpcState {
@@ -71,8 +118,7 @@ async fn handle_connection(stream: IpcStream, state: Arc<AgentIpcState>) -> anyh
     let mut reader = BufReader::new(read);
     let mut line = String::new();
 
-    // One request per connection for most commands. OpenStream is special
-    // (switches to raw splice after Ready) - handled separately.
+    // One request per connection for most commands. Ping streams multiple replies.
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
         return Ok(());
@@ -81,9 +127,6 @@ async fn handle_connection(stream: IpcStream, state: Arc<AgentIpcState>) -> anyh
         .with_context(|| format!("parse IPC request: {}", line.trim()))?;
 
     match req {
-        IpcRequest::OpenStream { host, port } => {
-            handle_open_stream(host, port, state, reader, write).await
-        }
         IpcRequest::Ping {
             peer,
             count,
@@ -112,23 +155,15 @@ async fn write_response(
 
 async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
     match req {
-        IpcRequest::ListPeers => {
-            let peers = peer_lites(state);
-            IpcResponse::Peers { peers }
-        }
         IpcRequest::Status { peers } => IpcResponse::Status(build_status(state, peers)),
         IpcRequest::DnsStatus => IpcResponse::DnsStatus(build_dns_status(state)),
         IpcRequest::RouteList => IpcResponse::Routes(build_routes(state)),
         IpcRequest::RouteAdd { cidr, description } => match cidr.parse::<ipnet::Ipv4Net>() {
             Ok(net) => match advertise_subnet_route(state, &net.to_string(), description).await {
                 Ok(cidr) => IpcResponse::RouteAdded { cidr },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             },
-            Err(e) => IpcResponse::Error {
-                message: format!("invalid cidr: {e}"),
-            },
+            Err(e) => err(IpcErrorCode::InvalidRequest, format!("invalid cidr: {e}")),
         },
         IpcRequest::Diag => IpcResponse::Diag(build_diag(state).await),
         IpcRequest::Netcheck => IpcResponse::Netcheck(build_netcheck(state).await),
@@ -152,9 +187,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             .await
             {
                 Ok(info) => IpcResponse::Serve(info),
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::ServeStatus => IpcResponse::Serves {
@@ -162,9 +195,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
         },
         IpcRequest::ServeOff { port } => match state.serves.stop(port) {
             Ok(info) => IpcResponse::Serve(info),
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::TunnelStart {
             port,
@@ -181,32 +212,24 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
         .await
         {
             Ok(info) => IpcResponse::Tunnel(info),
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::TunnelStatus => IpcResponse::Tunnels {
             tunnels: state.tunnels.list(),
         },
         IpcRequest::TunnelOff { port } => match stop_tunnel(state, port).await {
             Ok(info) => IpcResponse::Tunnel(info),
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::SshSessions { limit, status } => {
             match list_ssh_sessions(state, limit, status.as_deref()).await {
                 Ok(sessions) => IpcResponse::SshSessions { sessions },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::SshRecordings { limit } => match list_ssh_recordings(state, limit).await {
             Ok(recordings) => IpcResponse::SshRecordings { recordings },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::SshPlay { session_id } => match get_ssh_cast(state, &session_id).await {
             Ok((session_id, cast_text, content_sha256)) => IpcResponse::SshCast {
@@ -214,9 +237,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
                 cast_text,
                 content_sha256,
             },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::SshAuthPoll { challenge_token } => {
             match poll_ssh_auth(state, &challenge_token).await {
@@ -224,9 +245,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
                     status,
                     proof_token,
                 },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::SendFile {
@@ -241,16 +260,12 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             Ok(records) => IpcResponse::Transfers {
                 transfers: records.into_iter().map(transfer_info).collect(),
             },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::SendAccept { transfer_id } => {
             match state.send.accept_pending(&transfer_id).await {
                 Ok(r) => IpcResponse::Transfer(transfer_info(r)),
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::SendReject {
@@ -260,9 +275,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             Ok(()) => IpcResponse::Ok {
                 message: "rejected".into(),
             },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::SendList => {
             let mut transfers: Vec<_> = state
@@ -302,9 +315,10 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
                 match tunnet_common::send::SendConsentMode::parse(&c) {
                     Some(m) => cfg.consent = m,
                     None => {
-                        return IpcResponse::Error {
-                            message: format!("invalid consent mode: {c}"),
-                        };
+                        return err(
+                            IpcErrorCode::InvalidRequest,
+                            format!("invalid consent mode: {c}"),
+                        );
                     }
                 }
             }
@@ -328,13 +342,13 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             Ok(()) => IpcResponse::Ok {
                 message: "data plane up".into(),
             },
-            Err(e) => IpcResponse::Error { message: e },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::DataPlaneDown => match state.data_plane.bring_down().await {
             Ok(()) => IpcResponse::Ok {
                 message: "data plane down".into(),
             },
-            Err(e) => IpcResponse::Error { message: e },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::DirectInvite {
             network,
@@ -342,56 +356,42 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             expires,
         } => match direct_invite(state, network.as_deref(), reusable, &expires) {
             Ok(code) => IpcResponse::DirectInvite { code },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::DirectRequests { network } => {
             match direct_requests(state, network.as_deref()) {
                 Ok(requests) => IpcResponse::DirectPending { requests },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectAccept { network, peer_id } => {
             match direct_accept(state, network.as_deref(), &peer_id) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectDeny { network, peer_id } => {
             match direct_deny(state, network.as_deref(), &peer_id) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectKick { network, peer_id } => {
             match direct_kick(state, network.as_deref(), &peer_id).await {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallShow { network } => {
             match direct_firewall_show(state, network.as_deref()) {
                 Ok(info) => info,
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallOff { network } => {
             match direct_firewall_off(state, network.as_deref()) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallAdd {
@@ -411,154 +411,117 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             peer,
         ) {
             Ok(msg) => IpcResponse::Ok { message: msg },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::DirectFirewallRemove { network, index } => {
             match direct_firewall_remove(state, network.as_deref(), index) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallReset { network } => {
             match direct_firewall_reset(state, network.as_deref()) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallFlushConntrack { network } => {
             match direct_firewall_flush(state, network.as_deref()) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallPending { network } => {
             match direct_firewall_pending(state, network.as_deref()) {
                 Ok(r) => r,
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallAcceptSuggestion { network } => {
             match direct_firewall_accept(state, network.as_deref()) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectFirewallRejectSuggestion { network } => {
             match direct_firewall_reject_suggestion(state, network.as_deref()) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectPolicyShow { network } => {
             match direct_policy_show(state, network.as_deref()).await {
                 Ok(r) => r,
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectPolicySet { network, toml } => {
             match direct_policy_set(state, network.as_deref(), &toml).await {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectPolicyClear { network } => {
             match direct_policy_clear(state, network.as_deref()).await {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectOverrideIp { network, peer, ip } => {
             match direct_override_ip(state, network.as_deref(), &peer, &ip) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectKeepAlive { hostname, enable } => {
             match direct_keep_alive(state, &hostname, enable) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectConnect { contact_id } => {
             match crate::direct::connect::request_connect(state, &contact_id).await {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectConnectAllow { contact_id } => {
             match crate::direct::connect::allow_contact(state, &contact_id) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectConnectPending => match crate::direct::connect::list_pending(state) {
             Ok(r) => r,
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         IpcRequest::DirectConnectAccept { contact_id } => {
             match crate::direct::connect::accept_pending(state, &contact_id).await {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectConnectDeny { contact_id } => {
             match crate::direct::connect::deny_pending(state, &contact_id) {
                 Ok(msg) => IpcResponse::Ok { message: msg },
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::DirectConnectRotate => {
             match crate::direct::connect::rotate_identity(state).await {
                 Ok(r) => r,
-                Err(e) => IpcResponse::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => err_anyhow(e),
             }
         }
         IpcRequest::Reload => match reload_config(state).await {
             Ok(msg) => IpcResponse::Ok { message: msg },
-            Err(e) => IpcResponse::Error {
-                message: e.to_string(),
-            },
+            Err(e) => err_anyhow(e),
         },
         // Handled earlier:
-        IpcRequest::OpenStream { .. } | IpcRequest::Ping { .. } => IpcResponse::Error {
-            message: "internal: request should have been handled specially".into(),
-        },
+        IpcRequest::Ping { .. } => err(
+            IpcErrorCode::Internal,
+            "internal: request should have been handled specially",
+        ),
     }
 }
 
@@ -585,13 +548,13 @@ async fn reload_config(state: &AgentIpcState) -> anyhow::Result<String> {
 
     // Firewall from tunnet.toml
     let fw_cfg = cfg.firewall_for_network(&network);
-    if let Some(engine) = state.node.firewall() {
+    if let Some(engine) = state.node.primary_firewall() {
         engine.reload_local(&fw_cfg);
     }
 
     // DNS into membership + routes
     let dns = cfg.dns_for_network(&network);
-    if let Some(docs) = state.node.docs() {
+    if let Some(docs) = state.node.primary_docs() {
         docs.set_dns(dns.clone());
         if let Some(auth) = state.node.direct_auth.as_ref() {
             let policy = (**state.node.acl.bundle.load()).clone();
@@ -785,6 +748,7 @@ async fn stop_tunnel(
 }
 
 fn peer_lites(state: &AgentIpcState) -> Vec<PeerLite> {
+    let pool = &state.node.tunnel_pool;
     let self_id = state.node.endpoint_id_hex();
     state
         .node
@@ -793,8 +757,8 @@ fn peer_lites(state: &AgentIpcState) -> Vec<PeerLite> {
         .into_iter()
         .filter(|p| p.endpoint_hex != self_id)
         .map(|p| {
-            let snap = state.node.pool.peer_snapshot(p.endpoint);
-            let (bytes_in, bytes_out) = state.node.pool.peer_bytes(p.endpoint);
+            let snap = pool.peer_snapshot(p.endpoint);
+            let (bytes_in, bytes_out) = pool.peer_bytes(p.endpoint);
             let latency_ms = state.peer_rtt.get(&p.endpoint_hex).map(|v| *v);
             let last_seen = if snap.last_activity_secs_ago == u64::MAX {
                 None
@@ -806,7 +770,7 @@ fn peer_lites(state: &AgentIpcState) -> Vec<PeerLite> {
                 hostname: p.hostname.clone(),
                 endpoint_id: p.endpoint_hex.clone(),
                 tags: p.tags.clone(),
-                online: Some(snap.live || state.node.pool.has_live(p.endpoint)),
+                online: Some(snap.live || pool.has_live(p.endpoint)),
                 latency_ms,
                 os: None,
                 conn_state: Some(snap.state),
@@ -835,10 +799,12 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
     } else {
         "managed"
     };
-    let od = state.node.pool.on_demand_stats();
+    // Mesh datagram pool owns on-demand / keep-alive path state.
+    let pool = &state.node.tunnel_pool;
+    let od = pool.on_demand_stats();
     let (firewall_drops, conntrack) = state
         .node
-        .firewall()
+        .primary_firewall()
         .map(|fw| {
             let s = fw.stats();
             (
@@ -888,7 +854,7 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
         peers: include_peers.then_some(peers),
         mode: Some(mode.into()),
         data_plane_up: Some(state.data_plane.is_up()),
-        keep_alive: Some(state.node.pool.keep_alive_global()),
+        keep_alive: Some(pool.keep_alive_global()),
         firewall_drops,
         conntrack_entries: conntrack,
         on_demand: Some(OnDemandStatusInfo {
@@ -1125,9 +1091,10 @@ async fn handle_ping(
             Err(e) => {
                 write_response(
                     write,
-                    &IpcResponse::Error {
-                        message: format!("seq={seq} timeout/error: {e}"),
-                    },
+                    &err(
+                        IpcErrorCode::Internal,
+                        format!("seq={seq} timeout/error: {e}"),
+                    ),
                 )
                 .await?;
             }
@@ -1168,34 +1135,6 @@ async fn handle_ping(
         }),
     )
     .await
-}
-
-async fn handle_open_stream(
-    host: String,
-    port: u16,
-    state: Arc<AgentIpcState>,
-    reader: BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>,
-    mut write: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-) -> anyhow::Result<()> {
-    let peer = resolve_peer(&state.node, &host)
-        .ok_or_else(|| anyhow::anyhow!("no peer matches host {host}"))?;
-    match crate::stream::dial_stream(&state.node.pool, peer.endpoint, port, host.clone()).await {
-        Ok((send, recv)) => {
-            write_response(&mut write, &IpcResponse::Ready).await?;
-            let local_read = reader.into_inner();
-            crate::stream::splice_bidirectional(recv, send, local_read, write).await
-        }
-        Err(e) => {
-            write_response(
-                &mut write,
-                &IpcResponse::Error {
-                    message: e.to_string(),
-                },
-            )
-            .await?;
-            Err(e)
-        }
-    }
 }
 
 fn resolve_peer(node: &CoreNode, host: &str) -> Option<std::sync::Arc<crate::routing::PeerInfo>> {

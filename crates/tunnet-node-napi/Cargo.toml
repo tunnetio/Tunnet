@@ -9,26 +9,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-tunnet-common.workspace = true
-tunnet-core.workspace = true
 
 napi.workspace = true
 napi-derive.workspace = true
 
 tokio.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true }
-serde.workspace = true
-serde_json.workspace = true
-uuid.workspace = true
-hex.workspace = true
-bytes.workspace = true
-futures-util.workspace = true
-
-iroh.workspace = true
-iroh-blobs.workspace = true
-chrono.workspace = true
+tunnet = { version = "0.2.0", path = "../tunnet", features = ["managed", "send"] }
 
 [build-dependencies]
 napi-build.workspace = true

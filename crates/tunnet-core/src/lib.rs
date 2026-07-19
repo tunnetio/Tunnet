@@ -56,9 +56,8 @@ pub use send::{SendConfig, SendManager, TransferDirection, TransferRecord, Trans
 pub use serve::{ServeAcl, ServeManager};
 pub use state::{CliAuthTokens, DirectState, ManagedState, NodeMode, PersistedState, StatePaths};
 pub use stream::{
-    StreamHandler, TUNNEL_STREAM_ALPN, dial_stream, serve_stream_acceptor, serve_stream_connection,
+    StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN, dial_stream, serve_stream_connection,
 };
 pub use stream_proxy::stream_handler;
 #[cfg(feature = "tunnel")]
 pub use tunnel::TunnelManager;
-pub use tunnet_common as common;

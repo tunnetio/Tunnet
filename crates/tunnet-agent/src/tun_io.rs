@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bytes::Bytes;
+use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use tun_rs::{AsyncDevice, DeviceBuilder};
 use tunnet_common::policy::Direction;
@@ -12,9 +13,13 @@ use tunnet_core::direct::{
 use tunnet_core::{AclEngine, ConnPool, RoutingTable, iroh_pool::send_datagram};
 use uuid::Uuid;
 
+use crate::dataplane::TunSlot;
 use crate::ip;
 use crate::metrics::AgentMetrics;
 use crate::ssh_nat;
+
+const OUTBOUND_QUEUE_CAP: usize = 1024;
+
 pub fn build_tun(
     ifname: &str,
     ipv4: std::net::Ipv4Addr,
@@ -74,104 +79,125 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
         firewalls,
         metrics,
     } = deps;
-    let mut buf = vec![0u8; 65_536];
-    tracing::info!("outbound TUN→iroh loop started");
-    loop {
-        let n = tun.recv(&mut buf).await?;
-        if n == 0 {
-            continue;
-        }
-        // SSH port NAT: replies from internal listen port → external :22.
-        let self_ip = acl.self_id.load().ip;
-        let _ = ssh_nat::rewrite_outbound(&mut buf[..n], self_ip);
-        let packet = &buf[..n];
-        let Some(parsed) = ip::parse_ipv4(packet) else {
-            metrics.dropped_inc("non_ipv4");
-            continue;
-        };
 
-        // PeerDNS magic IP is local - never mesh-forward.
-        if routes.is_magic_dns_destination(&parsed.dst) {
-            metrics.dropped_inc("magic_dns_local");
-            continue;
-        }
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(EndpointId, Bytes)>(OUTBOUND_QUEUE_CAP);
 
-        if routes.is_advertised_destination(&parsed.dst) {
-            metrics.dropped_inc("local_subnet");
-            continue;
-        }
-
-        let Some(peer) = routes.lookup_ip(&parsed.dst) else {
-            metrics.dropped_inc("no_route");
-            continue;
-        };
-
-        // Never mesh-forward to ourselves (PeerDNS injects self into the table).
-        if peer.ip == self_ip {
-            metrics.dropped_inc("self");
-            continue;
-        }
-
-        // Connection-level ACL (Managed + Direct peer accept).
-        if !acl.allow_packet(
-            &peer.endpoint_hex,
-            Some(parsed.dst),
-            parsed.dst_port,
-            parsed.protocol,
-            Direction::Outbound,
-        ) {
-            metrics.dropped_inc("policy_deny");
-            continue;
-        }
-
-        if let Some(fw) = firewalls.get(&peer.network_id) {
-            match fw.evaluate(
-                PacketDirection::Outbound,
-                packet,
-                Some(&peer.endpoint_hex),
-                Some(&peer.hostname),
-                Some(peer.network_id),
-            ) {
-                EvalResult::Allow => {}
-                EvalResult::Deny => {
-                    metrics.dropped_inc("fw_deny_out");
-                    continue;
-                }
-                EvalResult::Reject { reply } => {
-                    metrics.dropped_inc("fw_reject_out");
-                    if !reply.is_empty() {
-                        let _ = tun.send(&reply).await;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        let payload = Bytes::copy_from_slice(packet);
-        let n = payload.len() as u64;
-        let pool = pool.clone();
-        let peer_endpoint = peer.endpoint;
-        let m = metrics.clone();
-        tokio::spawn(async move {
-            match pool.send_or_buffer(peer_endpoint, payload).await {
+    let worker_pool = pool.clone();
+    let worker_metrics = metrics.clone();
+    let worker = tokio::spawn(async move {
+        while let Some((peer, payload)) = rx.recv().await {
+            let n = payload.len() as u64;
+            match worker_pool.send_or_buffer(peer, payload).await {
                 Ok(()) => {
-                    m.packets_inc("out");
-                    m.bytes_add("out", n);
-                    pool.record_bytes_out(peer_endpoint, n);
+                    worker_metrics.packets_inc("out");
+                    worker_metrics.bytes_add("out", n);
+                    worker_pool.record_bytes_out(peer, n);
                 }
                 Err(e) => {
-                    tracing::warn!(%peer_endpoint, ?e, "send/buffer failed");
-                    m.dropped_inc("send_failed");
+                    tracing::warn!(%peer, ?e, "send/buffer failed");
+                    worker_metrics.dropped_inc("send_failed");
                 }
             }
-        });
+        }
+    });
+
+    let mut buf = vec![0u8; 65_536];
+    tracing::info!("outbound TUN→iroh loop started");
+    let read_result: anyhow::Result<()> = async {
+        loop {
+            let n = tun.recv(&mut buf).await?;
+            if n == 0 {
+                continue;
+            }
+            // SSH port NAT: replies from internal listen port → external :22.
+            let self_ip = acl.self_id.load().ip;
+            let _ = ssh_nat::rewrite_outbound(&mut buf[..n], self_ip);
+            let packet = &buf[..n];
+            let Some(parsed) = ip::parse_ipv4(packet) else {
+                metrics.dropped_inc("non_ipv4");
+                continue;
+            };
+
+            // PeerDNS magic IP is local - never mesh-forward.
+            if routes.is_magic_dns_destination(&parsed.dst) {
+                metrics.dropped_inc("magic_dns_local");
+                continue;
+            }
+
+            if routes.is_advertised_destination(&parsed.dst) {
+                metrics.dropped_inc("local_subnet");
+                continue;
+            }
+
+            let Some(peer) = routes.lookup_ip(&parsed.dst) else {
+                metrics.dropped_inc("no_route");
+                continue;
+            };
+
+            // Never mesh-forward to ourselves (PeerDNS injects self into the table).
+            if peer.ip == self_ip {
+                metrics.dropped_inc("self");
+                continue;
+            }
+
+            // Connection-level ACL (Managed + Direct peer accept).
+            if !acl.allow_packet(
+                &peer.endpoint_hex,
+                Some(parsed.dst),
+                parsed.dst_port,
+                parsed.protocol,
+                Direction::Outbound,
+            ) {
+                metrics.dropped_inc("policy_deny");
+                continue;
+            }
+
+            if let Some(fw) = firewalls.get(&peer.network_id) {
+                match fw.evaluate(
+                    PacketDirection::Outbound,
+                    packet,
+                    Some(&peer.endpoint_hex),
+                    Some(&peer.hostname),
+                    Some(peer.network_id),
+                ) {
+                    EvalResult::Allow => {}
+                    EvalResult::Deny => {
+                        metrics.dropped_inc("fw_deny_out");
+                        continue;
+                    }
+                    EvalResult::Reject { reply } => {
+                        metrics.dropped_inc("fw_reject_out");
+                        if !reply.is_empty() {
+                            let _ = tun.send(&reply).await;
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let payload = Bytes::copy_from_slice(packet);
+            match tx.try_send((peer.endpoint, payload)) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    metrics.dropped_inc("outbound_queue_full");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    anyhow::bail!("outbound send worker closed");
+                }
+            }
+        }
     }
+    .await;
+
+    drop(tx);
+    let _ = worker.await;
+    read_result
 }
 
 /// Handle an already-accepted connection negotiated with [`tunnet_common::TUNNEL_ALPN`].
 pub struct InboundDeps {
     pub conn: Connection,
-    pub tun: Arc<AsyncDevice>,
+    pub tun: TunSlot,
     pub routes: RoutingTable,
     pub acl: AclEngine,
     pub firewalls: HashMap<Uuid, FirewallEngine>,
@@ -212,7 +238,17 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
         .and_then(|a| a.networks_for(&remote_hex).into_iter().next())
         .or_else(|| routes.lookup_endpoint(&remote_hex).map(|p| p.network_id));
 
+    let start_gen = tun.read().await.generation;
+
     loop {
+        // Exit cleanly if data plane went down or TUN was swapped.
+        {
+            let slot = tun.read().await;
+            if slot.device.is_none() || slot.generation != start_gen {
+                break;
+            }
+        }
+
         match conn.read_datagram().await {
             Ok(dg) => {
                 if let Some(p) = &pool {
@@ -271,12 +307,11 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
                 if let Some(nid) = peer_net
                     && let Some(fw) = firewalls.get(&nid)
                 {
-                    let hostname = peer_info.as_ref().map(|p| p.hostname.clone());
                     match fw.evaluate(
                         PacketDirection::Inbound,
                         &dg,
                         Some(&remote_hex),
-                        hostname.as_deref(),
+                        peer_info.as_ref().map(|p| p.hostname.as_str()),
                         Some(nid),
                     ) {
                         EvalResult::Allow => {}
@@ -287,7 +322,7 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
                         EvalResult::Reject { reply } => {
                             metrics.dropped_inc("fw_reject_in");
                             if !reply.is_empty() {
-                                let _ = send_datagram(&conn, reply);
+                                let _ = send_datagram(&conn, reply).await;
                             }
                             continue;
                         }
@@ -297,9 +332,23 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
                 let n = dg.len() as u64;
                 // SSH port NAT: inbound :22 → internal listen port before kernel.
                 let self_ip = acl.self_id.load().ip;
-                let mut packet = dg.to_vec();
-                let _ = ssh_nat::rewrite_inbound(&mut packet, self_ip);
-                if let Err(e) = tun.send(&packet).await {
+                let send_result = {
+                    let slot = tun.read().await;
+                    let Some(device) = slot.device.as_ref() else {
+                        break;
+                    };
+                    if slot.generation != start_gen {
+                        break;
+                    }
+                    if ssh_nat::needs_inbound_rewrite(&dg, self_ip) {
+                        let mut packet = dg.to_vec();
+                        let _ = ssh_nat::rewrite_inbound(&mut packet, self_ip);
+                        device.send(&packet).await
+                    } else {
+                        device.send(dg.as_ref()).await
+                    }
+                };
+                if let Err(e) = send_result {
                     tracing::warn!(?e, "tun send failed");
                     metrics.dropped_inc("tun_send_failed");
                     break;

@@ -12,8 +12,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::auth::{AuthError, authenticate};
-use crate::enrollment::hash_token;
 use crate::state::SharedState;
+use crate::token_hash::hash_token;
 
 fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
