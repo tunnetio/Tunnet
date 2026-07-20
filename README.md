@@ -51,10 +51,8 @@ For management automation (policy, groups, ACLs) see the [Go management SDK](htt
 
 ### Two modes, one product
 
-- **Managed** - control plane, dashboard, SSO/OIDC, centralized policies, Policy as Code (HCL/JSON/YAML, Terraform, GitOps), audit logs, tunnels, SSH recording. Built for teams.
-- **Direct** - zero-server P2P mesh for individuals and small groups.
-
-[Managed](https://docs.tunnet.io/modes/managed/) · [Direct](https://docs.tunnet.io/modes/direct/) · [Policy as Code](https://docs.tunnet.io/guide/policy-as-code)
+- [Managed](https://docs.tunnet.io/modes/managed/) - control plane, dashboard, SSO/OIDC, centralized policies, Policy as Code (HCL/JSON/YAML, Terraform, GitOps), audit logs, tunnels, SSH recording. Built for teams.
+- [Direct](https://docs.tunnet.io/modes/direct/) - zero-server P2P mesh for individuals and small groups.
 
 ### Policy as Code
 

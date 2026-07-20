@@ -3,6 +3,7 @@
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
 @import "@fontsource-variable/geist-mono";
+@import "@xyflow/react/dist/style.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -220,6 +221,31 @@ body {
     transparent 0
   );
   background-size: 16px 16px;
+}
+
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-node-border-default: transparent;
+  --xy-node-background-color-default: transparent;
+  --xy-controls-button-background-color: var(--color-card);
+  --xy-controls-button-border-color: color-mix(
+    in oklab,
+    var(--color-border) 70%,
+    transparent
+  );
+  --xy-minimap-background-color: color-mix(
+    in oklab,
+    var(--color-card) 90%,
+    transparent
+  );
+}
+
+.react-flow__node {
+  font-size: 12px;
+}
+
+.react-flow__attribution {
+  display: none;
 }
 
 .panel {

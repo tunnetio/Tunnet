@@ -1,3 +1,4 @@
+import { useRouterState } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import { AppSidebar } from "@/components/app/app-sidebar";
@@ -10,14 +11,24 @@ import {
 } from "@/components/ui/sidebar";
 import { usePresenceStream } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
+import { cn } from "@/lib/utils";
 
 type AppShellProps = {
   children: ReactNode;
 };
 
+function useCanvasMode(pathname: string): boolean {
+  if (pathname === "/app" || pathname === "/app/") return true;
+  if (/^\/app\/networks\/[^/]+\/?$/.test(pathname)) return true;
+  if (/^\/app\/kubernetes\/networks\/[^/]+\/?$/.test(pathname)) return true;
+  return false;
+}
+
 export function AppShell({ children }: AppShellProps) {
   const { data: activeOrg } = useActiveOrganization();
   usePresenceStream(activeOrg?.id);
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const canvasMode = useCanvasMode(pathname);
 
   return (
     <SidebarProvider className="h-svh overflow-hidden">
@@ -30,8 +41,19 @@ export function AppShell({ children }: AppShellProps) {
             <OrgSwitcher />
           </div>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto w-full max-w-[1400px] space-y-6 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        <main
+          className={cn(
+            "min-h-0 flex-1",
+            canvasMode ? "overflow-hidden" : "overflow-y-auto",
+          )}
+        >
+          <div
+            className={cn(
+              canvasMode
+                ? "flex h-full min-h-0 w-full flex-col"
+                : "mx-auto w-full max-w-[1400px] space-y-6 px-4 py-6 sm:px-6 sm:py-8 lg:px-8",
+            )}
+          >
             {children}
           </div>
         </main>
