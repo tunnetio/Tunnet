@@ -5,6 +5,9 @@ export const entitlementsSchema = z.object({
   multiOrganization: z.boolean(),
   cloudLanding: z.boolean(),
   openSignUp: z.boolean(),
+  clickhouseAudit: z.boolean(),
+  auditEnterpriseStreams: z.boolean(),
+  complianceExport: z.boolean(),
   licenseExpiresAt: z.number().nullable(),
 });
 

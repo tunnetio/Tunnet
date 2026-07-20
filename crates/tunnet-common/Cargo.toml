@@ -24,6 +24,9 @@ ed25519-dalek.workspace = true
 chrono.workspace = true
 ipnet.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 rand.workspace = true

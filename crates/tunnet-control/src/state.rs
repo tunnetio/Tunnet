@@ -3,6 +3,8 @@ use std::sync::atomic::AtomicBool;
 
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
+use tunnet_audit::AuditEmitter;
+use tunnet_common::license::Entitlements;
 
 use crate::config::Args;
 use crate::pg_notify;
@@ -19,6 +21,9 @@ pub struct AppState {
     pub service_auth: ServiceAuth,
     pub listen_connected: Arc<AtomicBool>,
     pub posture_grace: PostureGraceMap,
+    pub audit: AuditEmitter,
+    #[allow(dead_code)] // Used when ClickHouse / enterprise streams are enabled.
+    pub entitlements: Entitlements,
 }
 
 impl AppState {
@@ -27,6 +32,8 @@ impl AppState {
         pool: PgPool,
         policy_key: SigningKey,
         service_auth: ServiceAuth,
+        audit: AuditEmitter,
+        entitlements: Entitlements,
     ) -> Self {
         let metrics = crate::metrics::Metrics::new().expect("metrics registration");
         Self {
@@ -38,6 +45,8 @@ impl AppState {
             service_auth,
             listen_connected: Arc::new(AtomicBool::new(false)),
             posture_grace: crate::posture::grace_map(),
+            audit,
+            entitlements,
         }
     }
 

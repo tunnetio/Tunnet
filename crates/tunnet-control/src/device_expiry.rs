@@ -27,16 +27,24 @@ impl CleanupMode {
 }
 
 /// Run one cleanup pass.
-pub async fn run_cleanup(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Result<(u64, u64)> {
-    let soft = soft_expire_due_devices(pool, ws_hub).await?;
-    let hard = hard_delete_due_devices(pool, ws_hub).await?;
+pub async fn run_cleanup(
+    pool: &PgPool,
+    ws_hub: &WsHub,
+    audit: &tunnet_audit::AuditEmitter,
+) -> anyhow::Result<(u64, u64)> {
+    let soft = soft_expire_due_devices(pool, ws_hub, audit).await?;
+    let hard = hard_delete_due_devices(pool, ws_hub, audit).await?;
     if soft > 0 || hard > 0 {
         tracing::info!(soft, hard, "machine auto-cleanup pass complete");
     }
     Ok((soft, hard))
 }
 
-async fn soft_expire_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Result<u64> {
+async fn soft_expire_due_devices(
+    pool: &PgPool,
+    ws_hub: &WsHub,
+    audit: &tunnet_audit::AuditEmitter,
+) -> anyhow::Result<u64> {
     let due: Vec<(String, String, Option<String>, bool)> = sqlx::query_as(
         "SELECT d.endpoint_id, d.organization_id, \
                 o.settings->'machines'->'autoCleanup'->>'mode', \
@@ -70,14 +78,18 @@ async fn soft_expire_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Resul
         if org_enabled && mode == CleanupMode::Hard {
             continue;
         }
-        if soft_expire_device(pool, ws_hub, &endpoint_id, &organization_id).await? {
+        if soft_expire_device(pool, ws_hub, audit, &endpoint_id, &organization_id).await? {
             count += 1;
         }
     }
     Ok(count)
 }
 
-async fn hard_delete_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Result<u64> {
+async fn hard_delete_due_devices(
+    pool: &PgPool,
+    ws_hub: &WsHub,
+    audit: &tunnet_audit::AuditEmitter,
+) -> anyhow::Result<u64> {
     let hard_due: Vec<(String, String)> = sqlx::query_as(
         "SELECT d.endpoint_id, d.organization_id \
          FROM devices d \
@@ -110,7 +122,7 @@ async fn hard_delete_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Resul
 
     let mut count = 0u64;
     for (endpoint_id, organization_id) in hard_due {
-        if hard_delete_device(pool, ws_hub, &endpoint_id, &organization_id).await? {
+        if hard_delete_device(pool, ws_hub, audit, &endpoint_id, &organization_id).await? {
             count += 1;
         }
     }
@@ -132,7 +144,7 @@ async fn hard_delete_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Resul
         .await?;
 
         if due.map(|(v,)| v).unwrap_or(false)
-            && hard_delete_device(pool, ws_hub, &endpoint_id, &organization_id).await?
+            && hard_delete_device(pool, ws_hub, audit, &endpoint_id, &organization_id).await?
         {
             count += 1;
         }
@@ -143,6 +155,7 @@ async fn hard_delete_due_devices(pool: &PgPool, ws_hub: &WsHub) -> anyhow::Resul
 async fn soft_expire_device(
     pool: &PgPool,
     ws_hub: &WsHub,
+    audit: &tunnet_audit::AuditEmitter,
     endpoint_id: &str,
     organization_id: &str,
 ) -> anyhow::Result<bool> {
@@ -188,15 +201,14 @@ async fn soft_expire_device(
     tx.commit().await?;
 
     crate::audit::log(
-        pool,
+        audit,
         Some(organization_id),
         None,
         "device.expired",
         Some(endpoint_id),
         serde_json::json!({ "reason": "inactivity_ttl", "mode": "soft" }),
         None,
-    )
-    .await;
+    );
 
     ws_hub
         .disconnect(
@@ -222,6 +234,7 @@ async fn soft_expire_device(
 async fn hard_delete_device(
     pool: &PgPool,
     ws_hub: &WsHub,
+    audit: &tunnet_audit::AuditEmitter,
     endpoint_id: &str,
     organization_id: &str,
 ) -> anyhow::Result<bool> {
@@ -271,15 +284,14 @@ async fn hard_delete_device(
     tx.commit().await?;
 
     crate::audit::log(
-        pool,
+        audit,
         Some(organization_id),
         None,
         "device.purged",
         Some(endpoint_id),
         serde_json::json!({ "reason": "inactivity_ttl", "mode": "hard" }),
         None,
-    )
-    .await;
+    );
 
     for (network_id,) in memberships {
         let version: i64 = sqlx::query_scalar("SELECT version FROM networks WHERE id = $1")

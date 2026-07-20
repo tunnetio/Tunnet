@@ -1,6 +1,7 @@
 pub mod agent_policy;
 pub mod duration;
 pub mod ipv6;
+pub mod license;
 pub mod policy;
 pub mod posture;
 pub mod recording;

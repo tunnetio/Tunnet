@@ -234,6 +234,7 @@ async fn enroll_inner(
     let resp = crate::register::register_device(
         &state.pool,
         &state.policy_key,
+        &state.audit,
         crate::register::RegisterDeviceParams {
             endpoint_id: req.endpoint_id.clone(),
             organization_id: organization_id.clone(),

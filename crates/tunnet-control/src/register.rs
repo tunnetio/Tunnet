@@ -1,6 +1,7 @@
 use ed25519_dalek::SigningKey;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use tunnet_audit::AuditEmitter;
 use tunnet_common::EnrollResponse;
 use uuid::Uuid;
 
@@ -23,6 +24,7 @@ pub struct RegisterDeviceParams {
 pub async fn register_device(
     pool: &PgPool,
     policy_key: &SigningKey,
+    audit: &AuditEmitter,
     params: RegisterDeviceParams,
 ) -> Result<EnrollResponse, (axum::http::StatusCode, String)> {
     tunnet_common::validate_endpoint_id(&params.endpoint_id).map_err(|_| {
@@ -294,7 +296,7 @@ pub async fn register_device(
     };
 
     crate::audit::log(
-        pool,
+        audit,
         Some(&params.organization_id),
         Some(&params.endpoint_id),
         audit_action,
@@ -306,8 +308,7 @@ pub async fn register_device(
             "status": final_status,
         }),
         None,
-    )
-    .await;
+    );
 
     let pool_bg = pool.clone();
     let endpoint_id = params.endpoint_id.clone();

@@ -121,6 +121,7 @@ pub async fn serve(bind: &str, state: AdminState) -> anyhow::Result<()> {
             "/internal/v1/posture/attributes",
             get(posture_attributes_handler),
         )
+        .route("/internal/v1/audit/ingest", post(audit_ingest_handler))
         .with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -245,6 +246,7 @@ async fn register_device_handler(
     let outcome = crate::register::register_device(
         &state.pool,
         &state.policy_key,
+        &state.audit,
         crate::register::RegisterDeviceParams {
             endpoint_id: parsed.endpoint_id,
             organization_id: parsed.organization_id,
@@ -698,6 +700,45 @@ async fn posture_attributes_handler(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+async fn audit_ingest_handler(
+    State(state): State<Arc<AdminState>>,
+    req: Request<axum::body::Body>,
+) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+    let body = match axum::body::to_bytes(req.into_body(), 4 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    if let Err(resp) = state
+        .service_auth
+        .verify(&method, &path, &headers, &body)
+        .await
+        .map_err(|e: ServiceAuthError| e.into_response())
+    {
+        return resp;
+    }
+
+    let parsed: tunnet_audit::AuditIngestRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid json: {e}")).into_response();
+        }
+    };
+
+    if parsed.events.is_empty() {
+        return (StatusCode::BAD_REQUEST, "events array required").into_response();
+    }
+
+    for event in parsed.events {
+        state.audit.emit(event.into());
+    }
+
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn verify_service(

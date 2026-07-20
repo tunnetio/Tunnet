@@ -13,6 +13,7 @@ members = [
   "crates/tunnet-operator",
   "crates/tunnet-posture",
   "crates/tunnet-policy-engine",
+  "crates/tunnet-audit",
 ]
 
 [workspace.package]
@@ -130,6 +131,7 @@ tunnet-common = { version = "0.7.0", path = "crates/tunnet-common" }
 tunnet-core = { version = "0.7.0", path = "crates/tunnet-core" }
 tunnet-posture = { version = "0.7.0", path = "crates/tunnet-posture" }
 tunnet-policy-engine = { version = "0.7.0", path = "crates/tunnet-policy-engine" }
+tunnet-audit = { version = "0.7.0", path = "crates/tunnet-audit" }
 yaml_serde = "0.10.4"
 hcl-rs = "0.19"
 

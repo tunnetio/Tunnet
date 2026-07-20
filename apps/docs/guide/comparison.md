@@ -77,6 +77,7 @@ Raw WireGuard requires manual key exchange, manual IP allocation, and manual con
 | SSO / OIDC | Yes | Yes | Yes | Yes |
 | ACL policies | Yes | Yes | Partial³ | Yes |
 | Policy as Code | Yes | Limited⁴ | No | Limited⁵ |
+| Audit logs (self-hosted) | Yes | Yes (vendor-hosted) | Partial | Yes |
 | P2P mode (no server) | Direct mode | No | No | No |
 | License | AGPL-3.0 | Proprietary | Proprietary | Proprietary |
 

@@ -37,18 +37,26 @@ function LogsPage() {
         header: "Time",
         cell: ({ row }) => (
           <span className="text-muted-foreground text-sm whitespace-nowrap">
-            {formatDistanceToNow(new Date(row.original.at), {
+            {formatDistanceToNow(new Date(row.original.time), {
               addSuffix: true,
             })}
           </span>
         ),
       },
       {
-        id: "action",
-        header: "Action",
-        accessorKey: "action",
+        id: "message",
+        header: "Event",
         cell: ({ row }) => (
-          <span className="font-mono text-xs">{row.original.action}</span>
+          <span className="text-sm">{row.original.message}</span>
+        ),
+      },
+      {
+        id: "class",
+        header: "Class",
+        cell: ({ row }) => (
+          <span className="font-mono text-xs text-muted-foreground">
+            {row.original.classUid}
+          </span>
         ),
       },
       {
@@ -56,7 +64,8 @@ function LogsPage() {
         header: "Target",
         cell: ({ row }) => (
           <span className="font-mono text-xs">
-            {row.original.target ?? "—"}
+            {row.original.target.targetType}:
+            {row.original.target.targetId || "—"}
           </span>
         ),
       },
@@ -65,7 +74,7 @@ function LogsPage() {
         header: "Actor",
         cell: ({ row }) => (
           <span className="text-muted-foreground text-xs">
-            {row.original.actor ?? "—"}
+            {row.original.actor.displayName ?? row.original.actor.actorId}
           </span>
         ),
       },
@@ -104,7 +113,7 @@ function LogsPage() {
       <DataTable
         columns={columns}
         data={entries}
-        getRowId={(row) => String(row.id)}
+        getRowId={(row) => String(row.sequenceNumber)}
         emptyMessage="No audit entries yet."
       />
 

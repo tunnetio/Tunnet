@@ -27,6 +27,7 @@ You also get more than a VPN. Instead of stitching Tailscale + ngrok + scp + a b
 | **Self-hosted relay** | Vendor edge networks | [Relay](https://docs.tunnet.io/products/relay/) |
 | **Kubernetes operator** | Custom VPN + Ingress glue | [Kubernetes](https://docs.tunnet.io/integrations/kubernetes/) |
 | **Policy as Code** | HuJSON ACLs + ad-hoc GitOps | [Policy as Code](https://docs.tunnet.io/guide/policy-as-code) |
+| **Audit logs** | SIEM-only or closed admin trails | [Audit Logs](https://docs.tunnet.io/guide/concepts/audit-logs) |
 | **Node / Rust / Go SDKs** | Embedding tunnels + management API | [SDK](https://docs.tunnet.io/sdk/) |
 
 ### Mesh that feels like a LAN
@@ -52,7 +53,7 @@ For management automation (policy, groups, ACLs) see the [Go management SDK](htt
 
 ### Two modes, one product
 
-- **Managed** - control plane, dashboard, SSO/OIDC, centralized policies, Policy as Code (HCL/JSON/YAML, Terraform, GitOps), audit, tunnels, SSH recording. Built for teams.
+- **Managed** - control plane, dashboard, SSO/OIDC, centralized policies, Policy as Code (HCL/JSON/YAML, Terraform, GitOps), [audit logs](https://docs.tunnet.io/guide/concepts/audit-logs), tunnels, SSH recording. Built for teams.
 - **Direct** - zero-server P2P mesh for individuals and small groups.
 
 [Managed](https://docs.tunnet.io/modes/managed/) · [Direct](https://docs.tunnet.io/modes/direct/) · [Policy as Code](https://docs.tunnet.io/guide/policy-as-code)
@@ -79,6 +80,7 @@ Author ACLs, groups, tags, SSH, and posture in Git. Validate and simulate offlin
 | Kubernetes operator | Yes | Yes | Yes | Community¹ |
 | Embeddable SDKs | JS, Rust | Go, C | Go, Rust, Python, JS, Java | No² |
 | Policy as Code | **Yes** | Limited | No | Limited |
+| Audit logs | **Yes** (self-hostable) | Yes | Partial | Yes |
 | License | AGPL-3.0 | Proprietary | Proprietary | Proprietary |
 
 > ¹ Cloudflare has official K8s deployment guides for Tunnel but the operators are community-maintained.

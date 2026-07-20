@@ -21,6 +21,8 @@ The management server derives the control plane admin API URL from `CONTROL_PLAN
 | `DATABASE_URL` | PostgreSQL connection string | `postgres://user:pass@localhost:5432/tunnet` |
 | `BETTER_AUTH_SECRET` | Auth signing secret (32+ chars) | `a-long-random-string-at-least-32-characters` |
 | `TUNNET_SERVICE_SECRET` | Internal API shared secret (management ↔ control) | `a-long-random-string-at-least-32-characters` |
+| `TUNNET_AUDIT_HMAC_KEY` | Audit integrity key (32+ chars) | `another-long-random-string-at-least-32-chars` |
+| `TUNNET_LICENSE` | Optional commercial license certificate | `/etc/tunnet/license.json` |
 
 ## Agent (`tunnet`)
 
@@ -39,10 +41,19 @@ The management server derives the control plane admin API URL from `CONTROL_PLAN
 | `TUNNET_RECORDER` | Enable SSH recording | `true` |
 | `TUNNET_JSON_LOGS` | JSON log format | `true` |
 
-## Control plane internals
+## Control plane
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `TUNNET_BIND` | Public API bind address | `0.0.0.0:8080` |
 | `TUNNET_ADMIN_BIND` | Internal admin API bind | `127.0.0.1:9091` |
 | `TUNNET_INTERNAL_BIND` | Metrics/ready bind | `127.0.0.1:9090` |
+| `TUNNET_LICENSE` | Commercial license certificate (inline JSON, file path, or HTTPS URL). Unlocks Cloud/Enterprise features when valid. | — (Community) |
+| `TUNNET_AUDIT_HMAC_KEY` | Secret used to protect the audit integrity chain (32+ characters, required for Managed) | — |
+| `TUNNET_AUDIT_STREAM_WEBHOOK_URL` | Optional HTTP endpoint that receives batched audit events as JSON | — |
+| `TUNNET_AUDIT_STREAM_WEBHOOK_HEADERS` | Optional comma-separated `Header:Value` pairs for the webhook | — |
+| `TUNNET_AUDIT_BUFFER_SIZE` | In-memory audit buffer capacity before drop | `8192` |
+| `TUNNET_AUDIT_BATCH_SIZE` | Max events flushed together | `500` |
+| `TUNNET_AUDIT_FLUSH_INTERVAL_MS` | Max flush interval in milliseconds | `1000` |
+
+See [Audit Logs](/guide/concepts/audit-logs) for how the trail works in the dashboard and how to verify integrity.

@@ -352,3 +352,38 @@ export async function pushPostureRecheck(body: {
     })
     .json();
 }
+
+export type AuditIngestEvent = {
+  organization_id: string;
+  class_uid: number;
+  activity_id: number;
+  severity_id?: number;
+  status_id?: number;
+  message: string;
+  actor: {
+    actor_type: string;
+    actor_id: string;
+    display_name?: string | null;
+    email?: string | null;
+    ip_address?: string | null;
+    user_agent?: string | null;
+  };
+  target: {
+    target_type: string;
+    target_id: string;
+    display_name?: string | null;
+  };
+  network_id?: string | null;
+  group_id?: string | null;
+  metadata?: Record<string, unknown>;
+  trace_id?: string | null;
+};
+
+/** Fire-and-forget friendly: ingest OCSF audit events into the control plane. */
+export async function ingestAuditEvents(
+  events: AuditIngestEvent[],
+): Promise<void> {
+  await getClient().post("/internal/v1/audit/ingest", {
+    json: { events },
+  });
+}

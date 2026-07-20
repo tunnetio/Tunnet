@@ -127,6 +127,10 @@ export default defineConfig({
               text: "Encryption & Secrets",
               link: "/guide/concepts/encryption",
             },
+            {
+              text: "Audit Logs",
+              link: "/guide/concepts/audit-logs",
+            },
           ],
         },
       ],

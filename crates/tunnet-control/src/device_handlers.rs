@@ -172,15 +172,14 @@ pub async fn merge_device_labels(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("notify: {e}")))?;
 
     crate::audit::log(
-        &state.pool,
+        &state.audit,
         Some(organization_id),
         Some(endpoint_id),
         "device.labels_updated",
         Some(endpoint_id),
         serde_json::json!({ "labels": merged }),
         None,
-    )
-    .await;
+    );
 
     Ok(merged)
 }
@@ -258,6 +257,7 @@ pub async fn patch_device_tags_handler(
 
     match apply_device_tag_changes(
         &state.pool,
+        &state.audit,
         &auth.endpoint_id,
         &auth.organization_id,
         &add,
@@ -336,6 +336,7 @@ async fn assert_device_can_assign_tags(
 
 async fn apply_device_tag_changes(
     pool: &sqlx::PgPool,
+    audit: &tunnet_audit::AuditEmitter,
     endpoint_id: &str,
     organization_id: &str,
     add: &[String],
@@ -371,15 +372,14 @@ async fn apply_device_tag_changes(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("notify: {e}")))?;
 
     crate::audit::log(
-        pool,
+        audit,
         Some(organization_id),
         Some(endpoint_id),
         "device.tags_updated",
         Some(endpoint_id),
         serde_json::json!({ "add": add, "remove": remove }),
         None,
-    )
-    .await;
+    );
 
     list_device_tags(pool, endpoint_id).await
 }

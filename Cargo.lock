@@ -8009,6 +8009,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tunnet-audit"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac",
+ "rand 0.10.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tunnet-common"
 version = "0.7.0"
 dependencies = [
@@ -8020,9 +8040,12 @@ dependencies = [
  "hex",
  "ipnet",
  "rand 0.10.2",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -8070,6 +8093,7 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tunnet-audit",
  "tunnet-common",
  "tunnet-posture",
  "uuid",

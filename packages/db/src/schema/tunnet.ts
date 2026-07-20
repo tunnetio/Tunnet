@@ -10,6 +10,7 @@ import {
   jsonb,
   pgTable,
   primaryKey,
+  smallint,
   text,
   timestamp,
   unique,
@@ -680,28 +681,60 @@ export const peerMetrics = pgTable(
   ],
 );
 
-export const auditLog = pgTable(
-  "audit_log",
+/** OCSF-aligned append-only audit events (hash-chained per organization). */
+export const auditEvents = pgTable(
+  "audit_events",
   {
-    id: bigserial("id", { mode: "number" }).primaryKey(),
-    organizationId: text("organization_id").references(() => organization.id, {
-      onDelete: "set null",
-    }),
-    actor: text("actor"),
-    action: text("action").notNull(),
-    target: text("target"),
+    organizationId: text("organization_id").notNull(),
+    sequenceNumber: bigint("sequence_number", { mode: "number" }).notNull(),
+    categoryUid: smallint("category_uid").notNull(),
+    classUid: smallint("class_uid").notNull(),
+    activityId: smallint("activity_id").notNull(),
+    typeUid: integer("type_uid").notNull(),
+    severityId: smallint("severity_id").notNull().default(1),
+    statusId: smallint("status_id").notNull().default(1),
+    time: timestamp("time", { withTimezone: true }).notNull().defaultNow(),
+    message: text("message").notNull(),
+    actorType: text("actor_type").notNull(),
+    actorId: text("actor_id").notNull(),
+    actorName: text("actor_name"),
+    actorEmail: text("actor_email"),
+    actorIp: inet("actor_ip"),
+    actorUa: text("actor_ua"),
+    targetType: text("target_type").notNull(),
+    targetId: text("target_id").notNull(),
+    targetName: text("target_name"),
+    networkId: uuid("network_id"),
+    groupId: text("group_id"),
+    diffBefore: jsonb("diff_before"),
+    diffAfter: jsonb("diff_after"),
     metadata: jsonb("metadata").notNull().default({}),
     traceId: text("trace_id"),
-    at: timestamp("at", { withTimezone: true }).defaultNow().notNull(),
+    prevEntryHash: text("prev_entry_hash").notNull(),
+    entryHash: text("entry_hash").notNull(),
+    hmacSchemaVersion: smallint("hmac_schema_version").notNull().default(1),
   },
   (table) => [
-    index("audit_log_by_organization_at_idx").on(
+    primaryKey({
+      columns: [table.organizationId, table.sequenceNumber, table.time],
+      name: "audit_events_pkey",
+    }),
+    index("idx_audit_org_time").on(table.organizationId, table.time),
+    index("idx_audit_org_class").on(
       table.organizationId,
-      table.at,
+      table.classUid,
+      table.time,
     ),
-    index("audit_log_by_organization_actor_idx").on(
+    index("idx_audit_org_actor").on(
       table.organizationId,
-      table.actor,
+      table.actorId,
+      table.time,
+    ),
+    index("idx_audit_org_target").on(
+      table.organizationId,
+      table.targetType,
+      table.targetId,
+      table.time,
     ),
   ],
 );

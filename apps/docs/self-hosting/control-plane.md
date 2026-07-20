@@ -4,7 +4,7 @@ The control plane (`tunnet-control`) is the Rust server that coordinates managed
 
 ## What it does
 
-The control plane handles machine enrollment and IP allocation, network snapshot building and distribution, peer discovery (exchanging iroh endpoint IDs), WebSocket connections from agents, policy distribution, device posture reports and evaluation, tunnel routing (assigning tunnels to relays), relay registration, SSH session tracking, audit logging, and the internal admin API (port 9091) used by the management server.
+The control plane handles machine enrollment and IP allocation, network snapshot building and distribution, peer discovery (exchanging iroh endpoint IDs), WebSocket connections from agents, policy distribution, device posture reports and evaluation, tunnel routing (assigning tunnels to relays), relay registration, SSH session tracking, [audit logging](/guide/concepts/audit-logs), and the admin API used by the management server.
 
 ## Ports
 
@@ -37,4 +37,17 @@ The control plane image is built from `deploy/Dockerfile.control` using a multi-
 | `TUNNET_INTERNAL_BIND` | `0.0.0.0:9090` | Internal metrics bind |
 | `TUNNET_ADMIN_BIND` | `0.0.0.0:9091` | Admin API bind |
 | `TUNNET_SERVICE_SECRET` | - | Shared secret for internal API auth (required, must match management) |
+| `TUNNET_AUDIT_HMAC_KEY` | - | Audit integrity key (required, 32+ characters) |
+| `TUNNET_LICENSE` | - | Optional commercial license (Cloud / Enterprise entitlements) |
+| `TUNNET_AUDIT_STREAM_WEBHOOK_URL` | - | Optional SIEM / collector webhook for audit events |
 | `TUNNET_JSON_LOGS` | `false` | Enable structured JSON logs |
+
+## Audit verification
+
+Verify the integrity chain for an organization:
+
+```bash
+tunnet-control audit verify --org <organization_id>
+```
+
+See [Audit Logs](/guide/concepts/audit-logs) for dashboard usage, webhook export, and commercial options.
