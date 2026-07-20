@@ -18,7 +18,7 @@ managed = ["dep:tokio-tungstenite"]
 direct = ["dep:iroh-docs", "dep:iroh-blobs", "dep:mainline", "dep:iroh-mdns-address-lookup", "dep:mdns-sd", "dep:bs58"]
 send = ["dep:iroh-blobs"]
 serve = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
-tunnel = []
+tunnel = ["dep:axum", "dep:httparse"]
 dns = ["dep:hickory-proto"]
 recording = []
 ipc = []
@@ -69,6 +69,8 @@ rustls-pemfile = { workspace = true, optional = true }
 aes-gcm = "0.10"
 zeroize = { version = "1.9.0", features = ["std", "derive"] }
 mdns-sd = { version = "0.20.1", optional = true }
+axum = { workspace = true, optional = true }
+httparse = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

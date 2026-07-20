@@ -424,11 +424,12 @@ fn wait_for_running(
                     ServiceExitCode::ServiceSpecific(c) => c,
                 };
                 let log = service_log_path();
+                let hint = startup_failure_hint(&log);
                 anyhow::bail!(
                     "tunnet service exited during startup (win32={win32}).\n\
                      Check {} or run interactively:\n\
                        tunnet run\n\
-                     Common cause on a fresh Windows host: missing wintun.dll next to tunnet.exe.",
+                     {hint}",
                     log.display()
                 );
             }
@@ -445,6 +446,43 @@ fn wait_for_running(
         // Poll quickly; SCM wait_hint is often 30–60s and would stall the CLI.
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Prefer the last FATAL/ERROR line from the service log over a generic wintun hint.
+fn startup_failure_hint(log: &std::path::Path) -> String {
+    let tail = std::fs::read_to_string(log).unwrap_or_default();
+    let last_fatal = tail
+        .lines()
+        .rev()
+        .find(|l| {
+            let u = l.to_ascii_uppercase();
+            u.contains(" FATAL") || u.contains("FATAL:") || u.contains(" ERROR")
+        })
+        .map(str::trim);
+
+    if let Some(line) = last_fatal {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("10055")
+            || lower.contains("lacked sufficient buffer space")
+            || lower.contains("queue was full")
+        {
+            return format!(
+                "Last log: {line}\n\
+                 Cause: Windows socket exhaustion (WSAENOBUFS / 10055).\n\
+                 Often WSL mirrored networking (WslDeviceHost_Net / dllhost) holds thousands of UDP ports.\n\
+                 Try: wsl --shutdown   then   tunnet service start"
+            );
+        }
+        if lower.contains("wintun") {
+            return format!(
+                "Last log: {line}\n\
+                 Cause: wintun.dll missing or failed to load beside tunnet.exe."
+            );
+        }
+        return format!("Last log: {line}");
+    }
+
+    "If this is a fresh Windows host, also check that wintun.dll sits next to tunnet.exe.".into()
 }
 
 /// Stop the service and wait until it is Stopped (or timeout).

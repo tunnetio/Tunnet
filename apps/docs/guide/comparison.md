@@ -66,6 +66,7 @@ Raw WireGuard requires manual key exchange, manual IP allocation, and manual con
 | Mesh VPN | Yes | Yes | No | Yes (Mesh) |
 | Open control plane | Yes | No | No | No |
 | Public tunnels | Yes | Funnel | Yes | Yes (Tunnel) |
+| Traffic inspection / replay | Yes | No | Yes | No |
 | Internal services | Serve | Serve | No | Access |
 | File transfer | Send | Taildrop | No | No |
 | SSH (identity-based) | Yes | Yes | No | Yes (browser-rendered) |

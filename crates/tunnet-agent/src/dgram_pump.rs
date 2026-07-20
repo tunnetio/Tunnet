@@ -54,7 +54,6 @@ pub fn install_dialer_datagram_pump(
             let direct_auth = direct_auth.clone();
             let pool = pool_for_hook.clone();
             let ingress = ingress.clone();
-            // Dial installed a new canonical conn — replace any stale reader.
             ingress.force_spawn(peer, async move {
                 if tun_slot.read().await.device.is_none() {
                     return;

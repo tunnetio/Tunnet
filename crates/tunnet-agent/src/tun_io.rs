@@ -23,7 +23,7 @@ const PRIORITY_QUEUE_CAP: usize = 256;
 
 #[derive(Clone, Copy)]
 enum OutPriority {
-    /// ICMP — dedicated worker so bulk TCP waits cannot stall ping.
+    /// ICMP - dedicated worker so bulk TCP waits cannot stall ping.
     Latency,
     /// Everything else (TCP/UDP bulk + ACKs).
     Bulk,
@@ -123,7 +123,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 let result = match pool.send_latency(peer, payload.clone()).await {
                     Ok(()) => Ok(()),
                     Err(e) => {
-                        // Older peers may not advertise tunnel-lat — fall back to bulk.
+                        // Older peers may not advertise tunnel-lat - fall back to bulk.
                         tracing::debug!(%peer, ?e, "latency path unavailable; using bulk");
                         pool.send_or_buffer(peer, payload).await
                     }

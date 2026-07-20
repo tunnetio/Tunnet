@@ -8,7 +8,7 @@ type DbConn = Database | Parameters<Parameters<Database["transaction"]>[0]>[0];
 export type TagActor = {
   userId: string | null;
   email: string | null;
-  /** Org owner or admin — always allowed to assign any tag. */
+  /** Org owner or admin - always allowed to assign any tag. */
   isOrgAdmin: boolean;
   /** Device endpoint requesting self-tag (CLI / config). */
   endpointId: string | null;
@@ -26,8 +26,8 @@ export function defaultOwnerForUser(userId: string): string {
  * Resolve whether `actor` may assign/remove `tagName` for the org.
  * Org admins/owners always may. Otherwise owners entries are checked:
  * - `user:<id>` or `user:<email>`
- * - `tag:<name>` — actor's device must hold that tag (or user has assign permission and owns via hierarchy)
- * - `autogroup:admin` — org admin (already covered by isOrgAdmin)
+ * - `tag:<name>` - actor's device must hold that tag (or user has assign permission and owns via hierarchy)
+ * - `autogroup:admin` - org admin (already covered by isOrgAdmin)
  */
 export async function canAssignTag(
   organizationId: string,

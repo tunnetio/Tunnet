@@ -401,12 +401,21 @@ impl DocsMembership {
                 continue;
             };
             let hash = entry.content_hash();
-            let bytes = self
-                .inner
-                .blobs
-                .get_bytes(hash)
-                .await
-                .map_err(|e| anyhow::anyhow!("get blob for {id}/{field}: {e}"))?;
+            let bytes = match self.inner.blobs.get_bytes(hash).await {
+                Ok(b) => b,
+                Err(e) => {
+                    // Missing/corrupt blob must not brick agent startup (common after
+                    // partial sync, version skew, or unreachable peers).
+                    tracing::warn!(
+                        peer = %id,
+                        %field,
+                        hash = %hash,
+                        error = %e,
+                        "skipping unread membership blob"
+                    );
+                    continue;
+                }
+            };
             let value = String::from_utf8_lossy(&bytes).into_owned();
             fields.entry(id).or_default().insert(field, value);
         }

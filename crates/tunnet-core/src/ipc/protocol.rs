@@ -82,6 +82,12 @@ pub enum IpcRequest {
         relay: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subdomain: Option<String>,
+        /// Capture HTTP traffic and serve a local inspector UI.
+        #[serde(default)]
+        inspect: bool,
+        /// Bind address for the inspector (default `127.0.0.1:4040`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inspect_addr: Option<String>,
     },
     TunnelStatus,
     TunnelOff {
@@ -671,6 +677,9 @@ pub struct TunnelInfo {
     pub public_url: String,
     pub relay: String,
     pub status: String,
+    /// Local inspector URL when `--inspect` is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

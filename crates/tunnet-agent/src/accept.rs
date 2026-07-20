@@ -118,7 +118,7 @@ fn preferred_network(auth: &Option<AuthCache>, peer: &str) -> Option<Uuid> {
 ///
 /// Prefer AuthCache (peer already PSK-authenticated). If the peer is unknown yet
 /// (ticket sync before AUTH), fall back to the sole joined network so membership
-/// can bootstrap — otherwise docs never sync and peers stay at 0/0.
+/// can bootstrap - otherwise docs never sync and peers stay at 0/0.
 fn docs_for_peer<'a>(
     auth: &Option<AuthCache>,
     docs: &'a HashMap<Uuid, DocsMembership>,

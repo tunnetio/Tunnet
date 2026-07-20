@@ -48,10 +48,10 @@ The management server derives the control plane admin API URL from `CONTROL_PLAN
 | `TUNNET_BIND` | Public API bind address | `0.0.0.0:8080` |
 | `TUNNET_ADMIN_BIND` | Internal admin API bind | `127.0.0.1:9091` |
 | `TUNNET_INTERNAL_BIND` | Metrics/ready bind | `127.0.0.1:9090` |
-| `TUNNET_LICENSE` | Commercial license certificate (inline JSON, file path, or HTTPS URL). Unlocks Cloud/Enterprise features when valid. | — (Community) |
-| `TUNNET_AUDIT_HMAC_KEY` | Secret used to protect the audit integrity chain (32+ characters, required for Managed) | — |
-| `TUNNET_AUDIT_STREAM_WEBHOOK_URL` | Optional HTTP endpoint that receives batched audit events as JSON | — |
-| `TUNNET_AUDIT_STREAM_WEBHOOK_HEADERS` | Optional comma-separated `Header:Value` pairs for the webhook | — |
+| `TUNNET_LICENSE` | Commercial license certificate (inline JSON, file path, or HTTPS URL). Unlocks Cloud/Enterprise features when valid. | - (Community) |
+| `TUNNET_AUDIT_HMAC_KEY` | Secret used to protect the audit integrity chain (32+ characters, required for Managed) | - |
+| `TUNNET_AUDIT_STREAM_WEBHOOK_URL` | Optional HTTP endpoint that receives batched audit events as JSON | - |
+| `TUNNET_AUDIT_STREAM_WEBHOOK_HEADERS` | Optional comma-separated `Header:Value` pairs for the webhook | - |
 | `TUNNET_AUDIT_BUFFER_SIZE` | In-memory audit buffer capacity before drop | `8192` |
 | `TUNNET_AUDIT_BATCH_SIZE` | Max events flushed together | `500` |
 | `TUNNET_AUDIT_FLUSH_INTERVAL_MS` | Max flush interval in milliseconds | `1000` |

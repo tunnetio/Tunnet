@@ -949,6 +949,12 @@ pub struct TunnelArgs {
     pub relay: Option<String>,
     #[arg(long)]
     pub subdomain: Option<String>,
+    /// Capture HTTP traffic and open a local inspector UI
+    #[arg(long)]
+    pub inspect: bool,
+    /// Inspector bind address (default `127.0.0.1:4040`)
+    #[arg(long)]
+    pub inspect_addr: Option<String>,
     #[arg(long)]
     pub json: bool,
     #[arg(long, env = "TUNNET_STATE_DIR")]
@@ -993,6 +999,8 @@ pub async fn run_tunnel(args: TunnelArgs) -> anyhow::Result<()> {
                 &args.protocol,
                 args.relay.as_deref(),
                 args.subdomain.as_deref(),
+                args.inspect,
+                args.inspect_addr.as_deref(),
                 args.json,
                 args.state_dir.as_deref(),
             )
@@ -1001,15 +1009,21 @@ pub async fn run_tunnel(args: TunnelArgs) -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tunnel_start(
     port: u16,
     protocol: &str,
     relay: Option<&str>,
     subdomain: Option<&str>,
+    inspect: bool,
+    inspect_addr: Option<&str>,
     json: bool,
     state_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     let out = Output::new(json);
+    if inspect && protocol != "https" && protocol != "http" {
+        anyhow::bail!("--inspect requires --protocol https (or http in Direct mode)");
+    }
     let ipc = ipc_or_err(state_dir).await?;
     let resp = ipc
         .request(IpcRequest::TunnelStart {
@@ -1017,6 +1031,8 @@ async fn run_tunnel_start(
             protocol: protocol.to_string(),
             relay: relay.map(str::to_string),
             subdomain: subdomain.map(str::to_string),
+            inspect,
+            inspect_addr: inspect_addr.map(str::to_string),
         })
         .await?;
     let IpcResponse::Tunnel(info) = resp else {
@@ -1026,11 +1042,123 @@ async fn run_tunnel_start(
         return out.print_json(&info);
     }
     out.writeln(format!(
-        "{} Tunnel active at {}",
+        "{} Forwarding  {} {} {}",
         out.green("✓"),
-        out.cyan(&info.public_url)
+        out.cyan(&info.public_url),
+        out.dim("→"),
+        out.cyan(&format!("http://127.0.0.1:{port}"))
     ));
+    if let Some(url) = &info.inspector_url {
+        out.writeln(format!("  Inspector  {}", out.cyan(url)));
+    }
+    if !inspect {
+        return Ok(());
+    }
+
+    let inspector_url = info
+        .inspector_url
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:4040".into());
+    out.writeln(out.dim("Streaming requests - Ctrl+C to stop"));
+    out.writeln("");
+
+    let stream = stream_inspect_console(&out, &inspector_url);
+    let ctrl = tokio::signal::ctrl_c();
+    tokio::pin!(stream);
+    tokio::pin!(ctrl);
+    tokio::select! {
+        _ = &mut ctrl => {}
+        r = &mut stream => {
+            if let Err(e) = r {
+                tracing::debug!(?e, "inspect console stream ended");
+            }
+        }
+    }
+
+    out.writeln("");
+    out.writeln(out.dim("Stopping tunnel…"));
+    let _ = ipc.request(IpcRequest::TunnelOff { port }).await;
+    out.writeln(format!("{} Tunnel stopped", out.green("✓")));
     Ok(())
+}
+
+async fn stream_inspect_console(out: &Output, inspector_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let list_url = format!("{}/api/requests", inspector_url.trim_end_matches('/'));
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(400));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+        let resp = match client.get(&list_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let Ok(items) = resp.json::<Vec<InspectLogRow>>().await else {
+            continue;
+        };
+        for row in items {
+            if !seen.insert(row.id.clone()) {
+                continue;
+            }
+            let status = if row.status == 0 {
+                "-".to_string()
+            } else {
+                row.status.to_string()
+            };
+            let status_painted = if row.status >= 400 || row.status == 0 {
+                out.red(&status)
+            } else if row.status >= 300 {
+                out.dim(&status)
+            } else {
+                out.green(&status)
+            };
+            let method = format!("{:<7}", row.method);
+            let path = truncate_path(&row.path, 48);
+            out.writeln(format!(
+                "  {} {} {}  {:>5}  {}",
+                out.dim(&short_time(&row.started_at)),
+                out.bold(&method),
+                path,
+                status_painted,
+                out.dim(&format!("{}ms", row.latency_ms)),
+            ));
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectLogRow {
+    id: String,
+    started_at: String,
+    method: String,
+    path: String,
+    status: u16,
+    latency_ms: u64,
+}
+
+fn short_time(rfc3339: &str) -> String {
+    // Prefer HH:MM:SS from an RFC3339 timestamp.
+    if let Some(t) = rfc3339.split('T').nth(1) {
+        return t.chars().take(8).collect();
+    }
+    rfc3339.chars().take(8).collect()
+}
+
+fn truncate_path(path: &str, max: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max {
+        let mut s = path.to_string();
+        while s.chars().count() < max {
+            s.push(' ');
+        }
+        return s;
+    }
+    let mut s: String = chars.into_iter().take(max.saturating_sub(1)).collect();
+    s.push('…');
+    s
 }
 
 async fn run_tunnel_status(json: bool, state_dir: Option<&str>) -> anyhow::Result<()> {

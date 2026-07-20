@@ -12,6 +12,13 @@ Tunnel competes directly with **ngrok** (public tunnels to local services), **Cl
 # Expose port 3000 to the internet
 tunnet tunnel 3000
 
+# Capture HTTP traffic in a local inspector (like ngrok)
+tunnet tunnel 3000 --inspect
+# → public URL + Inspector at http://127.0.0.1:4040
+
+# Optional: bind the inspector elsewhere
+tunnet tunnel 3000 --inspect --inspect-addr 127.0.0.1:4041
+
 # Check active tunnels
 tunnet tunnel status
 
@@ -20,6 +27,14 @@ tunnet tunnel off 3000
 ```
 
 The CLI outputs a public URL like `https://abc123.your-relay.example.com` that anyone can access.
+
+## Traffic inspection & replay
+
+With `--inspect`, the agent captures plaintext HTTP (headers and bodies, up to 1 MiB each) on the machine and serves a local UI at `http://127.0.0.1:4040` by default. The CLI stays attached and streams each request to the console (Ctrl+C stops the tunnel). You can also open the UI to inspect details and **Replay** any captured request against your local upstream. Bodies never leave the machine.
+
+`--inspect` works in **Managed** mode (public HTTPS URL via relay) and **Direct** mode (local forward URL only - no public relay). In Direct mode, traffic is accepted on a local listen port and proxied to your app.
+
+Without `--inspect`, public tunnels still require Managed mode.
 
 ## How it works
 

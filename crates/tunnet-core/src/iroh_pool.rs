@@ -236,7 +236,7 @@ impl ConnPool {
     ///
     /// Returns whether `conn` is (or already was) the canonical live connection.
     /// If a *different* live dial already won the race, returns `false` and leaves
-    /// the pool unchanged — caller should close `conn` and not start a reader.
+    /// the pool unchanged - caller should close `conn` and not start a reader.
     pub async fn adopt(&self, peer: EndpointId, conn: Connection) -> bool {
         let slot = self.slot(peer);
         let mut guard = slot.lock().await;
@@ -245,7 +245,6 @@ impl ConnPool {
                 guard.touch();
                 return true;
             }
-            // Dial already installed a live connection — keep it.
             guard.touch();
             return false;
         }

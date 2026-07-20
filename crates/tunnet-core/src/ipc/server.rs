@@ -216,12 +216,16 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
             protocol,
             relay,
             subdomain,
+            inspect,
+            inspect_addr,
         } => match start_tunnel(
             state,
             port,
             &protocol,
             relay.as_deref(),
             subdomain.as_deref(),
+            inspect,
+            inspect_addr.as_deref(),
         )
         .await
         {
@@ -712,7 +716,26 @@ async fn start_tunnel(
     protocol: &str,
     relay: Option<&str>,
     subdomain: Option<&str>,
+    inspect: bool,
+    inspect_addr: Option<&str>,
 ) -> anyhow::Result<super::protocol::TunnelInfo> {
+    if state.node.persisted.is_direct() {
+        if !inspect {
+            anyhow::bail!(
+                "this command requires Managed mode; this agent is in Direct mode \
+                 (run `tunnet reset --yes` to switch). \
+                 Or use `tunnet tunnel {port} --inspect` for a local request inspector."
+            );
+        }
+        if protocol != "https" && protocol != "http" {
+            anyhow::bail!("--inspect in Direct mode requires http/https (got {protocol})");
+        }
+        return state
+            .tunnels
+            .start_local_inspect(port, inspect_addr, None)
+            .await;
+    }
+
     let managed = state.node.persisted.require_managed()?;
     let client = crate::control::SignedClient::new(
         managed.control_url.clone(),
@@ -737,6 +760,8 @@ async fn start_tunnel(
             &created.auth_token,
             created.redirect_rules,
             None,
+            inspect,
+            inspect_addr,
         )
         .await
     {
@@ -760,7 +785,12 @@ async fn stop_tunnel(
     port: u16,
 ) -> anyhow::Result<super::protocol::TunnelInfo> {
     let info = state.tunnels.stop_by_port(port)?;
-    let managed = state.node.persisted.require_managed()?;
+    if info.relay == "local" || state.node.persisted.is_direct() {
+        return Ok(info);
+    }
+    let Ok(managed) = state.node.persisted.require_managed() else {
+        return Ok(info);
+    };
     let client = crate::control::SignedClient::new(
         managed.control_url.clone(),
         state.node.endpoint_id_hex(),
@@ -819,7 +849,6 @@ fn build_status(state: &AgentIpcState, include_peers: bool) -> StatusInfo {
     } else {
         "managed"
     };
-    // Reverse tunnels (Managed), not iroh relay — N/A in Direct mode.
     let relay_status = if mode == "direct" {
         "n/a"
     } else if state.tunnels.list().is_empty() {

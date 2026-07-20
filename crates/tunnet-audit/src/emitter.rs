@@ -34,7 +34,7 @@ impl AuditEmitter {
             Err(mpsc::error::TrySendError::Full(e)) => {
                 tracing::warn!(
                     organization_id = %e.organization_id,
-                    "audit buffer full, event dropped — increase TUNNET_AUDIT_BUFFER_SIZE"
+                    "audit buffer full, event dropped - increase TUNNET_AUDIT_BUFFER_SIZE"
                 );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {

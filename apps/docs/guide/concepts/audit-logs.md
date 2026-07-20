@@ -59,7 +59,7 @@ Delivery is best-effort with retries. PostgreSQL remains the system of record fo
 
 Community deployments already get the dashboard trail, integrity verification, and webhook export.
 
-**Cloud** and **Enterprise** licenses unlock additional audit options for larger estates — high-volume analytics storage and native connectors for common SIEM / object-storage targets. Install a license with `TUNNET_LICENSE` (inline JSON, file path, or HTTPS URL). See [Environment Variables](/self-hosting/env) and [COMMERCIAL-LICENSE.md](https://github.com/tunnetio/Tunnet/blob/main/COMMERCIAL-LICENSE.md).
+**Cloud** and **Enterprise** licenses unlock additional audit options for larger estates - high-volume analytics storage and native connectors for common SIEM / object-storage targets. Install a license with `TUNNET_LICENSE` (inline JSON, file path, or HTTPS URL). See [Environment Variables](/self-hosting/env) and [COMMERCIAL-LICENSE.md](https://github.com/tunnetio/Tunnet/blob/main/COMMERCIAL-LICENSE.md).
 
 ## Upgrading from older releases
 

@@ -170,7 +170,7 @@ async fn run_serve(args: Args) -> anyhow::Result<()> {
     let mut sinks: Vec<Box<dyn AuditSink>> =
         vec![Box::new(PostgresPgSink::new(pool.clone(), hmac_key))];
 
-    // Phase 2: ClickHouse — refuse without entitlement.
+    // Phase 2: ClickHouse - refuse without entitlement.
     if std::env::var("TUNNET_AUDIT_CLICKHOUSE_URL").is_ok() {
         if entitlements.clickhouse_audit {
             tracing::warn!(

@@ -528,6 +528,8 @@ async fn setup_tunnel(node: &CoreNode, args: &TunnelArgs) -> anyhow::Result<()> 
             &args.auth_token,
             redirect_rules,
             target_addr,
+            false,
+            None,
         )
         .await
         .context("start tunnel")?;

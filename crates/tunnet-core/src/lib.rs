@@ -9,6 +9,8 @@ pub mod direct;
 pub mod dns_stub;
 pub mod effective_config;
 pub mod identity;
+#[cfg(feature = "tunnel")]
+pub mod inspect;
 pub mod ipc;
 pub mod iroh_pool;
 pub mod known_hosts;

@@ -392,6 +392,8 @@ pub fn spawn_ws_processor(
                                     &auth_token,
                                     redirect_rules,
                                     parsed_target,
+                                    false,
+                                    None,
                                 )
                                 .await
                             } else {
