@@ -60,7 +60,7 @@ struct ActiveServe {
     internal_hostname: String,
     /// True when started via control-plane `StartServe` (dashboard-managed).
     managed: bool,
-    /// Live ACL — updated in place on access-control changes (no rebind).
+    /// Live ACL - updated in place on access-control changes (no rebind).
     acl: Arc<ArcSwap<ServeAcl>>,
     generation: u64,
     stop: Option<oneshot::Sender<()>>,

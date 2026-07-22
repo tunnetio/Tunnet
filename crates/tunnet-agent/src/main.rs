@@ -44,13 +44,13 @@ use crate::cli::Cli;
 use clap::Parser;
 
 fn main() {
-    // Windows service mode must call StartServiceCtrlDispatcher before building
-    // a tokio runtime. Detect `--service` early (before clap / #[tokio::main]).
+    #[cfg(windows)]
+    crate::win_service::setup_elevation_capture();
     #[cfg(windows)]
     if std::env::args().any(|a| a == "--service") {
         if let Err(e) = crate::win_service::run_as_service() {
             eprintln!("{e:#}");
-            std::process::exit(1);
+            exit_with(1);
         }
         return;
     }
@@ -62,18 +62,27 @@ fn main() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("failed to create tokio runtime: {e}");
-            std::process::exit(1);
+            exit_with(1);
         }
     };
 
     if let Err(e) = rt.block_on(async_main()) {
         eprintln!("{e:#}");
-        std::process::exit(1);
+        exit_with(1);
     }
+}
+
+fn exit_with(code: i32) -> ! {
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::exit(code);
 }
 
 async fn async_main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    #[cfg(windows)]
+    let cli = Cli::parse_from(crate::win_service::args_for_clap());
+    #[cfg(not(windows))]
     let cli = Cli::parse();
 
     let quiet = matches!(

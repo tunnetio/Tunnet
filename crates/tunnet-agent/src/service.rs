@@ -55,6 +55,7 @@ fn install_inner(state_dir: Option<&str>, announce: bool) -> anyhow::Result<()> 
     }
     #[cfg(windows)]
     {
+        crate::win_service::ensure_elevated()?;
         crate::win_service::install(&exe, state_dir)?;
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -81,6 +82,8 @@ fn install_inner(state_dir: Option<&str>, announce: bool) -> anyhow::Result<()> 
 }
 
 pub fn uninstall() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    crate::win_service::ensure_elevated()?;
     let _ = stop(None);
     #[cfg(target_os = "linux")]
     {
@@ -161,6 +164,7 @@ pub fn start(state_dir: Option<&str>) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
+        crate::win_service::ensure_elevated()?;
         let initial = crate::win_service::probe();
         if !initial.installed {
             println!("Service not installed; installing…");
@@ -245,6 +249,7 @@ pub fn stop(_state_dir: Option<&str>) -> anyhow::Result<()> {
     }
     #[cfg(windows)]
     {
+        crate::win_service::ensure_elevated()?;
         crate::win_service::stop_and_wait()?;
     }
     println!("Service stopped.");
@@ -254,8 +259,8 @@ pub fn stop(_state_dir: Option<&str>) -> anyhow::Result<()> {
 pub fn restart(state_dir: Option<&str>) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        // Stop+wait then start+wait - avoid sc's 1056 "already running" race.
         let _ = state_dir;
+        crate::win_service::ensure_elevated()?;
         println!("Restarting tunnet service…");
         crate::win_service::stop_and_wait()?;
         crate::win_service::start_and_wait()?;

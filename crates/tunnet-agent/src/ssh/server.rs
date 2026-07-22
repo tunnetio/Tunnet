@@ -53,7 +53,6 @@ pub struct SshHandler {
     check_period_secs: u64,
     decision: Option<SshPolicyRule>,
     channels: HashMap<ChannelId, Channel<Msg>>,
-    /// Per-connection PTY stdin routing (must not be global — ChannelIds collide across connections).
     pty_in: Arc<Mutex<PtyInMap>>,
     pty_resize: Arc<Mutex<PtyResizeMap>>,
     term: String,
