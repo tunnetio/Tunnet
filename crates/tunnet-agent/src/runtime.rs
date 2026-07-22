@@ -323,6 +323,11 @@ pub async fn run(
         network_name: network_name.clone(),
         self_endpoint_id: node.endpoint_id_hex(),
     };
+    if ssh_deps.cp_tx.is_none() {
+        tracing::warn!(
+            "SSH session reporting disabled (no control-plane WS channel yet); sessions will not appear in the dashboard"
+        );
+    }
     match crate::ssh::spawn_ssh_listener(assigned_ipv4, &node.paths.dir, ssh_deps).await {
         Ok(_handle) => {}
         Err(e) => tracing::error!(?e, "failed to start SSH listener"),

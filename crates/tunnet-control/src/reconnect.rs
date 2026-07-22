@@ -162,6 +162,15 @@ async fn replay_serves(
     .fetch_all(pool)
     .await?;
 
+    let desired_ids: Vec<String> = rows.iter().map(|(id, ..)| id.to_string()).collect();
+    hub.push_to(
+        endpoint_id,
+        ServerMsg::ReconcileServes {
+            serve_ids: desired_ids,
+        },
+    )
+    .await;
+
     for (
         serve_id,
         port,

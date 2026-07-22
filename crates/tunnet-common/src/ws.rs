@@ -41,6 +41,11 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_addr: Option<String>,
     },
+    /// Desired set of dashboard-managed serve ids. Agent stops managed serves not listed.
+    ReconcileServes {
+        #[serde(default)]
+        serve_ids: Vec<String>,
+    },
     StopServe {
         serve_id: String,
     },

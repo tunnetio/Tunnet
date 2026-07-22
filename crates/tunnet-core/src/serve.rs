@@ -58,6 +58,8 @@ struct ActiveServe {
     protocol: String,
     target_addr: SocketAddr,
     internal_hostname: String,
+    /// True when started via control-plane `StartServe` (dashboard-managed).
+    managed: bool,
     /// Live ACL — updated in place on access-control changes (no rebind).
     acl: Arc<ArcSwap<ServeAcl>>,
     generation: u64,
@@ -109,6 +111,8 @@ impl ServeManager {
         acl: ServeAcl,
         // Upstream to proxy to (defaults to `127.0.0.1:port` when `None`).
         target_addr: Option<SocketAddr>,
+        // When true, this serve is owned by the control plane and subject to reconcile.
+        managed: bool,
     ) -> anyhow::Result<ServeInfo> {
         let local = target_addr.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
 
@@ -116,21 +120,21 @@ impl ServeManager {
         // immediately rebinding the same mesh IP:port races (WSAEADDRINUSE / 10048)
         // and can leave the previous listener (old ACL) still accepting.
         {
-            let guard = self.inner.lock();
-            if let Some(existing) = guard.serves.values().find(|s| s.info.id == id)
+            let mut guard = self.inner.lock();
+            if let Some(existing) = guard.serves.values_mut().find(|s| s.info.id == id)
                 && existing.info.port == port
                 && existing.protocol == protocol
                 && existing.target_addr == local
                 && existing.internal_hostname == internal_hostname
             {
                 existing.acl.store(Arc::new(acl));
-                tracing::info!(
-                    port,
-                    protocol,
-                    access_mode = %existing.acl.load().access_mode,
-                    "serve ACL updated in place"
-                );
-                return Ok(existing.info.clone());
+                if managed {
+                    existing.managed = true;
+                }
+                let access_mode = existing.acl.load().access_mode.clone();
+                let info = existing.info.clone();
+                tracing::info!(port, protocol, %access_mode, "serve ACL updated in place");
+                return Ok(info);
             }
         }
 
@@ -241,6 +245,7 @@ impl ServeManager {
                 protocol: protocol.to_string(),
                 target_addr: local,
                 internal_hostname: internal_hostname.to_string(),
+                managed,
                 acl: acl_slot,
                 generation,
                 stop: Some(stop_tx),
@@ -248,8 +253,43 @@ impl ServeManager {
             },
         );
 
-        tracing::info!(%url, port, protocol, "serve active");
+        tracing::info!(%url, port, protocol, managed, "serve active");
         Ok(info)
+    }
+
+    pub async fn stop_by_id(&self, id: &str) -> anyhow::Result<ServeInfo> {
+        let port = {
+            let guard = self.inner.lock();
+            guard
+                .serves
+                .values()
+                .find(|s| s.info.id == id)
+                .map(|s| s.info.port)
+        };
+        let Some(port) = port else {
+            bail!("no active serve with id {id}");
+        };
+        self.stop(port).await
+    }
+
+    /// Stop dashboard-managed serves whose ids are not in `desired_ids`.
+    /// Local/CLI serves are left alone.
+    pub async fn reconcile_managed(&self, desired_ids: &[String]) {
+        let to_stop: Vec<(String, u16)> = {
+            let guard = self.inner.lock();
+            guard
+                .serves
+                .values()
+                .filter(|s| s.managed && !desired_ids.iter().any(|id| id == &s.info.id))
+                .map(|s| (s.info.id.clone(), s.info.port))
+                .collect()
+        };
+        for (id, port) in to_stop {
+            tracing::info!(%id, port, "reconcile: stopping removed managed serve");
+            if let Err(e) = self.stop(port).await {
+                tracing::warn!(?e, %id, port, "reconcile: stop failed");
+            }
+        }
     }
 
     pub async fn stop(&self, port: u16) -> anyhow::Result<ServeInfo> {
@@ -659,6 +699,7 @@ mod tests {
                     ..Default::default()
                 },
                 Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+                true,
             )
             .await
             .unwrap();
@@ -683,6 +724,7 @@ mod tests {
                     allowed_tags: Vec::new(),
                 },
                 Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+                true,
             )
             .await
             .unwrap();
@@ -697,9 +739,40 @@ mod tests {
             );
             assert_eq!(active.acl.load().access_mode, "machines");
             assert_eq!(active.acl.load().allowed_endpoint_ids.len(), 1);
+            assert!(active.managed);
         }
 
         mgr.stop(port).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_stops_removed_managed_serves() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mgr = ServeManager::new(Ipv4Addr::LOCALHOST, RoutingTable::new());
+        mgr.start(
+            "managed-1".into(),
+            port,
+            "tcp",
+            "host.default.tunnet",
+            None,
+            None,
+            ServeAcl::default(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            true,
+        )
+        .await
+        .unwrap();
+
+        mgr.reconcile_managed(&[]).await;
+        assert!(
+            mgr.list().is_empty(),
+            "managed serve must stop when omitted"
+        );
     }
 
     #[tokio::test]
@@ -720,6 +793,7 @@ mod tests {
             None,
             ServeAcl::default(),
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            true,
         )
         .await
         .unwrap();
@@ -739,6 +813,7 @@ mod tests {
                 allowed_tags: Vec::new(),
             },
             Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            true,
         )
         .await
         .expect("rebind after awaited stop must succeed");

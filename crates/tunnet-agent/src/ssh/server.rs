@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use russh::server::{Auth, Handler, Msg, Session};
@@ -26,9 +26,6 @@ type PtyInTx = std::sync::mpsc::Sender<Vec<u8>>;
 type PtyResizeTx = std::sync::mpsc::Sender<(u16, u16)>;
 type PtyInMap = HashMap<ChannelId, PtyInTx>;
 type PtyResizeMap = HashMap<ChannelId, PtyResizeTx>;
-
-static ACTIVE_PTY_IN: LazyLock<Mutex<PtyInMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-static ACTIVE_RESIZE: LazyLock<Mutex<PtyResizeMap>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone)]
 pub struct SshServeDeps {
@@ -56,6 +53,9 @@ pub struct SshHandler {
     check_period_secs: u64,
     decision: Option<SshPolicyRule>,
     channels: HashMap<ChannelId, Channel<Msg>>,
+    /// Per-connection PTY stdin routing (must not be global — ChannelIds collide across connections).
+    pty_in: Arc<Mutex<PtyInMap>>,
+    pty_resize: Arc<Mutex<PtyResizeMap>>,
     term: String,
     width: u16,
     height: u16,
@@ -90,10 +90,29 @@ impl SshHandler {
             check_period_secs: 3600,
             decision: None,
             channels: HashMap::new(),
+            pty_in: Arc::new(Mutex::new(HashMap::new())),
+            pty_resize: Arc::new(Mutex::new(HashMap::new())),
             term: "xterm-256color".into(),
             width: 80,
             height: 24,
             env_vars: Vec::new(),
+        }
+    }
+
+    fn emit_cp(&self, msg: ClientMsg) {
+        let Some(tx) = &self.deps.cp_tx else {
+            tracing::debug!(
+                peer = %self.peer_hex,
+                "ssh session event dropped (no control-plane channel)"
+            );
+            return;
+        };
+        if let Err(e) = tx.try_send(msg) {
+            tracing::warn!(
+                peer = %self.peer_hex,
+                ?e,
+                "ssh session event dropped (control-plane channel full or closed)"
+            );
         }
     }
 
@@ -245,15 +264,13 @@ impl SshHandler {
 
         let _ = session.channel_success(channel);
         let actually_recorded = tee.is_some();
-        if let Some(tx) = &self.deps.cp_tx {
-            let _ = tx.try_send(ClientMsg::SshSessionStarted {
-                session_id: session_id.to_string(),
-                src_endpoint_id: self.peer_hex.clone(),
-                target_user: self.username.clone(),
-                src_hostname: self.peer_hostname.clone(),
-                recorded: actually_recorded,
-            });
-        }
+        self.emit_cp(ClientMsg::SshSessionStarted {
+            session_id: session_id.to_string(),
+            src_endpoint_id: self.peer_hex.clone(),
+            target_user: self.username.clone(),
+            src_hostname: self.peer_hostname.clone(),
+            recorded: actually_recorded,
+        });
 
         let PtySession {
             mut reader,
@@ -273,8 +290,8 @@ impl SshHandler {
         let (pty_in_tx, pty_in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u16, u16)>();
 
-        ACTIVE_PTY_IN.lock().insert(channel, pty_in_tx);
-        ACTIVE_RESIZE.lock().insert(channel, resize_tx);
+        self.pty_in.lock().insert(channel, pty_in_tx);
+        self.pty_resize.lock().insert(channel, resize_tx);
 
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
@@ -319,6 +336,8 @@ impl SshHandler {
         let signed = self.deps.signed.clone();
         let acl = self.deps.acl.clone();
         let peer_hex = self.peer_hex.clone();
+        let pty_in = self.pty_in.clone();
+        let pty_resize = self.pty_resize.clone();
         let started = std::time::Instant::now();
 
         tokio::spawn(async move {
@@ -344,8 +363,8 @@ impl SshHandler {
             let _ = handle.eof(channel).await;
             let _ = handle.close(channel).await;
 
-            ACTIVE_PTY_IN.lock().remove(&channel);
-            ACTIVE_RESIZE.lock().remove(&channel);
+            pty_in.lock().remove(&channel);
+            pty_resize.lock().remove(&channel);
             sessions.remove(&session_id);
             let killed = sessions.take_killed(&session_id);
             let _ = child_killer.kill();
@@ -354,14 +373,16 @@ impl SshHandler {
             if let Some(t) = tee {
                 match t.finish(store.as_deref(), duration_ms) {
                     Ok(Some((meta, finalized))) => {
-                        if let Some(tx) = &cp_tx {
-                            let _ = tx.try_send(ClientMsg::SshRecordingSaved {
+                        if let Some(tx) = &cp_tx
+                            && let Err(e) = tx.try_send(ClientMsg::SshRecordingSaved {
                                 session_id: meta.session_id.clone(),
                                 recorder_endpoint_id: acl.self_id.load().endpoint_hex.clone(),
                                 duration_ms: Some(duration_ms),
                                 byte_size: finalized.byte_size,
                                 content_sha256: finalized.sha256_hex.clone(),
-                            });
+                            })
+                        {
+                            tracing::warn!(?e, "SshRecordingSaved event dropped");
                         }
                         if let Some(client) = &signed {
                             match std::fs::read_to_string(&finalized.path) {
@@ -388,8 +409,8 @@ impl SshHandler {
                 }
             }
 
-            if let Some(tx) = &cp_tx {
-                let _ = tx.try_send(ClientMsg::SshSessionEnded {
+            if let Some(tx) = &cp_tx
+                && let Err(e) = tx.try_send(ClientMsg::SshSessionEnded {
                     session_id: session_id.to_string(),
                     status: if killed {
                         "killed".into()
@@ -397,7 +418,9 @@ impl SshHandler {
                         "ended".into()
                     },
                     duration_ms: Some(duration_ms),
-                });
+                })
+            {
+                tracing::warn!(?e, %session_id, "SshSessionEnded event dropped");
             }
             tracing::debug!(%peer_hex, %session_id, "ssh session finished");
         });
@@ -600,7 +623,7 @@ impl Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         self.width = col_width.max(1) as u16;
         self.height = row_height.max(1) as u16;
-        if let Some(tx) = ACTIVE_RESIZE.lock().get(&channel) {
+        if let Some(tx) = self.pty_resize.lock().get(&channel) {
             let _ = tx.send((self.width, self.height));
         }
         session.channel_success(channel)?;
@@ -613,7 +636,7 @@ impl Handler for SshHandler {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(tx) = ACTIVE_PTY_IN.lock().get(&channel) {
+        if let Some(tx) = self.pty_in.lock().get(&channel) {
             let _ = tx.send(data.to_vec());
         }
         Ok(())
@@ -624,8 +647,8 @@ impl Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        ACTIVE_PTY_IN.lock().remove(&channel);
-        ACTIVE_RESIZE.lock().remove(&channel);
+        self.pty_in.lock().remove(&channel);
+        self.pty_resize.lock().remove(&channel);
         session.close(channel)?;
         Ok(())
     }

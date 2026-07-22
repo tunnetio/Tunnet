@@ -96,7 +96,8 @@ pub async fn run_ws(
                     };
                     match msg {
                 Message::Text(txt) => {
-                    if let Ok(cm) = serde_json::from_str::<ClientMsg>(txt.as_str()) {
+                    match serde_json::from_str::<ClientMsg>(txt.as_str()) {
+                        Ok(cm) => {
                         match cm {
                             ClientMsg::Heartbeat { .. } => {
                                 last_heartbeat = Instant::now();
@@ -359,7 +360,7 @@ pub async fn run_ws(
                                 src_hostname,
                                 recorded,
                             } => {
-                                if let Err(e) = sqlx::query(
+                                match sqlx::query(
                                     "INSERT INTO ssh_sessions \
                                        (id, organization_id, network_id, src_endpoint_id, dst_endpoint_id, \
                                         src_hostname, dst_hostname, target_user, status, recorded, started_at) \
@@ -369,7 +370,7 @@ pub async fn run_ws(
                                      FROM devices d \
                                      JOIN network_memberships nm ON nm.endpoint_id = d.endpoint_id \
                                        AND nm.status = 'active' \
-                                     WHERE d.endpoint_id = $3 \
+                                     WHERE lower(d.endpoint_id) = lower($3) \
                                      LIMIT 1 \
                                      ON CONFLICT (id) DO NOTHING",
                                 )
@@ -382,7 +383,26 @@ pub async fn run_ws(
                                 .execute(&pool)
                                 .await
                                 {
-                                    tracing::warn!(?e, %session_id, "SshSessionStarted insert failed");
+                                    Ok(res) if res.rows_affected() == 0 => {
+                                        tracing::warn!(
+                                            %session_id,
+                                            dst = %ep,
+                                            src = %src_endpoint_id,
+                                            "SshSessionStarted insert matched no device/membership row"
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        tracing::info!(
+                                            %session_id,
+                                            dst = %ep,
+                                            src = %src_endpoint_id,
+                                            %target_user,
+                                            "ssh session recorded"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(?e, %session_id, "SshSessionStarted insert failed");
+                                    }
                                 }
                             }
                             ClientMsg::SshSessionEnded {
@@ -574,6 +594,15 @@ pub async fn run_ws(
                                 }
                             }
                             ClientMsg::Hello { .. } | ClientMsg::Pong { .. } => {}
+                        }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ?e,
+                                %ep,
+                                preview = %txt.chars().take(120).collect::<String>(),
+                                "failed to parse client ws message"
+                            );
                         }
                     }
                 }

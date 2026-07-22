@@ -79,10 +79,13 @@ impl WsHub {
         self.inner.subs.len() as i64
     }
 
-    pub async fn push_to(&self, endpoint_id: &str, msg: ServerMsg) {
-        if let Some(tx) = self.inner.subs.get(endpoint_id) {
-            let _ = tx.try_send(msg);
-        }
+    pub async fn push_to(&self, endpoint_id: &str, msg: ServerMsg) -> bool {
+        let Some(tx) = self.inner.subs.get(endpoint_id) else {
+            return false;
+        };
+        // Prefer waiting over try_send so StopServe / StartServe are not dropped
+        // when the agent is briefly busy.
+        tx.send(msg).await.is_ok()
     }
 
     /// Broadcast a peer-joined delta to other agents on the network (skips `joined_endpoint_id`).

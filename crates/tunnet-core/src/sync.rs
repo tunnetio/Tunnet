@@ -312,6 +312,7 @@ pub fn spawn_ws_processor(
                                         allowed_endpoint_ids,
                                     },
                                     parsed_target,
+                                    true,
                                 )
                                 .await
                             } else {
@@ -345,15 +346,27 @@ pub fn spawn_ws_processor(
                                 .await;
                         }
                         #[cfg(feature = "serve")]
+                        ServerMsg::ReconcileServes { serve_ids } => {
+                            if let Some(mgr) = &serves {
+                                mgr.reconcile_managed(&serve_ids).await;
+                            }
+                        }
+                        #[cfg(not(feature = "serve"))]
+                        ServerMsg::ReconcileServes { .. } => {
+                            tracing::warn!("ReconcileServes ignored (`serve` feature disabled)");
+                        }
+                        #[cfg(feature = "serve")]
                         ServerMsg::StopServe { serve_id } => {
                             if let Some(mgr) = &serves {
-                                let port = mgr
-                                    .list()
-                                    .into_iter()
-                                    .find(|s| s.id == serve_id)
-                                    .map(|s| s.port);
-                                if let Some(port) = port {
-                                    let _ = mgr.stop(port).await;
+                                match mgr.stop_by_id(&serve_id).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            ?e,
+                                            %serve_id,
+                                            "StopServe: serve not active (already stopped?)"
+                                        );
+                                    }
                                 }
                             }
                             let _ = ws.tx.send(ClientMsg::ServeStopped { serve_id }).await;

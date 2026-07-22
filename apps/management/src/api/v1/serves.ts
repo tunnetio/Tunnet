@@ -413,6 +413,17 @@ export const servesRoutes = new Elysia()
           });
           if (!existing) return notFound("Serve not found");
 
+          // Stop the agent listener before deleting the row. If the agent is
+          // offline, reconnect reconcile will clear orphans once it returns.
+          try {
+            await pushStopServe({
+              endpointId: existing.endpointId,
+              serveId: params.serveId,
+            });
+          } catch (e) {
+            console.error("pushStopServe failed", e);
+          }
+
           await db.transaction(async (tx) => {
             // serve_sessions cascade on delete
             await tx
@@ -440,15 +451,6 @@ export const servesRoutes = new Elysia()
               metadata: { internalHostname: existing.internalHostname },
             });
           });
-
-          try {
-            await pushStopServe({
-              endpointId: existing.endpointId,
-              serveId: params.serveId,
-            });
-          } catch (e) {
-            console.error("pushStopServe failed", e);
-          }
 
           return { ok: true };
         },

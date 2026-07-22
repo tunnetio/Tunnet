@@ -296,28 +296,35 @@ async fn run_connect(
 struct WindowsConsoleGuard {
     in_handle: windows_sys::Win32::Foundation::HANDLE,
     out_handle: windows_sys::Win32::Foundation::HANDLE,
+    err_handle: windows_sys::Win32::Foundation::HANDLE,
     in_mode: Option<u32>,
     out_mode: Option<u32>,
+    err_mode: Option<u32>,
 }
 
 #[cfg(windows)]
 impl WindowsConsoleGuard {
     fn capture() -> Self {
         use windows_sys::Win32::System::Console::{
-            GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         };
         unsafe {
             let in_handle = GetStdHandle(STD_INPUT_HANDLE);
             let out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let err_handle = GetStdHandle(STD_ERROR_HANDLE);
             let mut in_mode = 0u32;
             let mut out_mode = 0u32;
+            let mut err_mode = 0u32;
             let in_ok = GetConsoleMode(in_handle, &mut in_mode) != 0;
             let out_ok = GetConsoleMode(out_handle, &mut out_mode) != 0;
+            let err_ok = GetConsoleMode(err_handle, &mut err_mode) != 0;
             Self {
                 in_handle,
                 out_handle,
+                err_handle,
                 in_mode: in_ok.then_some(in_mode),
                 out_mode: out_ok.then_some(out_mode),
+                err_mode: err_ok.then_some(err_mode),
             }
         }
     }
@@ -325,20 +332,26 @@ impl WindowsConsoleGuard {
     fn restore(&self) {
         use windows_sys::Win32::System::Console::{
             ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
-            ENABLE_WRAP_AT_EOL_OUTPUT, SetConsoleMode,
+            ENABLE_WRAP_AT_EOL_OUTPUT, FlushConsoleInputBuffer, SetConsoleMode,
         };
         unsafe {
-            if let Some(mode) = self.in_mode {
-                let _ = SetConsoleMode(
-                    self.in_handle,
-                    mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT,
-                );
-            }
+            // Exact restore of the pre-ssh mode. If capture failed, fall back to cooked input.
+            let in_mode = self
+                .in_mode
+                .unwrap_or(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+            let _ = SetConsoleMode(self.in_handle, in_mode);
+            let _ = FlushConsoleInputBuffer(self.in_handle);
+
             if let Some(mode) = self.out_mode {
+                let _ = SetConsoleMode(self.out_handle, mode);
+            } else {
                 let _ = SetConsoleMode(
                     self.out_handle,
-                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT,
+                    ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT,
                 );
+            }
+            if let Some(mode) = self.err_mode {
+                let _ = SetConsoleMode(self.err_handle, mode);
             }
         }
     }

@@ -498,6 +498,7 @@ async fn setup_ingress(node: &CoreNode, args: &IngressArgs) -> anyhow::Result<()
             None,
             tunnet_core::ServeAcl::default(),
             Some(target),
+            false,
         )
         .await
         .context("start ingress serve")?;

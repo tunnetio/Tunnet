@@ -466,7 +466,7 @@ async fn stop_serve_handler(
         Ok(v) => v,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid json").into_response(),
     };
-    state
+    let delivered = state
         .ws_hub
         .push_to(
             &parsed.endpoint_id,
@@ -475,7 +475,11 @@ async fn stop_serve_handler(
             },
         )
         .await;
-    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "delivered": delivered })),
+    )
+        .into_response()
 }
 
 #[derive(serde::Deserialize)]

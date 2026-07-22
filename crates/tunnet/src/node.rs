@@ -530,6 +530,7 @@ impl TunnetNode {
                 private_key_pem,
                 acl,
                 target_addr,
+                false,
             )
             .await
             .map_err(Error::from_anyhow)?;
