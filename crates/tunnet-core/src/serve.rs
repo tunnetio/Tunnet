@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use rustls::ServerConfig;
 use rustls::pki_types::CertificateDer;
@@ -44,6 +46,7 @@ pub struct ServeManager {
     routes: RoutingTable,
     /// Optional WS client channel for ServePeerJoined / ServePeerLeft.
     client_tx: Arc<Mutex<Option<mpsc::Sender<ClientMsg>>>>,
+    next_generation: Arc<AtomicU64>,
 }
 
 struct Inner {
@@ -52,7 +55,15 @@ struct Inner {
 
 struct ActiveServe {
     info: ServeInfo,
+    protocol: String,
+    target_addr: SocketAddr,
+    internal_hostname: String,
+    /// Live ACL — updated in place on access-control changes (no rebind).
+    acl: Arc<ArcSwap<ServeAcl>>,
+    generation: u64,
     stop: Option<oneshot::Sender<()>>,
+    /// Signaled after the proxy task has dropped the listener.
+    finished: Option<oneshot::Receiver<()>>,
 }
 
 impl ServeManager {
@@ -64,6 +75,7 @@ impl ServeManager {
             mesh_ip,
             routes,
             client_tx: Arc::new(Mutex::new(None)),
+            next_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -98,22 +110,50 @@ impl ServeManager {
         // Upstream to proxy to (defaults to `127.0.0.1:port` when `None`).
         target_addr: Option<SocketAddr>,
     ) -> anyhow::Result<ServeInfo> {
+        let local = target_addr.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+
+        // Access-control-only updates must not rebind: on Windows, stopping and
+        // immediately rebinding the same mesh IP:port races (WSAEADDRINUSE / 10048)
+        // and can leave the previous listener (old ACL) still accepting.
         {
             let guard = self.inner.lock();
-            if let Some(existing) = guard.serves.values().find(|s| s.info.id == id) {
-                let port_to_stop = existing.info.port;
-                drop(guard);
-                let _ = self.stop(port_to_stop);
-            } else if guard.serves.contains_key(&port) {
-                // Port held by a different serve id - replace it.
-                drop(guard);
-                let _ = self.stop(port);
+            if let Some(existing) = guard.serves.values().find(|s| s.info.id == id)
+                && existing.info.port == port
+                && existing.protocol == protocol
+                && existing.target_addr == local
+                && existing.internal_hostname == internal_hostname
+            {
+                existing.acl.store(Arc::new(acl));
+                tracing::info!(
+                    port,
+                    protocol,
+                    access_mode = %existing.acl.load().access_mode,
+                    "serve ACL updated in place"
+                );
+                return Ok(existing.info.clone());
+            }
+        }
+
+        // Full replace: await old listener teardown before binding again.
+        {
+            let port_to_stop = {
+                let guard = self.inner.lock();
+                if let Some(existing) = guard.serves.values().find(|s| s.info.id == id) {
+                    Some(existing.info.port)
+                } else if guard.serves.contains_key(&port) {
+                    Some(port)
+                } else {
+                    None
+                }
+            };
+            if let Some(p) = port_to_stop {
+                let _ = self.stop(p).await;
             }
         }
 
         let url = match protocol {
-            "tcp" => format!("{}:{}", internal_hostname, port),
-            _ => format!("https://{}:{}", internal_hostname, port),
+            "tcp" => format!("{internal_hostname}:{port}"),
+            _ => format!("https://{internal_hostname}:{port}"),
         };
 
         let info = ServeInfo {
@@ -125,47 +165,86 @@ impl ServeManager {
         };
 
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = oneshot::channel::<anyhow::Result<()>>();
         let bind = SocketAddr::from((self.mesh_ip, port));
-        let local = target_addr.unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
         let routes = self.routes.clone();
-        let acl_c = acl.clone();
+        let acl_slot = Arc::new(ArcSwap::from_pointee(acl));
+        let acl_for_task = acl_slot.clone();
         let client_tx = self.client_tx.clone();
         let serve_id = id.clone();
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let mgr = self.clone();
+        let port_c = port;
 
         if protocol == "tcp" {
-            let mgr = self.clone();
-            let port_c = port;
             tokio::spawn(async move {
-                if let Err(e) =
-                    run_tcp_proxy(bind, local, routes, acl_c, serve_id, client_tx, stop_rx).await
-                {
+                let result = run_tcp_proxy(
+                    bind,
+                    local,
+                    routes,
+                    acl_for_task,
+                    serve_id,
+                    client_tx,
+                    stop_rx,
+                    ready_tx,
+                )
+                .await;
+                if let Err(e) = &result {
                     tracing::error!(?e, port = port_c, "serve tcp proxy exited");
                 }
-                mgr.inner.lock().serves.remove(&port_c);
+                remove_if_generation(&mgr, port_c, generation);
+                let _ = finished_tx.send(());
             });
         } else {
             let cert_pem = certificate_pem.context("HTTPS serve requires certificate_pem")?;
             let key_pem = private_key_pem.context("HTTPS serve requires private_key_pem")?;
             let acceptor = build_tls_acceptor(cert_pem, key_pem)?;
-            let mgr = self.clone();
-            let port_c = port;
             tokio::spawn(async move {
-                if let Err(e) = run_tls_proxy(
-                    bind, local, acceptor, routes, acl_c, serve_id, client_tx, stop_rx,
+                let result = run_tls_proxy(
+                    bind,
+                    local,
+                    acceptor,
+                    routes,
+                    acl_for_task,
+                    serve_id,
+                    client_tx,
+                    stop_rx,
+                    ready_tx,
                 )
-                .await
-                {
+                .await;
+                if let Err(e) = &result {
                     tracing::error!(?e, port = port_c, "serve tls proxy exited");
                 }
-                mgr.inner.lock().serves.remove(&port_c);
+                remove_if_generation(&mgr, port_c, generation);
+                let _ = finished_tx.send(());
             });
+        }
+
+        // Wait for bind success before publishing the serve as active.
+        match ready_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = finished_rx.await;
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = finished_rx.await;
+                bail!("serve task exited before bind completed");
+            }
         }
 
         self.inner.lock().serves.insert(
             port,
             ActiveServe {
                 info: info.clone(),
+                protocol: protocol.to_string(),
+                target_addr: local,
+                internal_hostname: internal_hostname.to_string(),
+                acl: acl_slot,
+                generation,
                 stop: Some(stop_tx),
+                finished: Some(finished_rx),
             },
         );
 
@@ -173,16 +252,37 @@ impl ServeManager {
         Ok(info)
     }
 
-    pub fn stop(&self, port: u16) -> anyhow::Result<ServeInfo> {
-        let mut guard = self.inner.lock();
-        let Some(mut active) = guard.serves.remove(&port) else {
-            bail!("no active serve on port {port}");
+    pub async fn stop(&self, port: u16) -> anyhow::Result<ServeInfo> {
+        let (finished, mut info) = {
+            let mut guard = self.inner.lock();
+            let Some(mut active) = guard.serves.remove(&port) else {
+                bail!("no active serve on port {port}");
+            };
+            if let Some(tx) = active.stop.take() {
+                let _ = tx.send(());
+            }
+            let finished = active.finished.take();
+            active.info.status = "stopped".into();
+            (finished, active.info)
         };
-        if let Some(tx) = active.stop.take() {
-            let _ = tx.send(());
+
+        if let Some(finished) = finished {
+            // Ensure the OS has released the listen socket before callers rebind.
+            let _ = finished.await;
         }
-        active.info.status = "stopped".into();
-        Ok(active.info)
+        info.status = "stopped".into();
+        Ok(info)
+    }
+}
+
+fn remove_if_generation(mgr: &ServeManager, port: u16, generation: u64) {
+    let mut guard = mgr.inner.lock();
+    if guard
+        .serves
+        .get(&port)
+        .is_some_and(|s| s.generation == generation)
+    {
+        guard.serves.remove(&port);
     }
 }
 
@@ -226,7 +326,8 @@ fn allow_peer(routes: &RoutingTable, acl: &ServeAcl, peer_addr: SocketAddr) -> b
                 )
             })
         }
-        _ => true,
+        // Fail closed: unknown / empty mode must not grant access.
+        _ => false,
     }
 }
 
@@ -277,18 +378,28 @@ fn build_tls_acceptor(cert_pem: &str, key_pem: &str) -> anyhow::Result<TlsAccept
     Ok(TlsAcceptor::from(Arc::new(cfg)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tcp_proxy(
     bind: SocketAddr,
     local: SocketAddr,
     routes: RoutingTable,
-    acl: ServeAcl,
+    acl: Arc<ArcSwap<ServeAcl>>,
     serve_id: String,
     client_tx: Arc<Mutex<Option<mpsc::Sender<ClientMsg>>>>,
     mut stop: oneshot::Receiver<()>,
+    ready: oneshot::Sender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind serve TCP {bind}"))?;
+    let listener = match TcpListener::bind(bind).await {
+        Ok(l) => {
+            let _ = ready.send(Ok(()));
+            l
+        }
+        Err(e) => {
+            let err = anyhow::Error::new(e).context(format!("bind serve TCP {bind}"));
+            let _ = ready.send(Err(anyhow::anyhow!("{err:#}")));
+            return Err(err);
+        }
+    };
     tracing::info!(%bind, %local, "serve TCP listening");
     loop {
         tokio::select! {
@@ -297,9 +408,10 @@ async fn run_tcp_proxy(
                 break;
             }
             accepted = listener.accept() => {
-                let (inbound, peer) = accepted?;
-                if !allow_peer(&routes, &acl, peer) {
+                let (mut inbound, peer) = accepted?;
+                if !allow_peer(&routes, &acl.load(), peer) {
                     tracing::debug!(%peer, "serve ACL denied");
+                    let _ = inbound.shutdown().await;
                     continue;
                 }
                 let (peer_endpoint_id, peer_hostname) = peer_identity(&routes, peer);
@@ -338,14 +450,23 @@ async fn run_tls_proxy(
     local: SocketAddr,
     acceptor: TlsAcceptor,
     routes: RoutingTable,
-    acl: ServeAcl,
+    acl: Arc<ArcSwap<ServeAcl>>,
     serve_id: String,
     client_tx: Arc<Mutex<Option<mpsc::Sender<ClientMsg>>>>,
     mut stop: oneshot::Receiver<()>,
+    ready: oneshot::Sender<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("bind serve TLS {bind}"))?;
+    let listener = match TcpListener::bind(bind).await {
+        Ok(l) => {
+            let _ = ready.send(Ok(()));
+            l
+        }
+        Err(e) => {
+            let err = anyhow::Error::new(e).context(format!("bind serve TLS {bind}"));
+            let _ = ready.send(Err(anyhow::anyhow!("{err:#}")));
+            return Err(err);
+        }
+    };
     tracing::info!(%bind, %local, "serve HTTPS listening");
     loop {
         tokio::select! {
@@ -354,9 +475,10 @@ async fn run_tls_proxy(
                 break;
             }
             accepted = listener.accept() => {
-                let (inbound, peer) = accepted?;
-                if !allow_peer(&routes, &acl, peer) {
+                let (mut inbound, peer) = accepted?;
+                if !allow_peer(&routes, &acl.load(), peer) {
                     tracing::debug!(%peer, "serve ACL denied");
+                    let _ = inbound.shutdown().await;
                     continue;
                 }
                 let (peer_endpoint_id, peer_hostname) = peer_identity(&routes, peer);
@@ -423,4 +545,204 @@ async fn proxy_tls(
     let (bytes_in, bytes_out) = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
     let _ = outbound.shutdown().await;
     Ok((bytes_in, bytes_out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::RoutingTable;
+    use std::net::Ipv4Addr;
+    use tunnet_common::{DeviceProfile, DnsConfig, PeerEntry};
+    use uuid::Uuid;
+
+    fn peer_entry(endpoint: &str, ip: &str) -> PeerEntry {
+        PeerEntry {
+            ip: ip.parse().unwrap(),
+            endpoint_id: endpoint.to_string(),
+            hostname: String::new(),
+            tags: vec![],
+            ssh_host_key: None,
+        }
+    }
+
+    fn routes_with(peers: &[PeerEntry]) -> RoutingTable {
+        let table = RoutingTable::new();
+        let self_id = "ff".repeat(32);
+        table.replace(
+            peers,
+            &[],
+            &[],
+            &[],
+            &DeviceProfile::default(),
+            &DnsConfig::default(),
+            "default",
+            Uuid::nil(),
+            &self_id,
+            1,
+        );
+        table
+    }
+
+    #[test]
+    fn allow_peer_all_peers() {
+        let routes = RoutingTable::new();
+        let acl = ServeAcl {
+            access_mode: "all_peers".into(),
+            ..Default::default()
+        };
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 12345));
+        assert!(allow_peer(&routes, &acl, peer));
+    }
+
+    #[test]
+    fn allow_peer_machines_filters_by_endpoint() {
+        let desktop = "aa".repeat(32);
+        let ctl = "bb".repeat(32);
+        let routes = routes_with(&[
+            peer_entry(&ctl, "10.7.0.1"),
+            peer_entry(&desktop, "10.7.0.2"),
+        ]);
+        let acl = ServeAcl {
+            access_mode: "machines".into(),
+            allowed_endpoint_ids: vec![desktop.clone()],
+            allowed_tags: Vec::new(),
+        };
+
+        let from_ctl = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
+        let from_desktop = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 2), 1));
+        assert!(!allow_peer(&routes, &acl, from_ctl));
+        assert!(allow_peer(&routes, &acl, from_desktop));
+    }
+
+    #[test]
+    fn allow_peer_machines_empty_denies_all() {
+        let routes = routes_with(&[peer_entry(&"cc".repeat(32), "10.7.0.1")]);
+        let acl = ServeAcl {
+            access_mode: "machines".into(),
+            allowed_endpoint_ids: Vec::new(),
+            allowed_tags: Vec::new(),
+        };
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
+        assert!(!allow_peer(&routes, &acl, peer));
+    }
+
+    #[test]
+    fn allow_peer_unknown_mode_denies() {
+        let routes = RoutingTable::new();
+        let acl = ServeAcl {
+            access_mode: "bogus".into(),
+            ..Default::default()
+        };
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
+        assert!(!allow_peer(&routes, &acl, peer));
+    }
+
+    #[tokio::test]
+    async fn access_change_updates_acl_without_rebind() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mgr = ServeManager::new(Ipv4Addr::LOCALHOST, RoutingTable::new());
+        let info = mgr
+            .start(
+                "serve-1".into(),
+                port,
+                "tcp",
+                "host.default.tunnet",
+                None,
+                None,
+                ServeAcl {
+                    access_mode: "all_peers".into(),
+                    ..Default::default()
+                },
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.port, port);
+
+        let generation_before = {
+            let guard = mgr.inner.lock();
+            guard.serves.get(&port).unwrap().generation
+        };
+
+        let updated = mgr
+            .start(
+                "serve-1".into(),
+                port,
+                "tcp",
+                "host.default.tunnet",
+                None,
+                None,
+                ServeAcl {
+                    access_mode: "machines".into(),
+                    allowed_endpoint_ids: vec!["aa".repeat(32)],
+                    allowed_tags: Vec::new(),
+                },
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.id, "serve-1");
+
+        {
+            let guard = mgr.inner.lock();
+            let active = guard.serves.get(&port).unwrap();
+            assert_eq!(
+                active.generation, generation_before,
+                "must not restart proxy"
+            );
+            assert_eq!(active.acl.load().access_mode, "machines");
+            assert_eq!(active.acl.load().allowed_endpoint_ids.len(), 1);
+        }
+
+        mgr.stop(port).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_then_start_rebinds_same_port() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mgr = ServeManager::new(Ipv4Addr::LOCALHOST, RoutingTable::new());
+        mgr.start(
+            "serve-2".into(),
+            port,
+            "tcp",
+            "host.default.tunnet",
+            None,
+            None,
+            ServeAcl::default(),
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+        )
+        .await
+        .unwrap();
+
+        mgr.stop(port).await.unwrap();
+
+        mgr.start(
+            "serve-2".into(),
+            port,
+            "tcp",
+            "host.default.tunnet",
+            None,
+            None,
+            ServeAcl {
+                access_mode: "machines".into(),
+                allowed_endpoint_ids: Vec::new(),
+                allowed_tags: Vec::new(),
+            },
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9))),
+        )
+        .await
+        .expect("rebind after awaited stop must succeed");
+
+        mgr.stop(port).await.unwrap();
+    }
 }

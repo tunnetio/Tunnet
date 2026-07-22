@@ -353,7 +353,7 @@ pub fn spawn_ws_processor(
                                     .find(|s| s.id == serve_id)
                                     .map(|s| s.port);
                                 if let Some(port) = port {
-                                    let _ = mgr.stop(port);
+                                    let _ = mgr.stop(port).await;
                                 }
                             }
                             let _ = ws.tx.send(ClientMsg::ServeStopped { serve_id }).await;

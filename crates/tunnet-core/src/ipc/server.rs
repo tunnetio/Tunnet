@@ -199,7 +199,7 @@ async fn dispatch(req: IpcRequest, state: &AgentIpcState) -> IpcResponse {
         IpcRequest::ServeStatus => IpcResponse::Serves {
             serves: state.serves.list(),
         },
-        IpcRequest::ServeOff { port } => match state.serves.stop(port) {
+        IpcRequest::ServeOff { port } => match state.serves.stop(port).await {
             Ok(info) => {
                 // Report to control plane so the serve row is hard-deleted.
                 if let Some(tx) = state.serves.client_tx() {

@@ -538,9 +538,9 @@ impl TunnetNode {
 
     /// Stop a serve on `port`.
     #[cfg(feature = "serve")]
-    pub fn stop_serve(&self, port: u16) -> Result<crate::ServeInfo> {
+    pub async fn stop_serve(&self, port: u16) -> Result<crate::ServeInfo> {
         let node = self.require_coordinator_serve()?;
-        let info = node.serves.stop(port).map_err(Error::from_anyhow)?;
+        let info = node.serves.stop(port).await.map_err(Error::from_anyhow)?;
         Ok(crate::ServeInfo::from(info))
     }
 
