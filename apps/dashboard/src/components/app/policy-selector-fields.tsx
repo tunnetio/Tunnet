@@ -1,4 +1,5 @@
 import type { CreatePolicyBody, Selector } from "@tunnet/api/management";
+import { EndpointCombobox } from "@/components/app/endpoint-combobox";
 import { TagCombobox } from "@/components/app/tag-combobox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,6 +13,7 @@ import {
 
 export function PolicySelectorFields({
   orgId,
+  networkId,
   label,
   kind,
   value,
@@ -19,6 +21,7 @@ export function PolicySelectorFields({
   onValueChange,
 }: {
   orgId?: string;
+  networkId?: string;
   label: string;
   kind: string;
   value: string;
@@ -53,6 +56,15 @@ export function PolicySelectorFields({
             value={value}
             onValueChange={onValueChange}
             placeholder="Search tags…"
+            className="flex-1"
+          />
+        ) : kind === "endpoint" ? (
+          <EndpointCombobox
+            orgId={orgId}
+            networkId={networkId}
+            value={value}
+            onValueChange={onValueChange}
+            placeholder="Search machines…"
             className="flex-1"
           />
         ) : kind !== "any" ? (

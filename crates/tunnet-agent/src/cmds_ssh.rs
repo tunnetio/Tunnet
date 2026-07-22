@@ -278,14 +278,92 @@ async fn run_connect(
         args.extend(command);
     }
 
+    let _console = WindowsConsoleGuard::capture();
+
     let status = std::process::Command::new("ssh")
         .args(&args)
         .status()
         .context("failed to exec ssh - is OpenSSH client installed?")?;
+    drop(_console);
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
     Ok(())
+}
+
+/// Saves and restores Windows console modes around an interactive `ssh` session.
+#[cfg(windows)]
+struct WindowsConsoleGuard {
+    in_handle: windows_sys::Win32::Foundation::HANDLE,
+    out_handle: windows_sys::Win32::Foundation::HANDLE,
+    in_mode: Option<u32>,
+    out_mode: Option<u32>,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleGuard {
+    fn capture() -> Self {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            let in_handle = GetStdHandle(STD_INPUT_HANDLE);
+            let out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut in_mode = 0u32;
+            let mut out_mode = 0u32;
+            let in_ok = GetConsoleMode(in_handle, &mut in_mode) != 0;
+            let out_ok = GetConsoleMode(out_handle, &mut out_mode) != 0;
+            Self {
+                in_handle,
+                out_handle,
+                in_mode: in_ok.then_some(in_mode),
+                out_mode: out_ok.then_some(out_mode),
+            }
+        }
+    }
+
+    fn restore(&self) {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+            ENABLE_WRAP_AT_EOL_OUTPUT, SetConsoleMode,
+        };
+        unsafe {
+            if let Some(mode) = self.in_mode {
+                let _ = SetConsoleMode(
+                    self.in_handle,
+                    mode | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT,
+                );
+            }
+            if let Some(mode) = self.out_mode {
+                let _ = SetConsoleMode(
+                    self.out_handle,
+                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsConsoleGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(not(windows))]
+struct WindowsConsoleGuard;
+
+#[cfg(not(windows))]
+impl WindowsConsoleGuard {
+    fn capture() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for WindowsConsoleGuard {
+    fn drop(&mut self) {}
 }
 
 /// OpenSSH ProxyCommand: splice stdin/stdout to TCP `host:port` over the mesh TUN.
@@ -310,7 +388,6 @@ pub async fn run_ssh_proxy(args: SshProxyArgs) -> anyhow::Result<()> {
 
     let upload = async {
         tokio::io::copy(&mut stdin, &mut writer).await?;
-        let _ = writer.shutdown().await;
         Ok::<_, anyhow::Error>(())
     };
     let download = async {
@@ -318,10 +395,14 @@ pub async fn run_ssh_proxy(args: SshProxyArgs) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::select! {
-        r = upload => r?,
-        r = download => r?,
-    }
+    let result = tokio::select! {
+        r = upload => r,
+        r = download => r,
+    };
+    // Always FIN the write half so OpenSSH sees a clean ProxyCommand exit
+    // (select! cancels the other direction mid-copy).
+    let _ = writer.shutdown().await;
+    result?;
     Ok(())
 }
 
