@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use iroh::endpoint::Connection;
-use tun_rs::{AsyncDevice, DeviceBuilder};
+use tun_rs::AsyncDevice;
+#[cfg(not(target_os = "android"))]
+use tun_rs::DeviceBuilder;
 use tunnet_common::packet::{self, Packet};
 use tunnet_common::policy::Direction;
 use tunnet_core::direct::{
@@ -18,6 +20,51 @@ use crate::metrics::AgentMetrics;
 use crate::qos::{self, OutboundScheduler};
 use crate::ssh_nat;
 
+/// Ask the app's `VpnService` to establish a tunnel, then adopt its descriptor.
+///
+/// The interface name is meaningless on Android (the framework names it `tunN`)
+/// and addressing is applied by `VpnService.Builder`, so those parameters are
+/// forwarded to the app rather than applied here.
+///
+/// Only a single local address is supported: the JNI `TunRequest` carries one
+/// address, and the extra `/32`s that `build_tun_multi` adds to the device on
+/// other platforms would have to be applied by the JVM side instead. Refuse
+/// rather than silently establishing a tunnel that is missing addresses.
+#[cfg(target_os = "android")]
+pub fn build_tun_multi(
+    ifname: &str,
+    addrs: &[std::net::Ipv4Addr],
+    prefix: u8,
+    mtu: u16,
+) -> anyhow::Result<AsyncDevice> {
+    use std::os::fd::IntoRawFd;
+
+    use crate::android_tun::{self, TunRequest};
+
+    let (ipv4, extra) = addrs
+        .split_first()
+        .context("at least one local address required")?;
+    anyhow::ensure!(
+        extra.is_empty(),
+        "Android supports one TUN address, got {}: extend TunRequest and the \
+         VpnService builder before enabling multi-address networks",
+        addrs.len()
+    );
+
+    let fd = android_tun::establish(TunRequest {
+        ipv4: *ipv4,
+        prefix,
+        mtu,
+    })?;
+    // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
+    // into_raw_fd() gives up our close so the device becomes sole owner.
+    let dev = unsafe { AsyncDevice::from_fd(fd.into_raw_fd()) }
+        .context("adopt VpnService TUN descriptor")?;
+    tracing::debug!(ifname, "TUN device adopted");
+    Ok(dev)
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn build_tun_multi(
     ifname: &str,
     addrs: &[std::net::Ipv4Addr],

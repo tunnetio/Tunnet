@@ -59,6 +59,15 @@ impl Actor for RouteActor {
 }
 
 impl RouteActor {
+    /// Watch the OS route table so external changes trigger reconciliation.
+    ///
+    /// Android has no such table to watch from an app: `VpnService.Builder`
+    /// declares the routes and the framework installs them, so there is nothing
+    /// to observe and no listener to establish.
+    #[cfg(target_os = "android")]
+    fn start_listener(&mut self, _actor_ref: ActorRef<Self>) {}
+
+    #[cfg(not(target_os = "android"))]
     fn start_listener(&mut self, actor_ref: ActorRef<Self>) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
