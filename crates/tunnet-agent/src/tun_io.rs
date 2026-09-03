@@ -6,7 +6,9 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures_util::FutureExt as _;
 use iroh::endpoint::Connection;
-use tun_rs::{AsyncDevice, DeviceBuilder};
+use tun_rs::AsyncDevice;
+#[cfg(not(target_os = "android"))]
+use tun_rs::DeviceBuilder;
 use tunnet_common::packet::{self, LogicalPacket};
 use tunnet_common::policy::Direction;
 use tunnet_core::direct::{AuthCache, SpoofTracker, source_matches_peer};
@@ -26,6 +28,32 @@ use crate::tun_fast;
 /// drain already-ready datagrams without busy-polling.
 pub const INBOUND_DRAIN_BUDGET: usize = 32;
 
+/// Ask the app's `VpnService` to establish a tunnel, then adopt its descriptor.
+///
+/// The interface name is meaningless on Android (the framework names it `tunN`)
+/// and addressing is applied by `VpnService.Builder`, so those parameters are
+/// forwarded to the app rather than applied here.
+#[cfg(target_os = "android")]
+pub fn build_tun(
+    ifname: &str,
+    ipv4: std::net::Ipv4Addr,
+    prefix: u8,
+    mtu: u16,
+) -> anyhow::Result<AsyncDevice> {
+    use std::os::fd::IntoRawFd;
+
+    use crate::android_tun::{self, TunRequest};
+
+    let fd = android_tun::establish(TunRequest { ipv4, prefix, mtu })?;
+    // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
+    // into_raw_fd() gives up our close so the device becomes sole owner.
+    let dev = unsafe { AsyncDevice::from_fd(fd.into_raw_fd()) }
+        .context("adopt VpnService TUN descriptor")?;
+    tracing::debug!(ifname, "TUN device adopted");
+    Ok(dev)
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn build_tun(
     ifname: &str,
     ipv4: std::net::Ipv4Addr,

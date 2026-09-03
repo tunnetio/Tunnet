@@ -6,6 +6,11 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
+// Android has no `route_manager` backend, and needs none: routes there are
+// declared on `VpnService.Builder` before the tunnel is established, so the
+// framework owns the table. Only the kernel-facing backend below is
+// platform-specific; the desired-state logic in this file is shared.
+#[cfg(not(target_os = "android"))]
 use route_manager::{AsyncRouteManager, Route};
 use thiserror::Error;
 use tunnet_common::{DeviceProfile, SplitTunnelMode};
@@ -187,10 +192,12 @@ pub(crate) trait RouteBackend: Send {
     async fn delete(&mut self, route: &RouteSpec) -> Result<(), RouteError>;
 }
 
+#[cfg(not(target_os = "android"))]
 struct NativeBackend {
     manager: AsyncRouteManager,
 }
 
+#[cfg(not(target_os = "android"))]
 impl NativeBackend {
     fn new() -> io::Result<Self> {
         Ok(Self {
@@ -199,6 +206,40 @@ impl NativeBackend {
     }
 }
 
+/// Android backend: the framework installed the routes, so reconciliation has
+/// nothing to do and must not claim otherwise.
+///
+/// Reporting an empty table is truthful from this process's point of view: it
+/// owns no routes, so it has none to add or remove. The engine then computes an
+/// empty diff rather than repeatedly trying to install routes it cannot.
+#[cfg(target_os = "android")]
+struct FrameworkOwnedBackend;
+
+#[cfg(target_os = "android")]
+#[async_trait]
+impl RouteBackend for FrameworkOwnedBackend {
+    async fn list(&mut self) -> Result<Vec<RouteSpec>, RouteError> {
+        Ok(Vec::new())
+    }
+
+    async fn add(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+        tracing::debug!(
+            ?route,
+            "route add skipped; VpnService.Builder owns the table"
+        );
+        Ok(())
+    }
+
+    async fn delete(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
+        tracing::debug!(
+            ?route,
+            "route delete skipped; VpnService.Builder owns the table"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn spec_to_route(spec: &RouteSpec) -> Route {
     let mut route = Route::new(IpAddr::V4(spec.dest.network()), spec.dest.prefix_len())
         .with_if_index(spec.if_index);
@@ -216,6 +257,7 @@ fn spec_to_route(spec: &RouteSpec) -> Route {
     route
 }
 
+#[cfg(not(target_os = "android"))]
 fn spec_from_route(route: &Route) -> Option<RouteSpec> {
     let IpAddr::V4(dest) = route.destination() else {
         return None;
@@ -235,6 +277,7 @@ fn spec_from_route(route: &Route) -> Option<RouteSpec> {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 #[async_trait]
 impl RouteBackend for NativeBackend {
     async fn list(&mut self) -> Result<Vec<RouteSpec>, RouteError> {
@@ -366,8 +409,12 @@ pub(crate) struct RouteEngine {
 
 impl RouteEngine {
     pub(crate) fn new() -> anyhow::Result<Self> {
-        let backend = NativeBackend::new().map_err(|e| anyhow::anyhow!("route manager: {e}"))?;
-        Ok(Self::with_backend(Box::new(backend)))
+        #[cfg(not(target_os = "android"))]
+        let backend: Box<dyn RouteBackend> =
+            Box::new(NativeBackend::new().map_err(|e| anyhow::anyhow!("route manager: {e}"))?);
+        #[cfg(target_os = "android")]
+        let backend: Box<dyn RouteBackend> = Box::new(FrameworkOwnedBackend);
+        Ok(Self::with_backend(backend))
     }
 
     pub(crate) fn with_backend(backend: Box<dyn RouteBackend>) -> Self {
