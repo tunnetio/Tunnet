@@ -4,6 +4,7 @@ members = [
   "crates/tunnet-common",
   "crates/tunnet-core",
   "crates/tunnet-client",
+  "crates/tunnet-mobile",
   "crates/tunnet",
   "crates/tunnet-control",
   "crates/tunnet-agent",
@@ -182,6 +183,7 @@ napi-derive = "3"
 napi-build = "2"
 
 # Local
+tunnet-agent = { version = "0.9.1", path = "crates/tunnet-agent" }
 tunnet-common = { version = "0.9.1", path = "crates/tunnet-common" }
 tunnet-core = { version = "0.9.1", path = "crates/tunnet-core" }
 tunnet-client = { version = "0.9.1", path = "crates/tunnet-client" }
