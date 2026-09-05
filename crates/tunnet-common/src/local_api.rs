@@ -231,6 +231,8 @@ pub struct DataPlaneInfo {
     /// `up` | `degraded` | `restarting` | `down`.
     pub state: String,
     pub outbound_alive: bool,
+    #[serde(default)]
+    pub writer_alive: bool,
     pub restart_count: u64,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

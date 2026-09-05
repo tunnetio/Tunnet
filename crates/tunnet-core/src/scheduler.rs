@@ -1,40 +1,49 @@
-//! Per-peer FQ-CoDel packet scheduler state (RFC 8290, Tunnet-sized).
+//! Endpoint-global FQ-CoDel packet scheduler (RFC 8290, Tunnet-sized).
 //!
-//! Pure state machine: no I/O, no transport calls, no metrics registry. The
-//! agent pump drives it (`next` → transmit or drop) and reports counters.
+//! Pure state machine: no I/O, no transport calls, no metrics registry. One
+//! scheduler is owned by each endpoint TX worker; every membership of that
+//! endpoint feeds it. Flows are keyed by `(NetworkId, FlowKey)` so the same
+//! 5-tuple in two Direct networks never merges into one flow.
 //!
 //! ```text
-//! PeerScheduler
+//! EndpointScheduler
 //!   ├─ new flows (sparse/interactive, bounded epoch budget)
-//!   ├─ old flows (backlogged, byte-DRR across flows)
+//!   ├─ old flows (backlogged, byte-DRR across flows, one packet per visit)
 //!   ├─ per-flow FIFO (ordering preserved within a flow)
 //!   ├─ per-flow CoDel state (first_above_time/dropping/drop_next/count)
-//!   └─ byte caps + emergency sojourn ceiling (safety bound only)
+//!   └─ endpoint byte/packet hard caps (memory safety only) + emergency ceiling
 //! ```
 //!
-//! Complexity: dequeue performs rotation rounds over old flows (one
-//! quantum per flow per round); rounds repeat immediately only while no
-//! flow could send, bounded by [`MAX_DRR_ROUNDS`]. No linear scans for
-//! drops, no per-packet allocation on the dequeue path.
+//! The scheduler queues LOGICAL packets: one inner packet is one scheduling
+//! object. Segmentation happens after dequeue; the worker reports each
+//! logical packet ONCE at completion via [`EndpointScheduler::complete`]
+//! with `(logical_len, total_wire_len)`.
 //!
-//! The scheduler queues LOGICAL packets (§7): one inner packet is one
-//! scheduling object. Segmentation happens after dequeue; the pump reports
-//! each logical packet ONCE at completion via
-//! [`PeerScheduler::account_sent`] with `(logical_len, total_wire_len)` so
-//! fairness reflects transmitted bytes including framing overhead (and
-//! segmented traffic is never double-charged).
+//! Accounting is exact and single-sourced: every mutation updates cumulative
+//! counters, and [`SchedReporter`] diffs snapshots into telemetry deltas.
+//! There is no snapshot-reconcile pass, no partitioned drain, and no
+//! double-report path. Conservation holds by construction:
 //!
-//! `Empty` means genuinely no schedulable work: rounds repeat immediately
-//! inside the call, so a flow whose head exceeds one quantum is served
-//! after enough rounds — never deferred to a 50 ms pump sleep. Service is
-//! proper byte-DRR: each visit grants one quantum and serves every
-//! affordable head as a burst, so a 9000-byte flow and a 100-byte flow
-//! receive equal byte shares over time, not equal packet counts.
+//! ```text
+//! accepted == delivered + explicitly_dropped + currently_owned
+//! owned    == queued + inflight        (packets and bytes)
+//! ```
+//!
+//! Dequeue serves ONE logical packet at a time and moves it to explicitly
+//! tracked in-flight ownership (`queued -> inflight`); `complete`,
+//! `discard_inflight`, or a purge resolves it. No packet disappears between
+//! states. `Empty` means genuinely no queued work.
+//!
+//! Hard caps are tail-rejection only: when an endpoint cap is reached the
+//! ARRIVING packet is shed with its reason. There is no per-flow cap and no
+//! old-head replacement — CoDel (not a tiny packet count) controls queue
+//! latency; the caps are memory safety bounds.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use tunnet_common::packet::{FlowKey, LogicalPacket};
+use uuid::Uuid;
 
 /// CoDel target: minimum sojourn indicating a standing queue (~5 ms baseline;
 /// consider serialization time on slow links per RFC 8290 §4.2).
@@ -43,56 +52,77 @@ pub const CODEL_TARGET: Duration = Duration::from_millis(5);
 pub const CODEL_INTERVAL: Duration = Duration::from_millis(100);
 /// Emergency maximum queue lifetime: hard safety bound only, not the AQM.
 pub const EMERGENCY_CEILING: Duration = Duration::from_millis(1000);
-/// Total queued bytes per peer (queueing budget shared with transport).
-pub const PEER_BYTE_CAP: usize = 256 * 1024;
-/// Hard packet cap per peer (memory bound for tiny packets).
-pub const PEER_PACKET_CAP: usize = 512;
-/// Per-flow packet cap default (diagnostic override via
-/// `TUNNET_FLOW_PACKET_CAP`, e.g. 64 vs 256 A/B runs). One flow cannot
-/// dominate peer memory.
-pub const FLOW_PACKET_CAP: usize = 64;
-
-/// Default per-flow packet cap, honoring the diagnostic override.
-fn flow_packet_cap_default() -> usize {
-    std::env::var("TUNNET_FLOW_PACKET_CAP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= 8)
-        .unwrap_or(FLOW_PACKET_CAP)
-}
+/// Total queued bytes per endpoint (queueing budget shared with transport).
+pub const ENDPOINT_BYTE_CAP: usize = 256 * 1024;
+/// Hard packet cap per endpoint (memory bound for tiny packets).
+pub const ENDPOINT_PACKET_CAP: usize = 512;
 /// New flows stay "sparse" until they send this many bytes.
 pub const NEW_FLOW_BYTE_BUDGET: usize = 16 * 1024;
 /// Sparse flow sojourn bar: heads older than this are not "interactive".
 pub const SPARSE_SOJOURN_BAR: Duration = Duration::from_millis(25);
-/// Cap-pressure probe bound (flows inspected per enqueue tdrops).
-pub const CAP_PROBE_BOUND: usize = 4;
-/// Upper bound on immediate DRR rounds inside one `next()` call (§2.2-3).
-/// One quantum (≥512 B) per round per flow; worst-case deficit gap is one
-/// max head plus accumulated wire overshoot (~19 KB ⇒ ≤37 rounds). 64 is a
-/// safe deterministic margin; typical calls send on the first round.
+/// Upper bound on immediate DRR rounds inside one `next()` call.
+/// One quantum (≥512 B) per round per flow; 64 is a safe deterministic
+/// margin; typical calls send on the first round.
 pub const MAX_DRR_ROUNDS: u8 = 64;
+
+/// Scheduler flow key: the 5-tuple PLUS the network it belongs to. The same
+/// 5-tuple in two Direct networks is two flows, never one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SchedFlowKey {
+    pub net: Uuid,
+    pub flow: FlowKey,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
-    PeerByteCap,
-    PeerPacketCap,
-    FlowCap,
+    EndpointByteCap,
+    EndpointPacketCap,
     Codel,
     EmergencyCeiling,
     TooLarge,
     NoConnection,
+    /// Packet belonged to a revoked membership (worker-owned discard or
+    /// network purge).
+    MembershipRevoked,
+    /// Packet belonged to a torn-down dataplane generation.
+    GenerationEnd,
 }
 
 impl DropReason {
+    pub const ALL: [DropReason; 8] = [
+        DropReason::EndpointByteCap,
+        DropReason::EndpointPacketCap,
+        DropReason::Codel,
+        DropReason::EmergencyCeiling,
+        DropReason::TooLarge,
+        DropReason::NoConnection,
+        DropReason::MembershipRevoked,
+        DropReason::GenerationEnd,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::EndpointByteCap => 0,
+            Self::EndpointPacketCap => 1,
+            Self::Codel => 2,
+            Self::EmergencyCeiling => 3,
+            Self::TooLarge => 4,
+            Self::NoConnection => 5,
+            Self::MembershipRevoked => 6,
+            Self::GenerationEnd => 7,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::PeerByteCap => "sched_peer_bytes",
-            Self::PeerPacketCap => "sched_peer_packets",
-            Self::FlowCap => "sched_flow_cap",
+            Self::EndpointByteCap => "sched_endpoint_bytes",
+            Self::EndpointPacketCap => "sched_endpoint_packets",
             Self::Codel => "sched_codel",
             Self::EmergencyCeiling => "sched_emergency",
             Self::TooLarge => "datagram_too_large",
             Self::NoConnection => "no_connection",
+            Self::MembershipRevoked => "sched_membership_revoked",
+            Self::GenerationEnd => "sched_generation_end",
         }
     }
 }
@@ -136,8 +166,7 @@ struct FlowQueue {
 }
 
 impl FlowQueue {
-    fn new(now: Instant) -> Self {
-        let _ = now;
+    fn new() -> Self {
         Self {
             packets: VecDeque::new(),
             bytes: 0,
@@ -149,106 +178,167 @@ impl FlowQueue {
     }
 }
 
-/// Scheduler counters reported to telemetry (deltas applied by the pump).
+/// Cumulative scheduler counters — the ONE accounting source. Every mutation
+/// updates these; [`SchedReporter`] diffs consecutive snapshots into exact
+/// telemetry deltas. Levels (`queued_*`, `active_flows`, `inflight_*`) are
+/// state; `sent_*`/`wire_bytes`/`drop_*` are monotonic totals.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SchedCounters {
-    pub enqueued: u64,
+pub struct SchedSnapshot {
+    pub queued_packets: u64,
+    pub queued_bytes: u64,
+    pub active_flows: u64,
+    pub inflight_packets: u64,
+    pub inflight_bytes: u64,
     pub sent_packets: u64,
     pub sent_bytes: u64,
     pub wire_bytes: u64,
-    pub drops_codel: u64,
-    pub drops_cap: u64,
-    pub drops_emergency: u64,
-    pub transport_full: u64,
+    pub drop_packets: [u64; 8],
+    pub drop_bytes: [u64; 8],
 }
 
-/// Sojourn observation for histogram telemetry (filled by dequeue).
-#[derive(Debug, Clone, Copy)]
-pub struct SojournSample {
-    pub sojourn: Duration,
+impl SchedSnapshot {
+    /// Packets currently owned by the scheduler (queued + in-flight).
+    pub fn owned_packets(self) -> u64 {
+        self.queued_packets + self.inflight_packets
+    }
+
+    /// Bytes currently owned by the scheduler (queued + in-flight).
+    pub fn owned_bytes(self) -> u64 {
+        self.queued_bytes + self.inflight_bytes
+    }
+
+    /// Total explicitly dropped packets across all reasons.
+    pub fn dropped_packets(self) -> u64 {
+        self.drop_packets.iter().sum()
+    }
+
+    /// Total explicitly dropped bytes across all reasons.
+    pub fn dropped_bytes(self) -> u64 {
+        self.drop_bytes.iter().sum()
+    }
+
+    /// Conservation: every offered packet is delivered, explicitly
+    /// dropped (including tail-rejected newcomers), or still owned.
+    pub fn conserves(self, offered_packets: u64, offered_bytes: u64) -> bool {
+        offered_packets == self.sent_packets + self.dropped_packets() + self.owned_packets()
+            && offered_bytes == self.sent_bytes + self.dropped_bytes() + self.owned_bytes()
+    }
 }
 
-/// One DRR service opportunity: every queued packet the visited flow could
-/// afford with its deficit (§2.2-3). Non-empty by construction. Classic DRR
-/// serves a flow's eligible packets together — this is what makes byte
-/// shares fair when packet sizes differ wildly (a 9000 B flow and a 100 B
-/// flow each receive ~one quantum of service per visit, not one packet).
-pub struct DequeueBurst {
-    pub packets: Vec<(Box<LogicalPacket>, SojournSample)>,
+/// Exact delta between two snapshots, for telemetry. Level deltas are signed
+/// (gauges); sent/drop deltas are unsigned (counters). Computed by
+/// [`SchedReporter`]; saturates rather than wraps on misuse.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SchedDiff {
+    pub dq_packets: i64,
+    pub dq_bytes: i64,
+    pub dq_flows: i64,
+    pub dq_inflight_packets: i64,
+    pub dq_inflight_bytes: i64,
+    pub sent_packets: u64,
+    pub sent_bytes: u64,
+    pub wire_bytes: u64,
+    pub drop_packets: [u64; 8],
+    pub drop_bytes: [u64; 8],
 }
 
-/// Dequeue decision returned to the pump.
-pub enum Dequeue {
-    /// Transmit this burst (all packets, in order). Boxed: a burst is
-    /// heap-sized and Empty is unit-sized.
-    Send(Box<DequeueBurst>),
-    /// Scheduler empty.
-    Empty,
+/// Diffs scheduler snapshots into exact telemetry deltas. Owned by the single
+/// endpoint TX worker, so baselines are race-free by construction.
+#[derive(Debug, Default)]
+pub struct SchedReporter {
+    last: SchedSnapshot,
 }
 
-/// Per-peer FQ-CoDel scheduler. Not thread-safe; owned by the peer's pump
-/// (either behind the fast-state lock or by a single pump task).
-pub struct PeerScheduler {
-    flows: HashMap<FlowKey, FlowQueue>,
-    /// New (sparse) flows first, oldest-first.
-    new_list: VecDeque<FlowKey>,
-    /// Backlogged flows in DRR order.
-    old_list: VecDeque<FlowKey>,
-    bytes: usize,
-    packets: usize,
-    quantum: usize,
-    /// Per-flow packet cap (diagnostic override via TUNNET_FLOW_PACKET_CAP).
-    flow_packet_cap: usize,
-    target: Duration,
-    interval: Duration,
-    counters: SchedCounters,
-    /// Baselines for [`Self::drain_drops`]: cumulative counters already
-    /// reported to telemetry (codel, emergency). Split across however many
-    /// threads drain — the sum stays exact, never double-counted.
-    reported_codel: u64,
-    reported_emergency: u64,
+impl SchedReporter {
+    pub fn new(initial: SchedSnapshot) -> Self {
+        Self { last: initial }
+    }
+
+    pub fn diff(&mut self, cur: SchedSnapshot) -> SchedDiff {
+        let out = SchedDiff {
+            dq_packets: cur.queued_packets as i64 - self.last.queued_packets as i64,
+            dq_bytes: cur.queued_bytes as i64 - self.last.queued_bytes as i64,
+            dq_flows: cur.active_flows as i64 - self.last.active_flows as i64,
+            dq_inflight_packets: cur.inflight_packets as i64 - self.last.inflight_packets as i64,
+            dq_inflight_bytes: cur.inflight_bytes as i64 - self.last.inflight_bytes as i64,
+            sent_packets: cur.sent_packets.saturating_sub(self.last.sent_packets),
+            sent_bytes: cur.sent_bytes.saturating_sub(self.last.sent_bytes),
+            wire_bytes: cur.wire_bytes.saturating_sub(self.last.wire_bytes),
+            drop_packets: std::array::from_fn(|i| {
+                cur.drop_packets[i].saturating_sub(self.last.drop_packets[i])
+            }),
+            drop_bytes: std::array::from_fn(|i| {
+                cur.drop_bytes[i].saturating_sub(self.last.drop_bytes[i])
+            }),
+        };
+        self.last = cur;
+        out
+    }
 }
 
-/// Enqueue decision. EVERY shed or evicted packet is reported here — there
-/// are no invisible drops: the caller reconciles gauges and telemetry for
-/// both the admitted packet and any evicted one.
+/// Enqueue decision. Rejection sheds the ARRIVING packet (tail drop) with its
+/// reason — the queue is never reordered or replaced to admit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueOutcome {
-    /// Admitted (gauges: +1 packet, +len bytes).
-    Accepted,
-    /// Admitted, but an older packet was evicted to make room (gauges: +1
-    /// packet/+len for the newcomer AND -1/-evicted_len for the victim;
-    /// report `reason` to telemetry).
-    AcceptedEvicted {
-        reason: DropReason,
-        evicted_len: usize,
-    },
+    /// Admitted (`new_flow` tells the caller whether a flow gauge +1 applies).
+    Accepted { new_flow: bool },
     /// Shed (report `reason` to telemetry; gauges untouched).
     Rejected { reason: DropReason },
 }
 
 impl EnqueueOutcome {
     pub fn is_accepted(self) -> bool {
-        matches!(self, Self::Accepted | Self::AcceptedEvicted { .. })
+        matches!(self, Self::Accepted { .. })
     }
 }
 
-/// CoDel/emergency drops since the last drain (see [`Self::drain_drops`]).
-/// Cap-pressure sheds are reported at the enqueue decision site instead
-/// (see [`EnqueueOutcome`]), so the two paths never double-count.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SchedDropDeltas {
-    pub codel: u64,
-    pub emergency: u64,
+/// One owned logical packet handed to the endpoint worker. Ownership moved
+/// queued -> in-flight; the worker resolves it via [`EndpointScheduler::complete`]
+/// (delivered) or [`EndpointScheduler::discard_inflight`] (revoked/torn down).
+pub struct DequeuedPacket {
+    pub net: Uuid,
+    pub flow: FlowKey,
+    pub packet: LogicalPacket,
+    pub sojourn: Duration,
 }
 
-impl SchedDropDeltas {
-    pub fn is_empty(self) -> bool {
-        self.codel == 0 && self.emergency == 0
-    }
+/// Dequeue decision returned to the endpoint worker.
+pub enum Dequeue {
+    /// Transmit this packet (single logical packet, in order). Boxed: the
+    /// packet is heap-sized and Empty is unit-sized.
+    Send(Box<DequeuedPacket>),
+    /// No queued work.
+    Empty,
 }
 
-impl PeerScheduler {
+/// Endpoint-global FQ-CoDel scheduler. Not thread-safe; owned by the
+/// endpoint's single TX worker behind a lock.
+pub struct EndpointScheduler {
+    flows: HashMap<SchedFlowKey, FlowQueue>,
+    /// New (sparse) flows first, oldest-first.
+    new_list: VecDeque<SchedFlowKey>,
+    /// Backlogged flows in DRR order.
+    old_list: VecDeque<SchedFlowKey>,
+    /// In-progress DRR visit: the last-served backlogged flow still owns
+    /// its quantum grant, so the next dequeue continues its affordable
+    /// heads instead of granting a fresh quantum elsewhere. This keeps
+    /// single-packet dequeue byte-fair exactly like classic burst DRR.
+    drr_turn: Option<SchedFlowKey>,
+    bytes: usize,
+    packets: usize,
+    inflight_packets: u64,
+    inflight_bytes: u64,
+    quantum: usize,
+    target: Duration,
+    interval: Duration,
+    sent_packets: u64,
+    sent_bytes: u64,
+    wire_bytes: u64,
+    drop_packets: [u64; 8],
+    drop_bytes: [u64; 8],
+}
+
+impl EndpointScheduler {
     pub fn new(quantum: usize) -> Self {
         Self::with_params(quantum, CODEL_TARGET, CODEL_INTERVAL)
     }
@@ -260,15 +350,19 @@ impl PeerScheduler {
             flows: HashMap::new(),
             new_list: VecDeque::new(),
             old_list: VecDeque::new(),
+            drr_turn: None,
             bytes: 0,
             packets: 0,
+            inflight_packets: 0,
+            inflight_bytes: 0,
             quantum: quantum.max(512),
-            flow_packet_cap: flow_packet_cap_default(),
             target,
             interval: interval.max(Duration::from_millis(1)),
-            counters: SchedCounters::default(),
-            reported_codel: 0,
-            reported_emergency: 0,
+            sent_packets: 0,
+            sent_bytes: 0,
+            wire_bytes: 0,
+            drop_packets: [0; 8],
+            drop_bytes: [0; 8],
         }
     }
 
@@ -276,211 +370,111 @@ impl PeerScheduler {
         self.quantum = quantum.max(512);
     }
 
-    /// Override the per-flow packet cap (diagnostic A/B only).
-    pub fn set_flow_packet_cap(&mut self, cap: usize) {
-        self.flow_packet_cap = cap.max(8);
+    /// True when queued (not in-flight) work exists.
+    pub fn has_queued_work(&self) -> bool {
+        self.packets > 0
     }
 
-    pub fn levels(&self) -> (u64, u64, u64) {
-        (
-            self.packets as u64,
-            self.bytes as u64,
-            self.flows.len() as u64,
-        )
-    }
-
-    pub fn counters(&self) -> SchedCounters {
-        self.counters
-    }
-
-    /// Take unreported CoDel/emergency drops since the last drain (for
-    /// telemetry; call after `next()` batches and after enqueues). Safe to
-    /// call from multiple threads sharing the scheduler lock: deltas are
-    /// partitioned, the sum stays exact.
-    pub fn drain_drops(&mut self) -> SchedDropDeltas {
-        let out = SchedDropDeltas {
-            codel: self.counters.drops_codel - self.reported_codel,
-            emergency: self.counters.drops_emergency - self.reported_emergency,
-        };
-        self.reported_codel = self.counters.drops_codel;
-        self.reported_emergency = self.counters.drops_emergency;
-        out
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.packets == 0
-    }
-
-    /// Drop all queued packets (teardown ownership change). Returns the
-    /// dropped (packets, bytes, flows) for gauge reconciliation.
-    pub fn clear(&mut self) -> (u64, u64, u64) {
-        let out = (
-            self.packets as u64,
-            self.bytes as u64,
-            self.flows.len() as u64,
-        );
-        self.flows.clear();
-        self.new_list.clear();
-        self.old_list.clear();
-        self.bytes = 0;
-        self.packets = 0;
-        out
-    }
-
-    /// Enqueue a logical packet. The outcome reports EVERYTHING: admission,
-    /// eviction (with the victim's length for gauge reconciliation), or
-    /// rejection with its reason. Callers must reconcile gauges and report
-    /// telemetry for evictions/rejections — no invisible drops.
-    /// `now` should be the packet's observation time (usually Instant::now()).
-    pub fn enqueue(&mut self, packet: LogicalPacket, now: Instant) -> EnqueueOutcome {
-        let flow = packet.flow;
-        let len = packet.len();
-        // Memory bounds first: probe a bounded number of flows for an
-        // over-ceiling head to evict; otherwise shed the newcomer (tail drop
-        // keeps the work O(1) instead of scanning all flows).
-        if self.packets >= PEER_PACKET_CAP || self.bytes + len > PEER_BYTE_CAP {
-            if !self.evict_one(now) && self.packets >= PEER_PACKET_CAP {
-                self.counters.drops_cap += 1;
-                return EnqueueOutcome::Rejected {
-                    reason: DropReason::PeerPacketCap,
-                };
-            }
-            if self.bytes + len > PEER_BYTE_CAP {
-                self.counters.drops_cap += 1;
-                return EnqueueOutcome::Rejected {
-                    reason: if self.packets >= PEER_PACKET_CAP {
-                        DropReason::PeerPacketCap
-                    } else {
-                        DropReason::PeerByteCap
-                    },
-                };
-            }
+    /// Current cumulative counters (the accounting source).
+    pub fn snapshot(&self) -> SchedSnapshot {
+        SchedSnapshot {
+            queued_packets: self.packets as u64,
+            queued_bytes: self.bytes as u64,
+            active_flows: self.flows.len() as u64,
+            inflight_packets: self.inflight_packets,
+            inflight_bytes: self.inflight_bytes,
+            sent_packets: self.sent_packets,
+            sent_bytes: self.sent_bytes,
+            wire_bytes: self.wire_bytes,
+            drop_packets: self.drop_packets,
+            drop_bytes: self.drop_bytes,
         }
-        let is_new_flow = !self.flows.contains_key(&flow);
-        let flow_cap = self.flow_packet_cap;
-        let q = self
-            .flows
-            .entry(flow)
-            .or_insert_with(|| FlowQueue::new(now));
-        if q.packets.len() >= flow_cap {
-            // Per-flow cap: drop the flow's own stalest head (tail stays
-            // fresh: retransmits and sparse signals survive). REPORTED via
-            // the outcome (with victim length) — never silent.
-            if let Some(old) = q.packets.pop_front() {
-                let evicted_len = old.len;
-                q.bytes -= evicted_len;
-                self.bytes -= evicted_len;
-                self.packets -= 1;
-                self.counters.drops_cap += 1;
-                q.bytes += len;
-                q.packets.push_back(QueuedPacket { packet, len });
-                self.bytes += len;
-                self.packets += 1;
-                self.counters.enqueued += 1;
-                if is_new_flow && !self.new_list.contains(&flow) && !self.old_list.contains(&flow) {
-                    self.new_list.push_back(flow);
-                }
-                return EnqueueOutcome::AcceptedEvicted {
-                    reason: DropReason::FlowCap,
-                    evicted_len,
-                };
-            }
-            self.counters.drops_cap += 1;
+    }
+
+    fn record_drop(
+        drop_packets: &mut [u64; 8],
+        drop_bytes: &mut [u64; 8],
+        reason: DropReason,
+        packets: u64,
+        bytes: u64,
+    ) {
+        let i = reason.index();
+        drop_packets[i] += packets;
+        drop_bytes[i] += bytes;
+    }
+
+    /// Enqueue one logical packet for `net`. Tail-rejects the newcomer when
+    /// an endpoint hard cap is reached — never evicts, never reorders.
+    /// `now` should be the packet's observation time (usually Instant::now()).
+    pub fn enqueue(&mut self, net: Uuid, packet: LogicalPacket, now: Instant) -> EnqueueOutcome {
+        let key = SchedFlowKey {
+            net,
+            flow: packet.flow,
+        };
+        let len = packet.len();
+        // Memory safety bounds only: shed the ARRIVING packet.
+        if self.packets >= ENDPOINT_PACKET_CAP {
+            Self::record_drop(
+                &mut self.drop_packets,
+                &mut self.drop_bytes,
+                DropReason::EndpointPacketCap,
+                1,
+                len as u64,
+            );
             return EnqueueOutcome::Rejected {
-                reason: DropReason::FlowCap,
+                reason: DropReason::EndpointPacketCap,
             };
         }
+        if self.bytes + len > ENDPOINT_BYTE_CAP {
+            Self::record_drop(
+                &mut self.drop_packets,
+                &mut self.drop_bytes,
+                DropReason::EndpointByteCap,
+                1,
+                len as u64,
+            );
+            return EnqueueOutcome::Rejected {
+                reason: DropReason::EndpointByteCap,
+            };
+        }
+        let is_new_flow = !self.flows.contains_key(&key);
+        let q = self.flows.entry(key).or_insert_with(FlowQueue::new);
+        let _ = now;
         q.bytes += len;
         q.packets.push_back(QueuedPacket { packet, len });
         self.bytes += len;
         self.packets += 1;
-        self.counters.enqueued += 1;
-        if is_new_flow && !self.new_list.contains(&flow) && !self.old_list.contains(&flow) {
-            self.new_list.push_back(flow);
+        if is_new_flow && !self.new_list.contains(&key) && !self.old_list.contains(&key) {
+            self.new_list.push_back(key);
         }
-        EnqueueOutcome::Accepted
+        EnqueueOutcome::Accepted {
+            new_flow: is_new_flow,
+        }
     }
 
-    /// Bounded cap-pressure eviction: inspect at most CAP_PROBE_BOUND flows
-    /// (round-robin from the old list, then new list) for an emergency head.
-    /// Returns true when something was evicted.
-    fn evict_one(&mut self, now: Instant) -> bool {
-        for _ in 0..CAP_PROBE_BOUND {
-            let key = if let Some(k) = self.old_list.pop_front() {
-                k
-            } else if let Some(k) = self.new_list.pop_front() {
-                k
-            } else {
-                return false;
-            };
-            let evicted = match self.flows.get_mut(&key) {
-                Some(q) => match q.packets.front() {
-                    Some(h)
-                        if now.saturating_duration_since(h.packet.enqueued_at)
-                            > EMERGENCY_CEILING =>
-                    {
-                        let old = q.packets.pop_front().expect("head");
-                        q.bytes -= old.len;
-                        self.bytes -= old.len;
-                        self.packets -= 1;
-                        self.counters.drops_emergency += 1;
-                        true
-                    }
-                    Some(_) => {
-                        // Not evictable: rotate to the back and keep probing.
-                        if q.is_new {
-                            self.new_list.push_back(key);
-                        } else {
-                            self.old_list.push_back(key);
-                        }
-                        false
-                    }
-                    None => false,
-                },
-                None => false,
-            };
-            if evicted {
-                // Keep a non-empty flow scheduled.
-                if let Some(q) = self.flows.get(&key) {
-                    if !q.packets.is_empty() {
-                        if q.is_new {
-                            self.new_list.push_front(key);
-                        } else {
-                            self.old_list.push_front(key);
-                        }
-                    } else {
-                        self.flows.remove(&key);
-                    }
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Dequeue the next service opportunity: sparse flows first (one
-    /// packet: bounded epoch budget, young head), else proper byte-DRR
-    /// across old flows with per-flow CoDel standing-queue control.
+    /// Dequeue the next service opportunity: sparse flows first (one packet:
+    /// bounded epoch budget, young head), then the in-progress DRR visit,
+    /// else byte-DRR across old flows (one packet per visit) with per-flow
+    /// CoDel standing-queue control.
     ///
-    /// DRR discipline (§2.2-3): each visit grants the flow exactly ONE
-    /// quantum; the flow serves every head packet it can afford (burst);
-    /// unaffordable heads rotate for a later round. Rounds repeat
-    /// immediately — no `Empty`, no sleep — until some flow sends, drops,
-    /// or retires. `Empty` is returned ONLY when no schedulable work
-    /// remains. Each round strictly grows deficits or shrinks the queue,
-    /// and rounds are hard-bounded, so the loop terminates.
+    /// The served packet moves to in-flight ownership. `Empty` is returned
+    /// ONLY when no queued work remains.
     pub fn next(&mut self, now: Instant) -> Dequeue {
         // 1) Sparse/new flows: single packet (interactive latency first).
         // Drain Gone heads; one Demote breaks to DRR.
         while let Some(key) = self.new_list.pop_front() {
             match self.serve_sparse(key, now) {
-                SparseOut::Send(packet, sample) => {
-                    return Dequeue::Send(Box::new(DequeueBurst {
-                        packets: vec![(packet, sample)],
-                    }));
-                }
+                SparseOut::Send(item) => return Dequeue::Send(item),
                 SparseOut::Gone => continue,
                 SparseOut::Demoted => break,
+            }
+        }
+        // 2) In-progress DRR visit: continue the affordable heads of the
+        // last-served backlogged flow under its existing quantum grant.
+        if let Some(key) = self.drr_turn.take() {
+            match self.resume_turn(key, now) {
+                TurnOut::Send(item) => return Dequeue::Send(item),
+                TurnOut::Ended | TurnOut::Gone => {}
             }
         }
         // 2) Byte-DRR across old flows with CoDel. List rotation lives
@@ -491,17 +485,20 @@ impl PeerScheduler {
             if n == 0 {
                 return Dequeue::Empty;
             }
-            let mut burst: Option<DequeueBurst> = None;
+            let mut served: Option<Box<DequeuedPacket>> = None;
             for _ in 0..n {
                 let Some(key) = self.old_list.pop_front() else {
                     break;
                 };
                 match self.serve_old(key, now) {
-                    OldOut::Send(b) => {
+                    OldOut::Send(item) => {
                         if self.flows.get(&key).is_some_and(|q| !q.packets.is_empty()) {
                             self.old_list.push_back(key);
+                            // Continue this visit next call under the same
+                            // quantum grant (single-packet burst fairness).
+                            self.drr_turn = Some(key);
                         }
-                        burst = Some(b);
+                        served = Some(item);
                         break;
                     }
                     OldOut::Rotate => {
@@ -512,8 +509,8 @@ impl PeerScheduler {
                     OldOut::Gone => {}
                 }
             }
-            if let Some(b) = burst {
-                return Dequeue::Send(Box::new(b));
+            if let Some(item) = served {
+                return Dequeue::Send(item);
             }
             // No send this round: every visit either dropped a packet
             // (CoDel/emergency, strictly reducing queued packets) or
@@ -521,47 +518,23 @@ impl PeerScheduler {
             // rotated an unaffordable head (deficit grew by one quantum).
             // Loop for another immediate round — never Empty with work.
         }
-        // Unreachable safety: the deficit gap is bounded (~19 KB worst
-        // case ⇒ ≤37 rounds at minimum quantum), so 64 rounds always
-        // serve or drain. Never hang the pump.
+        // Unreachable safety: the deficit gap is bounded, so 64 rounds always
+        // serve or drain. Never hang the worker.
         debug_assert!(false, "scheduler DRR round bound exhausted");
         Dequeue::Empty
     }
 
-    /// Requeue a packet at its flow head (transport-full: retry later without
-    /// losing order). Restores both flow and global accounting so a
-    /// dequeue→requeue cycle is a no-op on the books. Counts a
-    /// transport-full event for backoff telemetry.
-    pub fn requeue_head(&mut self, flow: FlowKey, packet: LogicalPacket) {
-        let len = packet.len();
-        match self.flows.get_mut(&flow) {
-            Some(q) => {
-                q.bytes += len;
-                q.packets.push_front(QueuedPacket { packet, len });
-            }
-            None => {
-                let mut q = FlowQueue::new(Instant::now());
-                q.bytes = len;
-                q.packets.push_front(QueuedPacket { packet, len });
-                self.flows.insert(flow, q);
-                self.old_list.push_front(flow);
-            }
-        }
-        self.bytes += len;
-        self.packets += 1;
-        self.counters.transport_full += 1;
-    }
-
-    /// Account one COMPLETED logical packet (logical + total wire bytes).
-    /// Called exactly once per logical packet when transmission finishes —
-    /// never per segment — so segmented traffic is charged once: the
-    /// dequeue already debited the logical length from DRR deficit, and
-    /// only the wire overhead beyond it leans future rounds here.
-    pub fn account_sent(&mut self, flow: FlowKey, logical_len: usize, wire_len: usize) {
-        self.counters.sent_packets += 1;
-        self.counters.sent_bytes += logical_len as u64;
-        self.counters.wire_bytes += wire_len as u64;
-        if let Some(q) = self.flows.get_mut(&flow) {
+    /// Resolve one in-flight packet as DELIVERED. Called exactly once per
+    /// dequeued logical packet when transmission finishes — never per
+    /// segment — so segmented traffic is charged once. The DRR deficit lean
+    /// for wire overhead applies best-effort (the flow may have retired).
+    pub fn complete(&mut self, key: &SchedFlowKey, logical_len: usize, wire_len: usize) {
+        self.inflight_packets = self.inflight_packets.saturating_sub(1);
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(logical_len as u64);
+        self.sent_packets += 1;
+        self.sent_bytes += logical_len as u64;
+        self.wire_bytes += wire_len as u64;
+        if let Some(q) = self.flows.get_mut(key) {
             // Extra wire overhead beyond the DRR deficit debit leans future
             // rounds slightly against overhead-heavy flows.
             let overhead = wire_len.saturating_sub(logical_len);
@@ -569,13 +542,145 @@ impl PeerScheduler {
         }
     }
 
-    fn remove_flow(&mut self, key: &FlowKey) {
+    /// Resolve one in-flight packet as DROPPED (revoked membership, torn-down
+    /// generation). The worker owns the bytes; the scheduler records the
+    /// exact drop so conservation holds.
+    pub fn discard_inflight(&mut self, len: usize, reason: DropReason) {
+        self.inflight_packets = self.inflight_packets.saturating_sub(1);
+        self.inflight_bytes = self.inflight_bytes.saturating_sub(len as u64);
+        Self::record_drop(
+            &mut self.drop_packets,
+            &mut self.drop_bytes,
+            reason,
+            1,
+            len as u64,
+        );
+    }
+
+    /// Drop every QUEUED packet bound to `net` (membership revoked). In-flight
+    /// packets are worker-owned; the worker discards them via
+    /// [`Self::discard_inflight`]. Drops are recorded with exact
+    /// packets/bytes under `reason`.
+    pub fn purge_network(&mut self, net: Uuid, reason: DropReason) {
+        if self.drr_turn.is_some_and(|k| k.net == net) {
+            self.drr_turn = None;
+        }
+        let keys: Vec<SchedFlowKey> = self
+            .flows
+            .keys()
+            .filter(|k| k.net == net)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(q) = self.flows.remove(&key) {
+                let (mut p, mut b) = (0u64, 0u64);
+                for qp in q.packets {
+                    p += 1;
+                    b += qp.len as u64;
+                }
+                self.packets -= p as usize;
+                self.bytes -= b as usize;
+                Self::record_drop(&mut self.drop_packets, &mut self.drop_bytes, reason, p, b);
+            }
+        }
+        self.new_list.retain(|k| k.net != net);
+        self.old_list.retain(|k| k.net != net);
+    }
+
+    /// Drop every QUEUED packet (generation teardown). In-flight packets are
+    /// worker-owned and discarded by the exiting worker.
+    pub fn purge_all(&mut self, reason: DropReason) {
+        let p = self.packets as u64;
+        let b = self.bytes as u64;
+        Self::record_drop(&mut self.drop_packets, &mut self.drop_bytes, reason, p, b);
+        self.flows.clear();
+        self.new_list.clear();
+        self.old_list.clear();
+        self.drr_turn = None;
+        self.bytes = 0;
+        self.packets = 0;
+    }
+
+    fn remove_flow(&mut self, key: &SchedFlowKey) {
         self.flows.remove(key);
         self.new_list.retain(|k| k != key);
         self.old_list.retain(|k| k != key);
+        if self.drr_turn == Some(*key) {
+            self.drr_turn = None;
+        }
     }
 
-    fn serve_sparse(&mut self, key: FlowKey, now: Instant) -> SparseOut {
+    /// Continue an in-progress DRR visit: serve ONE more affordable head of
+    /// the last-served flow under its existing quantum grant (no new grant,
+    /// no CoDel re-check — same visit). Ends the turn when the head is
+    /// unaffordable or the flow is gone.
+    fn resume_turn(&mut self, key: SchedFlowKey, now: Instant) -> TurnOut {
+        // The flow sits in the old list (pushed back when the visit
+        // started); take it out to serve without duplicating the key.
+        let in_list = if let Some(pos) = self.old_list.iter().position(|k| *k == key) {
+            self.old_list.remove(pos);
+            true
+        } else {
+            false
+        };
+        let Some(q) = self.flows.get_mut(&key) else {
+            return TurnOut::Gone;
+        };
+        // Emergency ceiling applies per packet, like the burst loop.
+        while let Some(h) = q.packets.front() {
+            if now.saturating_duration_since(h.packet.enqueued_at) > EMERGENCY_CEILING {
+                let old = q.packets.pop_front().expect("head");
+                q.bytes -= old.len;
+                self.bytes -= old.len;
+                self.packets -= 1;
+                Self::record_drop(
+                    &mut self.drop_packets,
+                    &mut self.drop_bytes,
+                    DropReason::EmergencyCeiling,
+                    1,
+                    old.len as u64,
+                );
+            } else {
+                break;
+            }
+        }
+        let Some(head_len) = q.packets.front().map(|h| h.len) else {
+            self.remove_flow(&key);
+            return TurnOut::Gone;
+        };
+        if (head_len as isize) > q.deficit {
+            // Quantum exhausted: end the turn, re-list for a later visit.
+            if (in_list || self.flows.contains_key(&key)) && !self.old_list.contains(&key) {
+                self.old_list.push_back(key);
+            }
+            return TurnOut::Ended;
+        }
+        let qp = q.packets.pop_front().expect("head");
+        let sojourn = now.saturating_duration_since(qp.packet.enqueued_at);
+        q.bytes -= qp.len;
+        self.bytes -= qp.len;
+        self.packets -= 1;
+        q.deficit -= qp.len as isize;
+        q.epoch_bytes += qp.len;
+        if q.packets.is_empty() {
+            self.remove_flow(&key);
+        } else {
+            if !self.old_list.contains(&key) {
+                self.old_list.push_back(key);
+            }
+            self.drr_turn = Some(key);
+        }
+        self.inflight_packets += 1;
+        self.inflight_bytes += qp.len as u64;
+        TurnOut::Send(Box::new(DequeuedPacket {
+            net: key.net,
+            flow: key.flow,
+            packet: qp.packet,
+            sojourn,
+        }))
+    }
+
+    fn serve_sparse(&mut self, key: SchedFlowKey, now: Instant) -> SparseOut {
         enum Prep {
             Send,
             Demote,
@@ -592,7 +697,13 @@ impl PeerScheduler {
                     q.bytes -= old.len;
                     self.bytes -= old.len;
                     self.packets -= 1;
-                    self.counters.drops_emergency += 1;
+                    Self::record_drop(
+                        &mut self.drop_packets,
+                        &mut self.drop_bytes,
+                        DropReason::EmergencyCeiling,
+                        1,
+                        old.len as u64,
+                    );
                 } else {
                     break;
                 }
@@ -623,9 +734,7 @@ impl PeerScheduler {
             Prep::Send => {
                 let q = self.flows.get_mut(&key).expect("present");
                 let qp = q.packets.pop_front().expect("head");
-                let sample = SojournSample {
-                    sojourn: now.saturating_duration_since(qp.packet.enqueued_at),
-                };
+                let sojourn = now.saturating_duration_since(qp.packet.enqueued_at);
                 q.bytes -= qp.len;
                 self.bytes -= qp.len;
                 self.packets -= 1;
@@ -640,12 +749,19 @@ impl PeerScheduler {
                 } else {
                     self.new_list.push_front(key);
                 }
-                SparseOut::Send(Box::new(qp.packet), sample)
+                self.inflight_packets += 1;
+                self.inflight_bytes += qp.len as u64;
+                SparseOut::Send(Box::new(DequeuedPacket {
+                    net: key.net,
+                    flow: key.flow,
+                    packet: qp.packet,
+                    sojourn,
+                }))
             }
         }
     }
 
-    fn serve_old(&mut self, key: FlowKey, now: Instant) -> OldOut {
+    fn serve_old(&mut self, key: SchedFlowKey, now: Instant) -> OldOut {
         // Emergency ceiling + CoDel observe the head first.
         enum Head {
             Ready,
@@ -663,7 +779,13 @@ impl PeerScheduler {
                     q.bytes -= old.len;
                     self.bytes -= old.len;
                     self.packets -= 1;
-                    self.counters.drops_emergency += 1;
+                    Self::record_drop(
+                        &mut self.drop_packets,
+                        &mut self.drop_bytes,
+                        DropReason::EmergencyCeiling,
+                        1,
+                        old.len as u64,
+                    );
                 } else {
                     break;
                 }
@@ -708,7 +830,13 @@ impl PeerScheduler {
                     q.bytes -= old.len;
                     self.bytes -= old.len;
                     self.packets -= 1;
-                    self.counters.drops_codel += 1;
+                    Self::record_drop(
+                        &mut self.drop_packets,
+                        &mut self.drop_bytes,
+                        DropReason::Codel,
+                        1,
+                        old.len as u64,
+                    );
                     // Re-observe the new head next visit.
                     if q.packets.is_empty() {
                         Head::Gone
@@ -736,40 +864,49 @@ impl PeerScheduler {
             }
             Head::Ready => {
                 let q = self.flows.get_mut(&key).expect("present");
-                // Proper DRR (§2.2-3): exactly ONE quantum per visit. Serve
-                // every head the flow can afford as one burst; an
-                // unaffordable head rotates for a later round (the caller's
-                // round loop retries immediately — no Empty, no sleep).
-                // Burst bytes are naturally bounded: at most one quantum
-                // plus one max head per visit.
+                // Classic DRR: exactly ONE quantum per visit, ONE packet per
+                // service. An unaffordable head rotates for a later round
+                // (the caller's round loop retries immediately — no Empty,
+                // no sleep).
                 q.deficit += self.quantum as isize;
-                let mut burst = DequeueBurst {
-                    packets: Vec::new(),
+                let head_len = match q.packets.front() {
+                    Some(h) => {
+                        let sojourn = now.saturating_duration_since(h.packet.enqueued_at);
+                        if sojourn > EMERGENCY_CEILING {
+                            let old = q.packets.pop_front().expect("head");
+                            q.bytes -= old.len;
+                            self.bytes -= old.len;
+                            self.packets -= 1;
+                            Self::record_drop(
+                                &mut self.drop_packets,
+                                &mut self.drop_bytes,
+                                DropReason::EmergencyCeiling,
+                                1,
+                                old.len as u64,
+                            );
+                            if q.packets.is_empty() {
+                                self.remove_flow(&key);
+                                return OldOut::Gone;
+                            }
+                            return OldOut::Rotate;
+                        }
+                        h.len
+                    }
+                    None => {
+                        self.remove_flow(&key);
+                        return OldOut::Gone;
+                    }
                 };
-                while let Some(h) = q.packets.front() {
-                    let sojourn = now.saturating_duration_since(h.packet.enqueued_at);
-                    let head_len = h.len;
-                    // Emergency ceiling applies per packet inside bursts too.
-                    if sojourn > EMERGENCY_CEILING {
-                        let old = q.packets.pop_front().expect("head");
-                        q.bytes -= old.len;
-                        self.bytes -= old.len;
-                        self.packets -= 1;
-                        self.counters.drops_emergency += 1;
-                        continue;
-                    }
-                    if (head_len as isize) > q.deficit {
-                        break;
-                    }
-                    let qp = q.packets.pop_front().expect("head");
-                    let sample = SojournSample { sojourn };
-                    q.bytes -= qp.len;
-                    self.bytes -= qp.len;
-                    self.packets -= 1;
-                    q.deficit -= qp.len as isize;
-                    q.epoch_bytes += qp.len;
-                    burst.packets.push((Box::new(qp.packet), sample));
+                if (head_len as isize) > q.deficit {
+                    return OldOut::Rotate;
                 }
+                let qp = q.packets.pop_front().expect("head");
+                let sojourn = now.saturating_duration_since(qp.packet.enqueued_at);
+                q.bytes -= qp.len;
+                self.bytes -= qp.len;
+                self.packets -= 1;
+                q.deficit -= qp.len as isize;
+                q.epoch_bytes += qp.len;
                 // Leaving dropping state: sojourn fell below target on a
                 // previous observation (first_above_time cleared above).
                 if q.codel.first_above_time.is_none() {
@@ -781,25 +918,34 @@ impl PeerScheduler {
                 }
                 // List rotation belongs to the caller (`next` requeues on
                 // Send/Rotate); serve_old never pushes.
-                if burst.packets.is_empty() {
-                    OldOut::Rotate
-                } else {
-                    OldOut::Send(burst)
-                }
+                self.inflight_packets += 1;
+                self.inflight_bytes += qp.len as u64;
+                OldOut::Send(Box::new(DequeuedPacket {
+                    net: key.net,
+                    flow: key.flow,
+                    packet: qp.packet,
+                    sojourn,
+                }))
             }
         }
     }
 }
 
 enum SparseOut {
-    Send(Box<LogicalPacket>, SojournSample),
+    Send(Box<DequeuedPacket>),
     Gone,
     Demoted,
 }
 
 enum OldOut {
-    Send(DequeueBurst),
+    Send(Box<DequeuedPacket>),
     Rotate,
+    Gone,
+}
+
+enum TurnOut {
+    Send(Box<DequeuedPacket>),
+    Ended,
     Gone,
 }
 
@@ -808,6 +954,9 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tunnet_common::packet::PacketPool;
+
+    const NET: Uuid = Uuid::from_u128(0x2e2e);
+    const NET_OTHER: Uuid = Uuid::from_u128(0x3e3e);
 
     fn pool() -> Arc<PacketPool> {
         PacketPool::new(64)
@@ -822,18 +971,27 @@ mod tests {
         LogicalPacket::from_pooled(buf, raw.len()).unwrap()
     }
 
-    fn drain_all(s: &mut PeerScheduler) -> Vec<(FlowKey, usize)> {
+    fn enqueue(pool: &Arc<PacketPool>, s: &mut EndpointScheduler, sport: u16, size: usize) {
+        assert!(
+            s.enqueue(NET, logical(pool, sport, size), Instant::now())
+                .is_accepted()
+        );
+    }
+
+    fn drain_all(s: &mut EndpointScheduler) -> Vec<(FlowKey, usize)> {
         let mut out = Vec::new();
-        let mut guard = 4096;
+        let mut guard = 8192;
         while guard > 0 {
             guard -= 1;
             match s.next(Instant::now()) {
-                Dequeue::Send(burst) => {
-                    for (p, _) in burst.packets {
-                        let (f, l) = (p.flow, p.len());
-                        s.account_sent(f, l, l);
-                        out.push((f, l));
-                    }
+                Dequeue::Send(item) => {
+                    let key = SchedFlowKey {
+                        net: item.net,
+                        flow: item.flow,
+                    };
+                    let l = item.packet.len();
+                    s.complete(&key, l, l);
+                    out.push((item.flow, l));
                 }
                 Dequeue::Empty => break,
             }
@@ -841,8 +999,9 @@ mod tests {
         out
     }
 
-    /// Demote every flow to the old/DRR list, as the pump would.
-    fn demote_all(s: &mut PeerScheduler) {
+    /// Demote every flow to the old/DRR list, as the worker would observe
+    /// after the sparse budget is spent.
+    fn demote_all(s: &mut EndpointScheduler) {
         for k in s.flows.keys().cloned().collect::<Vec<_>>() {
             let q = s.flows.get_mut(&k).unwrap();
             q.is_new = false;
@@ -856,29 +1015,26 @@ mod tests {
 
     #[test]
     fn large_heads_serve_without_stall() {
-        // §2.2-3: logical packets far larger than the DRR quantum (2800 and
-        // 9000 byte packets against ~1200-byte MPS-scaled quanta) must be
-        // served via immediate internal rounds — Empty means empty, never
-        // "needs more rounds", and never a 50 ms pump sleep with work.
+        // Logical packets far larger than the DRR quantum must be served via
+        // immediate internal rounds — Empty means empty, never deferred.
         for (size, quantum) in [(2800usize, 1200usize), (9000, 1400), (9000, 512)] {
             let p = pool();
-            let mut s = PeerScheduler::new(quantum);
-            assert!(
-                s.enqueue(logical(&p, 1111, size - 28), Instant::now())
-                    .is_accepted()
-            );
+            let mut s = EndpointScheduler::new(quantum);
+            enqueue(&p, &mut s, 1111, size - 28);
             demote_all(&mut s);
             let mut empties = 0u32;
             let mut sent = 0u32;
-            while !s.is_empty() {
+            while s.has_queued_work() {
                 match s.next(Instant::now()) {
-                    Dequeue::Send(burst) => {
-                        for (pkt, _) in burst.packets {
-                            let (f, l) = (pkt.flow, pkt.len());
-                            assert_eq!(l, logical(&p, 1111, size - 28).len());
-                            s.account_sent(f, l, l + 12);
-                            sent += 1;
-                        }
+                    Dequeue::Send(item) => {
+                        let l = item.packet.len();
+                        assert_eq!(l, logical(&p, 1111, size - 28).len());
+                        let key = SchedFlowKey {
+                            net: item.net,
+                            flow: item.flow,
+                        };
+                        s.complete(&key, l, l + 12);
+                        sent += 1;
                     }
                     Dequeue::Empty => empties += 1,
                 }
@@ -894,48 +1050,37 @@ mod tests {
 
     #[test]
     fn wire_accounted_once_per_logical() {
-        // §2.1-2: one logical packet => exactly one account_sent at
-        // completion with (logical, total_wire); segmented traffic must not
-        // be double-charged through per-segment calls.
         let p = pool();
-        let mut s = PeerScheduler::new(1200);
+        let mut s = EndpointScheduler::new(1200);
         let want = logical(&p, 1111, 2800 - 28);
         let (flow, len) = (want.flow, want.len());
-        assert!(s.enqueue(want, Instant::now()).is_accepted());
+        assert!(s.enqueue(NET, want, Instant::now()).is_accepted());
         let (f, l) = match s.next(Instant::now()) {
-            Dequeue::Send(burst) => {
-                assert_eq!(burst.packets.len(), 1);
-                let (pkt, _) = &burst.packets[0];
-                (pkt.flow, pkt.len())
-            }
+            Dequeue::Send(item) => (item.flow, item.packet.len()),
             Dequeue::Empty => panic!("expected packet"),
         };
         assert_eq!((f, l), (flow, len));
-        // Pump transmits 3 segments then accounts once with total wire.
+        // Worker transmits 3 segments then completes once with total wire.
         let total_wire = l + 3 * 11;
-        s.account_sent(f, l, total_wire);
-        let c = s.counters();
-        assert_eq!(c.sent_packets, 1);
-        assert_eq!(c.sent_bytes, len as u64);
-        assert_eq!(c.wire_bytes, total_wire as u64);
+        s.complete(&SchedFlowKey { net: NET, flow: f }, l, total_wire);
+        let snap = s.snapshot();
+        assert_eq!(snap.sent_packets, 1);
+        assert_eq!(snap.sent_bytes, len as u64);
+        assert_eq!(snap.wire_bytes, total_wire as u64);
+        assert_eq!(snap.inflight_packets, 0);
+        assert!(snap.conserves(1, len as u64));
     }
 
     /// Queued length of one flow (by sport) for backlog maintenance.
-    fn qlen(s: &PeerScheduler, sport: u16) -> usize {
+    fn qlen(s: &EndpointScheduler, sport: u16) -> usize {
         s.flows
             .iter()
-            .filter(|(k, _)| k.sport == sport)
+            .filter(|(k, _)| k.flow.sport == sport)
             .map(|(_, q)| q.packets.len())
             .sum()
     }
 
     /// Continuously-backlogged byte shares for two flows.
-    /// Returns (big_bytes, small_bytes) served over `calls` dequeue calls.
-    /// Backlogs are TOPPED UP to bounded depths that fit the peer byte cap
-    /// together (a blind refill lets the jumbo flow hog the cap and sheds
-    /// the small flow's packets, which measures cap hogging, not DRR).
-    /// Depths stay >0 so flows never empty/recreate as "new" (which would
-    /// measure sparse priority, not DRR).
     fn fairness_ratio(
         big_payload: usize,
         small_payload: usize,
@@ -943,19 +1088,19 @@ mod tests {
         calls: usize,
     ) -> (u64, u64) {
         let p = pool();
-        let mut s = PeerScheduler::new(quantum);
+        let mut s = EndpointScheduler::new(quantum);
         for _ in 0..12 {
-            let _ = s.enqueue(logical(&p, 1111, big_payload), Instant::now());
+            enqueue(&p, &mut s, 1111, big_payload);
         }
         for _ in 0..64 {
-            let _ = s.enqueue(logical(&p, 2222, small_payload), Instant::now());
+            enqueue(&p, &mut s, 2222, small_payload);
         }
         demote_all(&mut s);
         let mut bytes = [0u64; 2];
         for _ in 0..calls {
             while qlen(&s, 1111) < 12 {
                 if !s
-                    .enqueue(logical(&p, 1111, big_payload), Instant::now())
+                    .enqueue(NET, logical(&p, 1111, big_payload), Instant::now())
                     .is_accepted()
                 {
                     break;
@@ -963,22 +1108,24 @@ mod tests {
             }
             while qlen(&s, 2222) < 64 {
                 if !s
-                    .enqueue(logical(&p, 2222, small_payload), Instant::now())
+                    .enqueue(NET, logical(&p, 2222, small_payload), Instant::now())
                     .is_accepted()
                 {
                     break;
                 }
             }
             match s.next(Instant::now()) {
-                Dequeue::Send(burst) => {
-                    for (pkt, _) in burst.packets {
-                        let (f, l) = (pkt.flow, pkt.len());
-                        s.account_sent(f, l, l);
-                        if f.sport == 1111 {
-                            bytes[0] += l as u64;
-                        } else {
-                            bytes[1] += l as u64;
-                        }
+                Dequeue::Send(item) => {
+                    let l = item.packet.len();
+                    let key = SchedFlowKey {
+                        net: item.net,
+                        flow: item.flow,
+                    };
+                    s.complete(&key, l, l);
+                    if item.flow.sport == 1111 {
+                        bytes[0] += l as u64;
+                    } else {
+                        bytes[1] += l as u64;
                     }
                 }
                 Dequeue::Empty => panic!("stall with work queued"),
@@ -989,9 +1136,6 @@ mod tests {
 
     #[test]
     fn drr_byte_fairness_jumbo_vs_small() {
-        // §2.2-3: 9000 B vs 100 B backlogged flows with a 1200 quantum must
-        // split BYTES ~evenly (real DRR), not 90:1 by packet count. Packet-
-        // count fairness would give ratio ≈ 90; byte fairness gives ≈ 1.
         let (big, small) = fairness_ratio(9000 - 28, 100 - 28, 1200, 400);
         let ratio = big as f64 / small as f64;
         assert!(
@@ -1002,7 +1146,6 @@ mod tests {
 
     #[test]
     fn drr_byte_fairness_matrix() {
-        // Same property across size pairs: byte shares, not packet shares.
         for (big_total, small_total, quantum) in [
             (2800usize, 100usize, 1200usize),
             (9000, 1200, 1400),
@@ -1019,9 +1162,8 @@ mod tests {
 
     #[test]
     fn drr_byte_fairness_three_flows() {
-        // Three mixed-size backlogged flows split bytes ~three ways.
         let p = pool();
-        let mut s = PeerScheduler::new(1200);
+        let mut s = EndpointScheduler::new(1200);
         let sizes = [
             (1111u16, 9000usize - 28),
             (2222, 1200 - 28),
@@ -1030,7 +1172,7 @@ mod tests {
         let depths = [12usize, 32, 64];
         for (i, (sport, size)) in sizes.iter().enumerate() {
             for _ in 0..depths[i] {
-                let _ = s.enqueue(logical(&p, *sport, *size), Instant::now());
+                enqueue(&p, &mut s, *sport, *size);
             }
         }
         demote_all(&mut s);
@@ -1039,7 +1181,7 @@ mod tests {
             for (i, (sport, size)) in sizes.iter().enumerate() {
                 while qlen(&s, *sport) < depths[i] {
                     if !s
-                        .enqueue(logical(&p, *sport, *size), Instant::now())
+                        .enqueue(NET, logical(&p, *sport, *size), Instant::now())
                         .is_accepted()
                     {
                         break;
@@ -1047,13 +1189,18 @@ mod tests {
                 }
             }
             match s.next(Instant::now()) {
-                Dequeue::Send(burst) => {
-                    for (pkt, _) in burst.packets {
-                        let (f, l) = (pkt.flow, pkt.len());
-                        s.account_sent(f, l, l);
-                        let i = sizes.iter().position(|(sp, _)| *sp == f.sport).unwrap();
-                        bytes[i] += l as u64;
-                    }
+                Dequeue::Send(item) => {
+                    let l = item.packet.len();
+                    let key = SchedFlowKey {
+                        net: item.net,
+                        flow: item.flow,
+                    };
+                    s.complete(&key, l, l);
+                    let i = sizes
+                        .iter()
+                        .position(|(sp, _)| *sp == item.flow.sport)
+                        .unwrap();
+                    bytes[i] += l as u64;
                 }
                 Dequeue::Empty => panic!("stall with work queued"),
             }
@@ -1069,97 +1216,138 @@ mod tests {
     }
 
     #[test]
-    fn eviction_reports_victim_for_gauge_reconcile() {
-        // The silent-drop bug: flow-cap eviction used to return None.
-        // Now the victim length rides the outcome so gauges stay exact.
+    fn same_tuple_two_networks_never_merge() {
+        // The same 5-tuple in two networks is two flows with independent
+        // budgets and FIFOs.
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
-        let one = logical(&p, 1111, 100).len();
-        for _ in 0..64 {
+        let mut s = EndpointScheduler::new(1536);
+        let one_len = logical(&p, 1111, 100).len() as u64;
+        for _ in 0..5 {
             assert!(
-                s.enqueue(logical(&p, 1111, 100), Instant::now())
+                s.enqueue(NET, logical(&p, 1111, 100), Instant::now())
+                    .is_accepted()
+            );
+            assert!(
+                s.enqueue(NET_OTHER, logical(&p, 1111, 100), Instant::now())
                     .is_accepted()
             );
         }
-        match s.enqueue(logical(&p, 1111, 100), Instant::now()) {
-            EnqueueOutcome::AcceptedEvicted {
-                reason,
-                evicted_len,
-            } => {
-                assert_eq!(reason, DropReason::FlowCap);
-                assert_eq!(evicted_len, one);
-            }
-            other => panic!("expected eviction report, got {other:?}"),
-        }
-        // Still exactly at cap (evict-one-accept-one is net-zero).
-        assert_eq!(s.levels().0 as usize, 64);
-        assert_eq!(s.counters().drops_cap, 1);
-        // No codel/emergency involved.
-        assert!(s.drain_drops().is_empty());
+        assert_eq!(s.snapshot().active_flows, 2);
+        // Purge one network: the other is untouched.
+        s.purge_network(NET, DropReason::NoConnection);
+        let snap = s.snapshot();
+        assert_eq!(snap.queued_packets, 5);
+        assert_eq!(snap.active_flows, 1);
+        assert_eq!(snap.drop_packets[DropReason::NoConnection.index()], 5);
+        let out = drain_all(&mut s);
+        assert_eq!(out.len(), 5);
+        assert!(s.snapshot().conserves(10, 10 * one_len));
     }
 
     #[test]
-    fn drain_drops_reports_codel_then_quiet() {
-        // CoDel drops surface through drain_drops exactly once.
+    fn hard_cap_tail_rejects_newcomer() {
+        // No old-head replacement: the arriving packet is shed, the queue
+        // keeps its oldest packets.
+        let p = pool();
+        let mut s = EndpointScheduler::new(1536);
+        let mut admitted = 0u64;
+        let mut offered_bytes = 0u64;
+        for i in 0..(ENDPOINT_PACKET_CAP + 64) {
+            let pkt = logical(&p, 1000 + (i % 8) as u16, 100);
+            offered_bytes += pkt.len() as u64;
+            match s.enqueue(NET, pkt, Instant::now()) {
+                EnqueueOutcome::Accepted { .. } => admitted += 1,
+                EnqueueOutcome::Rejected { reason } => {
+                    assert_eq!(reason, DropReason::EndpointPacketCap);
+                }
+            }
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap.queued_packets, ENDPOINT_PACKET_CAP as u64);
+        assert_eq!(snap.drop_packets[DropReason::EndpointPacketCap.index()], 64);
+        // Conservation over the whole sequence (offered = delivered +
+        // tail-rejected).
+        let out = drain_all(&mut s);
+        assert_eq!(out.len() as u64, admitted);
+        let snap = s.snapshot();
+        assert!(snap.conserves(ENDPOINT_PACKET_CAP as u64 + 64, offered_bytes));
+        assert_eq!(snap.owned_packets(), 0);
+    }
+
+    /// Move every new-list flow to the old/DRR list (backlogged). Used by
+    /// tests that recycle served packets back into the queue: a recycled
+    /// packet must rejoin the standing queue, not jump it as "new".
+    fn demote_new(s: &mut EndpointScheduler) {
+        while let Some(k) = s.new_list.pop_front() {
+            if let Some(q) = s.flows.get_mut(&k) {
+                q.is_new = false;
+                q.epoch_bytes = NEW_FLOW_BYTE_BUDGET;
+                s.old_list.push_back(k);
+            }
+        }
+    }
+
+    #[test]
+    fn codel_drops_surface_in_snapshot() {
+        // CoDel drops surface in the snapshot exactly once (monotonic).
         let target = Duration::from_millis(2);
         let interval = Duration::from_millis(10);
         let p = pool();
-        let mut s = PeerScheduler::with_params(1536, target, interval);
+        let mut s = EndpointScheduler::with_params(1536, target, interval);
         let t0 = Instant::now() - interval - Duration::from_millis(5);
         for _ in 0..10 {
             let mut pkt = logical(&p, 1111, 1200);
             pkt.enqueued_at = t0;
-            assert!(s.enqueue(pkt, t0).is_accepted());
+            assert!(s.enqueue(NET, pkt, t0).is_accepted());
         }
         demote_all(&mut s);
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut reported = 0u64;
         while Instant::now() < deadline {
             match s.next(Instant::now()) {
-                Dequeue::Send(burst) => {
-                    for (pkt, _) in burst.packets.into_iter().rev() {
-                        s.requeue_head(pkt.flow, *pkt);
-                    }
+                Dequeue::Send(item) => {
+                    // Hold as in-flight (worker stalled on transport), then
+                    // return the packet to the queue through a fresh enqueue
+                    // with the ORIGINAL timestamp (CoDel sojourn preserved).
+                    let enq = item.packet.enqueued_at;
+                    let pkt = item.packet;
+                    assert!(s.enqueue(NET, pkt, enq).is_accepted());
+                    demote_new(&mut s);
                 }
                 Dequeue::Empty => {}
             }
-            reported += s.drain_drops().codel;
+            reported = s.snapshot().drop_packets[DropReason::Codel.index()];
             if reported > 0 {
                 break;
             }
         }
-        assert!(reported > 0, "CoDel drops must surface via drain");
-        // Second drain is quiet (deltas partition, never double-count).
-        assert!(s.drain_drops().is_empty());
+        assert!(reported > 0, "CoDel drops must surface in the snapshot");
+        // Monotonic: the count never decreases, never double-counts.
+        let again = s.snapshot().drop_packets[DropReason::Codel.index()];
+        assert!(again >= reported);
     }
 
     #[test]
     fn per_flow_order_preserved() {
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
+        let mut s = EndpointScheduler::new(1536);
         for _ in 0..5 {
-            assert!(
-                s.enqueue(logical(&p, 1111, 100), Instant::now())
-                    .is_accepted()
-            );
+            enqueue(&p, &mut s, 1111, 100);
         }
         let out = drain_all(&mut s);
         assert_eq!(out.len(), 5);
         assert!(out.windows(2).all(|w| w[0].0 == w[1].0));
-        assert!(s.is_empty());
+        assert!(!s.has_queued_work());
     }
 
     #[test]
     fn sparse_flow_jumps_bulk_backlog() {
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
+        let mut s = EndpointScheduler::new(1536);
         for _ in 0..20 {
-            assert!(
-                s.enqueue(logical(&p, 1111, 1200), Instant::now())
-                    .is_accepted()
-            );
+            enqueue(&p, &mut s, 1111, 1200);
         }
-        // Age the bulk flow out of sparsity, as the pump would via demotion.
+        // Age the bulk flow out of sparsity.
         let bulk_key = {
             let k = *s.new_list.iter().next().unwrap();
             let q = s.flows.get_mut(&k).unwrap();
@@ -1169,12 +1357,9 @@ mod tests {
             s.old_list.push_back(k);
             k
         };
-        assert!(
-            s.enqueue(logical(&p, 2222, 100), Instant::now())
-                .is_accepted()
-        );
+        enqueue(&p, &mut s, 2222, 100);
         match s.next(Instant::now()) {
-            Dequeue::Send(burst) => assert_ne!(burst.packets[0].0.flow, bulk_key),
+            Dequeue::Send(item) => assert_ne!(item.flow, bulk_key.flow),
             Dequeue::Empty => panic!("expected sparse packet"),
         }
     }
@@ -1182,13 +1367,10 @@ mod tests {
     #[test]
     fn byte_drr_no_starvation() {
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
+        let mut s = EndpointScheduler::new(1536);
         for sport in [1111u16, 2222] {
             for _ in 0..4 {
-                assert!(
-                    s.enqueue(logical(&p, sport, 1200), Instant::now())
-                        .is_accepted()
-                );
+                enqueue(&p, &mut s, sport, 1200);
             }
         }
         for k in s.flows.keys().cloned().collect::<Vec<_>>() {
@@ -1196,7 +1378,6 @@ mod tests {
             q.is_new = false;
             q.epoch_bytes = NEW_FLOW_BYTE_BUDGET;
         }
-        // Move both to the old list like the pump would via demotion.
         s.new_list.clear();
         for k in s.flows.keys().cloned().collect::<Vec<_>>() {
             s.old_list.push_back(k);
@@ -1209,96 +1390,90 @@ mod tests {
 
     #[test]
     fn codel_drops_standing_queue() {
-        // A persistently backlogged flow with old arrivals must see CoDel
-        // drops (not just emergency-ceiling drops) once its sojourn exceeds
-        // target for longer than the interval. Custom short timing keeps the
-        // test fast while exercising the real control law.
         let target = Duration::from_millis(2);
         let interval = Duration::from_millis(10);
         let p = pool();
-        let mut s = PeerScheduler::with_params(1536, target, interval);
+        let mut s = EndpointScheduler::with_params(1536, target, interval);
         let t0 = Instant::now() - interval - Duration::from_millis(5);
         for _ in 0..10 {
             let mut pkt = logical(&p, 1111, 1200);
             pkt.enqueued_at = t0;
-            assert!(s.enqueue(pkt, t0).is_accepted());
+            assert!(s.enqueue(NET, pkt, t0).is_accepted());
         }
-        // Demote to old so CoDel (not sparse preference) governs.
         demote_all(&mut s);
-        // Keep the queue standing past the interval: serve + requeue.
-        // Note: a CoDel drop ends the current drain round (the pump then
-        // waits briefly and continues), so Empty does not end the test —
-        // only the deadline or an observed drop does.
+        // Keep the queue standing past the interval: serve + re-enqueue
+        // with the original timestamp (sojourn preserved, never reset).
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut codel_drops = 0u64;
         while Instant::now() < deadline {
             match s.next(Instant::now()) {
-                Dequeue::Send(burst) => {
-                    // Requeue the whole burst to keep the queue standing.
-                    for (pkt, _) in burst.packets.into_iter().rev() {
-                        s.requeue_head(pkt.flow, *pkt);
-                    }
+                Dequeue::Send(item) => {
+                    let enq = item.packet.enqueued_at;
+                    let pkt = item.packet;
+                    let key = SchedFlowKey {
+                        net: item.net,
+                        flow: item.flow,
+                    };
+                    let l = pkt.len();
+                    s.complete(&key, l, l);
+                    let mut rp = pkt;
+                    rp.enqueued_at = enq;
+                    let _ = s.enqueue(NET, rp, enq);
+                    demote_new(&mut s);
                 }
                 Dequeue::Empty => {}
             }
-            codel_drops = s.counters().drops_codel;
+            codel_drops = s.snapshot().drop_packets[DropReason::Codel.index()];
             if codel_drops > 0 {
                 break;
             }
         }
         assert!(codel_drops > 0, "CoDel must drop a standing queue");
-        assert_eq!(s.counters().drops_emergency, 0);
+        assert_eq!(
+            s.snapshot().drop_packets[DropReason::EmergencyCeiling.index()],
+            0
+        );
     }
 
     #[test]
     fn emergency_ceiling_is_safety_only() {
-        // Fresh traffic never hits the emergency path.
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
+        let mut s = EndpointScheduler::new(1536);
         for _ in 0..8 {
-            assert!(
-                s.enqueue(logical(&p, 1111, 200), Instant::now())
-                    .is_accepted()
-            );
+            enqueue(&p, &mut s, 1111, 200);
         }
         let out = drain_all(&mut s);
         assert_eq!(out.len(), 8);
-        assert_eq!(s.counters().drops_emergency, 0);
-        assert_eq!(s.counters().drops_codel, 0);
+        let snap = s.snapshot();
+        assert_eq!(snap.drop_packets[DropReason::EmergencyCeiling.index()], 0);
+        assert_eq!(snap.drop_packets[DropReason::Codel.index()], 0);
     }
 
     #[test]
     fn memory_bounds_enforced_without_scan() {
         let p = pool();
-        let mut s = PeerScheduler::new(1536);
-        let offered = PEER_PACKET_CAP + 64;
-        let mut admitted = 0usize;
-        let mut evicted_victims = 0usize;
-        let mut rejected = 0usize;
+        let mut s = EndpointScheduler::new(1536);
+        let offered = ENDPOINT_PACKET_CAP + 64;
+        let mut admitted = 0u64;
+        let mut offered_bytes = 0u64;
+        let mut rejected = 0u64;
         for i in 0..offered {
-            match s.enqueue(logical(&p, 1000 + (i % 8) as u16, 1400), Instant::now()) {
-                EnqueueOutcome::Accepted => admitted += 1,
-                EnqueueOutcome::AcceptedEvicted { .. } => {
-                    admitted += 1;
-                    evicted_victims += 1;
-                }
+            let pkt = logical(&p, 1000 + (i % 8) as u16, 1400);
+            offered_bytes += pkt.len() as u64;
+            match s.enqueue(NET, pkt, Instant::now()) {
+                EnqueueOutcome::Accepted { .. } => admitted += 1,
                 EnqueueOutcome::Rejected { .. } => rejected += 1,
             }
         }
-        let (packets, bytes, _) = s.levels();
-        assert!((packets as usize) <= PEER_PACKET_CAP);
-        assert!((bytes as usize) <= PEER_BYTE_CAP + 1500);
-        // Packet conservation under the reporting model: every admission
-        // is either still retained or was later evicted; every offered
-        // packet is retained, rejected, or an evicted victim — each
-        // reported exactly once.
-        assert_eq!(admitted, (packets as usize) + evicted_victims);
-        assert_eq!((packets as usize) + rejected + evicted_victims, offered);
-        let c = s.counters();
-        assert_eq!(c.drops_cap as usize, rejected + evicted_victims);
-        assert_eq!(c.drops_emergency, 0);
-        // Fresh traffic: no CoDel/emergency drops to drain.
-        assert!(s.drain_drops().is_empty());
+        let snap = s.snapshot();
+        assert!(snap.queued_packets as usize <= ENDPOINT_PACKET_CAP);
+        assert!(snap.queued_bytes as usize <= ENDPOINT_BYTE_CAP + 1500);
+        assert_eq!(admitted + rejected, offered as u64);
+        // Offered = retained + tail-rejected (rejections are recorded drops).
+        assert!(snap.conserves(offered as u64, offered_bytes));
+        // Fresh traffic: no CoDel/emergency drops.
+        assert_eq!(snap.drop_packets[DropReason::Codel.index()], 0);
+        assert_eq!(snap.drop_packets[DropReason::EmergencyCeiling.index()], 0);
     }
 
     #[test]
@@ -1321,14 +1496,13 @@ mod tests {
         let icmp = LP::from_slice(&icmp_raw).unwrap();
         let tcp = LP::from_slice(&tcp_raw).unwrap();
         assert_ne!(icmp.flow, tcp.flow);
-        let mut s = PeerScheduler::new(1536);
+        let mut s = EndpointScheduler::new(1536);
         for _ in 0..20 {
             let mut t = LP::from_slice(&tcp_raw).unwrap();
             t.enqueued_at = Instant::now();
-            assert!(s.enqueue(t, Instant::now()).is_accepted());
+            assert!(s.enqueue(NET, t, Instant::now()).is_accepted());
         }
-        // Bulk is backlogged (demoted as the pump would), so the fresh ICMP
-        // flow must jump it.
+        // Bulk is backlogged (demoted), so the fresh ICMP flow must jump it.
         for k in s.flows.keys().cloned().collect::<Vec<_>>() {
             let q = s.flows.get_mut(&k).unwrap();
             q.is_new = false;
@@ -1338,55 +1512,110 @@ mod tests {
         for k in s.flows.keys().cloned().collect::<Vec<_>>() {
             s.old_list.push_back(k);
         }
-        assert!(s.enqueue(icmp, Instant::now()).is_accepted());
+        assert!(s.enqueue(NET, icmp, Instant::now()).is_accepted());
         match s.next(Instant::now()) {
-            Dequeue::Send(burst) => assert_ne!(burst.packets[0].0.flow, tcp.flow),
+            Dequeue::Send(item) => assert_ne!(item.flow, tcp.flow),
             Dequeue::Empty => panic!("expected icmp"),
         }
     }
 
     #[test]
-    fn requeue_preserves_order_per_peer() {
-        // Transport-full requeue restores the head packet in order, and peer
-        // schedulers are fully independent objects (no global HOL).
+    fn inflight_conservation_across_revoke() {
+        // accepted = delivered + dropped + owned across dequeue (in-flight),
+        // revoke-purge (queued drops), and inflight discard.
         let p = pool();
-        let mut a = PeerScheduler::new(1536);
-        let mut b = PeerScheduler::new(1536);
-        for _ in 0..3 {
-            assert!(
-                a.enqueue(logical(&p, 1111, 100), Instant::now())
-                    .is_accepted()
-            );
+        let mut s = EndpointScheduler::new(1536);
+        let lens: Vec<usize> = (0..6)
+            .map(|i| logical(&p, 1111 + i as u16, 200).len())
+            .collect();
+        for (i, l) in lens.iter().enumerate() {
+            let _ = l;
+            enqueue(&p, &mut s, 1111 + i as u16, 200);
         }
-        assert!(
-            b.enqueue(logical(&p, 9999, 100), Instant::now())
-                .is_accepted()
-        );
-        // Simulate transport-full on A: dequeue (sparse serves one packet)
-        // then requeue the burst.
-        let burst = match a.next(Instant::now()) {
-            Dequeue::Send(burst) => burst,
+        let accepted_bytes: u64 = lens.iter().sum::<usize>() as u64;
+        // Dequeue two into in-flight; deliver one, hold one.
+        let held = match s.next(Instant::now()) {
+            Dequeue::Send(item) => {
+                let key = SchedFlowKey {
+                    net: item.net,
+                    flow: item.flow,
+                };
+                let l = item.packet.len();
+                s.complete(&key, l, l);
+                match s.next(Instant::now()) {
+                    Dequeue::Send(held) => held,
+                    Dequeue::Empty => panic!("expected second packet"),
+                }
+            }
             Dequeue::Empty => panic!("expected packet"),
         };
-        assert_eq!(burst.packets.len(), 1, "sparse serves one packet");
-        for (pkt, _) in burst.packets.into_iter().rev() {
-            a.requeue_head(pkt.flow, *pkt);
+        assert_eq!(s.snapshot().inflight_packets, 1);
+        // Revoke the network: queued drops recorded; worker discards held.
+        s.purge_network(NET, DropReason::NoConnection);
+        let held_len = held.packet.len();
+        let held_key = SchedFlowKey {
+            net: held.net,
+            flow: held.flow,
+        };
+        let _ = held_key;
+        s.discard_inflight(held_len, DropReason::NoConnection);
+        let snap = s.snapshot();
+        assert_eq!(snap.owned_packets(), 0);
+        assert!(snap.conserves(6, accepted_bytes));
+        assert_eq!(snap.sent_packets, 1);
+        assert_eq!(snap.dropped_packets(), 5);
+    }
+
+    #[test]
+    fn reporter_diffs_are_exact_and_single_sourced() {
+        // One mutation stream, one reporter: gauge deltas and counter
+        // deltas each account every packet exactly once.
+        let p = pool();
+        let mut s = EndpointScheduler::new(1536);
+        let mut r = SchedReporter::new(s.snapshot());
+        let lens: Vec<usize> = (0..4).map(|_| logical(&p, 1111, 200).len()).collect();
+        for _ in 0..4 {
+            enqueue(&p, &mut s, 1111, 200);
         }
-        // B drains independently (same packet shape, same length).
-        let expect_len = logical(&p, 9999, 100).len();
-        match b.next(Instant::now()) {
-            Dequeue::Send(burst) => assert_eq!(burst.packets[0].0.len(), expect_len),
-            Dequeue::Empty => panic!("peer B must be independent of A"),
-        }
-        // A still holds all 3 packets in order.
-        let mut n = 0;
-        while !a.is_empty() {
-            match a.next(Instant::now()) {
-                Dequeue::Send(burst) => n += burst.packets.len() as u32,
-                Dequeue::Empty => break,
-            }
-        }
-        assert_eq!(n, 3);
-        assert!(a.is_empty());
+        let d = r.diff(s.snapshot());
+        assert_eq!(d.dq_packets, 4);
+        assert_eq!(d.dq_bytes, lens.iter().sum::<usize>() as i64);
+        assert_eq!(d.dq_flows, 1);
+        assert_eq!(d.sent_packets, 0);
+        // Deliver one.
+        let item = match s.next(Instant::now()) {
+            Dequeue::Send(item) => item,
+            Dequeue::Empty => panic!("expected"),
+        };
+        let d = r.diff(s.snapshot());
+        assert_eq!(d.dq_packets, -1);
+        assert_eq!(d.dq_inflight_packets, 1);
+        let l = item.packet.len();
+        s.complete(
+            &SchedFlowKey {
+                net: item.net,
+                flow: item.flow,
+            },
+            l,
+            l,
+        );
+        let d = r.diff(s.snapshot());
+        assert_eq!(d.dq_inflight_packets, -1);
+        assert_eq!(d.sent_packets, 1);
+        assert_eq!(d.sent_bytes, l as u64);
+        // Purge the rest: drops surface with packets AND bytes.
+        s.purge_all(DropReason::NoConnection);
+        let d = r.diff(s.snapshot());
+        assert_eq!(d.dq_packets, -3);
+        assert_eq!(d.drop_packets[DropReason::NoConnection.index()], 3);
+        assert_eq!(
+            d.drop_bytes[DropReason::NoConnection.index()],
+            lens.iter().sum::<usize>() as u64 - l as u64
+        );
+        // Quiet afterwards: no phantom deltas.
+        let d = r.diff(s.snapshot());
+        assert_eq!(d.dq_packets, 0);
+        assert_eq!(d.sent_packets, 0);
+        assert_eq!(d.drop_packets, [0; 8]);
     }
 }

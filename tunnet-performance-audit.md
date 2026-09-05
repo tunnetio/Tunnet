@@ -1779,3 +1779,89 @@ ecv_multiple degrades to the single-packet path.
 - TCP matrix all-ERROR is still unexplained (likely server-side: no iperf3 listener on the peer, or control-channel blocking); the new error capture will name it on the next run.
 
 Validation: fmt/check/clippy clean both platforms; `nextest --workspace` 412 passed Windows; Linux 327 green; both bench scripts syntax-verified.
+
+# 19. Phase 2.3 — Dataplane convergence (final ownership model)
+
+The §18 diagnosis confirmed the structural problem: nine queue/backpressure owners with the bottlenecks (endpoint QUIC connection, TUN generation) owned by nobody. This pass deleted the distributed ownership and established exactly three I/O owners. What follows describes the FINAL model, not the patch sequence.
+
+## 19.1 The three owners
+
+```text
+1. One TUN reader per dataplane generation
+   OS TUN -> NAT/routing/policy -> endpoint TX queues
+   (tun_io::run_outbound; owns no queue state, abort-safe)
+
+2. One QUIC TX worker per remote endpoint
+   endpoint TX queue -> framing -> Connection::send_datagram_wait
+   (endpoint_tx::run_endpoint_worker; the ONLY QUIC submitter)
+
+3. One TUN writer per dataplane generation
+   QUIC readers -> complete logical packets -> OS TUN
+   (tun_writer; the ONLY TUN write path)
+```
+
+No other task writes to the TUN. No membership task calls `send_datagram*`. No QUIC reader awaits an OS TUN write. Hard invariants, enforced by construction (the APIs no longer exist elsewhere).
+
+## 19.2 Endpoint-global TX (replaces per-membership pumps)
+
+- `PeerMembershipState` carries network identity + policy slot + reassembly + epoch only. No scheduler, no pump, no notify.
+- `EndpointScheduler` (tunnet-core) is keyed `(NetworkId, FlowKey)`: all memberships of one endpoint feed one queue; the same 5-tuple in two networks never merges.
+- Dequeue is one logical packet at a time (queued -> explicit in-flight); an in-progress DRR visit (`drr_turn`) continues affordable heads under the same quantum grant, so single-packet dequeue is byte-fair exactly like classic burst DRR (fairness ratios re-verified: jumbo-vs-small ~1, matrix 0.6–1.7, three-flow ~1/3 each).
+- No per-flow cap, no old-head replacement: endpoint hard caps (256 KiB / 512 packets, memory safety only) tail-reject the ARRIVING packet. CoDel governs latency.
+- One transmit cursor per worker: singles and segmented share it; `send_datagram_wait` waits instead of racing a precheck; the logical packet stays worker-owned across reconnects (never re-parsed from wire, CoDel timestamps never reset, no 10 ms sleep). TooLarge replans from the ORIGINAL packet with a fresh segmentation id.
+
+## 19.3 Accounting (single-sourced, exact)
+
+- Every mutation updates cumulative `SchedSnapshot` counters (queued/inflight/sent/drops-by-reason, packets AND bytes). The single worker diffs snapshots into telemetry (`SchedReporter`) — no reconcile pass, no partitioned drain, no double-report.
+- Conservation law (tested): `offered == delivered + explicitly_dropped + owned` in packets and bytes, across enqueue/dequeue/CoDel/hard-cap/revoke/teardown sequences.
+- `PacketPool::take_hit_miss` (atomic swap) feeds the ONE agent-lifetime sampler; the pool is shared across generations.
+- Delivery metrics at real boundaries: `tun_rx_packets`, `overlay_tx_logical`, `overlay_tx_datagrams`, `overlay_rx` (datagrams + complete logicals), `tun_write_queued`, `tun_write_packets`, `tun_write_queue_drop`. Scheduler/AQM drops are separate. `record_rx` fires at writer-queue acceptance, never as proof of OS delivery.
+
+## 19.4 TUN writer + ingress decoupling
+
+- `TunWriterHandle::try_enqueue` is non-blocking and bounded (512 packets AND 1 MiB); full drops explicitly at the complete-IP-packet boundary (`tun_write_queue_full`), which must read zero at supported load.
+- Windows: `try_send`-only hot path; WouldBlock retains the SAME front packet with bounded backoff (100 us -> 2 ms, reset on progress); the tail drains with zero new ingress. Blocking `send` is never called from the dataplane.
+- Linux: same writer drains through the existing `LinuxTunBatchWriter` (`send_multiple`, GSO intact, virtio layout and `AsRef`/`AsMut` contracts preserved); any `send_multiple` error is a generation failure (ambiguous partial writes are never guessed).
+- Firewall reject replies enqueue to the same writer. `grep` for TUN writes outside `tun_writer` returns nothing.
+- Readers return `ReaderExit`; unexpected QUIC death while still canonical invalidates EXACTLY that connection (transport cleared, memberships NOT deactivated — the worker holds its packets and redials). TUN writer errors belong to `DataPlaneActor` (degraded -> restarting -> fresh generation), never to readers.
+
+## 19.5 Connection lifecycle (one install path)
+
+- `ConnPool::install_canonical` is the only tie-break + mirror + hook-fire path for accepted AND dialed connections. `adopt` (reader-side) and `send_or_buffer` are deleted.
+- `IngressRegistry` is keyed `(endpoint, stable_id)`: same connection installs idempotently (no second reader), new connections replace, old exits cannot unregister replacements.
+- The pool hook captures a `Weak<ConnPool>` + `IngressManager`: no `ConnPool -> callback -> ConnPool` cycle.
+- One `IngressContext` (same `AuthCache`) builds readers for both sides: the dialer-side auth bypass is gone (regression-tested: endpoint authed for A only, dialed connection, A-frame accepted, B-frame dropped).
+- Bootstrap order: shared pool/sampler -> supervisor -> ingress install + hook + gate -> BringUp (TUN gen + writer + TX registry) -> ALPN router -> readiness (`on_ready`/`sd_notify`) LAST. Preconnect is gated on the installer and bound to the generation token.
+
+## 19.6 Defaults + deleted knobs
+
+- Default MTU 1280/1280 (single-frame normal path; jumbo still segments/reassembles via the hardened geometry).
+- Deleted: `TUNNET_FLOW_PACKET_CAP`, `TUNNET_PUMP_BACKOFF_MAX_US`, `TUNNET_QUIC_DATAGRAM_BUFFER_KB`, `datagram_send_buffer_space` prechecks, `try_send_frame`/`FastSendError`, `try_send_datagram`/`TrySendError`, per-membership `pump.rs`, `TunWriteBatch::drain_or_wait`, `dgram_pump.rs`. `TUNNET_TUN_OFFLOAD` remains as a test-only switch; correctness never depends on it.
+
+## 19.7 Regression coverage (§24, all deterministic)
+
+- Scheduler conservation + fairness + CoDel + hard-cap tail-reject + net separation + revoke + reporter exactness (17 tests).
+- Endpoint: one worker/two networks, revoke purge, preconnect gate, cursor replan geometry (10 tests).
+- Writer: WouldBlock tail retention + front identity + ordering + packet/byte bounds + non-blocking enqueue (4 tests, mock sink).
+- Loopback (real QUIC): ping round trip, 2700 B jumbo segment/reassemble, 120-packet flood through a 4 KiB DATAGRAM buffer with zero loss, canonical invalidate lifecycle.
+- Ingress registry: same-conn no-op, replacement, stale-exit safety.
+- MTU default (const), pool take-deltas, health Up-requires-reader+writer.
+- Kept: real ignored `tun_kernel_round_trip`, tun-rs buffer/framing contract tests.
+
+## 19.8 Bench v3 completion (§21)
+
+- Native splatting (`[string[]]` + `@argv`) everywhere, no string-split args.
+- `server is busy` retries boundedly (3x + 5 s settle) in every runner path; never classified as loss.
+- Capacity = median of valid P4 repeats per direction (failures excluded); failed matrix still stops the run.
+- One shared UDP parser per script (receiver-delivered `sum_received` everywhere, including loaded-latency loads); downloads offer against `CAP_DOWN`.
+- Windows loaded latency is asynchronous/staggered (runspace pool, full window inside the load); p999 stays null by design at 200 samples, bash keeps real p999 at 1000.
+- Every row carries `sw_drops` (local scheduler/TUN software-drop deltas on tunnet runs): one benchmark is self-diagnosing.
+
+## 19.9 Acceptance
+
+All §26 invariants hold by construction (one TX owner/endpoint, one writer/generation, readers never await TUN, no drop-oldest race, no unbounded queue, no hidden tail, no old-head replacement, no CoDel reset, no dialer auth bypass, no readerless canonical conn, no preconnect before ingress, no cross-generation packets, one reason per drop, exact gauges, Linux offload contracts intact, 1280 default).
+
+Validation: `cargo fmt --check`, `cargo check --workspace --all-targets --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features` (424 passed Windows, 427 passed Linux-excl-desktop), `cargo test --workspace --all-features` (exit 0), `bash -n` + PS parser + embedded-python AST checks on both bench scripts.
+
+The only manual validation left is ONE final Windows <-> Linux benchmark (full run, no TCP-matrix abort): keep-alive ping with no first-packet black hole, TCP P1/P4 both directions, zero internal drop counters below capacity.
+

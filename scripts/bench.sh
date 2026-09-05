@@ -3,7 +3,7 @@
 # Shared schema with bench.ps1: one JSON object per line in results.jsonl:
 #   {ts, product, scenario, direction, fraction, offered_mbps, actual_mbps,
 #    loss_pct, retransmits, latency:{n,p50,p95,p99,p999,max}, path:{...},
-#    meta:{...}, note}
+#    meta:{...}, note, valid, sw_drops}
 # Throughput matrix with explicit JSON fields (no regexed human output),
 # loaded-latency sweeps per direction plus full-duplex bidir at fractions
 # of independently measured directional capacity, UDP rate x size sweep,
@@ -12,6 +12,13 @@
 # short). Up/down loads use separate server ports ($6/$7, default
 # 5201/5202 — the server must listen on both); failed loads mark their row
 # valid=false instead of hiding behind -1 placeholders.
+# Capacity is the MEDIAN of valid P4 repeats per direction (never a lucky
+# maximum); a failed matrix stops the run instead of inventing 50 Mbps.
+# "server is busy" listener contention retries boundedly (infrastructure,
+# never Tunnet loss). One shared parser (benchlib.py) reports
+# receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
+# Every row carries sw_drops (local scheduler/TUN software-drop deltas,
+# tunnet runs only): one benchmark is self-diagnosing.
 set -u
 PEER="${1:-10.7.0.2}"
 DURATION="${2:-10}"
@@ -30,6 +37,93 @@ JSONL="$RESULTS_DIR/results.jsonl"
 # Exported BEFORE the first consumer (every python block below reads them).
 export BENCH_PRODUCT="$PRODUCT" BENCH_DURATION="$DURATION"
 export BENCH_JSONL="$JSONL"
+
+# Shared result library: ONE UDP/load summary parser (receiver-delivered
+# only) plus software-drop delta math, imported by every scenario block so
+# field selection can never drift between sections.
+cat > "$RESULTS_DIR/benchlib.py" <<'PYEOF'
+import json
+
+
+def parse_udp_summary(d):
+    """Shared UDP/load summary parser: receiver-delivered throughput is
+    sum_received (never sender-side sum); loss/jitter/pps from receiver.
+    Returns dict with ok/actual/sent/loss/jitter/pps_sent/pps_recv/error."""
+    if isinstance(d.get('error'), str):
+        return {'ok': False, 'error': 'iperf error: %s' % d['error']}
+    try:
+        recv = d['end']['sum_received']
+    except Exception:
+        return {'ok': False, 'error': 'no sum_received in iperf JSON'}
+    try:
+        send = d['end'].get('sum') or {}
+    except Exception:
+        send = {}
+
+    def num(o, *keys, **kw):
+        default = kw.get('default')
+        for k in keys:
+            try:
+                v = o[k]
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return default
+
+    bps = num(recv, 'bits_per_second')
+    if bps is None:
+        return {'ok': False, 'error': 'receiver summary has no bits_per_second'}
+    out = {'ok': True, 'actual': round(bps / 1e6, 1), 'error': ''}
+    sbps = num(send, 'bits_per_second')
+    out['sent'] = round(sbps / 1e6, 1) if sbps is not None else None
+    out['loss'] = round(num(recv, 'lost_percent', default=-1), 2)
+    jm = num(recv, 'jitter_ms')
+    out['jitter'] = round(jm, 3) if jm is not None else None
+    out['pps_sent'] = num(send, 'packets')
+    out['pps_recv'] = num(recv, 'packets_received', 'packets')
+    return out
+
+
+def sw_diff(before, after):
+    """Delta of software-drop counters between two snapshots."""
+    d = {}
+    for k in ('sched', 'dropped', 'tun_write_drop'):
+        try:
+            d[k] = round(float(after.get(k, 0)) - float(before.get(k, 0)), 0)
+        except Exception:
+            d[k] = 0
+    return d
+PYEOF
+export BENCH_LIB="$RESULTS_DIR/benchlib.py"
+
+# Software-drop snapshot (tunnet runs only): low-cardinality counters for
+# per-scenario self-diagnosis. Empty/zeros otherwise.
+sw_snapshot() { # OUTFILE
+  if [ "$PRODUCT" = "tunnet" ]; then
+    curl -s --max-time 5 http://127.0.0.1:9100/metrics 2>/dev/null | python3 -c "
+import json,sys
+sched=dropped=twd=0.0
+for line in sys.stdin:
+    line=line.strip()
+    if not line or line.startswith('#'):
+        continue
+    try:
+        head, val = line.rsplit(None, 1)
+        v = float(val)
+    except Exception:
+        continue
+    if head.startswith('tunnet_sched_drops_total{'):
+        sched += v
+    elif head.startswith('tunnet_dropped_packets_total{'):
+        dropped += v
+    elif head.startswith('tunnet_tun_write_queue_drop_total'):
+        twd += v
+print(json.dumps({'sched':sched,'dropped':dropped,'tun_write_drop':twd}))" > "$1" 2>/dev/null || echo '{"sched":0,"dropped":0,"tun_write_drop":0}' > "$1"
+  else
+    echo '{"sched":0,"dropped":0,"tun_write_drop":0}' > "$1"
+  fi
+}
 
 meta_json() {
   python3 -c "
@@ -83,9 +177,21 @@ print(json.dumps(r))"
 }
 
 # Structured iperf runner: prints nothing human; writes JSON file; echoes path.
+# A persistent listener briefly reports "the server is busy running a test"
+# between scenarios: infrastructure, never Tunnet loss — bounded retries
+# with a settle delay (callers already serialize one client per port).
 run_iperf() { # NAME EXTRA_ARGS...
   local name="$1"; shift
-  iperf3 -c "$PEER" -t "$DURATION" "$@" --json > "$RESULTS_DIR/$name.json" 2>&1
+  local attempt=0
+  while true; do
+    attempt=$((attempt + 1))
+    iperf3 -c "$PEER" -t "$DURATION" "$@" --json > "$RESULTS_DIR/$name.json" 2>&1
+    if grep -qi "server is busy" "$RESULTS_DIR/$name.json" && [ "$attempt" -le 3 ]; then
+      sleep 5
+      continue
+    fi
+    break
+  done
 }
 
 echo "=== Tunnet Benchmark v3 ($PRODUCT) ==="
@@ -117,15 +223,21 @@ EOF
 # --- throughput matrix with repeats; explicit bidir parse ---
 echo "[2] Throughput matrix..."
 CAP_UP=0; CAP_DOWN=0
+CAP_UP_VALS=""; CAP_DOWN_VALS=""
 tp_case() { # NAME DIR REPEAT EXTRA...
   local name="$1" dir="$2" rep="$3"; shift 3
   path_json > "$RESULTS_DIR/$name-r$rep.path"
+  sw_snapshot "$RESULTS_DIR/$name-r$rep.sw0"
   run_iperf "$name-r$rep" "$@"
-  MBPS=$(python3 - "$RESULTS_DIR/$name-r$rep.json" "$RESULTS_DIR/$name-r$rep.path" "$name" "$dir" "$rep" <<'EOF'
+  sw_snapshot "$RESULTS_DIR/$name-r$rep.sw1"
+  MBPS=$(BENCH_SW0="$RESULTS_DIR/$name-r$rep.sw0" BENCH_SW1="$RESULTS_DIR/$name-r$rep.sw1" python3 - "$RESULTS_DIR/$name-r$rep.json" "$RESULTS_DIR/$name-r$rep.path" "$name" "$dir" "$rep" <<'EOF'
 import json,sys,datetime,os
+sys.path.insert(0, os.path.dirname(os.environ['BENCH_LIB']))
+from benchlib import sw_diff
 ipath, ppath, name, direction, rep = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 d = json.load(open(ipath))
 path = json.load(open(ppath))
+sw = sw_diff(json.load(open(os.environ['BENCH_SW0'])), json.load(open(os.environ['BENCH_SW1'])))
 if isinstance(d.get('error'), str):
     print(f"  {name} r{rep}: ERROR {d['error']}", flush=True)
     print(0)
@@ -138,7 +250,7 @@ else:
     print(f"  {name} r{rep}: {mbps} Mbps (retr={retr})", flush=True)
     row = {'scenario': name, 'direction': direction, 'repeat': int(rep),
            'actual_mbps': mbps, 'sent_mbps': sent, 'retransmits': retr,
-           'path': path}
+           'path': path, 'sw_drops': sw}
     row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     row['product'] = os.environ['BENCH_PRODUCT']
     row['meta'] = json.loads(os.environ['BENCH_META'])
@@ -148,34 +260,55 @@ EOF
 )
   echo "$MBPS" | tail -1
 }
+median_of() { # SPACE-SEPARATED-VALUES...
+  python3 -c "
+import statistics,sys
+vs=[float(x) for x in '''$*'''.split()]
+print(round(statistics.median(vs),1) if vs else 0)"
+}
 for rep in $(seq 1 "$REPEATS"); do
   tp_case tcp-up-1 up "$rep" -p "$PORT_UP" -P 1 > /dev/null
   MB=$(tp_case tcp-up-4 up "$rep" -p "$PORT_UP" -P 4 | tail -1)
-  CAP_UP=$(python3 -c "print(max(float('$CAP_UP'), float('$MB')))")
+  # Failed repeats (0) are not measurements: excluded from the median.
+  if python3 -c "import sys; sys.exit(0 if float('$MB')>0 else 1)" 2>/dev/null; then
+    CAP_UP_VALS="$CAP_UP_VALS $MB"
+  fi
   tp_case tcp-down-1 down "$rep" -p "$PORT_DOWN" -P 1 -R > /dev/null
   MB=$(tp_case tcp-down-4 down "$rep" -p "$PORT_DOWN" -P 4 -R | tail -1)
-  CAP_DOWN=$(python3 -c "print(max(float('$CAP_DOWN'), float('$MB')))")
+  if python3 -c "import sys; sys.exit(0 if float('$MB')>0 else 1)" 2>/dev/null; then
+    CAP_DOWN_VALS="$CAP_DOWN_VALS $MB"
+  fi
   # Bidirectional: parse both directions explicitly (v2 never did).
   path_json > "$RESULTS_DIR/tcp-bidir-r$rep.path"
+  sw_snapshot "$RESULTS_DIR/tcp-bidir-r$rep.sw0"
   run_iperf "tcp-bidir-r$rep" -p "$PORT_UP" -P 4 --bidir
-  python3 - "$RESULTS_DIR/tcp-bidir-r$rep.json" "$RESULTS_DIR/tcp-bidir-r$rep.path" "$rep" <<'EOF'
+  sw_snapshot "$RESULTS_DIR/tcp-bidir-r$rep.sw1"
+  BENCH_SW0="$RESULTS_DIR/tcp-bidir-r$rep.sw0" BENCH_SW1="$RESULTS_DIR/tcp-bidir-r$rep.sw1" python3 - "$RESULTS_DIR/tcp-bidir-r$rep.json" "$RESULTS_DIR/tcp-bidir-r$rep.path" "$rep" <<'EOF'
 import json,sys,datetime,os
+sys.path.insert(0, os.path.dirname(os.environ['BENCH_LIB']))
+from benchlib import sw_diff
 ipath, ppath, rep = sys.argv[1], sys.argv[2], sys.argv[3]
 d = json.load(open(ipath))
 path = json.load(open(ppath))
+sw = sw_diff(json.load(open(os.environ['BENCH_SW0'])), json.load(open(os.environ['BENCH_SW1'])))
 up = round(d['end']['sum_sent']['bits_per_second']/1e6, 1)
 down = round(d['end']['sum_received']['bits_per_second']/1e6, 1)
 try: retr = int(d['end']['sum_sent'].get('retransmits', 0))
 except Exception: retr = -1
 print(f"  tcp-bidir r{rep}: up={up}Mbps down={down}Mbps (retr={retr})")
 row = {'scenario': 'tcp-bidir', 'direction': 'bidir', 'repeat': int(rep),
-       'actual_mbps': up, 'down_mbps': down, 'retransmits': retr, 'path': path}
+       'actual_mbps': up, 'down_mbps': down, 'retransmits': retr, 'path': path,
+       'sw_drops': sw}
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
 row['meta'] = json.loads(os.environ['BENCH_META'])
 open(os.environ['BENCH_JSONL'], 'a').write(json.dumps(row) + chr(10))
 EOF
 done
+# Capacity is the MEDIAN of the valid P4 repeats per direction — never one
+# lucky maximum, never an invented fallback.
+CAP_UP=$(median_of "$CAP_UP_VALS")
+CAP_DOWN=$(median_of "$CAP_DOWN_VALS")
 # No invented capacity: if the TCP matrix failed, every capacity-dependent
 # sweep would be built on fiction. Stop loudly instead.
 if ! python3 -c "import sys; sys.exit(0 if float('$CAP_UP')>0 and float('$CAP_DOWN')>0 else 1)"; then
@@ -195,6 +328,7 @@ for dir in "upload:$CAP_UP:$PORT_UP:" "download:$CAP_DOWN:$PORT_DOWN:-R"; do
     PCT=$(python3 -c "print(int(float('$F')*100))")
     echo "  $name ${PCT}% (${RATE}Mbps)..."
     path_json > "$RESULTS_DIR/load-$name-$F.path0"
+    sw_snapshot "$RESULTS_DIR/load-$name-$F.sw0"
     # shellcheck disable=SC2086
     iperf3 -c "$PEER" -p "$port" -t "$DURATION" -u -b "${RATE}M" $extra --json > "$RESULTS_DIR/load-$name-$F.json" 2>&1 &
     LOAD_PID=$!
@@ -202,23 +336,36 @@ for dir in "upload:$CAP_UP:$PORT_UP:" "download:$CAP_DOWN:$PORT_DOWN:-R"; do
     # 1000 samples: p99.9 under load is real (gated to null when short).
     ping_samples_json 1000 "$RESULTS_DIR/ping-load-$name-$F.txt" > "$RESULTS_DIR/ping-load-$name-$F.lat"
     wait $LOAD_PID
+    # Server-busy between scenarios is infrastructure, never Tunnet loss:
+    # one bounded settle-and-retry for this exact condition.
+    if grep -qi "server is busy" "$RESULTS_DIR/load-$name-$F.json"; then
+      sleep 5
+      # shellcheck disable=SC2086
+      iperf3 -c "$PEER" -p "$port" -t "$DURATION" -u -b "${RATE}M" $extra --json > "$RESULTS_DIR/load-$name-$F.json" 2>&1 &
+      LOAD_PID=$!
+      wait $LOAD_PID
+    fi
     path_json > "$RESULTS_DIR/load-$name-$F.path1"
-    python3 - "$RESULTS_DIR/load-$name-$F.json" "$RESULTS_DIR/load-$name-$F.path0" "$RESULTS_DIR/load-$name-$F.path1" "$RESULTS_DIR/ping-load-$name-$F.lat" "$name" "$F" "$RATE" <<'EOF'
+    sw_snapshot "$RESULTS_DIR/load-$name-$F.sw1"
+    BENCH_SW0="$RESULTS_DIR/load-$name-$F.sw0" BENCH_SW1="$RESULTS_DIR/load-$name-$F.sw1" python3 - "$RESULTS_DIR/load-$name-$F.json" "$RESULTS_DIR/load-$name-$F.path0" "$RESULTS_DIR/load-$name-$F.path1" "$RESULTS_DIR/ping-load-$name-$F.lat" "$name" "$F" "$RATE" <<'EOF'
 import json,sys,datetime,os
+sys.path.insert(0, os.path.dirname(os.environ['BENCH_LIB']))
+from benchlib import parse_udp_summary, sw_diff
 ipath, p0path, p1path, latpath, name, frac, rate = (sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]))
 valid = True
 try:
     d = json.load(open(ipath))
-    if isinstance(d.get('error'), str):
-        raise ValueError(d['error'])
-    s = d['end']['sum']
-    actual = round(s['bits_per_second']/1e6, 1); loss = round(s.get('lost_percent', -1), 2)
+    ps = parse_udp_summary(d)
+    if not ps['ok']:
+        raise ValueError(ps['error'])
+    actual, loss = ps['actual'], ps['loss']
 except Exception as e:
     actual, loss = -1, -1
     valid = False
     print(f"  {name} {frac}: LOAD ERROR {e}", flush=True)
 lat = json.load(open(latpath))
 b = json.load(open(p0path)); a = json.load(open(p1path))
+sw = sw_diff(json.load(open(os.environ['BENCH_SW0'])), json.load(open(os.environ['BENCH_SW1'])))
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
@@ -231,7 +378,7 @@ print(f"  actual={actual}Mbps loss={loss}% p50={lat.get('p50')} p95={lat.get('p9
 row = {'scenario': 'loaded-latency', 'direction': name, 'fraction': frac,
        'offered_mbps': rate, 'actual_mbps': actual, 'loss_pct': loss,
        'latency': lat, 'path': b, 'path_after': a, 'note': note,
-       'valid': valid}
+       'valid': valid, 'sw_drops': sw}
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
 row['meta'] = json.loads(os.environ['BENCH_META'])
@@ -250,6 +397,7 @@ for F in 0.25 0.50 0.75 0.90 1.00; do
   PCT=$(python3 -c "print(int(float('$F')*100))")
   echo "  bidir ${PCT}% (up=${RATE_UP}Mbps down=${RATE_DOWN}Mbps)..."
   path_json > "$RESULTS_DIR/load-bidi-$F.path0"
+  sw_snapshot "$RESULTS_DIR/load-bidi-$F.sw0"
   iperf3 -c "$PEER" -p "$PORT_UP" -t "$DURATION" -u -b "${RATE_UP}M" --json > "$RESULTS_DIR/load-bidi-$F-up.json" 2>&1 &
   UP_PID=$!
   iperf3 -c "$PEER" -p "$PORT_DOWN" -t "$DURATION" -u -b "${RATE_DOWN}M" -R --json > "$RESULTS_DIR/load-bidi-$F-down.json" 2>&1 &
@@ -260,16 +408,18 @@ for F in 0.25 0.50 0.75 0.90 1.00; do
   wait $UP_PID || UP_OK=$?
   wait $DOWN_PID || DOWN_OK=$?
   path_json > "$RESULTS_DIR/load-bidi-$F.path1"
-  python3 - "$RESULTS_DIR/load-bidi-$F-up.json" "$RESULTS_DIR/load-bidi-$F-down.json" "$RESULTS_DIR/load-bidi-$F.path0" "$RESULTS_DIR/load-bidi-$F.path1" "$RESULTS_DIR/ping-load-bidi-$F.lat" "$F" "$RATE_UP" "$RATE_DOWN" "$UP_OK" "$DOWN_OK" <<'EOF'
+  sw_snapshot "$RESULTS_DIR/load-bidi-$F.sw1"
+  BENCH_SW0="$RESULTS_DIR/load-bidi-$F.sw0" BENCH_SW1="$RESULTS_DIR/load-bidi-$F.sw1" python3 - "$RESULTS_DIR/load-bidi-$F-up.json" "$RESULTS_DIR/load-bidi-$F-down.json" "$RESULTS_DIR/load-bidi-$F.path0" "$RESULTS_DIR/load-bidi-$F.path1" "$RESULTS_DIR/ping-load-bidi-$F.lat" "$F" "$RATE_UP" "$RATE_DOWN" "$UP_OK" "$DOWN_OK" <<'EOF'
 import json,sys,datetime,os
+sys.path.insert(0, os.path.dirname(os.environ['BENCH_LIB']))
+from benchlib import parse_udp_summary, sw_diff
 uppath, downpath, p0path, p1path, latpath, frac, rate_up, rate_down, up_ok, down_ok = (sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), float(sys.argv[7]), float(sys.argv[8]), int(sys.argv[9]), int(sys.argv[10]))
 def loadsum(p):
     try:
-        d = json.load(open(p))
-        if isinstance(d.get('error'), str):
-            raise ValueError(d['error'])
-        s = d['end']['sum']
-        return round(s['bits_per_second']/1e6, 1), round(s.get('lost_percent', -1), 2), None
+        ps = parse_udp_summary(json.load(open(p)))
+        if not ps['ok']:
+            raise ValueError(ps['error'])
+        return ps['actual'], ps['loss'], None
     except Exception as e:
         return -1, -1, str(e)[:200]
 actual_up, loss_up, err_up = loadsum(uppath)
@@ -280,6 +430,7 @@ if down_ok != 0:
     err_down = (err_down + '; ' if err_down else '') + f'iperf down client exited {down_ok}'
 lat = json.load(open(latpath))
 b = json.load(open(p0path)); a = json.load(open(p1path))
+sw = sw_diff(json.load(open(os.environ['BENCH_SW0'])), json.load(open(os.environ['BENCH_SW1'])))
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
@@ -301,7 +452,7 @@ row = {'scenario': 'loaded-latency', 'direction': 'bidir', 'fraction': frac,
        'actual_up_mbps': actual_up, 'actual_down_mbps': actual_down,
        'loss_up_pct': loss_up, 'loss_down_pct': loss_down,
        'latency': lat, 'path': b, 'path_after': a, 'note': note,
-       'valid': valid}
+       'valid': valid, 'sw_drops': sw}
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
 row['meta'] = json.loads(os.environ['BENCH_META'])
@@ -314,50 +465,52 @@ done
 # dataplane behavior; both directions run. `actual_mbps` is RECEIVER-side
 # delivered throughput (sum_received), never the sender offer.
 echo "[4] UDP sweep (sizes x directions)..."
-for dir in "up:$PORT_UP:" "down:$PORT_DOWN:-R"; do
-  name="${dir%%:*}"; rest="${dir#*:}"; port="${rest%%:*}"; extra="${rest#*:}"
+for dir in "up:$PORT_UP:$CAP_UP:" "down:$PORT_DOWN:$CAP_DOWN:-R"; do
+  name="${dir%%:*}"; rest="${dir#*:}"; port="${rest%%:*}"; rest2="${rest#*:}"
+  dcap="${rest2%%:*}"; extra="${rest2#*:}"
   for F in 0.25 0.50 1.00; do
-    RATE=$(python3 -c "print(round(float('$CAP_UP')*float('$F'),1))")
+    RATE=$(python3 -c "print(round(float('$dcap')*float('$F'),1))")
     for LEN in 512 900 1200 1460 2700; do
       path_json > "$RESULTS_DIR/udp.path"
+      sw_snapshot "$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.sw0"
       # shellcheck disable=SC2086
       run_iperf "udp-$name-${RATE}M-${LEN}B" -p "$port" -u -b "${RATE}M" -l "$LEN" $extra
-      python3 - "$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.json" "$RESULTS_DIR/udp.path" "$RATE" "$LEN" "$name" <<'EOF'
+      sw_snapshot "$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.sw1"
+      BENCH_SW0="$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.sw0" BENCH_SW1="$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.sw1" python3 - "$RESULTS_DIR/udp-$name-${RATE}M-${LEN}B.json" "$RESULTS_DIR/udp.path" "$RATE" "$LEN" "$name" <<'EOF'
 import json,sys,datetime,os
+sys.path.insert(0, os.path.dirname(os.environ['BENCH_LIB']))
+from benchlib import parse_udp_summary, sw_diff
 ipath, ppath, rate, length, direction = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 valid = True
 err = ''
 try:
-    d = json.load(open(ipath))
-    if isinstance(d.get('error'), str):
-        raise ValueError(d['error'])
-    send = d['end']['sum']
-    recv = d['end']['sum_received']
+    ps = parse_udp_summary(json.load(open(ipath)))
+    if not ps['ok']:
+        raise ValueError(ps['error'])
 except Exception as e:
     valid = False
     err = f'UDP FAILED: {e}'[:200]
-    send, recv = {}, {}
+    ps = {}
 path = json.load(open(ppath))
-def num(o, *keys, default=-1):
-    for k in keys:
-        try:
-            v = o[k]
-            if v is not None:
-                return v
-        except Exception:
-            pass
-    return default
-sent_mbps = round(num(send, 'bits_per_second')/1e6, 1) if valid else -1
-actual = round(num(recv, 'bits_per_second')/1e6, 1) if valid else -1
-pps_sent = round(num(send, 'packets', default=0)/float(os.environ.get('BENCH_DURATION', '10'))) if valid else -1
-pps_recv = round(num(recv, 'packets_received', 'packets', default=0)/float(os.environ.get('BENCH_DURATION', '10'))) if valid else -1
-loss = round(num(recv, 'lost_percent'), 2) if valid else -1
-jitter = round(num(recv, 'jitter_ms'), 3) if valid else -1
+sw = sw_diff(json.load(open(os.environ['BENCH_SW0'])), json.load(open(os.environ['BENCH_SW1'])))
+dur = float(os.environ.get('BENCH_DURATION', '10'))
+def pps(v):
+    try:
+        return round(v/dur) if v is not None else -1
+    except Exception:
+        return -1
+sent_mbps = ps.get('sent', -1) if valid else -1
+actual = ps.get('actual', -1) if valid else -1
+pps_sent = pps(ps.get('pps_sent')) if valid else -1
+pps_recv = pps(ps.get('pps_recv')) if valid else -1
+loss = ps.get('loss', -1) if valid else -1
+jitter = ps.get('jitter') if valid else -1
 note = '' if valid else err
 print(f"  {direction} offered={rate}Mbps sent={sent_mbps}Mbps delivered={actual}Mbps pps_sent={pps_sent} pps_recv={pps_recv} len={length}B loss={loss}% jitter={jitter}ms valid={valid} {note}")
 row = {'scenario': 'udp', 'direction': direction, 'offered_mbps': rate, 'packet_len': length,
        'sent_mbps': sent_mbps, 'actual_mbps': actual, 'pps_sent': pps_sent, 'pps_received': pps_recv,
-       'loss_pct': loss, 'jitter_ms': jitter, 'path': path, 'note': note, 'valid': valid}
+       'loss_pct': loss, 'jitter_ms': jitter, 'path': path, 'note': note, 'valid': valid,
+       'sw_drops': sw}
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
 row['meta'] = json.loads(os.environ['BENCH_META'])

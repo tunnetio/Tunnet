@@ -11,6 +11,11 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 /// second. Sojourn latency uses a bounded bucket histogram for p50/p95/p99
 /// estimates without per-packet registry work. Drop reasons on hot paths
 /// use pre-registered handles selected by a plain match.
+///
+/// Delivery is counted at real boundaries (§19): TUN receive, overlay TX
+/// (logical + datagrams), overlay RX (datagrams + complete logicals), TUN
+/// writer queue accept, and actual OS writes. Scheduler/AQM drops are
+/// separate from writer-queue drops.
 #[derive(Clone)]
 pub struct AgentMetrics {
     handle: PrometheusHandle,
@@ -22,15 +27,23 @@ pub struct AgentMetrics {
     queue_packets: Gauge,
     queue_bytes: Gauge,
     queue_flows: Gauge,
-    transport_full: Counter,
-    frames: Counter,
-    segments: Counter,
+    queue_inflight_packets: Gauge,
+    queue_inflight_bytes: Gauge,
+    overlay_tx_logical: Counter,
+    overlay_tx_datagrams: Counter,
+    overlay_rx_logical: Counter,
+    tun_rx_packets: Counter,
+    tun_write_queued: Counter,
+    tun_write_packets: Counter,
+    tun_write_queue_drop: Counter,
     pool_hits: Counter,
     pool_miss: Counter,
-    drop_sched_stale: Counter,
-    drop_sched_peer: Counter,
-    drop_sched_flow: Counter,
+    drop_sched_bytes: Counter,
+    drop_sched_packets: Counter,
     drop_sched_codel: Counter,
+    drop_sched_emergency: Counter,
+    drop_sched_revoke: Counter,
+    drop_sched_genend: Counter,
     drop_policy: Counter,
     drop_too_large: Counter,
     drop_no_conn: Counter,
@@ -52,6 +65,8 @@ struct HotCounters {
     queue_packets: AtomicI64,
     queue_bytes: AtomicI64,
     queue_flows: AtomicI64,
+    queue_inflight_packets: AtomicI64,
+    queue_inflight_bytes: AtomicI64,
 }
 
 /// Sojourn buckets (ms): [1, 5, 25, 100, 250, 1000, +inf). p50/p95/p99 are
@@ -133,15 +148,23 @@ impl AgentMetrics {
             queue_packets: gauge!("tunnet_sched_queue_packets"),
             queue_bytes: gauge!("tunnet_sched_queue_bytes"),
             queue_flows: gauge!("tunnet_sched_active_flows"),
-            transport_full: counter!("tunnet_sched_transport_full_total"),
-            frames: counter!("tunnet_frames_total"),
-            segments: counter!("tunnet_segments_total"),
+            queue_inflight_packets: gauge!("tunnet_sched_inflight_packets"),
+            queue_inflight_bytes: gauge!("tunnet_sched_inflight_bytes"),
+            overlay_tx_logical: counter!("tunnet_overlay_tx_logical_total"),
+            overlay_tx_datagrams: counter!("tunnet_overlay_tx_datagrams_total"),
+            overlay_rx_logical: counter!("tunnet_overlay_rx_logical_total"),
+            tun_rx_packets: counter!("tunnet_tun_rx_packets_total"),
+            tun_write_queued: counter!("tunnet_tun_write_queued_total"),
+            tun_write_packets: counter!("tunnet_tun_write_packets_total"),
+            tun_write_queue_drop: counter!("tunnet_tun_write_queue_drop_total"),
             pool_hits: counter!("tunnet_pool_hits_total"),
             pool_miss: counter!("tunnet_pool_miss_total"),
-            drop_sched_stale: counter!("tunnet_sched_drops_total", "reason" => "sched_stale"),
-            drop_sched_peer: counter!("tunnet_sched_drops_total", "reason" => "sched_peer"),
-            drop_sched_flow: counter!("tunnet_sched_drops_total", "reason" => "sched_flow_cap"),
+            drop_sched_bytes: counter!("tunnet_sched_drops_total", "reason" => "sched_endpoint_bytes"),
+            drop_sched_packets: counter!("tunnet_sched_drops_total", "reason" => "sched_endpoint_packets"),
             drop_sched_codel: counter!("tunnet_sched_drops_total", "reason" => "sched_codel"),
+            drop_sched_emergency: counter!("tunnet_sched_drops_total", "reason" => "sched_emergency"),
+            drop_sched_revoke: counter!("tunnet_sched_drops_total", "reason" => "sched_membership_revoked"),
+            drop_sched_genend: counter!("tunnet_sched_drops_total", "reason" => "sched_generation_end"),
             drop_policy: counter!("tunnet_dropped_packets_total", "reason" => "policy_deny"),
             drop_too_large: counter!("tunnet_dropped_packets_total", "reason" => "datagram_too_large"),
             drop_no_conn: counter!("tunnet_dropped_packets_total", "reason" => "no_connection"),
@@ -163,15 +186,34 @@ impl AgentMetrics {
         describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
         describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
         describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
-        describe_counter!(
-            "tunnet_sched_transport_full_total",
-            "Transport-full events (scheduler owns drop/retry)"
-        );
         describe_counter!("tunnet_sched_drops_total", "Scheduler drops by reason");
-        describe_counter!("tunnet_frames_total", "Overlay tunnel frames transmitted");
         describe_counter!(
-            "tunnet_segments_total",
-            "Overlay tunnel segments transmitted"
+            "tunnet_overlay_tx_logical_total",
+            "Logical packets transmitted to the overlay"
+        );
+        describe_counter!(
+            "tunnet_overlay_tx_datagrams_total",
+            "QUIC DATAGRAMs transmitted"
+        );
+        describe_counter!(
+            "tunnet_overlay_rx_logical_total",
+            "Complete logical packets received from the overlay"
+        );
+        describe_counter!(
+            "tunnet_tun_rx_packets_total",
+            "Packets read from the OS TUN"
+        );
+        describe_counter!(
+            "tunnet_tun_write_queued_total",
+            "Complete packets accepted into the TUN writer queue"
+        );
+        describe_counter!(
+            "tunnet_tun_write_packets_total",
+            "Packets actually written to the OS TUN"
+        );
+        describe_counter!(
+            "tunnet_tun_write_queue_drop_total",
+            "Complete packets dropped at the TUN writer queue"
         );
         describe_counter!("tunnet_reassembly_total", "Reassembly outcomes by result");
         describe_counter!("tunnet_tun_syscalls_total", "TUN syscalls by operation");
@@ -185,6 +227,14 @@ impl AgentMetrics {
         );
         describe_gauge!("tunnet_sched_queue_bytes", "Queued bytes across all peers");
         describe_gauge!("tunnet_sched_active_flows", "Active flows across all peers");
+        describe_gauge!(
+            "tunnet_sched_inflight_packets",
+            "Worker-owned in-flight packets"
+        );
+        describe_gauge!(
+            "tunnet_sched_inflight_bytes",
+            "Worker-owned in-flight bytes"
+        );
         describe_gauge!("tunnet_virtual_mtu_bytes", "Configured logical MTU");
         describe_gauge!("tunnet_sojourn_p50_ms", "Queue sojourn p50 estimate");
         describe_gauge!("tunnet_sojourn_p95_ms", "Queue sojourn p95 estimate");
@@ -229,6 +279,10 @@ impl AgentMetrics {
             .set(self.hot.queue_bytes.load(Ordering::Relaxed) as f64);
         self.queue_flows
             .set(self.hot.queue_flows.load(Ordering::Relaxed) as f64);
+        self.queue_inflight_packets
+            .set(self.hot.queue_inflight_packets.load(Ordering::Relaxed) as f64);
+        self.queue_inflight_bytes
+            .set(self.hot.queue_inflight_bytes.load(Ordering::Relaxed) as f64);
         self.sojourn_p50.set(self.sojourn.quantile_ms(0.50));
         self.sojourn_p95.set(self.sojourn.quantile_ms(0.95));
         self.sojourn_p99.set(self.sojourn.quantile_ms(0.99));
@@ -250,6 +304,20 @@ impl AgentMetrics {
         };
     }
 
+    pub fn packets_add(&self, direction: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        match direction {
+            "out" => self.hot.packets_out.fetch_add(n, Ordering::Relaxed),
+            "in" => self.hot.packets_in.fetch_add(n, Ordering::Relaxed),
+            _ => {
+                counter!("tunnet_packets_total", "direction" => direction).increment(n);
+                0
+            }
+        };
+    }
+
     pub fn bytes_add(&self, direction: &'static str, n: u64) {
         match direction {
             "out" => self.hot.bytes_out.fetch_add(n, Ordering::Relaxed),
@@ -262,37 +330,32 @@ impl AgentMetrics {
     }
 
     /// Drop counter with pre-registered hot handles (no per-packet lookup).
+    /// ONE call per drop event: the scheduler diff reporter is the only
+    /// scheduler-side caller, so nothing double-counts.
     pub fn dropped_inc(&self, reason: &'static str) {
+        self.dropped_add(reason, 1);
+    }
+
+    pub fn dropped_add(&self, reason: &'static str, n: u64) {
+        if n == 0 {
+            return;
+        }
         match reason {
-            "sched_stale" | "sched_emergency" => self.drop_sched_stale.increment(1),
-            "sched_peer_bytes" | "sched_peer_packets" => self.drop_sched_peer.increment(1),
-            "sched_flow_cap" => self.drop_sched_flow.increment(1),
-            "sched_codel" => self.drop_sched_codel.increment(1),
-            "policy_deny" | "policy_deny_in" => self.drop_policy.increment(1),
-            "datagram_too_large" => self.drop_too_large.increment(1),
-            "no_connection" => self.drop_no_conn.increment(1),
-            _ => self.drop_other.increment(1),
+            "sched_emergency" => self.drop_sched_emergency.increment(n),
+            "sched_endpoint_bytes" => self.drop_sched_bytes.increment(n),
+            "sched_endpoint_packets" => self.drop_sched_packets.increment(n),
+            "sched_codel" => self.drop_sched_codel.increment(n),
+            "sched_membership_revoked" => self.drop_sched_revoke.increment(n),
+            "sched_generation_end" => self.drop_sched_genend.increment(n),
+            "policy_deny" | "policy_deny_in" => self.drop_policy.increment(n),
+            "datagram_too_large" => self.drop_too_large.increment(n),
+            "no_connection" => self.drop_no_conn.increment(n),
+            _ => self.drop_other.increment(n),
         }
     }
 
-    /// Scheduler drop (same cached handles; reason already scheduler-scoped).
-    pub fn sched_drop_inc(&self, reason: &'static str) {
-        self.dropped_inc(reason);
-    }
-
-    /// Report drained scheduler drop deltas (CoDel/emergency drops observed
-    /// inside dequeue, which have no enqueue decision site to report them).
-    pub fn sched_drops_add(&self, codel: u64, emergency: u64) {
-        if codel > 0 {
-            self.drop_sched_codel.increment(codel);
-        }
-        if emergency > 0 {
-            self.drop_sched_stale.increment(emergency);
-        }
-    }
-
-    /// Aggregate queue levels across all peers (signed deltas, never
-    /// overwrites another peer's values).
+    /// Aggregate queue levels across all endpoints (signed deltas, never
+    /// overwrites another endpoint's values).
     pub fn queue_add(&self, packets: i64, bytes: i64, flows: i64) {
         if packets != 0 {
             self.hot.queue_packets.fetch_add(packets, Ordering::Relaxed);
@@ -305,16 +368,53 @@ impl AgentMetrics {
         }
     }
 
-    pub fn sched_transport_full_inc(&self) {
-        self.transport_full.increment(1);
+    /// Worker-owned in-flight levels (scheduler -> worker handoff accounting).
+    pub fn queue_inflight_add(&self, packets: i64, bytes: i64) {
+        if packets != 0 {
+            self.hot
+                .queue_inflight_packets
+                .fetch_add(packets, Ordering::Relaxed);
+        }
+        if bytes != 0 {
+            self.hot
+                .queue_inflight_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
     }
 
-    /// Phase 2 telemetry (all cached handles, no per-packet registry work).
-    pub fn frame_sent_inc(&self, segments: u64) {
-        self.frames.increment(1);
-        if segments > 1 {
-            self.segments.increment(segments);
+    /// Delivery-boundary counters (§19).
+    pub fn tun_rx_packets_inc(&self) {
+        self.tun_rx_packets.increment(1);
+    }
+
+    pub fn overlay_tx_logical_add(&self, n: u64) {
+        if n > 0 {
+            self.overlay_tx_logical.increment(n);
         }
+    }
+
+    pub fn overlay_tx_datagrams_add(&self, n: u64) {
+        if n > 0 {
+            self.overlay_tx_datagrams.increment(n);
+        }
+    }
+
+    pub fn overlay_rx_logical_inc(&self) {
+        self.overlay_rx_logical.increment(1);
+    }
+
+    pub fn tun_write_queued(&self) {
+        self.tun_write_queued.increment(1);
+    }
+
+    pub fn tun_write_packets_add(&self, n: u64) {
+        if n > 0 {
+            self.tun_write_packets.increment(n);
+        }
+    }
+
+    pub fn tun_write_queue_drop(&self) {
+        self.tun_write_queue_drop.increment(1);
     }
 
     pub fn observe_sojourn(&self, d: Duration) {

@@ -230,11 +230,10 @@ pub struct EffectiveAgentConfig {
 
 const DEFAULT_MDNS: bool = true;
 const DEFAULT_LAN_DISCOVERY: bool = true;
-/// Default logical/virtual MTU for the dataplane. 2800 matches the
-/// ZeroTier-style comparison point: far fewer packets per GiB than 1280 while
-/// staying cheap to segment onto typical QUIC path MTUs. See the benchmark
-/// matrix before changing this; 9000 is not an automatic default.
-const DEFAULT_TUNNEL_MTU: u16 = 2800;
+/// Default logical/virtual MTU for the dataplane: 1280, the stable
+/// production default. Ordinary inner packets travel as single frames on
+/// normal paths; larger MTUs stay configurable and segment when needed.
+const DEFAULT_TUNNEL_MTU: u16 = 1280;
 const DEFAULT_AUTO_UPDATE_ENABLED: bool = false;
 const DEFAULT_AUTO_UPDATE_INTERVAL: u64 = 6;
 const DEFAULT_POSTURE_INTERVAL: u64 = 300;

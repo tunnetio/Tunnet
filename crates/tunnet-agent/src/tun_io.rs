@@ -1,3 +1,14 @@
+//! TUN reader (outbound) and QUIC ingress readers (inbound).
+//!
+//! Ownership split:
+//! - The outbound task reads the OS TUN, runs NAT/routing/policy, and
+//!   enqueues accepted packets into the endpoint TX registry. It never
+//!   touches QUIC connections or the TUN writer.
+//! - QUIC ingress readers (`serve_tunnel_connection`) decode frames,
+//!   authorize per frame network, reassemble, and enqueue COMPLETE logical
+//!   IP packets into the generation-owned TUN writer. They never await TUN
+//!   write capacity and never call TUN write operations.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -7,23 +18,23 @@ use bytes::Bytes;
 use futures_util::FutureExt as _;
 use iroh::endpoint::Connection;
 use tun_rs::{AsyncDevice, DeviceBuilder};
-use tunnet_common::packet::{self, LogicalPacket};
+use tunnet_common::packet::LogicalPacket;
 use tunnet_common::policy::Direction;
+use tunnet_core::AclEngine;
 use tunnet_core::direct::{AuthCache, SpoofTracker, source_matches_peer};
 use tunnet_core::peers::{PeerIdentity, PeerMembershipState, PeerRegistry};
 use tunnet_core::policy_runtime::{PolicyRuntime, PolicyVerdict};
 use tunnet_core::routing::{RouteDecision, RoutingTable};
-use tunnet_core::{AclEngine, ConnPool, iroh_pool::send_datagram};
 use uuid::Uuid;
 
-use crate::actors::dataplane::PublishedPlane;
+use crate::endpoint_tx::{EndpointTxRegistry, enqueue_packet};
 use crate::metrics::AgentMetrics;
-use crate::pump::ensure_pump;
 use crate::ssh_nat;
 use crate::tun_fast;
+use crate::tun_writer::TunWriterHandle;
 
-/// Opportunistic inbound drain budget (§10): after each awaited datagram,
-/// drain already-ready datagrams without busy-polling.
+/// Opportunistic inbound drain budget: after each awaited datagram, drain
+/// already-ready datagrams without busy-polling.
 pub const INBOUND_DRAIN_BUDGET: usize = 32;
 
 pub fn build_tun(
@@ -33,8 +44,9 @@ pub fn build_tun(
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {
     // Fast-path builder: Linux enables offload; Windows uses the Wintun ring.
-    // Diagnostic override for A/B runs: TUNNET_TUN_OFFLOAD=0 disables
-    // tun-rs offload+GSO (plain single-packet TUN I/O instead).
+    // Diagnostic override for tests: TUNNET_TUN_OFFLOAD=0 disables tun-rs
+    // offload+GSO (plain single-packet TUN I/O instead). Correctness never
+    // depends on this switch.
     #[cfg(target_os = "linux")]
     let offload = std::env::var("TUNNET_TUN_OFFLOAD")
         .map(|v| {
@@ -69,80 +81,79 @@ pub fn build_tun(
 pub struct OutboundDeps {
     pub tun: Arc<AsyncDevice>,
     pub routes: RoutingTable,
-    pub pool: ConnPool,
     pub runtime: PolicyRuntime,
     pub metrics: AgentMetrics,
     pub bufs: Arc<tunnet_common::packet::PacketPool>,
-    pub meter: tunnet_core::CloudRelayMeter,
     pub mtu: u16,
+    pub tx_registry: EndpointTxRegistry,
+    pub tun_writer: TunWriterHandle,
 }
 
 /// Handle one owned logical packet through the outbound pipeline.
 /// Parse-once: `packet` already carries metadata; NAT refreshes it only when
 /// a rewrite actually mutated the bytes. Policy uses the shared runtime with
-/// the peer's stable network slot — no per-packet map lookups.
-fn handle_outbound_one(
-    mut packet: LogicalPacket,
-    fast_ctx: &OutboundCtx<'_>,
-) -> Option<Arc<PeerMembershipState>> {
+/// the peer's stable network slot — no per-packet map lookups. Accepted
+/// packets feed the endpoint TX queue; every shed packet is counted here.
+fn handle_outbound_one(packet: LogicalPacket, fast_ctx: &OutboundCtx<'_>) {
+    let mut packet = packet;
     let ctx = *fast_ctx;
     let OutboundCtx {
         routes,
         runtime,
         metrics,
-        pool,
+        tx_registry,
+        tun_writer,
         bufs,
-        meter,
         self_ip,
         ..
     } = ctx;
     // SSH NAT consumes existing metadata (no second parse) — and ONLY takes
     // the mutable/materializing path when metadata proves a rewrite is
-    // required (§2.1-7). Common packets stay immutable: zero copy.
+    // required. Common packets stay immutable: zero copy.
     let meta = packet.meta;
     if ssh_nat::needs_outbound_rewrite_with_meta(&meta, self_ip) {
         let Some(bytes) = packet_owner_bytes_mut(&mut packet, bufs) else {
             metrics.dropped_inc("nat_materialize");
-            return None;
+            return;
         };
         if ssh_nat::rewrite_outbound_with_meta(bytes, &meta, self_ip) && !packet.refresh() {
             // Rewrite applied but re-parse failed: fail closed.
             metrics.dropped_inc("nat_reparse");
-            return None;
+            return;
         }
     }
     let Some(dst) = packet.meta.dst_v4 else {
         metrics.dropped_inc("ipv6_unsupported");
-        return None;
+        return;
     };
 
     // Single immutable-snapshot route decision; the handle carries the
-    // stable fast state (no peer map lookup after routing).
+    // stable membership (no peer map lookup after routing).
     let fast = match routes.route_once(&dst) {
         RouteDecision::LocalMagic => {
             metrics.dropped_inc("magic_dns_local");
-            return None;
+            return;
         }
         RouteDecision::LocalAdvertised => {
             metrics.dropped_inc("local_subnet");
-            return None;
+            return;
         }
         RouteDecision::NoRoute => {
             metrics.dropped_inc("no_route");
-            return None;
+            return;
         }
         RouteDecision::Peer(h) => h.peer.fast.clone(),
     };
 
     if fast.identity.read().ip == self_ip {
         metrics.dropped_inc("self");
-        return None;
+        return;
     }
 
     // One compiled verdict against the shared runtime. The firewall
     // snapshot loads from the peer's STABLE network slot inside check()
     // (ACL-then-firewall order) — publication swaps it in place, so no
-    // relink is ever needed (§2.1-3, §2.2-2).
+    // relink is ever needed.
     let ident: Arc<PeerIdentity> = fast.identity.read().clone();
     let slot = fast.policy.load();
     let verdict = runtime.check(
@@ -159,57 +170,69 @@ fn handle_outbound_one(
         PolicyVerdict::Allow => {}
         PolicyVerdict::Deny => {
             metrics.dropped_inc("policy_deny");
-            return None;
+            return;
         }
         PolicyVerdict::Reject => {
             metrics.dropped_inc("fw_reject_out");
-            send_reject_reply(fast_ctx, &packet);
-            return None;
+            send_reject_reply(tun_writer, &packet, metrics);
+            return;
         }
     }
 
-    let len = packet.len() as i64;
-    // Every shed/evicted packet is reported (gauges + telemetry) — the
-    // scheduler never drops silently (see EnqueueOutcome).
-    let outcome = {
-        let mut sched = fast.scheduler.lock();
-        let outcome = sched.enqueue(packet, std::time::Instant::now());
-        let deltas = sched.drain_drops();
-        (outcome, deltas)
-    };
-    match outcome.0 {
-        tunnet_core::scheduler::EnqueueOutcome::Accepted => {}
-        tunnet_core::scheduler::EnqueueOutcome::AcceptedEvicted {
-            reason,
-            evicted_len,
-        } => {
-            metrics.queue_add(-1, -(evicted_len as i64), 0);
-            metrics.dropped_inc(reason.as_str());
-            metrics.sched_drop_inc(reason.as_str());
-        }
-        tunnet_core::scheduler::EnqueueOutcome::Rejected { reason } => {
-            metrics.dropped_inc(reason.as_str());
-            metrics.sched_drop_inc(reason.as_str());
-            report_sched_deltas(metrics, outcome.1);
-            return None;
-        }
-    }
-    report_sched_deltas(metrics, outcome.1);
-    metrics.queue_add(1, len, 0);
-    ensure_pump(
-        &fast,
-        pool.clone(),
-        metrics.clone(),
-        bufs.clone(),
-        meter.clone(),
-    );
-    Some(fast)
+    // Into the endpoint TX queue (tail-rejection counted by the reporter).
+    enqueue_packet(tx_registry, &fast, packet);
 }
 
-/// Report drained CoDel/emergency deltas (dequeue-side drops with no
-/// enqueue decision site).
-fn report_sched_deltas(metrics: &AgentMetrics, deltas: tunnet_core::scheduler::SchedDropDeltas) {
-    metrics.sched_drops_add(deltas.codel, deltas.emergency);
+struct OutboundCtx<'a> {
+    routes: &'a RoutingTable,
+    runtime: &'a PolicyRuntime,
+    metrics: &'a AgentMetrics,
+    tx_registry: &'a EndpointTxRegistry,
+    tun_writer: &'a TunWriterHandle,
+    bufs: &'a Arc<tunnet_common::packet::PacketPool>,
+    self_ip: std::net::Ipv4Addr,
+}
+
+impl Copy for OutboundCtx<'_> {}
+impl Clone for OutboundCtx<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+/// Reject replies are rare, but they must be protocol-correct: the peer
+/// expects every tunnel DATAGRAM to begin with 0x30/0x31 with its bound
+/// network. Route the reply through the endpoint TX queue like any other
+/// packet (the worker frames/segments it).
+fn send_reject_framed(
+    reply: Bytes,
+    member: &Arc<PeerMembershipState>,
+    tx_registry: &EndpointTxRegistry,
+    metrics: &AgentMetrics,
+) {
+    // Zero-copy: the synthesized reply bytes ride straight into the
+    // endpoint queue; the worker frames/segments them like any packet.
+    let Some(packet) = LogicalPacket::from_shared(reply) else {
+        metrics.dropped_inc("malformed_transport");
+        return;
+    };
+    enqueue_packet(tx_registry, member, packet);
+}
+
+/// Outbound reject replies go to the LOCAL TUN device (raw IP framing —
+/// correct there: TUN is not the tunnel wire). Rare: synthesize and enqueue
+/// to the generation-owned writer — never a side-channel TUN write.
+fn send_reject_reply(writer: &TunWriterHandle, packet: &LogicalPacket, metrics: &AgentMetrics) {
+    use tunnet_common::packet as packet_mod;
+    let reply = packet_mod::parse(packet.owner.as_bytes())
+        .ok()
+        .and_then(|p| packet_mod::synthesize_reject(&p));
+    let Some(reply) = reply.filter(|r| !r.is_empty()) else {
+        return;
+    };
+    if !writer.try_enqueue(reply) {
+        metrics.dropped_inc("tun_write_queue_full");
+    }
 }
 
 /// Mutable packet bytes for NAT, materializing pooled/shared storage.
@@ -232,147 +255,20 @@ fn packet_owner_bytes_mut<'a>(
     }
 }
 
-struct OutboundCtx<'a> {
-    tun: &'a Arc<AsyncDevice>,
-    routes: &'a RoutingTable,
-    runtime: &'a PolicyRuntime,
-    metrics: &'a AgentMetrics,
-    pool: &'a ConnPool,
-    bufs: &'a Arc<tunnet_common::packet::PacketPool>,
-    meter: &'a tunnet_core::CloudRelayMeter,
-    self_ip: std::net::Ipv4Addr,
-}
-
-impl Copy for OutboundCtx<'_> {}
-impl Clone for OutboundCtx<'_> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-/// Reject replies are rare, but they must be protocol-correct: the peer
-/// expects every tunnel DATAGRAM to begin with 0x30/0x31 with its bound
-/// network. Route the reply through the normal tunnel framing/transmit
-/// path (scheduler and pump, which segments large replies) instead of a
-/// second encoder path. Without a pool (no pump possible) fall back to a
-/// single framed best-effort send (still net-bound).
-async fn send_reject_framed(
-    reply: Bytes,
-    net: Uuid,
-    fast: &Arc<PeerMembershipState>,
-    pool: Option<&ConnPool>,
-    conn: &Connection,
-    bufs: &Arc<tunnet_common::packet::PacketPool>,
-    metrics: &AgentMetrics,
-) {
-    let Some(pool) = pool else {
-        // No pump available: single framed best-effort send, with the
-        // full v3 header ([kind][net][reply]).
-        let mut frame = Vec::with_capacity(reply.len() + tunnet_common::packet::SINGLE_OVERHEAD);
-        frame.push(tunnet_common::packet::KIND_SINGLE);
-        frame.extend_from_slice(net.as_bytes());
-        frame.extend_from_slice(&reply);
-        if conn
-            .max_datagram_size()
-            .is_some_and(|max| frame.len() > max)
-        {
-            metrics.dropped_inc("datagram_too_large");
-            return;
-        }
-        let _ = send_datagram(conn, Bytes::from(frame)).await;
-        return;
-    };
-    // Zero-copy: the synthesized reply bytes ride straight into the
-    // scheduler; the pump frames/segments them like any other packet.
-    let Some(packet) = LogicalPacket::from_shared(reply) else {
-        metrics.dropped_inc("malformed_transport");
-        return;
-    };
-    let len = packet.len() as i64;
-    let (outcome, deltas) = {
-        let mut sched = fast.scheduler.lock();
-        let outcome = sched.enqueue(packet, std::time::Instant::now());
-        let deltas = sched.drain_drops();
-        (outcome, deltas)
-    };
-    match outcome {
-        tunnet_core::scheduler::EnqueueOutcome::Accepted => {}
-        tunnet_core::scheduler::EnqueueOutcome::AcceptedEvicted {
-            reason,
-            evicted_len,
-        } => {
-            metrics.queue_add(-1, -(evicted_len as i64), 0);
-            metrics.dropped_inc(reason.as_str());
-            metrics.sched_drop_inc(reason.as_str());
-        }
-        tunnet_core::scheduler::EnqueueOutcome::Rejected { reason } => {
-            metrics.dropped_inc(reason.as_str());
-            metrics.sched_drop_inc(reason.as_str());
-            report_sched_deltas(metrics, deltas);
-            return;
-        }
-    }
-    report_sched_deltas(metrics, deltas);
-    metrics.queue_add(1, len, 0);
-    ensure_pump(
-        fast,
-        pool.clone(),
-        metrics.clone(),
-        bufs.clone(),
-        pool.cloud_relay_meter(),
-    );
-}
-
-/// Outbound reject replies go to the LOCAL TUN device (raw IP framing —
-/// correct there: TUN is not the tunnel wire). Rare: synthesize and send off
-/// the hot path with correct platform framing.
-fn send_reject_reply(ctx: &OutboundCtx<'_>, packet: &LogicalPacket) {
-    let reply = packet::parse(packet.owner.as_bytes())
-        .ok()
-        .and_then(|p| packet::synthesize_reject(&p));
-    let Some(reply) = reply.filter(|r| !r.is_empty()) else {
-        return;
-    };
-    #[cfg(target_os = "linux")]
-    {
-        let tun = ctx.tun.clone();
-        tokio::spawn(async move {
-            let mut w = tun_fast::LinuxTunBatchWriter::new();
-            w.push(&reply);
-            let _ = w.flush(&tun).await;
-        });
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let tun = ctx.tun.clone();
-        tokio::spawn(async move {
-            let _ = tun.send(&reply).await;
-        });
-    }
-}
-
+/// Outbound task: OS TUN -> routing/policy -> endpoint TX queues. Owns no
+/// queue state (enqueue is synchronous and non-blocking), so the actor may
+/// abort it on teardown. Any `Err` return is abnormal (device failure).
 pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     let OutboundDeps {
         tun,
         routes,
-        pool,
         runtime,
         metrics,
         bufs,
-        meter,
         mtu,
+        tx_registry,
+        tun_writer,
     } = deps;
-    // Cache pool hit/miss telemetry periodically (cheap atomics).
-    let metrics_pool = metrics.clone();
-    let bufs_pool = bufs.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            let (h, m) = bufs_pool.hit_miss();
-            metrics_pool.pool_hit_miss(h, m);
-        }
-    });
 
     let self_ip = runtime.self_ip();
     metrics.mtu_set(mtu as u64);
@@ -380,7 +276,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let mut batch = tun_fast::LinuxBatchEngine::new(bufs.clone(), mtu as usize);
 
-    tracing::info!("outbound TUN→iroh tunnel loop started");
+    tracing::info!("outbound TUN reader loop started");
     loop {
         #[cfg(target_os = "linux")]
         {
@@ -390,13 +286,12 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 continue;
             }
             let ctx = OutboundCtx {
-                tun: &tun,
                 routes: &routes,
                 runtime: &runtime,
                 metrics: &metrics,
-                pool: &pool,
+                tx_registry: &tx_registry,
+                tun_writer: &tun_writer,
                 bufs: &bufs,
-                meter: &meter,
                 self_ip,
             };
             for packet in packets {
@@ -404,6 +299,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                     metrics.dropped_inc("oversize_mtu");
                     continue;
                 }
+                metrics.tun_rx_packets_inc();
                 handle_outbound_one(packet, &ctx);
             }
             continue;
@@ -420,13 +316,12 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 continue;
             }
             let ctx = OutboundCtx {
-                tun: &tun,
                 routes: &routes,
                 runtime: &runtime,
                 metrics: &metrics,
-                pool: &pool,
+                tx_registry: &tx_registry,
+                tun_writer: &tun_writer,
                 bufs: &bufs,
-                meter: &meter,
                 self_ip,
             };
             for packet in burst {
@@ -434,65 +329,80 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                     metrics.dropped_inc("oversize_mtu");
                     continue;
                 }
+                metrics.tun_rx_packets_inc();
                 handle_outbound_one(packet, &ctx);
             }
         }
     }
 }
 
+/// How a QUIC ingress reader ended (for lifecycle supervision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderExit {
+    /// Dataplane generation cancelled: normal shutdown, no action.
+    GenerationDone,
+    /// Endpoint lost all memberships or the membership was revoked: the
+    /// connection is closed by us, no invalidation needed.
+    MembershipGone,
+    /// Read failed while still canonical: the pool must invalidate this
+    /// exact connection so reconnect starts clean (never a readerless live
+    /// connection).
+    ConnFailed { stable_id: usize },
+}
+
 pub struct InboundDeps {
     pub conn: Connection,
-    pub tun: PublishedPlane,
+    pub tun_writer: TunWriterHandle,
+    pub tx_registry: EndpointTxRegistry,
+    pub cancel: tokio_util::sync::CancellationToken,
     pub routes: RoutingTable,
     pub runtime: PolicyRuntime,
     pub acl: AclEngine,
     pub spoofs: HashMap<Uuid, SpoofTracker>,
-    pub pool: Option<ConnPool>,
     pub bufs: Arc<tunnet_common::packet::PacketPool>,
     pub metrics: AgentMetrics,
-    /// Per-network auth bindings for inbound packet authorization
-    /// (§2.2-1). None in managed mode (ACL admission governs); enforced
-    /// per frame network when present.
+    /// Per-network auth bindings for inbound packet authorization. None in
+    /// managed mode (ACL admission governs); enforced per frame network
+    /// when present. MUST be identical for accepted and dialed connections.
     pub auth: Option<AuthCache>,
 }
 
-pub async fn serve_tunnel_connection(deps: InboundDeps) {
+/// Network-ingress task ONLY: read DATAGRAMs continuously, decode, resolve
+/// the exact membership/network, authenticate the exact network, reassemble,
+/// anti-spoof, policy, NAT if required, and enqueue COMPLETE logical IP
+/// packets to the TUN writer. Never awaits TUN write capacity; never calls
+/// any TUN write operation.
+///
+/// The connection is already canonical (installed by the single install
+/// path before this reader starts); this function never adopts.
+pub async fn serve_tunnel_connection(deps: InboundDeps) -> ReaderExit {
     let InboundDeps {
         conn,
-        tun,
+        tun_writer,
+        tx_registry,
+        cancel: generation_cancel,
         routes,
         runtime,
         acl,
         spoofs,
-        pool,
         bufs,
         metrics,
         auth,
     } = deps;
     let remote_id = conn.remote_id();
     let remote_hex = format!("{remote_id}");
+    let stable_id = conn.stable_id();
     if !acl.allow_inbound_peer(&remote_hex) {
         tracing::warn!(%remote_id, "policy denied inbound peer");
         conn.close(1u32.into(), b"policy_deny");
-        return;
+        return ReaderExit::MembershipGone;
     }
     tracing::info!(%remote_id, "peer connected");
     metrics.active_conns_inc();
-    if let Some(p) = &pool {
-        p.touch_peer(remote_id);
-        if !p.adopt(remote_id, conn.clone()).await {
-            tracing::debug!(%remote_id, "ingress conn lost tie-break; exiting reader");
-            metrics.active_conns_dec();
-            return;
-        }
-        if let Some(max) = conn.max_datagram_size() {
-            tracing::debug!(%remote_id, max_datagram_size = max, "quic datagram limit");
-        }
-    }
-    // Membership resolution is lazy and per frame network (§2.2-1): the
-    // first datagram's bound network selects the (endpoint, network)
-    // membership; the cached Arc is reused while frames carry the same
-    // network. Never infer network identity from insertion order.
+    // Membership resolution is lazy and per frame network: the first
+    // datagram's bound network selects the (endpoint, network) membership;
+    // the cached Arc is reused while frames carry the same network. Never
+    // infer network identity from insertion order.
     let registry = routes.peer_registry().clone();
     // Truly unknown endpoints still close at admission (no membership in
     // any network); known endpoints resolve per frame network below.
@@ -500,49 +410,32 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
         tracing::debug!(%remote_id, "unknown peer at admission; closing");
         conn.close(1u32.into(), b"no_route");
         metrics.active_conns_dec();
-        return;
+        return ReaderExit::MembershipGone;
     }
     let mut fast_state: Option<Arc<PeerMembershipState>> = None;
     let mut fast_net = Uuid::nil();
     let mut fast_epoch = 0u64;
     let mut route_gen = routes.version();
 
-    // Load the published generation once (device + cancel token pinned).
-    let Some(plane) = tun.load_full() else {
-        metrics.active_conns_dec();
-        return;
-    };
-    let device = plane.device.clone();
-    let generation_cancel = plane.cancel.clone();
-    tracing::debug!(generation = plane.generation, %remote_id, "ingress reader pinned");
-
-    #[cfg(target_os = "linux")]
-    let mut tun_batch = tun_fast::LinuxTunBatchWriter::new();
-    #[cfg(not(target_os = "linux"))]
-    let mut tun_batch = tun_fast::TunWriteBatch::new();
-
-    loop {
+    let exit = loop {
         if generation_cancel.is_cancelled() {
-            break;
+            break ReaderExit::GenerationDone;
         }
         // Await one datagram (cancellation-first), then opportunistically
-        // drain already-ready datagrams up to a bounded budget (§10).
+        // drain already-ready datagrams up to a bounded budget.
         let first = tokio::select! {
             biased;
-            _ = generation_cancel.cancelled() => break,
+            _ = generation_cancel.cancelled() => break ReaderExit::GenerationDone,
             res = conn.read_datagram() => match res {
                 Ok(dg) => dg,
                 Err(e) => {
                     tracing::debug!(?e, "read_datagram closed");
-                    break;
+                    break ReaderExit::ConnFailed { stable_id };
                 }
             },
         };
         if generation_cancel.is_cancelled() {
-            break;
-        }
-        if let Some(p) = &pool {
-            p.touch_peer(remote_id);
+            break ReaderExit::GenerationDone;
         }
         metrics.datagram_inc("in");
         let mut batch: Vec<Bytes> = vec![first];
@@ -560,7 +453,7 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             }
         }
         if generation_cancel.is_cancelled() {
-            break;
+            break ReaderExit::GenerationDone;
         }
         // Routing generation check (one atomic load per batch): when
         // membership changed, drop the cached membership (per-packet
@@ -574,12 +467,12 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             if !registry.has_any_membership(remote_id) {
                 tracing::info!(%remote_id, "peer removed from all networks; closing ingress reader");
                 conn.close(1u32.into(), b"membership_removed");
-                break;
+                break ReaderExit::MembershipGone;
             }
         }
-        // Deactivation without a generation change (e.g. pool drop_peer):
-        // drop the cached membership; per-packet resolve re-resolves or,
-        // when nothing remains, the generation check above exits.
+        // Deactivation without a generation change: drop the cached
+        // membership; per-packet resolve re-resolves or, when nothing
+        // remains, the generation check above exits.
         if let Some(fast) = &fast_state
             && fast.epoch.load(Ordering::Relaxed) != fast_epoch
         {
@@ -587,7 +480,6 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             fast_state = None;
         }
         let self_ip = runtime.self_ip();
-        let mut tun_pending: u32 = 0;
         for dg in batch {
             // Decode the frame header first (no allocation): it binds the
             // network this packet belongs to.
@@ -635,42 +527,26 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
                 metrics.dropped_inc("membership_revoked");
                 continue;
             }
-            if handle_inbound_one(
+            handle_inbound_one(
                 &dg,
                 frame,
                 fast,
                 &runtime,
                 &spoofs,
-                &conn,
-                pool.as_ref(),
                 &bufs,
                 &metrics,
-                &mut tun_batch,
+                &tun_writer,
+                &tx_registry,
                 self_ip,
-            )
-            .await
-            {
-                tun_pending += 1;
-            }
-            // Flush mid-iteration so bursts larger than the batch still
-            // complete without loss (§9); the tail stays staged on failure.
-            if tun_pending >= tun_fast::TUN_WRITE_BATCH as u32 {
-                if !flush_tun_batch(&mut tun_batch, &device, &metrics).await {
-                    break;
-                }
-                tun_pending = 0;
-            }
+            );
         }
-        // Flush the TUN batch once per drain iteration (§9).
-        if tun_pending > 0 && !flush_tun_batch(&mut tun_batch, &device, &metrics).await {
-            break;
-        }
-    }
+    };
     metrics.active_conns_dec();
     tracing::info!(%remote_id, "peer disconnected");
+    exit
 }
 
-/// Slow-path resolve of the exact (endpoint, network) membership (§2.2-1):
+/// Slow-path resolve of the exact (endpoint, network) membership:
 /// registry first, else build from route info. Assigns the network's
 /// stable firewall slot on created states, like routing rebuilds do.
 /// Returns None when the endpoint has no such membership OR is not
@@ -719,23 +595,22 @@ fn resolve_membership(
 }
 
 /// Handle one inbound DATAGRAM: reassemble → parse → antispoof → policy →
-/// NAT → stage for the TUN batch. The frame (already decoded by the caller,
-/// which used its bound network to resolve `fast`) and the membership are
-/// passed in. Returns true when a TUN packet was staged.
+/// NAT → enqueue the COMPLETE logical packet to the TUN writer. The frame
+/// (already decoded by the caller, which used its bound network to resolve
+/// `fast`) and the membership are passed in.
 #[allow(clippy::too_many_arguments)]
-async fn handle_inbound_one(
+fn handle_inbound_one(
     dg: &Bytes,
     frame: tunnet_common::packet::Frame<'_>,
     fast: &Arc<PeerMembershipState>,
     runtime: &PolicyRuntime,
     spoofs: &HashMap<Uuid, SpoofTracker>,
-    conn: &Connection,
-    pool: Option<&ConnPool>,
     pool_bufs: &Arc<tunnet_common::packet::PacketPool>,
     metrics: &AgentMetrics,
-    tun_batch: &mut TunBatchForPlatform,
+    tun_writer: &TunWriterHandle,
+    tx_registry: &EndpointTxRegistry,
     self_ip: std::net::Ipv4Addr,
-) -> bool {
+) {
     use tunnet_core::reassembly::InsertOut;
     let now = std::time::Instant::now();
     let logical: LogicalPacket = match frame {
@@ -750,7 +625,7 @@ async fn handle_inbound_one(
                 }
                 None => {
                     metrics.dropped_inc("malformed_transport");
-                    return false;
+                    return;
                 }
             }
         }
@@ -767,17 +642,17 @@ async fn handle_inbound_one(
                         Some(pkt) => pkt,
                         None => {
                             metrics.dropped_inc("malformed_transport");
-                            return false;
+                            return;
                         }
                     }
                 }
                 InsertOut::Pending => {
                     metrics.reassembly_inc("pending");
-                    return false;
+                    return;
                 }
                 InsertOut::Duplicate => {
                     metrics.reassembly_inc("duplicate");
-                    return false;
+                    return;
                 }
                 InsertOut::Dropped(reason) => {
                     metrics.reassembly_inc("dropped");
@@ -787,15 +662,16 @@ async fn handle_inbound_one(
                         tunnet_core::reassembly::ReassemblyDrop::TooManyEntries => "reasm_entries",
                         _ => "reasm_malformed",
                     });
-                    return false;
+                    return;
                 }
             }
         }
     };
+    metrics.overlay_rx_logical_inc();
     // Anti-spoof against the connection's stable identity (exact match).
     let Some(src) = logical.meta.src_v4 else {
         metrics.dropped_inc("ipv6_unsupported_in");
-        return false;
+        return;
     };
     let ident: Arc<PeerIdentity> = fast.identity.read().clone();
     if !source_matches_peer(src, ident.ip) {
@@ -811,11 +687,11 @@ async fn handle_inbound_one(
                 );
             }
         }
-        return false;
+        return;
     }
     // Snapshot the policy slot (guards are not Send; Arcs are). check()
     // loads the firewall snapshot after the ACL snapshot inside, matching
-    // publish order — always current, no relink, no tear (§2.2-2).
+    // publish order — always current, no relink, no tear.
     let slot = fast.policy.load();
     let verdict = runtime.check(
         &logical.meta,
@@ -831,23 +707,19 @@ async fn handle_inbound_one(
         PolicyVerdict::Allow => {}
         PolicyVerdict::Deny => {
             metrics.dropped_inc("policy_deny_in");
-            return false;
+            return;
         }
         PolicyVerdict::Reject => {
             metrics.dropped_inc("fw_reject_in");
-            let reply = packet::parse(logical.owner.as_bytes())
+            // Reject replies travel the overlay (framed, net-bound) via the
+            // endpoint TX queue — never a side-channel TUN write.
+            let reply = tunnet_common::packet::parse(logical.owner.as_bytes())
                 .ok()
-                .and_then(|p| packet::synthesize_reject(&p));
+                .and_then(|p| tunnet_common::packet::synthesize_reject(&p));
             if let Some(reply) = reply.filter(|r| !r.is_empty()) {
-                // The frame already told us the bound network (used for
-                // resolve above); the reply carries the same binding.
-                let net = match &frame {
-                    tunnet_common::packet::Frame::Single { net, .. } => *net,
-                    tunnet_common::packet::Frame::Segment { net, .. } => *net,
-                };
-                send_reject_framed(reply, net, fast, pool, conn, pool_bufs, metrics).await;
+                send_reject_framed(reply, fast, tx_registry, metrics);
             }
-            return false;
+            return;
         }
     }
     // Inbound SSH-NAT consumes parsed metadata (no second parse); shared
@@ -856,96 +728,38 @@ async fn handle_inbound_one(
     if ssh_nat::needs_inbound_rewrite_with_meta(&logical.meta, self_ip) {
         if !logical.materialize(pool_bufs) {
             metrics.dropped_inc("nat_materialize");
-            return false;
+            return;
         }
         // PacketMeta is Copy: snapshot before the mutable borrow.
         let meta = logical.meta;
         let Some(region) = packet_owner_bytes_mut(&mut logical, pool_bufs) else {
             metrics.dropped_inc("nat_materialize");
-            return false;
+            return;
         };
         ssh_nat::rewrite_inbound_with_meta(region, &meta, self_ip);
     }
     let n = logical.len() as u64;
-    stage_tun_packet(tun_batch, logical, metrics);
-    fast.transport.record_rx(n);
-    metrics.packets_inc("in");
-    metrics.bytes_add("in", n);
-    true
-}
-
-#[cfg(target_os = "linux")]
-type TunBatchForPlatform = tun_fast::LinuxTunBatchWriter;
-#[cfg(not(target_os = "linux"))]
-type TunBatchForPlatform = tun_fast::TunWriteBatch;
-
-/// Flush the staged TUN batch. Returns false when the reader should stop
-/// (device error); on temporary backpressure the tail stays staged for the
-/// next iteration — never silently dropped.
-async fn flush_tun_batch(
-    batch: &mut TunBatchForPlatform,
-    device: &Arc<AsyncDevice>,
-    metrics: &AgentMetrics,
-) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if batch.is_empty() {
-            return true;
-        }
-        metrics.tun_syscall_inc("send_batch");
-        match batch.flush(device).await {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(?e, "tun batch send failed");
-                metrics.dropped_inc("tun_send_failed");
-                false
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if batch.is_empty() {
-            return true;
-        }
-        metrics.tun_syscall_inc("send_burst");
-        match batch.drain_or_wait(device).await {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(?e, "tun burst send failed");
-                metrics.dropped_inc("tun_send_failed");
-                false
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stage_tun_packet(
-    batch: &mut TunBatchForPlatform,
-    packet: LogicalPacket,
-    _metrics: &AgentMetrics,
-) {
-    let bytes = match packet.owner {
+    let bytes = match logical.owner {
         tunnet_common::packet::PacketOwner::Shared(b) => b,
         tunnet_common::packet::PacketOwner::Pooled(b) => Bytes::from_owner(b),
     };
-    batch.push(bytes);
-}
-
-#[cfg(target_os = "linux")]
-fn stage_tun_packet(
-    batch: &mut TunBatchForPlatform,
-    packet: LogicalPacket,
-    _metrics: &AgentMetrics,
-) {
-    batch.push(packet.owner.as_bytes());
+    // The ONLY TUN write path: complete packet into the writer queue.
+    // Full drops explicitly at this boundary (never blocks the reader).
+    if tun_writer.try_enqueue(bytes) {
+        fast.transport.record_rx(n);
+        metrics.packets_inc("in");
+        metrics.bytes_add("in", n);
+    } else {
+        metrics.dropped_inc("tun_write_queue_full");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::actors::test_support::test_metrics;
-    use crate::pump::ensure_pump;
+    use crate::endpoint_tx::EndpointTxRegistry;
+    use tunnet_core::ConnPool;
 
     const NET_A: Uuid = Uuid::from_u128(0x0a0a);
     const NET_B: Uuid = Uuid::from_u128(0x0b0b);
@@ -986,9 +800,10 @@ mod tests {
 
     #[test]
     fn resolve_binds_exact_membership_and_auth() {
-        // §2.2-1 (tests 5, 6): frames resolve to the EXACT (endpoint,
-        // network) membership — never the other network's state — and an
-        // endpoint authenticated only for A cannot claim B.
+        // One endpoint in networks A and B: frames resolve to the EXACT
+        // (endpoint, network) membership, and an endpoint authenticated
+        // only for A cannot claim B — on ANY connection (accepted or
+        // dialed: both paths build the same context with the same cache).
         let (table, ep, ep_hex) = two_net_routes();
         let registry = table.peer_registry().clone();
         let auth = AuthCache::new();
@@ -1017,13 +832,12 @@ mod tests {
         );
     }
 
-    /// End-to-end loopback ping (total-loss diagnosis loop): machine A
-    /// (10.7.0.1) sends a real ICMP echo to machine B (10.7.0.2) and back
-    /// over loopback QUIC through the REAL outbound policy + scheduler +
-    /// pump, REAL datagram transport, and the REAL inbound handler
-    /// (decode → membership → antispoof → policy → stage, no TUN device).
-    /// Times out (RED) exactly when user ping would: no frames arrive, or
-    /// the inbound path drops everything.
+    /// End-to-end loopback ping: machine A (10.7.0.1) sends a real ICMP echo
+    /// to machine B (10.7.0.2) and back over loopback QUIC through the REAL
+    /// outbound policy + endpoint TX worker, REAL datagram transport, and
+    /// the REAL inbound handler (decode → membership → antispoof → policy →
+    /// TUN writer queue, no TUN device). Times out (RED) exactly when user
+    /// ping would: no frames arrive, or the inbound path drops everything.
     struct Loopback {
         conn_a: iroh::endpoint::Connection,
         conn_b: iroh::endpoint::Connection,
@@ -1117,11 +931,22 @@ mod tests {
         }));
         reg_a.relink_policy(&rt_a);
         reg_b.relink_policy(&rt_b);
-        // Mirror live conns into transports (slow path, as the pool does).
-        reg_a.set_transport_conn(id_b, Some(conn_a.clone()));
-        reg_b.set_transport_conn(id_a, Some(conn_b.clone()));
         let pool_a = ConnPool::new(ep_a, alpn);
         let pool_b = ConnPool::new(ep_b, alpn);
+        // Link pools to registries (slow path, as bootstrap does) so the
+        // canonical install mirrors the live conn into the transport.
+        pool_a.set_peer_registry(Arc::new(reg_a.clone()));
+        pool_b.set_peer_registry(Arc::new(reg_b.clone()));
+        // Install the live conns as canonical (slow path, as the pool does).
+        use tunnet_core::InstallOutcome;
+        assert!(matches!(
+            pool_a.install_canonical(id_b, conn_a.clone(), true).await,
+            InstallOutcome::Canonical(_)
+        ));
+        assert!(matches!(
+            pool_b.install_canonical(id_a, conn_b.clone(), false).await,
+            InstallOutcome::Canonical(_)
+        ));
         Loopback {
             conn_a,
             conn_b,
@@ -1146,9 +971,9 @@ mod tests {
         o
     }
 
-    /// One directed leg: outbound policy + scheduler + real pump on the
-    /// sender; real QUIC datagrams; decode + membership + full inbound
-    /// handler on the receiver. Returns the staged TUN payload.
+    /// One directed leg: outbound policy + endpoint TX worker on the sender;
+    /// real QUIC datagrams; decode + membership + full inbound handler on
+    /// the receiver, staged into a TUN writer channel. Returns the payload.
     struct Leg<'a> {
         tx_reg: &'a PeerRegistry,
         tx_rt: &'a PolicyRuntime,
@@ -1165,6 +990,7 @@ mod tests {
     }
 
     async fn directed_leg(leg: Leg<'_>) -> Vec<u8> {
+        use tokio::sync::mpsc;
         use tunnet_common::packet::PacketPool;
         let Leg {
             tx_reg,
@@ -1200,29 +1026,24 @@ mod tests {
             PolicyVerdict::Allow,
             "outbound policy must allow the echo"
         );
-        // Scheduler + REAL pump (exits idle on its own).
-        assert!(
-            member
-                .scheduler
-                .lock()
-                .enqueue(pkt, std::time::Instant::now())
-                .is_accepted()
-        );
-        ensure_pump(
-            &member,
-            tx_pool.clone(),
-            test_metrics(),
-            PacketPool::new(8),
-            tunnet_core::CloudRelayMeter::new(),
-        );
-        // Receiver: real datagrams until the full logical packet stages.
+        // Endpoint TX worker (real framing over the real connection).
         let bufs = PacketPool::new(8);
         let metrics = test_metrics();
-        #[cfg(target_os = "linux")]
-        let mut batch = tun_fast::LinuxTunBatchWriter::new();
-        #[cfg(not(target_os = "linux"))]
-        let mut batch = tun_fast::TunWriteBatch::new();
+        let tx_registry = EndpointTxRegistry::new(
+            tokio_util::sync::CancellationToken::new(),
+            tx_pool.clone(),
+            Arc::new(tx_reg.clone()),
+            metrics.clone(),
+            bufs.clone(),
+            tunnet_core::CloudRelayMeter::new(),
+        );
+        crate::endpoint_tx::enqueue_packet(&tx_registry, &member, pkt);
+        // Receiver: real datagrams until the full logical packet stages
+        // into the writer channel.
+        let (wtx, mut wrx) = mpsc::channel::<Bytes>(64);
+        let writer = TunWriterHandle::new(wtx, metrics.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Pump the receiver until a complete packet lands in the writer.
         loop {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1241,26 +1062,28 @@ mod tests {
             let rx_member = rx_reg
                 .get_membership(rx_conn.remote_id(), got_net)
                 .expect("receiver must resolve the membership");
-            let staged = handle_inbound_one(
+            assert_eq!(rx_member.identity.read().network_id, net);
+            handle_inbound_one(
                 &dg,
                 frame,
                 &rx_member,
                 rx_rt,
                 &std::collections::HashMap::new(),
-                rx_conn,
-                None,
                 &bufs,
                 &metrics,
-                &mut batch,
+                &writer,
+                &tx_registry,
                 rx_self_ip,
-            )
-            .await;
-            if staged {
-                assert!(!batch.is_empty());
-                return raw;
+            );
+            if let Ok(staged) = wrx.try_recv() {
+                assert_eq!(&staged[..], &raw[..]);
+                break;
             }
             // Segmented packet: keep draining until completion.
         }
+        // The sender worker exits on registry drop; stop it explicitly.
+        tx_registry.shutdown().await;
+        raw
     }
 
     #[tokio::test]
@@ -1301,5 +1124,217 @@ mod tests {
             raw: raw_ba,
         })
         .await;
+    }
+
+    fn jumbo_udp(src: [u8; 4], dst: [u8; 4], payload: usize) -> Vec<u8> {
+        let b = etherparse::PacketBuilder::ipv4(src, dst, 64).udp(40000, 443);
+        let mut o = Vec::new();
+        b.write(&mut o, &vec![0xABu8; payload]).unwrap();
+        o
+    }
+
+    #[tokio::test]
+    async fn loopback_jumbo_segments_and_reassembles() {
+        // Explicitly configured jumbo MTUs still segment/reassemble: a
+        // 2700-byte logical packet cannot fit one DATAGRAM on loopback, so
+        // it must arrive complete via segments with identical bytes.
+        let fx = loopback_fixture().await;
+        let raw = jumbo_udp([10, 7, 0, 1], [10, 7, 0, 2], 2700 - 28);
+        assert_eq!(raw.len(), 2700);
+        let staged = directed_leg(Leg {
+            tx_reg: &fx.reg_a,
+            tx_rt: &fx.rt_a,
+            tx_pool: &fx.pool_a,
+            tx_peer: fx.id_b,
+            tx_hex: &fx.hex_b,
+            tx_host: "b",
+            rx_conn: &fx.conn_b,
+            rx_reg: &fx.reg_b,
+            rx_rt: &fx.rt_b,
+            rx_self_ip: std::net::Ipv4Addr::new(10, 7, 0, 2),
+            net: fx.net,
+            raw: raw.clone(),
+        })
+        .await;
+        assert_eq!(staged, raw);
+    }
+
+    #[tokio::test]
+    async fn loopback_congestion_waits_with_tiny_buffer() {
+        // A 4 KiB QUIC DATAGRAM buffer under flood: the endpoint worker
+        // must WAIT for buffer space, never displace old queued DATAGRAMs.
+        // No packet may disappear because of transport congestion.
+        use tunnet_common::packet::PacketPool;
+        use tunnet_core::transport_profile::TunnetTransportProfile;
+        let alpn = tunnet_common::TUNNEL_ALPN;
+        let profile = TunnetTransportProfile::default().with_send_buffer(4096);
+        let ep_a = profile
+            .apply(iroh::Endpoint::builder(iroh::endpoint::presets::N0))
+            .alpns(vec![alpn.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let ep_b = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![alpn.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let id_a = ep_a.id();
+        let id_b = ep_b.id();
+        let addr_b = ep_b.addr();
+        let ep_b2 = ep_b.clone();
+        let accept_b = tokio::spawn(async move { ep_b2.accept().await.unwrap().await.unwrap() });
+        let conn_a = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ep_a.connect(addr_b, alpn),
+        )
+        .await
+        .expect("dial must succeed")
+        .unwrap();
+        let conn_b = tokio::time::timeout(std::time::Duration::from_secs(10), accept_b)
+            .await
+            .expect("accept")
+            .unwrap();
+
+        let net = Uuid::from_u128(0xE4E);
+        let reg_a = PeerRegistry::new();
+        let reg_b = PeerRegistry::new();
+        let member_a = reg_a.ensure_membership(Arc::new(PeerIdentity {
+            endpoint: id_b,
+            endpoint_hex: format!("{id_b}"),
+            hostname: "b".into(),
+            ip: std::net::Ipv4Addr::new(10, 7, 0, 2),
+            tags: vec![],
+            network_id: net,
+            network_name: "net".into(),
+        }));
+        reg_b.ensure_membership(Arc::new(PeerIdentity {
+            endpoint: id_a,
+            endpoint_hex: format!("{id_a}"),
+            hostname: "a".into(),
+            ip: std::net::Ipv4Addr::new(10, 7, 0, 1),
+            tags: vec![],
+            network_id: net,
+            network_name: "net".into(),
+        }));
+        let pool_a = ConnPool::new(ep_a, alpn);
+        pool_a.set_peer_registry(Arc::new(reg_a.clone()));
+        use tunnet_core::InstallOutcome;
+        assert!(matches!(
+            pool_a.install_canonical(id_b, conn_a.clone(), true).await,
+            InstallOutcome::Canonical(_)
+        ));
+
+        // Flood: 120 back-to-back 1200-byte packets into a 4 KiB pipe.
+        let bufs = PacketPool::new(8);
+        let metrics = test_metrics();
+        let tx_registry = EndpointTxRegistry::new(
+            tokio_util::sync::CancellationToken::new(),
+            pool_a.clone(),
+            Arc::new(reg_a.clone()),
+            metrics.clone(),
+            bufs.clone(),
+            tunnet_core::CloudRelayMeter::new(),
+        );
+        const N: usize = 120;
+        let raws: Vec<Vec<u8>> = (0..N)
+            .map(|i| jumbo_udp([10, 7, 0, 1], [10, 7, 0, 2], 1200 - 28 + (i % 7)))
+            .collect();
+        for raw in &raws {
+            let pkt = LogicalPacket::from_vec(raw.clone()).expect("valid");
+            crate::endpoint_tx::enqueue_packet(&tx_registry, &member_a, pkt);
+        }
+        // Drain the receiver until every packet stages complete.
+        let (wtx, mut wrx) = tokio::sync::mpsc::channel::<Bytes>(256);
+        let writer = TunWriterHandle::new(wtx, metrics.clone());
+        let rx_rt = PolicyRuntime::bootstrap(
+            &Default::default(),
+            &Default::default(),
+            &tunnet_core::acl::SelfIdentity {
+                endpoint_hex: format!("{id_b}"),
+                ip: std::net::Ipv4Addr::new(10, 7, 0, 2),
+                tags: vec![],
+                network: "net".into(),
+            },
+            true,
+            false,
+        );
+        let mut staged = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while staged < N {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lost packets under congestion: staged {staged}/{N}"
+            );
+            let dg = tokio::time::timeout_at(deadline.into(), conn_b.read_datagram())
+                .await
+                .expect("datagrams must keep arriving")
+                .unwrap();
+            let frame = tunnet_common::packet::decode_frame(&dg).expect("must decode");
+            let rx_member = reg_b
+                .get_membership(conn_b.remote_id(), net)
+                .expect("receiver membership");
+            handle_inbound_one(
+                &dg,
+                frame,
+                &rx_member,
+                &rx_rt,
+                &std::collections::HashMap::new(),
+                &bufs,
+                &metrics,
+                &writer,
+                &tx_registry,
+                std::net::Ipv4Addr::new(10, 7, 0, 2),
+            );
+            while wrx.try_recv().is_ok() {
+                staged += 1;
+            }
+        }
+        assert_eq!(staged, N, "every flooded packet must arrive complete");
+        tx_registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn canonical_lifecycle_invalidate() {
+        // Canonical replacement leaves one reader slot; the slot reports
+        // its stable id; unexpected death of the CURRENT connection
+        // invalidates it (transport cleared, memberships NOT deactivated);
+        // a stale id invalidates nothing; same-connection install is
+        // idempotent.
+        use tunnet_core::InstallOutcome;
+        let fx = loopback_fixture().await;
+        let stable = fx.conn_a.stable_id();
+        // Same connection installs idempotently (no second reader owed).
+        assert!(matches!(
+            fx.pool_a
+                .install_canonical(fx.id_b, fx.conn_a.clone(), true)
+                .await,
+            InstallOutcome::Canonical(_)
+        ));
+        assert_eq!(fx.pool_a.canonical_stable_id(fx.id_b).await, Some(stable));
+        assert!(fx.pool_a.has_live(fx.id_b));
+        let member = fx.reg_a.get_membership(fx.id_b, fx.net).unwrap();
+        let epoch0 = member.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        // Stale id: nothing happens.
+        assert!(
+            !fx.pool_a
+                .invalidate_canonical(fx.id_b, stable.wrapping_add(1))
+                .await
+        );
+        assert!(fx.pool_a.has_live(fx.id_b));
+        // Current connection dies unexpectedly: invalidated, transport
+        // cleared, memberships untouched (worker holds packets + redials).
+        assert!(fx.pool_a.invalidate_canonical(fx.id_b, stable).await);
+        assert!(!fx.pool_a.has_live(fx.id_b));
+        let transport = fx.reg_a.get_transport(fx.id_b).unwrap();
+        assert!(transport.live_conn().is_none());
+        assert_eq!(
+            member.epoch.load(std::sync::atomic::Ordering::Relaxed),
+            epoch0,
+            "invalidation must not deactivate memberships"
+        );
+        assert!(fx.reg_a.get_membership(fx.id_b, fx.net).is_some());
     }
 }

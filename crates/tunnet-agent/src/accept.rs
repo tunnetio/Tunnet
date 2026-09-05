@@ -14,25 +14,19 @@ use tunnet_common::{RECORDING_ALPN, SEND_ALPN, TUNNEL_ALPN};
 use tunnet_core::Docs;
 use tunnet_core::direct::{
     AUTH_ALPN, AuthCache, DOCS_ALPN, DocsMembership, GOSSIP_ALPN, SharedAuthServerContext,
-    SpoofTracker, run_auth_server,
+    run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
-use tunnet_core::{AclEngine, ConnPool, PolicyRuntime, RoutingTable, SendManager, SignedClient};
+use tunnet_core::{AclEngine, RoutingTable, SendManager, SignedClient};
 use uuid::Uuid;
 
-use crate::actors::dataplane::PublishedPlane;
-use crate::ingress::IngressRegistry;
-use crate::metrics::AgentMetrics;
+use crate::ingress::IngressManager;
 use crate::recorder::{RecordingStore, serve_recording_connection};
-use crate::tun_io::{InboundDeps, serve_tunnel_connection};
 
 pub struct AcceptDeps {
     pub endpoint: iroh::Endpoint,
     pub routes: RoutingTable,
     pub acl: AclEngine,
-    pub runtime: PolicyRuntime,
-    pub metrics: AgentMetrics,
-    pub tun: PublishedPlane,
     pub stream_handler: StreamHandler,
     pub cp_tx: Option<tokio::sync::mpsc::Sender<ClientMsg>>,
     pub recording_store: Option<Arc<RecordingStore>>,
@@ -40,31 +34,21 @@ pub struct AcceptDeps {
     pub self_endpoint_id: String,
     pub recorder_enabled: bool,
     pub send: SendManager,
-    pub direct_auth: Option<AuthCache>,
     pub auth_server_ctx: Option<SharedAuthServerContext>,
     pub state_dir: PathBuf,
     pub docs: HashMap<Uuid, DocsMembership>,
-    pub spoofs: HashMap<Uuid, SpoofTracker>,
-    pub dgram_pool: ConnPool,
-    pub bufs: Arc<tunnet_common::packet::PacketPool>,
     pub agent_gossip: Option<iroh_gossip::net::Gossip>,
     pub shared_docs: Option<Docs>,
-    pub ingress: IngressRegistry,
+    pub ingress_manager: IngressManager,
+    /// Direct auth cache for the AUTH_ALPN server (same cache the ingress
+    /// context carries for tunnel readers).
+    pub direct_auth: Option<tunnet_core::direct::AuthCache>,
 }
 
 /// Spawn the unified ALPN router. Keep the returned [`Router`] alive for the process lifetime.
 pub fn spawn(deps: AcceptDeps) -> Router {
     let tunnel = TunnelHandler {
-        tun: deps.tun,
-        routes: deps.routes.clone(),
-        acl: deps.acl.clone(),
-        runtime: deps.runtime.clone(),
-        spoofs: deps.spoofs,
-        dgram_pool: deps.dgram_pool,
-        bufs: deps.bufs,
-        metrics: deps.metrics,
-        ingress: deps.ingress,
-        direct_auth: deps.direct_auth.clone(),
+        ingress_manager: deps.ingress_manager,
     };
     let stream = StreamProtocolHandler::new(deps.stream_handler);
     let auth = AuthHandler {
@@ -114,16 +98,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
 
 #[derive(Clone)]
 struct TunnelHandler {
-    tun: PublishedPlane,
-    routes: RoutingTable,
-    acl: AclEngine,
-    runtime: PolicyRuntime,
-    spoofs: HashMap<Uuid, SpoofTracker>,
-    dgram_pool: ConnPool,
-    bufs: Arc<tunnet_common::packet::PacketPool>,
-    metrics: AgentMetrics,
-    ingress: IngressRegistry,
-    direct_auth: Option<AuthCache>,
+    ingress_manager: IngressManager,
 }
 
 impl fmt::Debug for TunnelHandler {
@@ -134,45 +109,10 @@ impl fmt::Debug for TunnelHandler {
 
 impl ProtocolHandler for TunnelHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        if self.tun.load_full().is_none() {
-            tracing::debug!("tunnel ALPN ignored (data plane down)");
-            conn.close(1u32.into(), b"dataplane_down");
-            return Ok(());
-        }
-        let peer = conn.remote_id();
-
-        if !self.dgram_pool.adopt(peer, conn.clone()).await {
-            tracing::debug!(%peer, "accept lost tie-break; closing");
-            conn.close(0u32.into(), b"tie_break");
-            return Ok(());
-        }
-        self.ingress.force_spawn(peer, {
-            let conn = conn.clone();
-            let tun = self.tun.clone();
-            let routes = self.routes.clone();
-            let acl = self.acl.clone();
-            let runtime = self.runtime.clone();
-            let spoofs = self.spoofs.clone();
-            let dgram_pool = self.dgram_pool.clone();
-            let bufs = self.bufs.clone();
-            let metrics = self.metrics.clone();
-            let auth = self.direct_auth.clone();
-            async move {
-                serve_tunnel_connection(InboundDeps {
-                    conn,
-                    tun,
-                    routes,
-                    runtime,
-                    acl,
-                    spoofs,
-                    pool: Some(dgram_pool),
-                    bufs,
-                    metrics,
-                    auth,
-                })
-                .await;
-            }
-        });
+        // One canonical install path (tie-break + single reader install
+        // inside the manager). No dataplane-down check here: the manager
+        // skips reader install when no generation is published.
+        self.ingress_manager.install_accepted(conn).await;
         Ok(())
     }
 }

@@ -11,13 +11,12 @@ mod cmds_update;
 mod core_update;
 mod daemon;
 mod dataplane;
-mod dgram_pump;
+mod endpoint_tx;
 mod forward;
 mod ingress;
 mod magic_dns;
 mod metrics;
 mod policy_api;
-mod pump;
 mod recorder;
 mod runtime;
 #[cfg(unix)]
@@ -31,6 +30,7 @@ mod system_info;
 mod system_routes;
 mod tun_fast;
 mod tun_io;
+mod tun_writer;
 mod underlay;
 #[cfg(unix)]
 mod upgrade;

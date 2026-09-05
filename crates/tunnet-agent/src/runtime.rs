@@ -218,6 +218,26 @@ pub async fn run(
     let published = new_published_plane();
     let status_snapshot = tunnet_core::local_api::DataPlaneStatusSnapshot::new(false);
 
+    // ONE agent-lifetime packet pool (§18): the pool holds no dataplane
+    // generation state, so every generation shares it — along with the
+    // single pool telemetry sampler below (no per-restart sampler tasks).
+    let packet_pool = tunnet_common::packet::PacketPool::new(128);
+    {
+        let bufs = packet_pool.clone();
+        let pool_metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let (h, m) = bufs.take_hit_miss();
+                pool_metrics.pool_hit_miss(h, m);
+            }
+        });
+    }
+    // Ingress-install gate: set when the pool hook is registered (before
+    // BringUp). Preconnect never runs before this.
+    let ingress_gate = Arc::new(AtomicBool::new(false));
+
     // Child configs for the supervisor tree.
     let dataplane_cfg = DataPlaneActorConfig {
         ifname: args.ifname.clone(),
@@ -293,6 +313,8 @@ pub async fn run(
                 published: published.clone(),
                 status: status_snapshot.clone(),
                 ingress: ingress.clone(),
+                packet_pool: packet_pool.clone(),
+                ingress_gate: ingress_gate.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
@@ -369,12 +391,37 @@ pub async fn run(
     let _api_task = spawn_local_api(api_state.clone())
         .await
         .context("start Local Management API")?;
-    if let Some(tx) = on_ready.take() {
-        let _ = tx.send(());
-    }
+    // NOTE: readiness (`on_ready` / sd_notify) fires at the END of this
+    // function, after BringUp + the ALPN router: `up` means the TUN
+    // generation and its mandatory reader/writer tasks are alive.
 
-    #[cfg(unix)]
-    crate::sd_notify::ready("running");
+    // Ingress installation BEFORE BringUp (§13): shared reader context
+    // (same auth cache for accepted and dialed connections), the ingress
+    // manager, and the pool hook. No preconnect may run before this point.
+    let spoofs: HashMap<_, _> = node
+        .direct
+        .iter()
+        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
+        .collect();
+    let ingress_ctx = crate::ingress::IngressContext {
+        routes: node.routes.clone(),
+        acl: node.acl.clone(),
+        runtime: node.policy.clone(),
+        spoofs: spoofs.clone(),
+        bufs: packet_pool.clone(),
+        metrics: metrics.clone(),
+        auth: node.direct_auth.clone(),
+    };
+    let pool_arc = Arc::new(node.tunnel_pool.clone());
+    let ingress_manager = crate::ingress::IngressManager::new(
+        &pool_arc,
+        ingress.clone(),
+        ingress_ctx,
+        published.clone(),
+    );
+    node.tunnel_pool
+        .set_tunnel_hook(ingress_manager.dial_hook());
+    ingress_gate.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
@@ -395,28 +442,6 @@ pub async fn run(
     }
 
     let stream_handler = tunnet_core::stream_handler(node.routes.clone());
-    let dgram_pool = node.tunnel_pool.clone();
-
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-    // Shared tunnel packet resources: pooled buffers (MTU classes) for TUN
-    // receives and segment staging.
-    let packet_pool = tunnet_common::packet::PacketPool::new(128);
-
-    crate::dgram_pump::install_dialer_datagram_pump(
-        &dgram_pool,
-        published.clone(),
-        node.routes.clone(),
-        node.acl.clone(),
-        node.policy.clone(),
-        spoofs.clone(),
-        metrics.clone(),
-        packet_pool.clone(),
-        ingress.clone(),
-    );
 
     let docs_map: HashMap<_, _> = node
         .direct
@@ -523,9 +548,6 @@ pub async fn run(
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
         acl: node.acl.clone(),
-        runtime: node.policy.clone(),
-        metrics: metrics.clone(),
-        tun: published.clone(),
         stream_handler,
         cp_tx: node.serves.client_tx(),
         recording_store,
@@ -533,16 +555,13 @@ pub async fn run(
         self_endpoint_id: node.endpoint_id_hex(),
         recorder_enabled: args.recorder,
         send: node.send.clone(),
-        direct_auth: node.direct_auth.clone(),
         auth_server_ctx,
         state_dir: node.paths.dir.clone(),
         docs: docs_map,
-        spoofs,
-        dgram_pool: dgram_pool.clone(),
-        bufs: packet_pool.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
-        ingress: ingress.clone(),
+        ingress_manager: ingress_manager.clone(),
+        direct_auth: node.direct_auth.clone(),
     });
 
     // PeerDNS first: its Hickory upstream is snapshotted from the underlay
@@ -577,6 +596,15 @@ pub async fn run(
 
     // Explicit shutdown drain: supervisor first (control → presence/posture →
     // update → dataplane → ssh registry), then outer services, then endpoint.
+    // Readiness fires here: the TUN generation (reader + writer) and the
+    // ALPN router are up, so `up` means mandatory packet services are alive.
+    if let Some(tx) = on_ready.take() {
+        let _ = tx.send(());
+    }
+
+    #[cfg(unix)]
+    crate::sd_notify::ready("running");
+
     #[cfg(unix)]
     {
         let _ = shutdown;

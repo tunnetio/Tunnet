@@ -11,9 +11,9 @@ use arc_swap::ArcSwapOption;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
-use tun_rs::AsyncDevice;
 use tunnet_common::DnsConfig;
 use tunnet_common::local_api::LocalEvent;
+use tunnet_common::packet::PacketPool;
 use tunnet_core::CoreNode;
 use tunnet_core::local_api::{DataPlaneControl, DataPlaneStatusSnapshot};
 use uuid::Uuid;
@@ -29,15 +29,16 @@ use crate::system_routes::desired_from_membership;
 
 /// Immutable generation published by `DataPlaneActor`.
 ///
-/// Readers load once, retain `device`, and exit when `cancel` fires.
-/// A new TUN publishes a fresh generation; an old reader can never observe a
-/// new device because it holds the old `Arc` + old token only.
+/// Readers load once and retain `tun_writer` + `tx_registry`; they exit
+/// when `cancel` fires. A new TUN publishes a fresh generation; an old
+/// reader can never observe new state because it holds the old `Arc` +
+/// old token only.
 pub struct PublishedDataPlane {
-    /// Monotonic generation: readers pin the generation loaded at start and
-    /// never observe a newer device.
-    pub generation: u64,
-    pub device: Arc<AsyncDevice>,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Generation-owned TUN writer (the only TUN write path).
+    pub tun_writer: crate::tun_writer::TunWriterHandle,
+    /// Generation-owned endpoint TX workers (the only QUIC send path).
+    pub tx_registry: crate::endpoint_tx::EndpointTxRegistry,
 }
 
 pub type PublishedPlane = Arc<ArcSwapOption<PublishedDataPlane>>;
@@ -84,6 +85,13 @@ pub struct DataPlaneActorArgs {
     /// Ingress reader registry: aborted on BringDown alongside generation
     /// cancellation (defense in depth; readers also observe the token).
     pub ingress: crate::ingress::IngressRegistry,
+    /// Agent-lifetime shared packet pool (§18: one pool, one sampler; the
+    /// pool holds no generation state).
+    pub packet_pool: Arc<PacketPool>,
+    /// Set when the ingress installer (pool hook) is registered. Preconnect
+    /// never runs before this: dials without an installer become canonical
+    /// with no reader.
+    pub ingress_gate: Arc<AtomicBool>,
     /// Start in up state (initial plane already published by bootstrap).
     pub initially_up: bool,
     pub initial_generation: u64,
@@ -108,9 +116,14 @@ pub struct DataPlaneActor {
     published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
     ingress: crate::ingress::IngressRegistry,
+    packet_pool: Arc<PacketPool>,
+    ingress_gate: Arc<AtomicBool>,
     up: bool,
     generation: u64,
     outbound: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<tokio::task::JoinHandle<crate::tun_writer::WriterExit>>,
+    tx_registry: Option<crate::endpoint_tx::EndpointTxRegistry>,
+    preconnect: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -132,7 +145,12 @@ impl Actor for DataPlaneActor {
             published: args.published,
             status: args.status,
             ingress: args.ingress,
+            packet_pool: args.packet_pool,
+            ingress_gate: args.ingress_gate,
             outbound: None,
+            writer: None,
+            tx_registry: None,
+            preconnect: None,
             generation_cancel: None,
         };
         if auto_up {
@@ -166,6 +184,18 @@ impl DataPlaneActor {
         if let Some(outbound) = self.outbound.take() {
             outbound.abort();
         }
+        if let Some(preconnect) = self.preconnect.take() {
+            preconnect.abort();
+        }
+        // Observe endpoint worker termination (bounded): no queued packet
+        // may cross into the next generation.
+        if let Some(registry) = self.tx_registry.take() {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), registry.shutdown()).await;
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+        }
         // Close tunnel connections so old ingress readers exit.
         self.node.tunnel_pool.close_all().await;
         // Best-effort route/DNS cleanup; never fail shutdown.
@@ -185,6 +215,7 @@ impl DataPlaneActor {
         self.up = false;
         self.status.set_up(false);
         self.status.set_outbound_alive(false);
+        self.status.set_writer_alive(false);
         // NOTE: `restarting` is deliberately left alone here: teardown runs
         // on every stop including crashes, and a crash must keep reporting
         // `restarting` until the next successful bring-up clears it.
@@ -214,12 +245,39 @@ impl DataPlaneActor {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let cancel = tokio_util::sync::CancellationToken::new();
+        // Generation-owned I/O: one TUN writer task + one endpoint TX
+        // registry. Created BEFORE publishing so readers/installers never
+        // observe a generation without its mandatory services.
+        let tx_registry = crate::endpoint_tx::EndpointTxRegistry::new(
+            cancel.clone(),
+            self.node.tunnel_pool.clone(),
+            self.node.routes.peer_registry().clone(),
+            self.metrics.clone(),
+            self.packet_pool.clone(),
+            self.node.tunnel_pool.cloud_relay_meter(),
+        );
+        let writer_weak = self_ref.clone();
+        let writer_gen = cancel.clone();
+        let (tun_writer, writer_join) = crate::tun_writer::spawn_tun_writer(
+            tun.clone(),
+            cancel.clone(),
+            self.metrics.clone(),
+            move |err| {
+                if !writer_gen.is_cancelled()
+                    && let Some(actor) = writer_weak.upgrade()
+                {
+                    let _ = actor.tell(TunWriterFailed(err)).try_send();
+                }
+            },
+        );
         self.published.store(Some(Arc::new(PublishedDataPlane {
-            generation,
-            device: tun.clone(),
             cancel: cancel.clone(),
+            tun_writer: tun_writer.clone(),
+            tx_registry: tx_registry.clone(),
         })));
         self.generation_cancel = Some(cancel);
+        self.writer = Some(writer_join);
+        self.tx_registry = Some(tx_registry.clone());
 
         // OS DNS work stays off the actor executor thread.
         let dns_active = match self.cfg.dns.clone() {
@@ -291,18 +349,18 @@ impl DataPlaneActor {
         // Shared tunnel packet resources for this generation: pooled buffers and
         // the runtime sweeper (tied to the generation token — no leaked tasks
         // across bring-up cycles).
-        let packet_pool = tunnet_common::packet::PacketPool::new(128);
+        let packet_pool = self.packet_pool.clone();
         self.node.policy.spawn_sweeper(exit_gen.clone());
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
             tun,
             routes: self.node.routes.clone(),
-            pool: self.node.tunnel_pool.clone(),
             runtime: self.node.policy.clone(),
             metrics: self.metrics.clone(),
             bufs: packet_pool,
-            meter: self.node.tunnel_pool.cloud_relay_meter(),
             mtu: self.cfg.mtu,
+            tx_registry: tx_registry.clone(),
+            tun_writer: tun_writer.clone(),
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
                     && let Some(actor) = exit_weak.upgrade()
@@ -316,35 +374,45 @@ impl DataPlaneActor {
         self.status.set_up(true);
         self.status.set_restarting(false);
         self.status.set_outbound_alive(true);
+        self.status.set_writer_alive(true);
         self.status.set_generation(generation);
         // Eager preconnect (keep-alive): dial every known peer NOW so the
-        // first real packet doesn't pay connection setup (the classic
-        // first-ping-timeout). Best-effort and bounded: skipped peers are
-        // still dialed on demand by the pump. Skipped entirely without
-        // keep-alive.
+        // first real packet doesn't pay connection setup. GATED on ingress
+        // readiness (set when the pool hook is registered, before BringUp):
+        // without an installer, dials would become canonical with no
+        // reader. Bound to the generation token: no stale dial survives
+        // BringDown.
         if self.node.tunnel_pool.keep_alive() {
             let pool = self.node.tunnel_pool.clone();
             let routes = self.node.routes.clone();
             let local = pool.endpoint().id();
-            tokio::spawn(async move {
-                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-                let mut set = tokio::task::JoinSet::new();
-                for peer in routes.peers() {
-                    if peer.endpoint == local {
-                        continue;
-                    }
-                    let Ok(permit) = sem.clone().try_acquire_owned() else {
-                        continue;
-                    };
-                    let pool = pool.clone();
-                    let ep = peer.endpoint;
-                    set.spawn(async move {
-                        let _permit = permit;
-                        let _ = pool.get(ep).await;
-                    });
-                }
-                while set.join_next().await.is_some() {}
+            let gate = self.ingress_gate.load(Ordering::SeqCst);
+            let gen_cancel = self
+                .generation_cancel
+                .clone()
+                .expect("generation token published above");
+            let peers: Vec<_> = routes
+                .peers()
+                .into_iter()
+                .filter(|p| p.endpoint != local)
+                .map(|p| p.endpoint)
+                .collect();
+            let preconnect = tokio::spawn(async move {
+                crate::endpoint_tx::preconnect_peers(
+                    peers,
+                    local,
+                    gate,
+                    &gen_cancel,
+                    move |peer| {
+                        let pool = pool.clone();
+                        async move {
+                            let _ = pool.get(peer).await;
+                        }
+                    },
+                )
+                .await;
             });
+            self.preconnect = Some(preconnect);
         }
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: true });
         tracing::info!("data plane up");
@@ -455,6 +523,23 @@ impl Message<OutboundExited> for DataPlaneActor {
     }
 }
 
+/// The generation-owned TUN writer hit a fatal device error. Fatal means
+/// ambiguous partial-write state: restart into a fresh generation rather
+/// than guessing which packets reached the OS.
+struct TunWriterFailed(String);
+
+impl Message<TunWriterFailed> for DataPlaneActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: TunWriterFailed, _ctx: &mut Context<Self, Self::Reply>) {
+        self.status
+            .note_restart(format!("TUN writer fatal device error: {}", msg.0));
+        self.status.set_writer_alive(false);
+        self.status.set_restarting(true);
+        panic!("TUN writer fatal device error: {}", msg.0);
+    }
+}
+
 impl Message<BringDown> for DataPlaneActor {
     type Reply = Result<(), DataPlaneError>;
 
@@ -536,6 +621,7 @@ impl DataPlaneControl for ActorDataPlaneControl {
         tunnet_common::local_api::DataPlaneInfo {
             state: self.status.state().to_string(),
             outbound_alive: self.status.outbound_alive(),
+            writer_alive: self.status.writer_alive(),
             restart_count: self.status.restart_count(),
             generation: self.status.generation(),
             last_error: self.status.last_error(),
@@ -596,6 +682,8 @@ mod tests {
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
             ingress: crate::ingress::IngressRegistry::new(),
+            packet_pool: tunnet_common::packet::PacketPool::new(8),
+            ingress_gate: Arc::new(AtomicBool::new(true)),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.
@@ -743,6 +831,8 @@ mod tests {
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
             ingress: crate::ingress::IngressRegistry::new(),
+            packet_pool: tunnet_common::packet::PacketPool::new(8),
+            ingress_gate: Arc::new(AtomicBool::new(true)),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.

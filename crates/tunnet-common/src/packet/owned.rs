@@ -23,8 +23,11 @@ use super::{FlowKey, PacketMeta, parse};
 /// frame header, so single-frame encoding never copies the payload.
 pub const FRAME_HEADROOM: usize = 32;
 
-/// Logical/virtual MTU default for the dataplane.
-pub const DEFAULT_VIRTUAL_MTU: usize = 2800;
+/// Logical/virtual MTU default for the dataplane: 1280, so ordinary inner
+/// packets travel as single frames on normal paths instead of depending on
+/// multi-DATAGRAM reassembly. Larger MTUs remain configurable up to
+/// [`MAX_LOGICAL_LEN`]; segmentation covers jumbo configs and small paths.
+pub const DEFAULT_VIRTUAL_MTU: usize = 1280;
 /// Hard ceiling for a logical packet (framing `total_len` is u16-compatible).
 pub const MAX_LOGICAL_LEN: usize = 9000;
 /// Smallest usable logical MTU.
@@ -123,6 +126,20 @@ impl PacketPool {
         for c in &self.classes {
             h += c.hits.load(Relaxed);
             m += c.misses.load(Relaxed);
+        }
+        (h, m)
+    }
+
+    /// Take (and reset) hit/miss counters for delta telemetry. Cumulative
+    /// `hit_miss` overcounts when sampled repeatedly — this is the only
+    /// sampler-facing accessor.
+    pub fn take_hit_miss(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut h = 0;
+        let mut m = 0;
+        for c in &self.classes {
+            h += c.hits.swap(0, Relaxed);
+            m += c.misses.swap(0, Relaxed);
         }
         (h, m)
     }
@@ -435,5 +452,30 @@ mod tests {
         let bytes = Bytes::from(raw.clone());
         let p = LogicalPacket::from_shared(bytes).unwrap();
         assert_eq!(p.owner.as_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn production_default_mtu_is_1280() {
+        // Ordinary inner packets must travel as single frames on normal
+        // paths, not depend on multi-DATAGRAM reassembly. Larger MTUs stay
+        // configurable up to MAX_LOGICAL_LEN.
+        const {
+            assert!(super::DEFAULT_VIRTUAL_MTU == 1280);
+            assert!(MAX_LOGICAL_LEN >= 9000);
+            assert!(MIN_VIRTUAL_MTU <= 1280);
+        }
+    }
+
+    #[test]
+    fn take_hit_miss_reports_deltas() {
+        // Cumulative hit_miss overcounts when sampled repeatedly; the
+        // sampler-facing accessor resets.
+        let pool = PacketPool::new(8);
+        let _ = pool.acquire(100);
+        let _ = pool.acquire(100);
+        let (h, m) = pool.take_hit_miss();
+        assert_eq!(h + m, 2);
+        let (h2, m2) = pool.take_hit_miss();
+        assert_eq!((h2, m2), (0, 0), "take resets the counters");
     }
 }

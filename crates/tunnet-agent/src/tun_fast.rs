@@ -1,21 +1,18 @@
-//! Platform-specific TUN fast paths sharing one packet semantics (§9).
+//! Platform-specific TUN fast paths sharing one packet semantics.
 //!
 //! Linux: offload + `recv_multiple` into pool-owned batch slots (ownership
 //! transferred to logical packets, no per-packet copy) and genuine
 //! multi-packet `send_multiple` batches that let GSO coalesce.
-//! Windows: Wintun ring drained as bursts into pooled buffers and filled
-//! from an explicit pending batch that retains its unsent tail — no silent
-//! loss. Ring capacity stays deliberate; bigger rings only mask queueing.
+//! Windows: Wintun ring drained as bursts into pooled buffers; the
+//! generation-owned TUN writer (see `tun_writer`) owns the pending packet
+//! until success — `try_send` only, no blocking send, no silent loss. Ring
+//! capacity stays deliberate; bigger rings only mask queueing.
 //!
-//! All slot sizes derive from the configured virtual MTU (§6): a 2800+ byte
-//! logical packet is never truncated by a fixed 2 KiB assumption.
+//! All slot sizes derive from the configured virtual MTU: a large logical
+//! packet is never truncated by a fixed 2 KiB assumption.
 
-#[cfg(not(target_os = "linux"))]
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-#[cfg(not(target_os = "linux"))]
-use bytes::Bytes;
 use tun_rs::AsyncDevice;
 #[cfg(any(target_os = "linux", test))]
 use tunnet_common::packet::PooledBuffer;
@@ -26,7 +23,10 @@ use tunnet_common::packet::{LogicalPacket, MAX_LOGICAL_LEN, PacketPool};
 pub const BATCH_SIZE: usize = tun_rs::IDEAL_BATCH_SIZE;
 /// Windows burst budget per readiness wakeup.
 pub const BURST_BUDGET: usize = 64;
-/// Inbound TUN write batch: packets accumulated per drain iteration (§9).
+/// Inbound TUN write batch: packets accumulated per drain iteration.
+/// Linux-only sizing now (the generation-owned writer drains this many per
+/// `send_multiple`); kept visible for tests on all platforms.
+#[allow(dead_code)]
 pub const TUN_WRITE_BATCH: usize = 32;
 
 /// Slot size for a virtual MTU: payload room plus virtio headroom on Linux.
@@ -198,10 +198,6 @@ impl LinuxTunBatchWriter {
         self.staging.push(buf);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.staging.is_empty()
-    }
-
     /// Flush the staged batch with one `send_multiple` call. Buffers are
     /// cleared and retained for the next batch (capacity kept).
     pub async fn flush(&mut self, dev: &AsyncDevice) -> anyhow::Result<usize> {
@@ -266,79 +262,6 @@ pub async fn windows_recv_burst(
     Ok(out)
 }
 
-/// Pending TUN write batch (§9, no silent loss).
-///
-/// `drain_pending` fills the device with repeated `try_send`; when it is
-/// full it waits once via async `send`, then resumes the SAME batch. The
-/// unsent tail is retained in `pending` across waits — ownership is explicit
-/// (`Bytes`, no copy) and nothing is silently discarded.
-///
-/// Used by the Windows Wintun burst writer and by platforms without GSO
-/// batching (same ring discipline everywhere outside Linux, where the GSO
-/// writer owns TUN output instead).
-#[cfg(not(target_os = "linux"))]
-pub struct TunWriteBatch {
-    pub pending: VecDeque<Bytes>,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl TunWriteBatch {
-    pub fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-        }
-    }
-
-    pub fn push(&mut self, pkt: Bytes) {
-        self.pending.push_back(pkt);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
-    /// Drain as much as the ring accepts right now. Returns the number of
-    /// packets written; the remainder stays queued.
-    pub fn drain_pending(&mut self, dev: &AsyncDevice) -> anyhow::Result<usize> {
-        let mut wrote = 0;
-        while let Some(front) = self.pending.front() {
-            match dev.try_send(front) {
-                Ok(_) => {
-                    self.pending.pop_front();
-                    wrote += 1;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(wrote)
-    }
-
-    /// Drain with one async wait when the ring is full; the tail is retained.
-    pub async fn drain_or_wait(&mut self, dev: &AsyncDevice) -> anyhow::Result<usize> {
-        let wrote = self.drain_pending(dev)?;
-        if self.pending.is_empty() {
-            return Ok(wrote);
-        }
-        // Ring full: exactly one async send to wait for space, then resume
-        // the same batch (no tail loss, no async-send pileup).
-        if let Some(front) = self.pending.front().cloned() {
-            dev.send(&front).await?;
-            self.pending.pop_front();
-            Ok(wrote + 1)
-        } else {
-            Ok(wrote)
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl Default for TunWriteBatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,11 +289,11 @@ mod tests {
         // exactly [12B virtio zeros][IP packet] so `flush` with offset 12
         // hands tun-rs the packet at the right place. No device needed.
         let mut w = LinuxTunBatchWriter::new();
-        assert!(w.is_empty());
+        assert!(w.staging.is_empty());
         let mut pkt = vec![0u8; 100];
         pkt[0] = 0x45; // IPv4-shaped, like a real packet
         w.push(&pkt);
-        assert!(!w.is_empty());
+        assert!(!w.staging.is_empty());
         assert_eq!(w.staging.len(), 1);
         let staged = &w.staging[0];
         assert_eq!(staged.len(), tun_rs::VIRTIO_NET_HDR_LEN + pkt.len());
@@ -453,18 +376,6 @@ mod tests {
                 }
             }
         });
-    }
-
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn tun_write_batch_retains_tail() {
-        // Pure state-machine coverage (no device): pending ownership is
-        // explicit; nothing is silently discarded.
-        let mut b = TunWriteBatch::new();
-        assert!(b.is_empty());
-        b.push(Bytes::from_static(&[1, 2, 3]));
-        b.push(Bytes::from_static(&[4, 5]));
-        assert!(!b.is_empty());
     }
 
     #[test]

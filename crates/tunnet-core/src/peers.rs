@@ -1,4 +1,4 @@
-//! Established-peer state (§0.5, §2.2-1).
+//! Established-peer state.
 //!
 //! Transport identity and network membership are SEPARATE objects because
 //! one endpoint may belong to many networks (Direct mode):
@@ -10,14 +10,16 @@
 //!
 //! PeerMembershipState (key: (EndpointId, NetworkId))
 //!   network_id, mesh IP, hostname/tags, network firewall slot,
-//!   per-membership scheduler + reassembly, pump task + epoch
+//!   per-membership reassembly, epoch/revocation state
 //! ```
 //!
-//! There is no mutable network identity inside endpoint-global transport
-//! state, and no endpoint-global scheduler shared across networks. Routing
-//! hands out `Arc<PeerMembershipState>` clones embedded in peer handles;
-//! inbound readers resolve (endpoint, frame network) per connection and
-//! switch membership when the frame network changes.
+//! Outbound queueing is owned by the endpoint TX worker (one scheduler per
+//! endpoint, flows keyed by network + 5-tuple); memberships carry no
+//! scheduler and no pump. There is no mutable network identity inside
+//! endpoint-global transport state. Routing hands out
+//! `Arc<PeerMembershipState>` clones embedded in peer handles; inbound
+//! readers resolve (endpoint, frame network) per connection and switch
+//! membership when the frame network changes.
 //!
 //! The registries (transport + membership DashMaps) are touched only on
 //! slow paths: creation, reconnect, teardown, policy relink, heartbeats.
@@ -25,19 +27,16 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use iroh::EndpointId;
 use iroh::endpoint::Connection;
-use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
+use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::policy_runtime::{FwSlot, PolicyRuntime};
 use crate::reassembly::ReassemblyTable;
-use crate::scheduler::PeerScheduler;
 
 /// Per-network peer identity: who this endpoint IS in one network.
 /// The same endpoint has one of these per network it belongs to — never a
@@ -60,7 +59,9 @@ pub const DEFAULT_MPS: usize = 1280;
 
 /// Endpoint-global transport state: the live QUIC connection and path
 /// measurements shared by all of the endpoint's network memberships.
-/// Carries NO network identity, NO firewall state, NO scheduler.
+/// Carries NO network identity, NO firewall state, NO scheduler. The single
+/// endpoint TX worker submits DATAGRAMs with `send_datagram_wait`; no other
+/// task touches the connection's send path.
 pub struct PeerTransportState {
     pub endpoint: EndpointId,
     pub conn: ArcSwapOption<Connection>,
@@ -72,7 +73,7 @@ pub struct PeerTransportState {
     pub relay: AtomicBool,
     /// Effective DATAGRAM payload size (frame bytes), adapted to path MTU.
     pub mps: AtomicUsize,
-    /// Cached RTT millis for adaptive backoff (updated by path watcher).
+    /// Cached RTT millis (updated by path watcher; informational).
     pub rtt_ms: AtomicU64,
     /// Frame-ID counter shared across memberships (unique per endpoint).
     pub next_frame_id: AtomicU32,
@@ -96,46 +97,6 @@ impl PeerTransportState {
             next_frame_id: AtomicU32::new(rand::random()),
             sends_since_mps_check: AtomicU64::new(0),
         })
-    }
-
-    /// Non-blocking DATAGRAM submit with Model A ownership (§0.6): submit
-    /// only when the reported free space fits the ENTIRE frame, so QUIC never
-    /// silently displaces an older buffered datagram behind our back.
-    ///
-    /// The frame is returned on EVERY error path (§2.1-8) — including a
-    /// failed `send_datagram` after the prechecks passed (via a cheap
-    /// refcount clone handed to QUIC) — so the pump can requeue or resume
-    /// losslessly. A stall never consumes bytes.
-    pub fn try_send_frame(&self, frame: bytes::Bytes) -> Result<(), (FastSendError, bytes::Bytes)> {
-        let frame_len = frame.len();
-        let Some(conn) = self.conn.load_full() else {
-            return Err((FastSendError::NoConnection, frame));
-        };
-        if conn.close_reason().is_some() {
-            self.conn.store(None);
-            return Err((FastSendError::NoConnection, frame));
-        }
-        if let Some(max) = conn.max_datagram_size()
-            && frame_len > max
-        {
-            return Err((FastSendError::TooLarge, frame));
-        }
-        if conn.datagram_send_buffer_space() < frame_len {
-            return Err((FastSendError::TransportFull, frame));
-        }
-        // Clone before handing to QUIC: `send_datagram` consumes its
-        // argument without returning it on error, so without this clone a
-        // late failure would silently eat the frame and break the
-        // ownership/requeue invariant. `Bytes::clone` is a refcount bump.
-        match conn.send_datagram(frame.clone()) {
-            Ok(()) => {
-                self.tx_packets.fetch_add(1, Ordering::Relaxed);
-                self.tx_bytes.fetch_add(frame_len as u64, Ordering::Relaxed);
-                self.touch();
-                Ok(())
-            }
-            Err(_) => Err((FastSendError::Closed, frame)),
-        }
     }
 
     /// Refresh the cached MPS from the live connection (slow-ish: locks the
@@ -175,6 +136,15 @@ impl PeerTransportState {
         }
     }
 
+    pub fn record_tx(&self, n: u64) {
+        self.tx_packets.fetch_add(1, Ordering::Relaxed);
+        self.tx_bytes.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Overlay receive accounting: call when a complete logical packet is
+    /// accepted into the TUN writer queue — NOT on DATAGRAM arrival, and
+    /// never as proof of OS delivery (see the writer's `tun_write_packets`).
     pub fn record_rx(&self, n: u64) {
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.rx_bytes.fetch_add(n, Ordering::Relaxed);
@@ -182,25 +152,25 @@ impl PeerTransportState {
     }
 }
 
-/// Per-(endpoint, network) membership state: everything the established
-/// packet path needs for ONE network, so after routing there are no map
-/// lookups, no async mutexes, and no string conversions.
+/// Per-(endpoint, network) membership state: everything the packet path
+/// needs for ONE network, so after routing there are no map lookups, no
+/// async mutexes, and no string conversions. Queueing lives in the
+/// endpoint TX worker; this state carries network identity, policy slot,
+/// reassembly, and revocation epoch only.
 pub struct PeerMembershipState {
     /// Shared endpoint transport (connection, MPS, counters).
     pub transport: Arc<PeerTransportState>,
     pub identity: RwLock<Arc<PeerIdentity>>,
-    /// Stable network firewall slot (§2.1-3): assigned once per network
+    /// Stable network firewall slot: assigned once per network
     /// (re)resolution, swapped in place by firewall publication. The hot
     /// path loads set + counters with two atomic loads — no map lookup,
     /// no relink.
     pub policy: ArcSwap<FwSlot>,
-    pub scheduler: Mutex<PeerScheduler>,
-    pub reassembly: Mutex<ReassemblyTable>,
-    pub notify: Notify,
-    pub pump_running: AtomicBool,
-    /// Membership epoch: bumped when THIS membership is revoked. Its pump
-    /// drains and exits; readers holding this Arc observe the change. Other
-    /// memberships of the same endpoint are unaffected.
+    pub reassembly: parking_lot::Mutex<ReassemblyTable>,
+    /// Membership epoch: bumped when THIS membership is revoked. Readers
+    /// holding this Arc observe the change; the endpoint worker drops this
+    /// network's queued and in-flight packets. Other memberships of the same
+    /// endpoint are unaffected.
     pub epoch: AtomicU64,
 }
 
@@ -214,31 +184,17 @@ impl PeerMembershipState {
             transport,
             identity: RwLock::new(identity),
             policy: ArcSwap::from_pointee(FwSlot::default()),
-            scheduler: Mutex::new(PeerScheduler::new(DEFAULT_QUANTUM)),
-            reassembly: Mutex::new(ReassemblyTable::new(reassembly_budget)),
-            notify: Notify::new(),
-            pump_running: AtomicBool::new(false),
+            reassembly: parking_lot::Mutex::new(ReassemblyTable::new(reassembly_budget)),
             epoch: AtomicU64::new(0),
         })
     }
 
-    /// Hard-deactivate THIS membership (§2.1-9, §2.2-1): epoch bump (its
-    /// pump drains and exits; readers holding this Arc observe it) plus a
-    /// pump wakeup for prompt exit. Never touches the shared transport
-    /// connection — sibling memberships keep working. Idempotent.
+    /// Hard-deactivate THIS membership: epoch bump (readers holding this Arc
+    /// observe it and exit; the endpoint worker purges this network).
+    /// Never touches the shared transport connection — sibling memberships
+    /// keep working. Idempotent.
     pub fn deactivate(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
-        self.notify.notify_one();
-    }
-
-    /// Refresh path measurements from the shared transport and retune this
-    /// membership's DRR quantum to the effective payload.
-    pub fn refresh_mps(&self) -> Option<usize> {
-        let mps = self.transport.refresh_mps()?;
-        // Scale the DRR quantum with the effective payload: one logical
-        // MTU-ish chunk keeps DRR fair as paths change.
-        self.scheduler.lock().set_quantum(mps.max(512));
-        Some(mps)
     }
 }
 
@@ -248,29 +204,6 @@ fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastSendError {
-    /// No live connection: caller must take the slow reconnect path.
-    NoConnection,
-    /// QUIC DATAGRAM buffer full: scheduler owns the drop/retry decision.
-    TransportFull,
-    TooLarge,
-    Closed,
-}
-
-impl std::fmt::Display for FastSendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoConnection => write!(f, "no live connection"),
-            Self::TransportFull => write!(f, "transport buffer full"),
-            Self::TooLarge => write!(f, "datagram_too_large"),
-            Self::Closed => write!(f, "connection closed"),
-        }
-    }
-}
-
-impl std::error::Error for FastSendError {}
 
 /// Slow-path-only registries. Packet paths never touch these maps: routing
 /// embeds `Arc<PeerMembershipState>` in peer handles and inbound readers
@@ -370,9 +303,9 @@ impl PeerRegistry {
     }
 
     /// Mirror a live connection into the endpoint transport (slow paths
-    /// only). `Some` stores + re-measures + resets frame pacing + retunes
-    /// member schedulers; `None` clears the connection and deactivates all
-    /// of the endpoint's memberships (teardown without replacement).
+    /// only). `Some` stores + re-measures + resets frame pacing; `None`
+    /// clears the connection and deactivates all of the endpoint's
+    /// memberships (teardown without replacement).
     pub fn set_transport_conn(&self, peer: EndpointId, conn: Option<Connection>) {
         let transport = self.ensure_transport(peer);
         match conn {
@@ -398,8 +331,19 @@ impl PeerRegistry {
         }
     }
 
-    /// Path-event refresh (slow path): re-measure transport MPS/RTT,
-    /// optionally update the relay flag, and retune member schedulers.
+    /// Clear a dead canonical connection WITHOUT deactivating memberships:
+    /// the QUIC connection failed, but the endpoint is still a member — the
+    /// endpoint worker holds its packets and reconnects. Used by reader-death
+    /// invalidation only; teardown uses `set_transport_conn(None)`.
+    pub fn clear_transport_conn(&self, peer: EndpointId) {
+        if let Some(t) = self.transports.get(&peer).map(|e| e.value().clone()) {
+            t.conn.store(None);
+        }
+    }
+
+    /// Path-event refresh (slow path): re-measure transport MPS/RTT and
+    /// optionally update the relay flag. Scheduler quanta are retuned by the
+    /// endpoint worker itself from the shared transport MPS.
     pub fn refresh_transport_path(&self, peer: EndpointId, metered: Option<bool>) {
         let Some(t) = self.transports.get(&peer).map(|e| e.value().clone()) else {
             return;
@@ -407,13 +351,7 @@ impl PeerRegistry {
         if let Some(m) = metered {
             t.relay.store(m, Ordering::Relaxed);
         }
-        if let Some(mps) = t.refresh_mps() {
-            for entry in self.memberships.iter() {
-                if entry.key().0 == peer {
-                    entry.value().scheduler.lock().set_quantum(mps.max(512));
-                }
-            }
-        }
+        t.refresh_mps();
     }
 
     /// Legacy single-peer set_conn (pool slow path): delegates to
@@ -589,28 +527,6 @@ impl PeerRegistry {
             None => (0, 0),
         }
     }
-
-    /// Adaptive transport-full backoff (§0.7): RTT/4 clamped to
-    /// [100µs, max]. The ceiling defaults to 2 ms and can be raised for
-    /// A/B runs via `TUNNET_PUMP_BACKOFF_MAX_US` (diagnostic only). No
-    /// fixed 5 ms stall, no spin, no send_datagram_wait. New enqueues
-    /// notify immediately, so this timeout is only the no-new-work
-    /// fallback. (A public `datagrams_unblocked` waiter in Iroh/noq would
-    /// be the cleaner upstream primitive; investigated, not available —
-    /// the internal Notify stays private.)
-    pub fn backoff_for(transport: &PeerTransportState) -> Duration {
-        static MAX_MICROS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let max = *MAX_MICROS.get_or_init(|| {
-            std::env::var("TUNNET_PUMP_BACKOFF_MAX_US")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v >= 100)
-                .unwrap_or(2000)
-        });
-        let rtt_ms = transport.rtt_ms.load(Ordering::Relaxed);
-        let micros = rtt_ms.saturating_mul(250).clamp(100, max);
-        Duration::from_micros(micros)
-    }
 }
 
 #[cfg(test)]
@@ -655,18 +571,6 @@ mod tests {
         let c = reg.ensure(id);
         assert!(Arc::ptr_eq(&a, &c));
         assert_eq!(c.identity.read().hostname, "renamed");
-    }
-
-    #[test]
-    fn try_send_without_conn_returns_frame() {
-        // §2.1-8: every error path returns the frame for lossless requeue.
-        let reg = PeerRegistry::new();
-        let ep = test_endpoint();
-        let s = reg.ensure(identity(ep));
-        let frame = bytes::Bytes::from_static(b"frame-bytes");
-        let (err, back) = s.transport.try_send_frame(frame.clone()).unwrap_err();
-        assert_eq!(err, FastSendError::NoConnection);
-        assert_eq!(back, frame, "frame must come back byte-identical");
     }
 
     #[test]
@@ -768,34 +672,5 @@ mod tests {
         assert!(reg.get_transport(ep).is_some());
         // Endpoint-wide get() now unambiguous again.
         assert!(reg.get(ep).is_some_and(|m| Arc::ptr_eq(&m, &b)));
-    }
-
-    #[test]
-    fn backoff_bounds() {
-        let reg = PeerRegistry::new();
-        let ep = test_endpoint();
-        let s = reg.ensure(identity(ep));
-        s.transport.rtt_ms.store(0, Ordering::Relaxed);
-        assert_eq!(
-            PeerRegistry::backoff_for(&s.transport),
-            Duration::from_micros(100)
-        );
-        s.transport.rtt_ms.store(10_000, Ordering::Relaxed);
-        assert_eq!(
-            PeerRegistry::backoff_for(&s.transport),
-            Duration::from_micros(2000)
-        );
-        s.transport.rtt_ms.store(90, Ordering::Relaxed);
-        // 90 ms → 22.5 ms raw, clamped to the 2 ms ceiling.
-        assert_eq!(
-            PeerRegistry::backoff_for(&s.transport),
-            Duration::from_micros(2000)
-        );
-        s.transport.rtt_ms.store(4, Ordering::Relaxed);
-        // 4 ms → 1 ms raw, inside the band.
-        assert_eq!(
-            PeerRegistry::backoff_for(&s.transport),
-            Duration::from_micros(1000)
-        );
     }
 }

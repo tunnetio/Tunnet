@@ -25,6 +25,7 @@ pub trait DataPlaneControl: Send + Sync {
         tunnet_common::local_api::DataPlaneInfo {
             state: DataPlaneState::Down.to_string(),
             outbound_alive: false,
+            writer_alive: false,
             restart_count: 0,
             generation: 0,
             last_error: None,
@@ -43,6 +44,7 @@ pub trait DataPlaneControl: Send + Sync {
 pub struct DataPlaneStatusSnapshot {
     up: Arc<AtomicBool>,
     outbound_alive: Arc<AtomicBool>,
+    writer_alive: Arc<AtomicBool>,
     restarting: Arc<AtomicBool>,
     restart_count: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
@@ -74,6 +76,7 @@ impl DataPlaneStatusSnapshot {
         Self {
             up: Arc::new(AtomicBool::new(up)),
             outbound_alive: Arc::new(AtomicBool::new(up)),
+            writer_alive: Arc::new(AtomicBool::new(up)),
             restarting: Arc::new(AtomicBool::new(false)),
             restart_count: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -89,12 +92,21 @@ impl DataPlaneStatusSnapshot {
         self.outbound_alive.load(Ordering::SeqCst)
     }
 
+    /// TUN writer task liveness (generation-owned writer draining to the OS).
+    pub fn writer_alive(&self) -> bool {
+        self.writer_alive.load(Ordering::SeqCst)
+    }
+
     pub fn set_up(&self, v: bool) {
         self.up.store(v, Ordering::SeqCst);
     }
 
     pub fn set_outbound_alive(&self, v: bool) {
         self.outbound_alive.store(v, Ordering::SeqCst);
+    }
+
+    pub fn set_writer_alive(&self, v: bool) {
+        self.writer_alive.store(v, Ordering::SeqCst);
     }
 
     pub fn set_restarting(&self, v: bool) {
@@ -130,7 +142,9 @@ impl DataPlaneStatusSnapshot {
         if self.restarting.load(Ordering::SeqCst) {
             DataPlaneState::Restarting
         } else if self.up.load(Ordering::SeqCst) {
-            if self.outbound_alive.load(Ordering::SeqCst) {
+            if self.outbound_alive.load(Ordering::SeqCst)
+                && self.writer_alive.load(Ordering::SeqCst)
+            {
                 DataPlaneState::Up
             } else {
                 DataPlaneState::Degraded
@@ -149,13 +163,19 @@ mod tests {
     fn health_state_transitions() {
         // A dead packet worker must never read as healthy: crash sets
         // restarting (not up), bring-up clears it, bring-down clears all.
+        // Up requires BOTH the TUN reader and the TUN writer alive.
         let s = DataPlaneStatusSnapshot::new(false);
         assert_eq!(s.state(), DataPlaneState::Down);
         s.set_up(true);
         s.set_outbound_alive(true);
+        s.set_writer_alive(true);
         assert_eq!(s.state(), DataPlaneState::Up);
-        // Worker death with the device half up: degraded, not up.
+        // Reader death with the writer half up: degraded, not up.
         s.set_outbound_alive(false);
+        assert_eq!(s.state(), DataPlaneState::Degraded);
+        // Writer death with the reader half up: degraded, not up.
+        s.set_outbound_alive(true);
+        s.set_writer_alive(false);
         assert_eq!(s.state(), DataPlaneState::Degraded);
         // Unexpected end: restarting + error + count, published before
         // supervision restarts the actor.
@@ -171,6 +191,7 @@ mod tests {
         s.set_up(true);
         s.set_restarting(false);
         s.set_outbound_alive(true);
+        s.set_writer_alive(true);
         s.set_generation(7);
         assert_eq!(s.state(), DataPlaneState::Up);
         assert_eq!(s.generation(), 7);
@@ -178,6 +199,7 @@ mod tests {
         s.set_up(false);
         s.set_restarting(false);
         s.set_outbound_alive(false);
+        s.set_writer_alive(false);
         assert_eq!(s.state(), DataPlaneState::Down);
     }
 }

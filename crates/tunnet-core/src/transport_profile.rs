@@ -11,8 +11,8 @@ use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
 
 /// Tunnet DATAGRAM send buffer: 64 KiB. Large enough for pacing/bursts,
 /// small enough that ~80 Mbps serializes it in ~6 ms instead of ~100 ms.
-/// Diagnostic override via `TUNNET_QUIC_DATAGRAM_BUFFER_KB` (e.g. 64 vs
-/// 128 vs 256 A/B runs); clamped to [4 KiB, 1 MiB] like `with_send_buffer`.
+/// One correct default: the endpoint TX worker waits on buffer space with
+/// `send_datagram_wait` instead of racing a precheck, so no tuning knob.
 pub const DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 /// Receive buffer: 256 KiB (generous inbound headroom, still bounded).
 pub const DATAGRAM_RECV_BUFFER: usize = 256 * 1024;
@@ -39,14 +39,9 @@ pub struct TunnetTransportProfile {
 
 impl Default for TunnetTransportProfile {
     fn default() -> Self {
-        let send_buffer = std::env::var("TUNNET_QUIC_DATAGRAM_BUFFER_KB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|kb| kb.saturating_mul(1024).clamp(4096, 1024 * 1024))
-            .unwrap_or(DATAGRAM_SEND_BUFFER);
         Self {
             congestion: CongestionControl::Cubic,
-            datagram_send_buffer: send_buffer,
+            datagram_send_buffer: DATAGRAM_SEND_BUFFER,
             datagram_recv_buffer: DATAGRAM_RECV_BUFFER,
             initial_rtt: Duration::from_millis(90),
             initial_mtu: 1200,
@@ -63,10 +58,9 @@ impl TunnetTransportProfile {
         }
     }
 
-    /// Override the DATAGRAM send buffer for the §19 experiment matrix
-    /// (16/32/64/128 KiB, 64 KiB control). The application queue and the QUIC
-    /// staging queue are one queueing budget: at ~80 Mbps even 64 KiB is
-    /// several milliseconds, so smaller is not automatically worse.
+    /// Override the DATAGRAM send buffer (tests only: tiny buffers prove
+    /// the endpoint TX worker waits instead of displacing queued DATAGRAMs).
+    /// Production uses the fixed default.
     pub fn with_send_buffer(mut self, bytes: usize) -> Self {
         self.datagram_send_buffer = bytes.clamp(4096, 1024 * 1024);
         self

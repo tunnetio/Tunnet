@@ -4,13 +4,12 @@
 //! closed after [`DEFAULT_IDLE_SECS`] and reopened when traffic resumes.
 //! Managed mode defaults to keep-alive (connections stay open).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use iroh::TransportAddr;
@@ -24,8 +23,6 @@ use crate::cloud_relay_meter::CloudRelayMeter;
 
 pub const DEFAULT_IDLE_SECS: u64 = 120;
 pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_BUFFER_PACKETS: usize = 64;
-pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
 type DialResult = Result<Connection, Arc<str>>;
 type DialWaiters = tokio::sync::broadcast::Sender<DialResult>;
@@ -56,6 +53,17 @@ pub struct PeerConnSnapshot {
     pub path: String,
 }
 
+/// Outcome of the canonical connection-install operation.
+#[derive(Debug)]
+pub enum InstallOutcome {
+    /// This connection is canonical (newly installed or already current):
+    /// the caller owns installing exactly one ingress reader for it.
+    Canonical(Connection),
+    /// Tie-break kept another connection: close the candidate, use this one
+    /// (it already has its reader).
+    KeepExisting(Connection),
+}
+
 struct PeerSlot {
     conn: Option<Connection>,
     /// True if the live connection was opened by our dial (not accepted).
@@ -63,8 +71,6 @@ struct PeerSlot {
     state: PeerConnState,
     last_activity: Instant,
     peer_keep_alive: bool,
-    buffer: VecDeque<Bytes>,
-    buffer_bytes: usize,
     /// Shared dial in flight: first waiter dials, others subscribe and await the result.
     dial_waiters: Option<DialWaiters>,
 }
@@ -77,37 +83,12 @@ impl PeerSlot {
             state: PeerConnState::Suspended,
             last_activity: Instant::now(),
             peer_keep_alive: false,
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
             dial_waiters: None,
         }
     }
 
     fn touch(&mut self) {
         self.last_activity = Instant::now();
-    }
-
-    fn push_buf(&mut self, packet: Bytes) -> bool {
-        if self.buffer.len() >= MAX_BUFFER_PACKETS
-            || self.buffer_bytes + packet.len() > MAX_BUFFER_BYTES
-        {
-            return false;
-        }
-        self.buffer_bytes += packet.len();
-        self.buffer.push_back(packet);
-        true
-    }
-
-    fn take_buf(&mut self) -> Vec<Bytes> {
-        self.buffer_bytes = 0;
-        self.buffer.drain(..).collect()
-    }
-
-    fn drop_buf(&mut self) -> usize {
-        let n = self.buffer.len();
-        self.buffer.clear();
-        self.buffer_bytes = 0;
-        n
     }
 
     fn live_conn(&self) -> Option<Connection> {
@@ -315,39 +296,87 @@ impl ConnPool {
         matches!((existing_ok, incoming_ok), (false, true))
     }
 
-    /// Install an accepted connection. Returns false if tie-break keeps the existing conn.
+    /// Outcome of the canonical connection-install operation.
     ///
-    /// Ownership rule: whoever calls `adopt` owns reading this connection
-    /// (accept path) or takes over an existing reader explicitly. `adopt`
-    /// deliberately does NOT fire the dialer tunnel hook — that hook belongs
-    /// to connections this pool dialed itself (`get`), so each connection
-    /// has exactly one reader and datagrams are never split across two
-    /// tasks (the loser would silently eat packets before being aborted).
-    pub async fn adopt(&self, peer: EndpointId, conn: Connection) -> bool {
+    /// Install a canonical tunnel connection: the ONE install path for
+    /// accepted and dialed connections. Atomically decides the tie-break
+    /// winner, mirrors the winner into the endpoint transport, and fires
+    /// the ingress installer when a NEW canonical connection wins.
+    /// Same-connection installs are idempotent no-ops (touch + re-mirror,
+    /// no second reader).
+    ///
+    /// Ownership rule: the caller that receives `Canonical` owns installing
+    /// exactly one ingress reader for it; `KeepExisting` means the candidate
+    /// must be closed (the surviving connection already has its reader).
+    pub async fn install_canonical(
+        &self,
+        peer: EndpointId,
+        conn: Connection,
+        opened_by_us: bool,
+    ) -> InstallOutcome {
         let local = self.endpoint.id();
         let slot = self.slot(peer);
         let mut guard = slot.lock().await;
         if let Some(existing) = guard.live_conn() {
             if existing.stable_id() == conn.stable_id() {
                 guard.touch();
+                guard.state = PeerConnState::Connected;
                 drop(guard);
-                self.sync_fast_conn(peer, Some(conn));
-                return true;
+                self.sync_fast_conn(peer, Some(existing.clone()));
+                return InstallOutcome::Canonical(existing);
             }
-            if !Self::prefer_incoming(local, peer, guard.opened_by_us, false) {
-                return false;
+            if !Self::prefer_incoming(local, peer, guard.opened_by_us, opened_by_us) {
+                guard.touch();
+                let existing = existing.clone();
+                drop(guard);
+                return InstallOutcome::KeepExisting(existing);
             }
             if let Some(old) = guard.conn.take() {
                 old.close(0u32.into(), b"tie_break");
             }
         }
         guard.conn = Some(conn.clone());
-        guard.opened_by_us = false;
+        guard.opened_by_us = opened_by_us;
         guard.state = PeerConnState::Connected;
         guard.touch();
         drop(guard);
-        self.sync_fast_conn(peer, Some(conn));
+        self.sync_fast_conn(peer, Some(conn.clone()));
+        self.spawn_cloud_relay_path_watch(peer, conn.clone());
+        self.fire_tunnel_hook(peer, conn.clone());
+        InstallOutcome::Canonical(conn)
+    }
+
+    /// Invalidate the canonical connection after its reader died unexpectedly
+    /// (QUIC failure while still canonical). Clears the slot and the endpoint
+    /// transport WITHOUT deactivating memberships — the endpoint worker holds
+    /// its packets and reconnects normally. Returns false when the slot
+    /// already moved on (a replacement won; nothing to do).
+    pub async fn invalidate_canonical(&self, peer: EndpointId, stable_id: usize) -> bool {
+        let slot = self.slot(peer);
+        let mut guard = slot.lock().await;
+        let matches = guard
+            .conn
+            .as_ref()
+            .is_some_and(|c| c.stable_id() == stable_id);
+        if !matches {
+            return false;
+        }
+        guard.conn.take();
+        guard.opened_by_us = false;
+        guard.state = PeerConnState::Suspended;
+        drop(guard);
+        if let Some(reg) = self.peer_registry.lock().clone() {
+            reg.clear_transport_conn(peer);
+        }
         true
+    }
+
+    /// Stable id of the current canonical connection, if any (reader-death
+    /// check: only invalidate when the dead reader's connection is still it).
+    pub async fn canonical_stable_id(&self, peer: EndpointId) -> Option<usize> {
+        let slot = self.slot(peer);
+        let guard = slot.lock().await;
+        guard.live_conn().map(|c| c.stable_id())
     }
 
     /// Close every default-ALPN peer connection (e.g. data plane down).
@@ -364,7 +393,6 @@ impl ConnPool {
             }
             g.opened_by_us = false;
             g.state = PeerConnState::Suspended;
-            g.drop_buf();
             tracing::debug!(%peer, "closed tunnel pool connection");
             self.sync_fast_conn(peer, None);
         }
@@ -593,71 +621,29 @@ impl ConnPool {
                         .store(latency_us, Ordering::Relaxed);
                 }
 
-                let local = self.endpoint.id();
-                let (canonical, buffered, fire_hook) = {
-                    let mut guard = slot.lock().await;
-                    if let Some(existing) = guard.live_conn() {
-                        let existing_by_us = guard.opened_by_us;
-                        if Self::prefer_incoming(local, peer, existing_by_us, true) {
-                            // Our dial wins tie-break over the accepted conn.
-                            if let Some(old) = guard.conn.take() {
-                                old.close(0u32.into(), b"tie_break");
-                            }
-                            guard.conn = Some(conn.clone());
-                            guard.opened_by_us = true;
-                            guard.state = PeerConnState::Connected;
-                            guard.touch();
-                            if let Some(tx) = guard.dial_waiters.take() {
-                                let _ = tx.send(Ok(conn.clone()));
-                            }
-                            let buffered = guard.take_buf();
-                            (conn, buffered, true)
-                        } else {
-                            // Tie-break loss: keep the existing connection
-                            // (already owned+read by whoever installed it)
-                            // and close ours. Do NOT fire the hook: firing
-                            // would spawn a second reader on a connection
-                            // that already has one, splitting datagrams.
-                            let existing = existing.clone();
-                            if let Some(tx) = guard.dial_waiters.take() {
-                                let _ = tx.send(Ok(existing.clone()));
-                            }
-                            let buffered = guard.take_buf();
-                            drop(guard);
-                            conn.close(0u32.into(), b"tie_break");
-                            (existing, buffered, false)
-                        }
-                    } else {
-                        guard.conn = Some(conn.clone());
-                        guard.opened_by_us = true;
-                        guard.state = PeerConnState::Connected;
-                        guard.touch();
+                // One canonical install path (same as accepted connections).
+                match self.install_canonical(peer, conn.clone(), true).await {
+                    InstallOutcome::Canonical(canonical) => {
+                        let mut guard = slot.lock().await;
                         if let Some(tx) = guard.dial_waiters.take() {
-                            let _ = tx.send(Ok(conn.clone()));
+                            let _ = tx.send(Ok(canonical.clone()));
                         }
-                        let buffered = guard.take_buf();
-                        (conn, buffered, true)
+                        Ok(canonical)
                     }
-                };
-
-                for pkt in buffered {
-                    if let Err(e) = send_datagram(&canonical, pkt).await {
-                        tracing::debug!(%peer, ?e, "flush buffered datagram dropped");
+                    InstallOutcome::KeepExisting(existing) => {
+                        let mut guard = slot.lock().await;
+                        if let Some(tx) = guard.dial_waiters.take() {
+                            let _ = tx.send(Ok(existing.clone()));
+                        }
+                        drop(guard);
+                        conn.close(0u32.into(), b"tie_break");
+                        Ok(existing)
                     }
                 }
-                self.sync_fast_conn(peer, Some(canonical.clone()));
-                if fire_hook {
-                    self.fire_tunnel_hook(peer, canonical.clone());
-                }
-                Ok(canonical)
             }
             Err(err) => {
                 self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
                 let mut guard = slot.lock().await;
-                let dropped = guard.drop_buf();
-                self.metrics
-                    .packets_dropped_timeout
-                    .fetch_add(dropped as u64, Ordering::Relaxed);
                 guard.state = PeerConnState::Suspended;
                 if let Some(tx) = guard.dial_waiters.take() {
                     let _ = tx.send(Err(err.clone()));
@@ -687,43 +673,6 @@ impl ConnPool {
             .with_context(|| format!("connect to {peer}"))?;
         *guard = Some(conn.clone());
         Ok(conn)
-    }
-
-    /// Send a packet, buffering + reconnecting when the peer is suspended (on-demand).
-    ///
-    /// Slow path only: connection setup, reconnect buffering, tie-breaking.
-    /// Established forwarding goes through `PeerMembershipState::try_send_frame`.
-    pub async fn send_or_buffer(&self, peer: EndpointId, packet: Bytes) -> anyhow::Result<()> {
-        let slot = self.slot(peer);
-        {
-            let mut guard = slot.lock().await;
-            if let Some(c) = guard.live_conn() {
-                guard.touch();
-                drop(guard);
-                return send_datagram(&c, packet).await;
-            }
-            if guard.conn.is_some() {
-                guard.conn = None;
-                guard.state = PeerConnState::Suspended;
-            }
-
-            if !guard.push_buf(packet) {
-                self.metrics
-                    .packets_dropped_timeout
-                    .fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("on-demand buffer full for {peer}");
-            }
-            self.metrics
-                .packets_buffered
-                .fetch_add(1, Ordering::Relaxed);
-            if guard.state == PeerConnState::Reconnecting || guard.dial_waiters.is_some() {
-                return Ok(());
-            }
-            guard.state = PeerConnState::Reconnecting;
-        }
-
-        let _ = self.get(peer).await?;
-        Ok(())
     }
 
     pub fn touch_peer(&self, peer: EndpointId) {
@@ -839,61 +788,6 @@ impl ConnPool {
             },
         }
     }
-}
-
-/// Non-blocking DATAGRAM error. The scheduler owns drop/retry decisions;
-/// the transport is never awaited while holding a stale packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrySendError {
-    Full,
-    TooLarge,
-    Closed,
-}
-
-impl std::fmt::Display for TrySendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => write!(f, "transport buffer full"),
-            Self::TooLarge => write!(f, "datagram_too_large"),
-            Self::Closed => write!(f, "connection closed"),
-        }
-    }
-}
-
-impl std::error::Error for TrySendError {}
-
-/// Non-blocking DATAGRAM submit with Model A ownership (§0.6): never awaits
-/// transport capacity, and never submits unless the reported free space fits
-/// the ENTIRE frame.
-///
-/// Iroh guarantees no older buffered datagram is displaced only when the new
-/// datagram is `<= datagram_send_buffer_space()`; plain `send_datagram`
-/// otherwise discards oldest-first to make room. Tunnet therefore treats
-/// insufficient space as [`TrySendError::Full`] and lets its flow-aware
-/// scheduler own the drop/retry decision (QUIC has no flow information).
-pub fn try_send_datagram(conn: &Connection, packet: Bytes) -> Result<(), TrySendError> {
-    if conn.close_reason().is_some() {
-        return Err(TrySendError::Closed);
-    }
-    if let Some(max) = conn.max_datagram_size()
-        && packet.len() > max
-    {
-        return Err(TrySendError::TooLarge);
-    }
-    if conn.datagram_send_buffer_space() < packet.len() {
-        return Err(TrySendError::Full);
-    }
-    conn.send_datagram(packet).map_err(|_| TrySendError::Closed)
-}
-
-/// Send a datagram without ever awaiting transport capacity.
-///
-/// Replaces the old `send_datagram_wait` semantics: when the QUIC DATAGRAM
-/// buffer is full the packet is dropped (caller records `transport_full`)
-/// instead of converting one stale packet into an arbitrarily long awaited
-/// future that blocks the whole peer scheduler.
-pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
-    try_send_datagram(conn, packet).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

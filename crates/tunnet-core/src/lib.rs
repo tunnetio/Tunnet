@@ -57,14 +57,12 @@ pub use control::{ManagementClient, SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
 #[cfg(feature = "direct")]
 pub use iroh_docs::protocol::Docs;
-pub use iroh_pool::{ConnPool, TrySendError, try_send_datagram};
+pub use iroh_pool::{ConnPool, InstallOutcome};
 pub use leave::leave_direct_network;
 #[cfg(feature = "direct")]
 pub use node::DirectNetworkRuntime;
 pub use node::{CoreNode, CoreNodeConfig};
-pub use peers::{
-    FastSendError, PeerIdentity, PeerMembershipState, PeerRegistry, PeerTransportState,
-};
+pub use peers::{PeerIdentity, PeerMembershipState, PeerRegistry, PeerTransportState};
 pub use policy_runtime::AclDenyRecord;
 pub use policy_runtime::{FwCounters, FwSet, FwSlot, FwSnapshot, PolicyRuntime, PolicyVerdict};
 pub use routing::{FastPeerHandle, PeerInfo, RouteDecision, RoutingTable};
