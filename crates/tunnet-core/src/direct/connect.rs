@@ -23,6 +23,13 @@ pub struct ConnectPending {
     pub endpoint_id: String,
     pub hostname: String,
     pub received_at: Timestamp,
+    /// Requester's mesh address, as it reported at request time.
+    ///
+    /// Absent for records written before the request carried it, and for peers
+    /// running an older agent. Falls back to derivation, which is only correct
+    /// when the peer's `collision_index` is 0.
+    #[serde(default)]
+    pub ipv4: Option<std::net::Ipv4Addr>,
 }
 
 fn load_allowlist(state: &LocalApiState) -> anyhow::Result<HashSet<String>> {
@@ -144,6 +151,9 @@ pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow:
         "contact_id": contact_id_from_endpoint(&state.node.endpoint.id()),
         "endpoint_id": self_hex,
         "hostname": hostname,
+        // Additive: lets the responder install a route to our real address
+        // instead of re-deriving it and guessing `collision_index` 0.
+        "ipv4": state.node.self_ipv4.to_string(),
     });
     let bytes = serde_json::to_vec(&req)?;
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
@@ -218,7 +228,17 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
         .endpoint_id
         .parse()
         .context("parse pending endpoint")?;
-    let peer_ip = derive_ipv4(&pending.endpoint_id, 0);
+    // Prefer the address the peer reported. Deriving it here assumes a
+    // `collision_index` of 0, so a peer the coordinator had to deconflict
+    // would get a route to the wrong address.
+    let peer_ip = pending.ipv4.unwrap_or_else(|| {
+        tracing::warn!(
+            endpoint = %pending.endpoint_id,
+            "pending connect has no reported mesh address; deriving with \
+             collision_index 0, which is wrong if the peer was deconflicted"
+        );
+        derive_ipv4(&pending.endpoint_id, 0)
+    });
     install_peer_route(state, peer, &pending.hostname, peer_ip)?;
 
     // Best-effort: dial back to notify acceptance.
@@ -317,6 +337,10 @@ pub async fn handle_inbound_connect(
         .and_then(|v| v.as_str())
         .unwrap_or(remote_hex)
         .to_string();
+    let peer_ipv4 = req
+        .get("ipv4")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
 
     if allowlist.contains(&contact_id) {
         let resp = serde_json::json!({
@@ -344,6 +368,7 @@ pub async fn handle_inbound_connect(
         endpoint_id,
         hostname,
         received_at: Timestamp::now(),
+        ipv4: peer_ipv4,
     });
     let _ = std::fs::write(&pending_path, serde_json::to_vec_pretty(&list)?);
 
@@ -365,4 +390,68 @@ pub fn load_allowlist_from_dir(state_dir: &std::path::Path) -> HashSet<String> {
 #[allow(dead_code)]
 fn _persist_mode_check(p: &PersistedState) {
     let _ = p.is_direct();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records written before the request carried an address must still load.
+    #[test]
+    fn pending_without_ipv4_still_deserializes() {
+        let old = r#"{
+            "contact_id": "abc",
+            "endpoint_id": "aa",
+            "hostname": "peer",
+            "received_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let p: ConnectPending = serde_json::from_str(old).expect("old record must load");
+        assert_eq!(p.ipv4, None);
+        assert_eq!(p.contact_id, "abc");
+    }
+
+    #[test]
+    fn pending_with_ipv4_round_trips() {
+        let p = ConnectPending {
+            contact_id: "abc".into(),
+            endpoint_id: "aa".repeat(32),
+            hostname: "peer".into(),
+            received_at: Timestamp::now(),
+            ipv4: Some("100.72.1.2".parse().unwrap()),
+        };
+        let back: ConnectPending =
+            serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        assert_eq!(back.ipv4, p.ipv4);
+    }
+
+    /// Why the reported address matters: deriving assumes `collision_index` 0,
+    /// so a peer the coordinator had to deconflict resolves to a different
+    /// address entirely and the installed route would point at the wrong node.
+    #[test]
+    fn derivation_is_wrong_for_a_deconflicted_peer() {
+        let id = "fe".repeat(32);
+        let assumed = derive_ipv4(&id, 0);
+        let actual = derive_ipv4(&id, 1);
+        assert_ne!(
+            assumed, actual,
+            "derivation with a hardcoded 0 cannot represent a deconflicted peer"
+        );
+    }
+
+    /// The reported address is used verbatim, whatever its collision index.
+    #[test]
+    fn reported_address_is_preferred_over_derivation() {
+        let id = "fe".repeat(32);
+        let reported: std::net::Ipv4Addr = derive_ipv4(&id, 3);
+        let pending = ConnectPending {
+            contact_id: "abc".into(),
+            endpoint_id: id.clone(),
+            hostname: "peer".into(),
+            received_at: Timestamp::now(),
+            ipv4: Some(reported),
+        };
+        let chosen = pending.ipv4.unwrap_or_else(|| derive_ipv4(&id, 0));
+        assert_eq!(chosen, reported);
+        assert_ne!(chosen, derive_ipv4(&id, 0));
+    }
 }
