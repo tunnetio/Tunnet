@@ -7,9 +7,12 @@
 
 mod accept;
 mod actors;
-// Platform-agnostic in content, Android-only in use. Also built under `test` so
-// its behaviour is covered by the host test run rather than only on a device.
-#[cfg(any(target_os = "android", test))]
+// Unix-shaped in content (it owns a raw fd), Android-only in use. Also built
+// under `test` on Unix hosts so its behaviour is covered by the host test run
+// rather than only on a device. The `unix` bound is required: `test` alone is
+// true on Windows too, where `std::os::fd` does not exist and `libc` is not a
+// dependency.
+#[cfg(any(target_os = "android", all(test, unix)))]
 pub mod android_tun;
 mod api_bootstrap;
 mod auto_update;
