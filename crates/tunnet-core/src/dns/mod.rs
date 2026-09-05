@@ -44,6 +44,18 @@ pub fn bind_addr(magic_or_tun_ip: Ipv4Addr) -> SocketAddr {
     SocketAddr::from((magic_or_tun_ip, 53))
 }
 
+/// Whether the `bind` fallback is a genuinely different socket from the
+/// magic-IP attempt.
+///
+/// Callers normally pass `bind_addr(magic_ip)`, so the two are usually the same
+/// socket. Retrying an identical address a second time cannot succeed and only
+/// doubles the delay before the error surfaces: 40 attempts over ~21s instead
+/// of 20 over ~10s. Measured on Android, where neither bind can ever succeed
+/// (the magic IP is not on the TUN and port 53 is privileged).
+fn fallback_is_distinct(magic_bind: SocketAddr, bind: SocketAddr) -> bool {
+    magic_bind != bind
+}
+
 async fn bind_udp_with_retry(bind: SocketAddr) -> anyhow::Result<UdpSocket> {
     const ATTEMPTS: u32 = 20;
     let mut last_err = None;
@@ -97,6 +109,7 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
             let magic_bind = SocketAddr::from((dns.magic_ip, bind.port()));
             let s = match bind_udp_with_retry(magic_bind).await {
                 Ok(s) => s,
+                Err(e) if !fallback_is_distinct(magic_bind, bind) => return Err(e),
                 Err(_) => bind_udp_with_retry(bind).await?,
             };
             tracing::info!(%bind, magic = %dns.magic_ip, suffix = %dns.suffix, "PeerDNS stub listening");
@@ -487,6 +500,28 @@ mod tests {
         // A post-overlay system state pointing only at PeerDNS leaves
         // nothing usable; the resolver must fail closed instead of looping.
         assert!(filter_self_nameservers([std::net::IpAddr::V4(magic)], magic).is_empty());
+    }
+
+    /// The fallback must not repeat the attempt that just failed. With the
+    /// standard wiring (`bind_addr(magic_ip)`) both sockets are identical, so
+    /// without this guard the bind is retried 40 times instead of 20, doubling
+    /// the time before the error surfaces.
+    #[test]
+    fn fallback_is_skipped_when_it_would_repeat_the_same_socket() {
+        let magic: Ipv4Addr = "169.254.0.53".parse().unwrap();
+        let bind = bind_addr(magic);
+        let magic_bind = SocketAddr::from((magic, bind.port()));
+        assert!(
+            !fallback_is_distinct(magic_bind, bind),
+            "standard wiring yields the same socket, so the fallback is useless"
+        );
+    }
+
+    #[test]
+    fn fallback_still_runs_for_a_genuinely_different_socket() {
+        let magic_bind = SocketAddr::from(("169.254.0.53".parse::<Ipv4Addr>().unwrap(), 53));
+        let other = SocketAddr::from(("100.95.248.22".parse::<Ipv4Addr>().unwrap(), 53));
+        assert!(fallback_is_distinct(magic_bind, other));
     }
 
     #[test]
