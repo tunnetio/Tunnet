@@ -364,21 +364,8 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 member,
                 member_epoch,
                 cur: PartialPacket::new(item.packet, item.net, mps, frame_id),
+                last_conn: None,
             });
-        }
-        // Periodic MPS refresh covers silent path changes (plus event-driven
-        // refresh in the pool's path watcher and TooLarge recovery below).
-        if ctx
-            .transport
-            .sends_since_mps_check
-            .fetch_add(1, Ordering::Relaxed)
-            >= 512
-            && let Some(mps) = ctx.transport.refresh_mps()
-        {
-            ctx.transport
-                .sends_since_mps_check
-                .store(0, Ordering::Relaxed);
-            state.sched.lock().set_quantum(mps.max(512));
         }
         // Periodic MPS refresh covers silent path changes (plus
         // event-driven refresh in the pool's path watcher and TooLarge
@@ -394,6 +381,20 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 .sends_since_mps_check
                 .store(0, Ordering::Relaxed);
             state.sched.lock().set_quantum(mps.max(512));
+        }
+        // Connection change since the last drive: prefix segments accepted
+        // by the old connection's send path may be lost with it. Replay
+        // from byte 0 (same id when geometry holds, fresh id + replan
+        // when it changed). Scheduler ownership and timestamps untouched.
+        {
+            let it = inflight.as_mut().expect("dequeued above");
+            let sid = conn.stable_id();
+            if it.last_conn != Some(sid) {
+                if it.cur.next_index > 0 {
+                    replay_for_new_connection(&ctx, it);
+                }
+                it.last_conn = Some(sid);
+            }
         }
         let mut sender = ConnSender { conn: &conn };
         match drive_inflight(
@@ -416,9 +417,16 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 report_state(&state, &inner.metrics);
             }
             Drive::ConnLost => {
-                // Cursor retained with owner, geometry, and accumulator
-                // intact; the loop redials above and resumes. Park briefly
-                // so an instantly-failing connection cannot hot-spin.
+                // TX-observed loss on THIS connection: invalidate exactly
+                // this canonical connection (same path as Fatal) so the
+                // worker never re-obtains or retries a connection that
+                // already produced ConnectionLost. The cursor is retained
+                // with everything intact; the loop redials and replays
+                // from byte 0. Park briefly so an instantly-failing
+                // connection cannot hot-spin.
+                ctx.pool
+                    .invalidate_canonical(endpoint, conn.stable_id())
+                    .await;
                 tokio::select! {
                     _ = state.notify.notified() => {}
                     _ = inner.cancel.cancelled() => {}
@@ -493,6 +501,46 @@ struct InFlightTx {
     member: Arc<PeerMembershipState>,
     member_epoch: u64,
     cur: PartialPacket,
+    /// Stable id of the connection the cursor was last driven on. A change
+    /// means `send_datagram_wait` success on the old connection no longer
+    /// proves anything (no remote ack): replay from byte 0 below.
+    last_conn: Option<usize>,
+}
+
+/// Re-drive the worker-owned cursor after a canonical connection change.
+///
+/// `send_datagram_wait` success only admitted the DATAGRAM into the local
+/// QUIC send path — it never acknowledged remote delivery. Prefix segments
+/// sent on the dead connection may be lost with it, so resuming only the
+/// suffix is unsafe. Retained across the change: the exact `LogicalPacket`,
+/// enqueue timestamp / CoDel ownership, scheduler in-flight ownership, and
+/// accumulated wire/frame accounting. Replayed from byte 0:
+/// - geometry unchanged: reuse the frame id and resend all segments (the
+///   receiver's duplicate handling absorbs redeliveries and completes from
+///   whichever prefix actually arrived);
+/// - geometry changed: fresh frame id + the existing safe full replan
+///   (a restart is a new accounting unit).
+fn replay_for_new_connection(ctx: &TxCtx<'_>, it: &mut InFlightTx) {
+    let cur = &mut it.cur;
+    if cur.next_index == 0 {
+        return;
+    }
+    let mps = ctx.transport.mps.load(Ordering::Relaxed);
+    match plan_for_mps(cur.total, mps) {
+        plan if plan == cur.plan => {
+            cur.replay_from_start();
+        }
+        SegmentPlan::Impossible => {
+            // Degenerate path: mark for the drive, which refreshes once
+            // and then drops explicitly.
+            cur.plan = SegmentPlan::Impossible;
+            cur.next_index = 0;
+        }
+        plan => {
+            let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
+            cur.adopt(plan, id);
+        }
+    }
 }
 
 enum Drive {
@@ -587,9 +635,14 @@ struct PartialPacket {
     /// Single for a fresh single-frame cursor).
     plan: SegmentPlan,
     total: usize,
-    /// Wire bytes sent under the current frame id (preserved across
-    /// reconnect resume; reset on restart). Completed exactly once.
+    /// Wire bytes sent under the current accounting unit. Preserved across
+    /// same-geometry replay (every transmission counts; the receiver
+    /// dedups); reset on restart (fresh id = new unit). Completed once.
     wire_bytes: u64,
+    /// DATAGRAM frames sent under the current accounting unit (same
+    /// retention rule as `wire_bytes`): pre-reconnect transmissions are
+    /// never lost from telemetry.
+    frames_sent: u64,
     /// Network bound at enqueue from the route's membership.
     net: Uuid,
 }
@@ -616,17 +669,28 @@ impl PartialPacket {
             plan,
             total,
             wire_bytes: 0,
+            frames_sent: 0,
             net,
         }
     }
 
-    /// Adopt a geometry wholesale: fresh id, offset reset, wire accumulator
-    /// reset. Old offsets are never reused after this point.
+    /// Adopt a geometry wholesale: fresh id, offset reset, accounting
+    /// accumulators reset (a restart is a new accounting unit). Old offsets
+    /// are never reused after this point.
     fn adopt(&mut self, plan: SegmentPlan, frame_id: u32) {
         self.plan = plan;
         self.next_index = 0;
         self.wire_bytes = 0;
+        self.frames_sent = 0;
         self.frame_id = frame_id;
+    }
+
+    /// Replay from byte 0 on a NEW connection with UNCHANGED geometry:
+    /// reuse the frame id and resend every segment (receiver duplicates
+    /// fill or absorb). Accumulators persist — every transmission counts.
+    /// Scheduler ownership, timestamps, and the logical owner are untouched.
+    fn replay_from_start(&mut self) {
+        self.next_index = 0;
     }
 
     /// Re-plan against current MPS (already refreshed by the caller).
@@ -702,7 +766,11 @@ async fn transmit_cursor(
     cur: &mut PartialPacket,
     cancel: &CancellationToken,
 ) -> Drive {
-    if cur.next_index == 0 {
+    // Fresh cursors (nothing transmitted yet) size and adopt here.
+    // Replayed cursors (replay_for_new_connection already validated the
+    // geometry and reset the offset) MUST skip adopt: it would mint a new
+    // id and wipe the retained accumulators.
+    if cur.next_index == 0 && cur.frames_sent == 0 && cur.wire_bytes == 0 {
         let mps = ctx.transport.mps.load(Ordering::Relaxed);
         match plan_for_mps(cur.total, mps) {
             SegmentPlan::Single => return transmit_single(ctx, sender, cur, cancel).await,
@@ -733,11 +801,27 @@ async fn transmit_cursor(
             }
         }
     }
-    debug_assert!(
-        matches!(cur.plan, SegmentPlan::Segmented { .. }),
-        "resumed cursors are always segmented (singles never hold across reconnect)"
-    );
-    transmit_segmented(ctx, sender, cur, 0, cancel).await
+    // Replayed cursors drive their stored plan (validated by the replay).
+    // A degenerate replay refreshes once, then drops explicitly.
+    match cur.plan {
+        SegmentPlan::Single => transmit_single(ctx, sender, cur, cancel).await,
+        SegmentPlan::Segmented { .. } => transmit_segmented(ctx, sender, cur, 0, cancel).await,
+        SegmentPlan::Impossible => {
+            ctx.transport.refresh_mps();
+            let mps2 = ctx.transport.mps.load(Ordering::Relaxed);
+            match plan_for_mps(cur.total, mps2) {
+                SegmentPlan::Single => transmit_single(ctx, sender, cur, cancel).await,
+                plan @ SegmentPlan::Segmented { .. } => {
+                    let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
+                    cur.adopt(plan, id);
+                    transmit_segmented(ctx, sender, cur, 0, cancel).await
+                }
+                SegmentPlan::Impossible => Drive::Dropped {
+                    reason: DropReason::TooLarge,
+                },
+            }
+        }
+    }
 }
 
 /// Encode one frame as a staged copy and wait for buffer space. The logical
@@ -756,7 +840,12 @@ async fn transmit_single(
                 ctx.meter.record(wire as u64);
             }
             ctx.transport.record_tx(wire as u64);
-            Drive::Done { wire, frames: 1 }
+            cur.wire_bytes += wire as u64;
+            cur.frames_sent += 1;
+            Drive::Done {
+                wire: cur.wire_bytes as usize,
+                frames: cur.frames_sent,
+            }
         }
         Err(FrameError::TooLarge) => {
             // Stale MPS: refresh and replan from the ORIGINAL packet.
@@ -800,14 +889,15 @@ async fn transmit_segmented(
             };
         }
     };
-    let mut frames = 0u64;
     // Bounded retries on flapping paths (budget shared across restarts).
+    // Frame/wire totals live in the cursor (not locals): pre-loss
+    // transmissions survive reconnects and complete exactly once.
     loop {
         if cur.next_index >= count {
             // Completion: the whole logical packet with total wire bytes.
             return Drive::Done {
                 wire: cur.wire_bytes as usize,
-                frames,
+                frames: cur.frames_sent,
             };
         }
         let i = cur.next_index;
@@ -840,7 +930,7 @@ async fn transmit_segmented(
         let wire = frame.len();
         match sender.send_frame(frame, cancel).await {
             Ok(()) => {
-                frames += 1;
+                cur.frames_sent += 1;
                 cur.wire_bytes += wire as u64;
                 if ctx.transport.relay.load(Ordering::Relaxed) {
                     ctx.meter.record(wire as u64);
@@ -1158,6 +1248,7 @@ mod tests {
             member: member.clone(),
             member_epoch: epoch,
             cur: PartialPacket::new(item.packet, item.net, mps, frame_id),
+            last_conn: None,
         }
     }
 
@@ -1183,17 +1274,18 @@ mod tests {
                 acc.check(sched);
                 None
             }
-            Drive::Fatal | Drive::Cancelled => {
-                // The worker closes/invalidates (Fatal) or observes
-                // generation end (Cancelled); the harness records the
-                // explicit drop the worker layer performs.
-                sched.discard_inflight(
-                    it.logical_len,
-                    match drive {
-                        Drive::Cancelled => DropReason::GenerationEnd,
-                        _ => DropReason::NoConnection,
-                    },
-                );
+            Drive::Fatal => {
+                // Production retains the cursor, closes/invalidates the
+                // connection, and reconnects. The harness models the same
+                // ownership: retained, conservation holding with the
+                // packet still owned.
+                acc.check(sched);
+                Some(it)
+            }
+            Drive::Cancelled => {
+                // The worker observes generation end; the harness records
+                // the explicit drop the worker layer performs.
+                sched.discard_inflight(it.logical_len, DropReason::GenerationEnd);
                 acc.dropped += 1;
                 acc.check(sched);
                 None
@@ -1433,26 +1525,79 @@ mod tests {
         assert_eq!(acc.completed, 1);
     }
 
-    #[tokio::test]
-    async fn conn_loss_between_jumbo_segments_resumes_same_id() {
-        // 2700 B at MPS 1280 -> 3 segments. Loss after two: resume keeps
-        // the SAME frame id and offset, accumulator intact; total wire
-        // covers all frames exactly once; bytes identical.
+    /// Feed DATAGRAM frames into a real receiver reassembly table,
+    /// collecting every completed logical payload. Returns the completions
+    /// in arrival order.
+    fn receive_all(frames: &[Bytes], budget: &Arc<std::sync::atomic::AtomicU64>) -> Vec<Vec<u8>> {
+        use tunnet_common::packet::decode_frame;
+        use tunnet_core::reassembly::{InsertOut, ReassemblyTable};
+        let mut table = ReassemblyTable::new(budget.clone());
+        let now = Instant::now();
+        let mut completed = Vec::new();
+        for f in frames {
+            let frame = decode_frame(f).expect("sender emits valid frames");
+            match frame {
+                tunnet_common::packet::Frame::Single { payload, .. } => {
+                    completed.push(payload.to_vec());
+                }
+                tunnet_common::packet::Frame::Segment {
+                    header, payload, ..
+                } => {
+                    let off = payload.as_ptr() as usize - f.as_ptr() as usize;
+                    let owned = f.slice(off..off + payload.len());
+                    match table.insert(header, owned, now) {
+                        InsertOut::Complete(logical) => completed.push(logical),
+                        InsertOut::Pending | InsertOut::Duplicate => {}
+                        InsertOut::Dropped(reason) => {
+                            panic!("receiver must not drop test frames: {reason:?}")
+                        }
+                    }
+                }
+            }
+        }
+        completed
+    }
+
+    async fn replay_setup(
+        fill: u8,
+    ) -> (
+        EndpointTxRegistry,
+        Arc<PeerTransportState>,
+        EndpointScheduler,
+        Arc<PeerMembershipState>,
+        Uuid,
+        Conservation,
+        CancellationToken,
+        Vec<u8>,
+    ) {
         let (_peer_reg, tx_reg) = test_registry().await;
         let dead = iroh::SecretKey::generate().public();
         let transport = tx_reg.inner.peer_registry.ensure_transport(dead);
-        let ctx = drive_ctx(&tx_reg, &transport);
         let mut sched = drive_sched();
         let peer_reg = PeerRegistry::new();
         let ep = iroh::SecretKey::generate().public();
         let net = Uuid::from_u128(0xbb);
         let member = test_member(&peer_reg, ep, net, [10, 0, 0, 2]);
         let mut acc = Conservation::new();
-        let pkt = test_packet_fill(2700, 0x22);
+        let pkt = test_packet_fill(2700, fill);
         let want = pkt.owner.as_bytes().to_vec();
         acc.offered(pkt.len());
         assert!(sched.enqueue(net, pkt, Instant::now()).is_accepted());
         let cancel = CancellationToken::new();
+        (tx_reg, transport, sched, member, net, acc, cancel, want)
+    }
+
+    #[tokio::test]
+    async fn replay_after_loss_reconstructs_at_receiver_same_geometry() {
+        // 2700 B at MPS 1280 -> 3 segments. Prefix frames return Ok (then
+        // are deliberately considered LOST), the connection fails, the new
+        // connection replays from byte 0 with the SAME frame id, and the
+        // receiver still reconstructs the exact original logical packet —
+        // from the replay alone AND mixed with stale duplicates.
+        let (tx_reg, transport, mut sched, member, net, mut acc, cancel, want) =
+            replay_setup(0x22).await;
+        let ctx = drive_ctx(&tx_reg, &transport);
+        let budget = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut sender = ScriptSender::new(vec![
             FrameScript::Ok,
             FrameScript::Ok,
@@ -1465,38 +1610,95 @@ mod tests {
         ));
         let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
         assert!(matches!(drive, Drive::ConnLost));
-        assert_eq!(sender.sent.len(), 2);
-        assert_eq!(it.cur.next_index, 2, "resume offset preserved");
-        let fid = it.cur.frame_id;
-        let two_seg_wire: usize = sender.sent.iter().map(|b| b.len()).sum();
-        assert_eq!(it.cur.wire_bytes, two_seg_wire as u64);
-        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        assert_eq!(sender.sent.len(), 2, "prefix accepted by old send path");
+        // New canonical connection: worker replays from byte 0 (same id,
+        // same geometry). Model it exactly as run_endpoint_worker does.
         let mut it = resolve_drive(&mut sched, &mut acc, it, drive)
             .await
             .expect("retained");
-        // Remaining script defaults to Ok: third segment sends, Done.
+        it.last_conn = Some(1000);
+        replay_for_new_connection(&ctx, &mut it);
+        assert_eq!(it.cur.next_index, 0, "replay restarts at byte 0");
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        it.last_conn = Some(1001);
         let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
-        assert_eq!(it.cur.frame_id, fid, "same packet id on resume");
-        let wire = match drive {
-            Drive::Done { wire, frames } => {
-                assert_eq!(frames, 1, "only the resumed segment in this drive");
-                wire
-            }
+        let (wire, frames) = match drive {
+            Drive::Done { wire, frames } => (wire, frames),
             other => panic!("expected Done, got {other:?}"),
         };
-        assert_eq!(sender.sent.len(), 3);
+        // 2 prefix + 3 replayed transmissions, all counted.
+        assert_eq!(sender.sent.len(), 5);
         let total_wire: usize = sender.sent.iter().map(|b| b.len()).sum();
-        assert_eq!(wire, total_wire, "wire covers every frame exactly once");
-        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
-        resolve_drive(&mut sched, &mut acc, it, Drive::Done { wire, frames: 1 }).await;
+        assert_eq!(wire, total_wire);
+        assert_eq!(frames, 5);
+        resolve_drive(&mut sched, &mut acc, it, Drive::Done { wire, frames }).await;
         assert_eq!(acc.completed, 1);
+
+        // Receiver view, prefix truly lost: replay alone completes exactly.
+        let replayed = &sender.sent[2..];
+        assert_eq!(replayed.len(), 3);
+        let completed = receive_all(replayed, &budget);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0], want, "replay reconstructs the original");
+
+        // Receiver view, prefix arrived after all (duplicates): exactly one
+        // completion with the original bytes, duplicates absorbed.
+        let completed = receive_all(&sender.sent, &budget);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0], want);
+        let _ = net;
+    }
+
+    #[tokio::test]
+    async fn replay_after_loss_replans_on_changed_mps() {
+        // Same loss, but the new path is smaller (MPS 1280 -> 700):
+        // replay adopts a fresh frame id with new geometry, and the
+        // receiver reconstructs the original from the new frame set while
+        // the stale old-id partial never completes.
+        let (tx_reg, transport, mut sched, member, _net, mut acc, cancel, want) =
+            replay_setup(0x33).await;
+        let ctx = drive_ctx(&tx_reg, &transport);
+        let budget = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut sender = ScriptSender::new(vec![
+            FrameScript::Ok,
+            FrameScript::Ok,
+            FrameScript::ConnLost,
+        ]);
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 41);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::ConnLost));
+        let old_id = it.cur.frame_id;
+        let mut it = resolve_drive(&mut sched, &mut acc, it, drive)
+            .await
+            .expect("retained");
+        // New path shrank before the replay.
+        ctx.transport.mps.store(700, Ordering::Relaxed);
+        it.last_conn = Some(1000);
+        replay_for_new_connection(&ctx, &mut it);
+        assert_ne!(it.cur.frame_id, old_id, "changed geometry mints fresh id");
+        assert!(matches!(
+            it.cur.plan,
+            SegmentPlan::Segmented { count: 5, .. }
+        ));
+        it.last_conn = Some(1001);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Done { .. }));
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.completed, 1);
+
+        // Receiver: old-id prefix (2 segs, never completes) + new-id full
+        // set (5 segs) -> exactly one completion, original bytes.
+        let completed = receive_all(&sender.sent, &budget);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0], want);
     }
 
     #[tokio::test]
     async fn several_packets_mixed_fates_conserve() {
         // Four packets: clean send, repeated TooLarge -> explicit drop,
-        // Fatal -> explicit worker-layer drop, cancel-mid-block ->
-        // GenerationEnd. Conservation after EVERY transition.
+        // Fatal -> retained across invalidation -> replacement connection
+        // completes it, cancel-mid-block -> exactly one GenerationEnd.
+        // Conservation after EVERY transition.
         let (_peer_reg, tx_reg) = test_registry().await;
         let dead = iroh::SecretKey::generate().public();
         let transport = tx_reg.inner.peer_registry.ensure_transport(dead);
@@ -1549,18 +1751,31 @@ mod tests {
         resolve_drive(&mut sched, &mut acc, it, drive).await;
         assert_eq!(acc.dropped, 1);
 
-        // p2: Fatal (unsupported) -> worker-layer explicit drop.
+        // p2: Fatal (unsupported) -> retained while production
+        // closes/invalidates the old connection; the replacement
+        // connection (mocked by the continuing script) completes it.
         let p2 = test_packet_fill(200, 0x03);
+        let want2 = p2.owner.as_bytes().to_vec();
         acc.offered(p2.len());
         assert!(sched.enqueue(net, p2, Instant::now()).is_accepted());
         let mut it = dequeue_inflight(&mut sched, &member, 1280, 3);
         let mut sender = ScriptSender::new(vec![FrameScript::Fatal]);
         let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
         assert!(matches!(drive, Drive::Fatal));
-        // The worker closes/invalidates and reconnects; the harness
-        // records the explicit drop the worker layer performs.
+        // Production ownership: logical packet remains in-flight across
+        // the invalidation (never reconstructed, never re-timestamped).
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want2[..]);
+        assert_eq!(it.cur.next_index, 0);
+        let mut it = resolve_drive(&mut sched, &mut acc, it, drive)
+            .await
+            .expect("retained across invalidation");
+        assert_eq!(acc.dropped, 1, "still only the TooLarge drop");
+        // Replacement connection: the SAME cursor completes.
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Done { frames: 1, .. }));
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want2[..]);
         resolve_drive(&mut sched, &mut acc, it, drive).await;
-        assert_eq!(acc.dropped, 2);
+        assert_eq!(acc.completed, 2);
 
         // p3: blocked send + generation cancel -> GenerationEnd.
         let p3 = test_packet_fill(200, 0x04);
@@ -1581,7 +1796,7 @@ mod tests {
         assert_eq!(it.cur.packet.owner.as_bytes(), &want3[..]);
         let _ = canceller_task.await;
         resolve_drive(&mut sched, &mut acc, it, drive).await;
-        assert_eq!(acc.dropped, 3);
+        assert_eq!(acc.dropped, 2);
 
         // End state: everything resolved, nothing owned.
         let snap = sched.snapshot();

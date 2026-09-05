@@ -1903,3 +1903,29 @@ Follow-up audit found bugs in the 2.3 architecture itself. All fixed, all with r
 
 Phase 2.3 is closed: every acceptance invariant from the closure spec holds by construction and is regression-tested. The only remaining manual step is the single final Windows<->Linux benchmark. Phase 3 not started.
 
+# 21. Replay, invalidation, shutdown, and bench follow-up
+
+The architecture held, but six invariants were still violated. Fixed without touching the ownership model.
+
+## 21.1 Replay segmented packets from byte 0 (item 1)
+
+`send_datagram_wait` Ok is not a remote ack: resuming only the suffix on a new connection could lose the prefix with the dead connection. The worker now tracks the last-driven connection id per in-flight cursor; any change with transmitted-but-unresolved frames replays from byte 0 — same frame id when geometry holds (receiver duplicates absorb), fresh id + full replan when it changed. Scheduler ownership, timestamps, and accumulators are untouched by the replay. Frame counts moved into the persistent cursor next to `wire_bytes` (pre-reconnect transmissions are no longer lost from telemetry; restarts remain new accounting units). The old `resumes_same_id` test is replaced by receiver-oriented regressions: prefix considered lost, replay alone reconstructs the exact bytes; mixed with stale duplicates exactly one completion; changed-MPS replay completes while the stale partial never does.
+
+## 21.2 Invalidate on TX ConnLost (item 2)
+
+`Drive::ConnLost` now takes the same exact-stable-id invalidation path as `Fatal`: the worker never re-obtains a connection that already produced `ConnectionLost`. The cursor is retained; the loop redials and replays.
+
+## 21.3 Shutdown, MPS, Fatal fidelity (items 3-5)
+
+- The outer `timeout(10s, registry.shutdown())` in teardown is deleted: the inner shutdown is already cancel → bounded-join → abort → await, and wrapping it could detach exactly the workers it proves terminated.
+- The duplicated periodic MPS block in the worker loop is removed (one remains).
+- `resolve_drive` models production for `Fatal` (retained across invalidation, completed by the replacement connection — not a synthetic drop). Cancellation mid-process resolves exactly one `GenerationEnd`.
+
+## 21.4 Capacity stats for Phase 3 (item 6)
+
+No new tuning matrix. Capacity measurement defaults to 3 P4 repeats and records explicit `capacity` rows per direction with median/min/max/spread/repeats; spread/median above 25% warns UNSTABLE in the row and on console. UDP/fragmentation behavior unchanged.
+
+## 21.5 Validation
+
+`cargo fmt --check`, `cargo check --workspace --all-targets --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features` (439 passed Windows, 442 passed Linux-excl-desktop), `cargo test --workspace --all-features` (exit 0), `bash -n` + PS parser + embedded-python AST checks on both bench scripts.
+

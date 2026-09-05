@@ -12,8 +12,10 @@
 # short). Up/down loads use separate server ports ($6/$7, default
 # 5201/5202 — the server must listen on both); failed loads mark their row
 # valid=false instead of hiding behind -1 placeholders.
-# Capacity is the MEDIAN of valid P4 repeats per direction (never a lucky
-# maximum); a failed matrix stops the run instead of inventing 50 Mbps.
+# Capacity is the MEDIAN of at least 3 valid P4 repeats per direction
+# (never a lucky maximum); min/max/spread ride explicit capacity rows and
+# a >25% spread is flagged UNSTABLE. A failed matrix stops the run instead
+# of inventing 50 Mbps.
 # "server is busy" listener contention retries boundedly (infrastructure,
 # never Tunnet loss). One shared parser (benchlib.py) reports
 # receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
@@ -26,7 +28,7 @@ set -u
 PEER="${1:-10.7.0.2}"
 DURATION="${2:-10}"
 PRODUCT="${3:-tunnet}"
-REPEATS="${4:-2}"
+REPEATS="${4:-3}"
 MTU="${5:-0}"
 # Independent iperf3 server ports per direction: two simultaneous clients
 # against one default port conflict (single active test per listener).
@@ -357,6 +359,32 @@ if [ "$N_UP" -lt "$REPEATS" ] || [ "$N_DOWN" -lt "$REPEATS" ]; then
   echo "Results so far: $JSONL"
   exit 1
 fi
+# Capacity summary rows: median/min/max/spread per direction. A large
+# spread is flagged UNSTABLE, never hidden inside the median.
+for dirspec in "up:$CAP_UP:$CAP_UP_VALS" "down:$CAP_DOWN:$CAP_DOWN_VALS"; do
+  dname="${dirspec%%:*}"; rest="${dirspec#*:}"; dmed="${rest%%:*}"; dvals="${rest#*:}"
+  path_json > "$RESULTS_DIR/capacity-$dname.path"
+  python3 - "$dname" "$dmed" "$dvals" "$RESULTS_DIR/capacity-$dname.path" <<'EOF'
+import json,sys,datetime,os,statistics
+direction, med, vals, ppath = sys.argv[1], float(sys.argv[2]), [float(x) for x in sys.argv[3].split()], sys.argv[4]
+mn, mx = min(vals), max(vals)
+spread = round(mx - mn, 1)
+spread_pct = round(spread / med, 3) if med > 0 else 0.0
+note = ''
+if spread_pct > 0.25:
+    note = 'UNSTABLE capacity spread (max-min/median > 25%): treat sweeps against this capacity with suspicion'
+    print(f"  WARNING: {direction} capacity unstable (median={med} min={mn} max={mx})", flush=True)
+path = json.load(open(ppath))
+row = {'scenario': 'capacity', 'direction': direction,
+       'median_mbps': med, 'min_mbps': mn, 'max_mbps': mx,
+       'spread_mbps': spread, 'spread_pct': spread_pct, 'repeats': len(vals),
+       'path': path, 'note': note, 'valid': True}
+row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+row['product'] = os.environ['BENCH_PRODUCT']
+row['meta'] = json.loads(os.environ['BENCH_META'])
+open(os.environ['BENCH_JSONL'], 'a').write(json.dumps(row) + chr(10))
+EOF
+done
 # No invented capacity: if the TCP matrix failed, every capacity-dependent
 # sweep would be built on fiction. Stop loudly instead.
 if ! python3 -c "import sys; sys.exit(0 if float('$CAP_UP')>0 and float('$CAP_DOWN')>0 else 1)"; then

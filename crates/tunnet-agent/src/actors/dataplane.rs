@@ -205,11 +205,13 @@ impl DataPlaneActor {
         Self::join_task(self.outbound.take()).await;
         Self::join_task(self.preconnect.take()).await;
         Self::join_task(self.sweeper.take()).await;
-        // Observe endpoint worker termination (bounded): no queued packet
-        // may cross into the next generation.
+        // Observe endpoint worker termination: the registry shutdown is
+        // already cancel → bounded-join → abort → await (deterministic),
+        // so no outer timeout may wrap it — timing out would drop the
+        // shutdown future and its JoinHandles and detach exactly the
+        // workers it exists to prove terminated.
         if let Some(registry) = self.tx_registry.take() {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(10), registry.shutdown()).await;
+            registry.shutdown().await;
         }
         Self::join_task(self.writer.take()).await;
         // Best-effort route/DNS cleanup; never fail shutdown.

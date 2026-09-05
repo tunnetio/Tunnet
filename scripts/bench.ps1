@@ -3,7 +3,7 @@ param(
     [int]$Duration = 10,
     [string]$Product = "tunnet",
     [string]$TunnetApi = "http://127.0.0.1:8899",
-    [int]$Repeats = 2,
+    [int]$Repeats = 3,
     [int]$Mtu = 0,
     # Independent iperf3 server ports per direction: two simultaneous
     # clients against one default port conflict (single active test per
@@ -33,8 +33,10 @@ param(
 # samples, else null. Latency probes are asynchronous/staggered via a
 # runspace pool so every sample window lies inside its load interval (200
 # samples: p50/p95/p99 meaningful, p999 null BY DESIGN; idle uses 1200).
-# Capacity is the MEDIAN of valid P4 repeats per direction (never a lucky
-# maximum); a failed matrix stops the run instead of inventing 50 Mbps.
+# Capacity is the MEDIAN of at least 3 valid P4 repeats per direction
+# (never a lucky maximum); min/max/spread ride explicit capacity rows and
+# a >25% spread is flagged UNSTABLE. A failed matrix stops the run instead
+# of inventing 50 Mbps.
 # "server is busy" listener contention retries boundedly (infrastructure,
 # never Tunnet loss). One shared UDP parser (Parse-UdpSummary) reports
 # receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
@@ -427,6 +429,27 @@ if ($cap.up -eq 0 -or $cap.down -eq 0) {
     Write-Host "  FATAL: TCP capacity measurement failed (up=$($cap.up) down=$($cap.down)). Refusing to invent 50 Mbps; fix the TCP path first." -ForegroundColor Red
     Write-Host "Results so far: $Jsonl" -ForegroundColor Yellow
     exit 1
+}
+# Capacity summary rows: median/min/max/spread per direction. A large
+# spread is flagged UNSTABLE (real signal about path variance), never
+# hidden inside the median.
+foreach ($dir in @("up", "down")) {
+    $vals = $capVals[$dir]
+    $med = $cap[$dir]
+    $mn = ($vals | Measure-Object -Minimum).Minimum
+    $mx = ($vals | Measure-Object -Maximum).Maximum
+    $spread = [math]::Round($mx - $mn, 1)
+    $spreadPct = 0.0
+    if ($med -gt 0) { $spreadPct = [math]::Round($spread / $med, 3) }
+    $note = ""
+    if ($spreadPct -gt 0.25) {
+        $note = "UNSTABLE capacity spread (max-min/median > 25%): treat sweeps against this capacity with suspicion"
+        Write-Host "  WARNING: $dir capacity unstable (median=${med} min=${mn} max=${mx})" -ForegroundColor Yellow
+    }
+    Write-Row @{ scenario = "capacity"; direction = $dir
+        median_mbps = $med; min_mbps = $mn; max_mbps = $mx
+        spread_mbps = $spread; spread_pct = $spreadPct; repeats = $vals.Count
+        path = (Get-PathState); note = $note; valid = $true }
 }
 Write-Host "  measured capacity: up=$($cap.up)Mbps down=$($cap.down)Mbps"
 
