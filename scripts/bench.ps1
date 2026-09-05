@@ -11,8 +11,12 @@ param(
     [int]$ServerPortUp = 5201,
     [int]$ServerPortDown = 5202,
     # Local agent metrics endpoint for per-scenario software-drop deltas
-    # (only queried when Product=tunnet; empty otherwise).
-    [string]$MetricsUrl = "http://127.0.0.1:9100/metrics"
+    # (only queried when Product=tunnet; unavailable reads as unavailable,
+    # never as zero).
+    [string]$MetricsUrl = "http://127.0.0.1:9100/metrics",
+    # Peer agent metrics endpoint (the SENDER side for downloads). Defaults
+    # to the peer's overlay metrics listener when Product=tunnet.
+    [string]$PeerMetricsUrl = ""
 )
 
 # Tunnet Benchmark v3 — structured, repeatable, hard to lie with.
@@ -20,7 +24,7 @@ param(
 # line to results.jsonl with fields:
 #   {ts, product, scenario, direction, fraction, offered_mbps, actual_mbps,
 #    loss_pct, retransmits, latency:{n,p50,p95,p99,p999,max}, path:{...},
-#    meta:{...}, note, valid, sw_drops}
+#    meta:{...}, note, valid, local_sw_drops, peer_sw_drops}
 # Throughput matrix (TCP 1/4, up/down/bidir with explicit JSON parse),
 # loaded-latency sweeps per direction plus full-duplex bidir at fractions
 # of independently measured directional capacity (download load uses -R),
@@ -34,8 +38,11 @@ param(
 # "server is busy" listener contention retries boundedly (infrastructure,
 # never Tunnet loss). One shared UDP parser (Parse-UdpSummary) reports
 # receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
-# Every row carries sw_drops (local scheduler/TUN software-drop deltas, tunnet
-# runs only), so one benchmark is self-diagnosing without manual A/B runs.
+# Every row carries local_sw_drops + peer_sw_drops (scheduler/TUN
+# software-drop deltas from both agents on tunnet runs, each with explicit
+# availability), so one benchmark is self-diagnosing without manual A/B
+# runs: sender scheduler drops and receiver TUN-writer drops are both
+# observable, and unavailable telemetry never reads as zero.
 
 $ErrorActionPreference = "Continue"
 
@@ -152,21 +159,39 @@ function Invoke-IperfJson {
 # the receiver; a missing receiver summary invalidates the row instead of
 # promoting the offer. Returns @{ok, actual, sent, loss, jitter, pps_sent,
 # pps_received, error}.
+# Property existence is checked explicitly ($Obj.PSObject.Properties):
+# a missing `packets_received` must fall back to `packets`, never
+# silently become pps_recv=0 on a successful non-zero run. Same for
+# sender counts.
+function Get-JsonProp($Obj, [string[]]$Names) {
+    if ($null -eq $Obj) { return $null }
+    foreach ($n in $Names) {
+        if ($Obj.PSObject.Properties.Name -contains $n -and $null -ne $Obj.$n) {
+            return $Obj.$n
+        }
+    }
+    return $null
+}
+
 function Parse-UdpSummary($j) {
     try {
         if ($j.error) { return @{ ok = $false; error = "iperf error: $($j.error)" } }
         $recv = $j.end.sum_received
         if ($null -eq $recv) { return @{ ok = $false; error = "no sum_received in iperf JSON" } }
         $send = $j.end.sum
+        $sbps = Get-JsonProp $send @("bits_per_second")
         $sent = $null
-        try { $sent = [math]::Round($send.bits_per_second / 1e6, 1) } catch {}
+        if ($null -ne $sbps) { $sent = [math]::Round($sbps / 1e6, 1) }
         $actual = [math]::Round($recv.bits_per_second / 1e6, 1)
         $loss = -1; $jitter = $null; $ppsSent = $null; $ppsRecv = $null
-        try { $loss = [math]::Round($recv.lost_percent, 2) } catch {}
-        try { $jitter = [math]::Round($recv.jitter_ms, 3) } catch {}
-        try { $ppsSent = [math]::Round($send.packets / $Duration, 0) } catch {}
-        try { $ppsRecv = [math]::Round($recv.packets_received / $Duration, 0) } catch {}
-        if ($null -eq $ppsRecv) { try { $ppsRecv = [math]::Round($recv.packets / $Duration, 0) } catch {} }
+        $lp = Get-JsonProp $recv @("lost_percent")
+        if ($null -ne $lp) { $loss = [math]::Round($lp, 2) }
+        $jm = Get-JsonProp $recv @("jitter_ms")
+        if ($null -ne $jm) { $jitter = [math]::Round($jm, 3) }
+        $sp = Get-JsonProp $send @("packets")
+        if ($null -ne $sp) { $ppsSent = [math]::Round($sp / $Duration, 0) }
+        $rp = Get-JsonProp $recv @("packets_received", "packets")
+        if ($null -ne $rp) { $ppsRecv = [math]::Round($rp / $Duration, 0) }
         return @{ ok = $true; actual = $actual; sent = $sent; loss = $loss; jitter = $jitter
             pps_sent = $ppsSent; pps_received = $ppsRecv; error = "" }
     } catch {
@@ -174,32 +199,60 @@ function Parse-UdpSummary($j) {
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($PeerMetricsUrl) -and $Product -eq "tunnet") {
+    # The agent listens on localhost AND its overlay IP: the peer's
+    # sender-side drops are observable over the tunnel itself.
+    $PeerMetricsUrl = "http://${Peer}:9100/metrics"
+}
+
 # Scenario telemetry: low-cardinality software-drop counters scraped from
-# the local agent before/after each scenario (Product=tunnet only). The
-# delta rides the result row, so one benchmark is self-diagnosing: any
-# internal Tunnet drop during a scenario shows up without manual A/B runs.
-# True network/outer-QUIC loss stays distinguishable (no counter moves).
-function Get-SwDrops {
-    $zero = [ordered]@{ sched = 0.0; dropped = 0.0; tun_write_drop = 0.0 }
-    if ($Product -ne "tunnet") { return $zero }
+# the LOCAL agent and the PEER agent before/after each scenario (tunnet
+# runs only). Uploads drop on the local sender; downloads drop on the
+# remote sender — one side alone cannot see both. Availability is explicit:
+# @{available=$false} when an endpoint is unreachable; zero is reported
+# only after a successful scrape, never as a substitute for "unknown".
+function Get-SwSnapshot([string]$Url) {
+    if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) {
+        return [ordered]@{ available = $false }
+    }
     try {
-        $text = Invoke-RestMethod -Uri $MetricsUrl -TimeoutSec 5
-        if ($text -isnot [string]) { return $zero }
-        $out = [ordered]@{ sched = 0.0; dropped = 0.0; tun_write_drop = 0.0 }
+        $text = Invoke-RestMethod -Uri $Url -TimeoutSec 5
+        if ($text -isnot [string]) { return [ordered]@{ available = $false } }
+        $out = [ordered]@{ available = $true; sched = 0.0; dropped = 0.0; tun_write_drop = 0.0 }
         foreach ($line in ($text -split "`n")) {
             if ($line -match "^tunnet_sched_drops_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.sched += [double]$Matches[1] }
             elseif ($line -match "^tunnet_dropped_packets_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.dropped += [double]$Matches[1] }
             elseif ($line -match "^tunnet_tun_write_queue_drop_total\s+([0-9.eE+-]+)") { $out.tun_write_drop += [double]$Matches[1] }
         }
         return $out
-    } catch { return $zero }
+    } catch { return [ordered]@{ available = $false } }
 }
 
-function Diff-SwDrops($Before, $After) {
+function Get-ScenarioSw {
     return [ordered]@{
+        local = (Get-SwSnapshot $MetricsUrl)
+        peer = (Get-SwSnapshot $PeerMetricsUrl)
+    }
+}
+
+function Diff-Sw($Before, $After) {
+    if (-not $Before.available -or -not $After.available) {
+        return [ordered]@{ available = $false }
+    }
+    return [ordered]@{
+        available = $true
         sched = [math]::Round($After.sched - $Before.sched, 0)
         dropped = [math]::Round($After.dropped - $Before.dropped, 0)
         tun_write_drop = [math]::Round($After.tun_write_drop - $Before.tun_write_drop, 0)
+    }
+}
+
+# Capture the "after" side and return both deltas for the row.
+function SwDelta($Before) {
+    $after = Get-ScenarioSw
+    return [ordered]@{
+        local_sw_drops = (Diff-Sw $Before.local $after.local)
+        peer_sw_drops = (Diff-Sw $Before.peer $after.peer)
     }
 }
 
@@ -276,7 +329,7 @@ $capVals = @{ up = @(); down = @() }
 foreach ($rep in 1..$Repeats) {
     foreach ($c in $tpCases) {
         $pathBefore = Get-PathState
-        $sw0 = Get-SwDrops
+        $sw0 = Get-ScenarioSw
         $r = Invoke-IperfJson -IperfArgs $c.args -OutFile "$ResultsDir\$($c.name)-r$rep.json"
         if ($r.ok) {
             $j = $r.json
@@ -285,22 +338,31 @@ foreach ($rep in 1..$Repeats) {
             $sentMbps = 0; try { $sentMbps = [math]::Round($j.end.sum_sent.bits_per_second / 1e6, 1) } catch {}
             Write-Host "  $($c.name) r$rep : $mbps Mbps (retr=$retr)"
             if ($c.name -like "*-4") {
-                $capVals[$c.dir] += $mbps
+                # A capacity repeat is valid only with measured throughput
+                # > 0 (iperf exit ok + receiver bytes > 0). Zeros are not
+                # measurements: they are excluded, and the repeat-count
+                # gate below fails the matrix instead of median-ing them.
+                if ($mbps -gt 0) { $capVals[$c.dir] += $mbps }
+                else { Write-Host "  $($c.name) r$rep : ZERO throughput — excluded from capacity" -ForegroundColor Red }
             }
+            $sw = SwDelta $sw0
             Write-Row @{ scenario = $c.name; direction = $c.dir; repeat = $rep; offered_mbps = $null
                 actual_mbps = $mbps; sent_mbps = $sentMbps; retransmits = $retr; path = $pathBefore; valid = $true
-                sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+                local_sw_drops = $sw.local_sw_drops
+                peer_sw_drops = $sw.peer_sw_drops }
         } else {
             Write-Host "  $($c.name) r$rep : FAILED: $($r.error)" -ForegroundColor Red
+            $sw = SwDelta $sw0
             Write-Row @{ scenario = $c.name; direction = $c.dir; repeat = $rep; offered_mbps = $null
                 actual_mbps = -1; sent_mbps = -1; retransmits = -1; path = $pathBefore
                 note = "TCP FAILED: $($r.error)"; valid = $false
-                sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+                local_sw_drops = $sw.local_sw_drops
+                peer_sw_drops = $sw.peer_sw_drops }
         }
     }
     # Bidirectional: parse both directions explicitly (v2 bug: bidir was unread).
     $pathBefore = Get-PathState
-    $sw0 = Get-SwDrops
+    $sw0 = Get-ScenarioSw
     $r = Invoke-IperfJson -IperfArgs @(
         "-c", $Peer,
         "-p", "$ServerPortUp",
@@ -324,15 +386,19 @@ foreach ($rep in 1..$Repeats) {
             }
         } catch {}
         Write-Host "  tcp-bidir r$rep : up=${upMbps}Mbps down=${downMbps}Mbps (retr=$retr)"
+        $sw = SwDelta $sw0
         Write-Row @{ scenario = "tcp-bidir"; direction = "bidir"; repeat = $rep
             actual_mbps = $upMbps; down_mbps = $downMbps; retransmits = $retr; path = $pathBefore; valid = $true
-            sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+            local_sw_drops = $sw.local_sw_drops
+            peer_sw_drops = $sw.peer_sw_drops }
     } else {
         Write-Host "  tcp-bidir r$rep : FAILED: $($r.error)" -ForegroundColor Red
+        $sw = SwDelta $sw0
         Write-Row @{ scenario = "tcp-bidir"; direction = "bidir"; repeat = $rep
             actual_mbps = -1; down_mbps = -1; retransmits = -1; path = $pathBefore
             note = "TCP FAILED: $($r.error)"; valid = $false
-            sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+            local_sw_drops = $sw.local_sw_drops
+            peer_sw_drops = $sw.peer_sw_drops }
     }
 }
 # No invented capacity: if the TCP matrix failed, every capacity-dependent
@@ -349,6 +415,14 @@ function Get-Median([double[]]$Values) {
 }
 $cap.up = [math]::Round((Get-Median $capVals.up), 1)
 $cap.down = [math]::Round((Get-Median $capVals.down), 1)
+# Matrix validity: ALL requested P4 repeats per direction must be valid.
+# One zero/invalid repeat (e.g. down r1=0, r2=104.1) must not median into
+# a false 52 Mbps capacity — the sweeps would test against fiction.
+if ($capVals.up.Count -lt $Repeats -or $capVals.down.Count -lt $Repeats) {
+    Write-Host "  FATAL: TCP capacity repeats incomplete (up valid $($capVals.up.Count)/$Repeats, down valid $($capVals.down.Count)/$Repeats). Matrix invalid; refusing capacity-relative sweeps." -ForegroundColor Red
+    Write-Host "Results so far: $Jsonl" -ForegroundColor Yellow
+    exit 1
+}
 if ($cap.up -eq 0 -or $cap.down -eq 0) {
     Write-Host "  FATAL: TCP capacity measurement failed (up=$($cap.up) down=$($cap.down)). Refusing to invent 50 Mbps; fix the TCP path first." -ForegroundColor Red
     Write-Host "Results so far: $Jsonl" -ForegroundColor Yellow
@@ -372,7 +446,7 @@ foreach ($d in $dirs) {
         $rate = [math]::Round($d.cap * $f, 1)
         $pct = [int]($f * 100)
         $pathBefore = Get-PathState
-        $sw0 = Get-SwDrops
+        $sw0 = Get-ScenarioSw
         # Direction-specific load: download MUST use -R (server sends), or
         # the "download" test silently measures upload load.
         $isDown = ($d.name -eq "download")
@@ -417,10 +491,12 @@ foreach ($d in $dirs) {
         if ($actual -gt 0 -and $actual -lt $rate * 0.7 -and $f -le 1.0) { $note += " under-delivered load" }
         if (-not $valid) { $note += " LOAD FAILED ($loadErr): row invalid, values are placeholders" }
         Write-Host "  $($d.name) ${pct}%: actual=${actual}Mbps loss=${loss}% p50=$($lat.p50) p95=$($lat.p95) p99=$($lat.p99) max=$($lat.max) valid=$valid $note"
+        $sw = SwDelta $sw0
         Write-Row @{ scenario = "loaded-latency"; direction = $d.name; fraction = $f
             offered_mbps = $rate; actual_mbps = $actual; loss_pct = $loss
             latency = $lat; path = $pathBefore; path_after = $pathAfter; note = $note.Trim(); valid = $valid
-            sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+            local_sw_drops = $sw.local_sw_drops
+            peer_sw_drops = $sw.peer_sw_drops }
     }
 }
 
@@ -434,7 +510,7 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
     $rateDown = [math]::Round($cap.down * $f, 1)
     $pct = [int]($f * 100)
     $pathBefore = Get-PathState
-    $sw0 = Get-SwDrops
+    $sw0 = Get-ScenarioSw
     $upFile = "$ResultsDir\load-bidi-$f-up.json"
     $downFile = "$ResultsDir\load-bidi-$f-down.json"
     $jobUp = Start-Job -ScriptBlock {
@@ -502,18 +578,24 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
     if ($errUp) { $note += " BIDIR INVALID: up load failed ($errUp)" }
     if ($errDown) { $note += " BIDIR INVALID: down load failed ($errDown)" }
     Write-Host "  bidir ${pct}%: up=${actualUp}Mbps loss=${lossUp}% down=${actualDown}Mbps loss=${lossDown}% p50=$($lat.p50) p95=$($lat.p95) p99=$($lat.p99) valid=$valid $note"
+    $sw = SwDelta $sw0
     Write-Row @{ scenario = "loaded-latency"; direction = "bidir"; fraction = $f
         offered_up_mbps = $rateUp; offered_down_mbps = $rateDown
         actual_up_mbps = $actualUp; actual_down_mbps = $actualDown
         loss_up_pct = $lossUp; loss_down_pct = $lossDown
         latency = $lat; path = $pathBefore; path_after = $pathAfter; note = $note.Trim(); valid = $valid
-        sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+        local_sw_drops = $sw.local_sw_drops
+        peer_sw_drops = $sw.peer_sw_drops }
 }
 
 # --- UDP sweep: rates x sizes x directions, sender vs receiver split ---
-# Sizes span single-frame (512, 900) and segmented (1200, 1460, 2700)
-# dataplane behavior; both directions run so upload/download asymmetries
-# (like the Linux→Windows collapse) show up with numbers, not vibes.
+# -l is the iperf PAYLOAD size; the IPv4 packet on the TUN is ~28 B larger.
+# With TUN MTU 1280: -l 512/900/1200 stay whole inner packets (single
+# overlay frames), while -l 1460 (~1488 B) and -l 2700 (~2728 B) exceed the
+# inner MTU and arrive as IPv4 FRAGMENTS — those two sizes are
+# inner-fragmentation stress tests (fragment identity + deferred policy),
+# NOT direct overlay-segmentation tests.
+# Both directions run so upload/download asymmetries show up with numbers.
 # `actual_mbps` is RECEIVER-side delivered throughput (sum_received), never
 # the sender offer: iperf3 UDP `sum` can be sender-side, and misreading it
 # once reported "actual=50Mbps loss=92%" for ~3.8 Mbps delivered.
@@ -538,7 +620,7 @@ foreach ($ud in $udpDirs) {
                 "-l", "$len",
                 "-t", "$Duration"
             ) + $ud.extra
-            $sw0 = Get-SwDrops
+            $sw0 = Get-ScenarioSw
             $r = Invoke-IperfJson -IperfArgs $udpArgs -OutFile "$ResultsDir\udp-$($ud.name)-${rate}M-${len}B.json"
             if ($r.ok) {
                 $j = $r.json
@@ -552,17 +634,21 @@ foreach ($ud in $udpDirs) {
                 $loss = $ps.loss
                 $jitter = $ps.jitter
                 Write-Host ("  $($ud.name) offered={0}Mbps sent={1}Mbps delivered={2}Mbps pps_sent={3} pps_recv={4} loss={5}% jitter={6}ms len={7}B" -f $rate, $sentMbps, $del, $ppsSent, $ppsRecv, $loss, $jitter, $len)
+                $sw = SwDelta $sw0
                 Write-Row @{ scenario = "udp"; direction = $ud.name; offered_mbps = $rate; packet_len = $len
                     sent_mbps = $sentMbps; actual_mbps = $del; pps_sent = $ppsSent; pps_received = $ppsRecv
                     loss_pct = $loss; jitter_ms = $jitter; path = (Get-PathState); valid = $true
-                    sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+                    local_sw_drops = $sw.local_sw_drops
+                    peer_sw_drops = $sw.peer_sw_drops }
             } else {
                 Write-Host "  $($ud.name) offered=${rate}Mbps len=${len}B : FAILED: $($r.error)" -ForegroundColor Red
+                $sw = SwDelta $sw0
                 Write-Row @{ scenario = "udp"; direction = $ud.name; offered_mbps = $rate; packet_len = $len
                     sent_mbps = -1; actual_mbps = -1; pps_sent = $null; pps_received = $null
                     loss_pct = -1; jitter_ms = $null; path = (Get-PathState)
                     note = "UDP FAILED: $($r.error)"; valid = $false
-                    sw_drops = (Diff-SwDrops $sw0 (Get-SwDrops)) }
+                    local_sw_drops = $sw.local_sw_drops
+                    peer_sw_drops = $sw.peer_sw_drops }
             }
         }
     }

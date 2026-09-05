@@ -25,7 +25,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use tunnet_common::packet::{
-    CachedTransport, FragKey, FragmentTable, PacketMeta, ResolvedL4, TcpFlags, Transport,
+    CachedTransport, FragmentTable, PacketMeta, ResolvedL4, TcpFlags, Transport,
 };
 use tunnet_common::policy::{
     Action, DefaultAction, Direction, IcmpPolicy, PolicyBundle, Protocol, RuleScope, Selector,
@@ -630,14 +630,18 @@ impl PolicyRuntime {
     /// Background expiry sweeper (§14): rate-limited, shard-local, never
     /// blocking packets. Each 250 ms tick reaps at most a few dozen expired
     /// nodes per shard and rebuilds a heap only when stale nodes dominate.
-    /// Tied to the dataplane generation token: BringDown cancels it, so no
-    /// sweeper task leaks across bring-up cycles.
-    pub fn spawn_sweeper(&self, cancel: tokio_util::sync::CancellationToken) {
+    /// Tied to the dataplane generation token: BringDown cancels it. Returns
+    /// the task handle so teardown can OBSERVE termination (None when no
+    /// async runtime exists, e.g. sync tests).
+    pub fn spawn_sweeper(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
+            return None;
         };
         let inner = self.inner.clone();
-        handle.spawn(async move {
+        Some(handle.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
             loop {
                 tokio::select! {
@@ -694,7 +698,7 @@ impl PolicyRuntime {
                     }
                 }
             }
-        });
+        }))
     }
 
     /// Current policy generation, read from the live snapshot (single
@@ -974,6 +978,20 @@ impl PolicyRuntime {
         (verdict, policy_gen, fw_gen)
     }
 
+    /// Scoped first-fragment context query (no remember, no verdict): used
+    /// by the deferred-fragment holder to decide whether a later fragment
+    /// can already evaluate (context exists) or must wait for its first
+    /// fragment. Scope (network, direction) matches `check_inner` exactly.
+    pub fn fragment_context(
+        &self,
+        meta: &PacketMeta,
+        network: Uuid,
+        direction: Direction,
+    ) -> Option<ResolvedL4> {
+        let inner = self.inner.load();
+        inner.fragments.lock().lookup_meta(meta, network, direction)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn check_inner(
         &self,
@@ -996,15 +1014,19 @@ impl PolicyRuntime {
         let fw_snap = fw_slot.snapshot.load();
         let fw_gen = fw_snap.generation;
         let fw = &fw_snap.set;
+        // Conntrack is network-scoped: the membership network joins the key.
+        // Fragment state is scoped by (network, direction) for the same
+        // reason — computed BEFORE the fragment block below.
+        let net = peer_network.unwrap_or(Uuid::nil());
         // Fast path: unfragmented traffic never touches the fragment lock.
         let l4: ResolvedL4 = if meta.is_later_fragment() {
-            let Some(hit) = inner.fragments.lock().lookup_meta(meta) else {
+            let Some(hit) = inner.fragments.lock().lookup_meta(meta, net, direction) else {
                 return (PolicyVerdict::Deny, policy_gen, fw_gen);
             };
             hit
         } else {
             if meta.is_fragment() {
-                inner.fragments.lock().remember_meta(meta);
+                inner.fragments.lock().remember_meta(meta, net, direction);
             }
             match ResolvedL4::from_transport(meta.transport) {
                 Some(l4) => l4,
@@ -1016,8 +1038,6 @@ impl PolicyRuntime {
             return (PolicyVerdict::Deny, policy_gen, fw_gen);
         };
         let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-        // Conntrack is network-scoped: the membership network joins the key.
-        let net = peer_network.unwrap_or(Uuid::nil());
 
         // Single canonical established lookup, shared both directions (§0.1).
         // Entries admitted under older generations revalidate once (§0.4,
@@ -1347,34 +1367,33 @@ fn fw_verdict(
 }
 
 trait FragMetaExt {
-    fn lookup_meta(&mut self, meta: &PacketMeta) -> Option<ResolvedL4>;
-    fn remember_meta(&mut self, meta: &PacketMeta);
+    fn lookup_meta(
+        &mut self,
+        meta: &PacketMeta,
+        network: Uuid,
+        direction: Direction,
+    ) -> Option<ResolvedL4>;
+    fn remember_meta(&mut self, meta: &PacketMeta, network: Uuid, direction: Direction);
 }
 
 impl FragMetaExt for FragmentTable {
-    fn lookup_meta(&mut self, meta: &PacketMeta) -> Option<ResolvedL4> {
-        let key = FragKey {
-            src: meta.src,
-            dst: meta.dst,
-            protocol: meta.proto,
-            identification: meta.fragmentation.identification()?,
-        };
+    fn lookup_meta(
+        &mut self,
+        meta: &PacketMeta,
+        network: Uuid,
+        direction: Direction,
+    ) -> Option<ResolvedL4> {
+        let key = FragmentTable::key_for_meta(meta, network, direction)?;
         self.lookup_cached(&key)
     }
 
-    fn remember_meta(&mut self, meta: &PacketMeta) {
+    fn remember_meta(&mut self, meta: &PacketMeta, network: Uuid, direction: Direction) {
         use tunnet_common::packet::Fragmentation;
         if !matches!(meta.fragmentation, Fragmentation::First { .. }) {
             return;
         }
-        let Some(id) = meta.fragmentation.identification() else {
+        let Some(key) = FragmentTable::key_for_meta(meta, network, direction) else {
             return;
-        };
-        let key = FragKey {
-            src: meta.src,
-            dst: meta.dst,
-            protocol: meta.proto,
-            identification: id,
         };
         let cached = match meta.transport {
             Transport::Tcp {
@@ -1768,6 +1787,51 @@ mod tests {
         let meta = PacketMeta::from_packet(&pkt);
         assert!(meta.is_later_fragment());
         assert_eq!(check_out(&p, &meta, &slot), PolicyVerdict::Allow);
+    }
+
+    #[test]
+    fn fragment_state_is_network_and_direction_scoped() {
+        // Network A's first fragment must never authorize network B's
+        // later fragment (overlapping Direct address spaces), and outbound
+        // state must never authorize inbound traffic.
+        let (p, slot) = new_policy(open_bundle());
+        let net_a = Uuid::from_u128(0x0a0a);
+        let net_b = Uuid::from_u128(0x0b0b);
+        let check = |m: &PacketMeta, net: Uuid, dir: Direction| {
+            p.check(m, dir, "bb", &[], None, Some(net), &slot, &slot.counters)
+        };
+        let b = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(40000, 443);
+        let mut first = Vec::new();
+        b.write(&mut first, &[0; 100]).unwrap();
+        first[4..6].copy_from_slice(&0x1111u16.to_be_bytes());
+        first[6] = 0x20; // MF set, offset 0
+        first[7] = 0x00;
+        let mut later = first.clone();
+        later[6] = 0x20;
+        later[7] = 0x08; // offset 64
+        let first_meta = PacketMeta::from_packet(&tunnet_common::packet::parse(&first).unwrap());
+        let later_meta = PacketMeta::from_packet(&tunnet_common::packet::parse(&later).unwrap());
+        assert!(later_meta.is_later_fragment());
+        // A's outbound first: allowed, primes A/outbound only.
+        assert_eq!(
+            check(&first_meta, net_a, Direction::Outbound),
+            PolicyVerdict::Allow
+        );
+        // A's outbound later: hit.
+        assert_eq!(
+            check(&later_meta, net_a, Direction::Outbound),
+            PolicyVerdict::Allow
+        );
+        // B's outbound later: fail-closed (no cross-network priming).
+        assert_eq!(
+            check(&later_meta, net_b, Direction::Outbound),
+            PolicyVerdict::Deny
+        );
+        // A's inbound later: fail-closed (no cross-direction priming).
+        assert_eq!(
+            check(&later_meta, net_a, Direction::Inbound),
+            PolicyVerdict::Deny
+        );
     }
 
     #[test]

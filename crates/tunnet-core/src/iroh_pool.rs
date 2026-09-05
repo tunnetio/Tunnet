@@ -73,6 +73,10 @@ struct PeerSlot {
     peer_keep_alive: bool,
     /// Shared dial in flight: first waiter dials, others subscribe and await the result.
     dial_waiters: Option<DialWaiters>,
+    /// Stable id of the connection a path watcher was last spawned for.
+    /// Guards exactly-one-watcher per canonical connection even if install
+    /// is re-entered.
+    watched_stable: Option<usize>,
 }
 
 impl PeerSlot {
@@ -84,6 +88,7 @@ impl PeerSlot {
             last_activity: Instant::now(),
             peer_keep_alive: false,
             dial_waiters: None,
+            watched_stable: None,
         }
     }
 
@@ -108,6 +113,7 @@ struct PoolMetrics {
     packets_dropped_timeout: AtomicU64,
     reconnect_latency_sum_us: AtomicU64,
     reconnect_latency_max_us: AtomicU64,
+    path_watchers_spawned: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +125,7 @@ pub struct OnDemandStats {
     pub packets_dropped_timeout: u64,
     pub reconnect_latency_avg_us: u64,
     pub reconnect_latency_max_us: u64,
+    pub path_watchers_spawned: u64,
 }
 
 type ExtraConnMap = DashMap<(EndpointId, Vec<u8>), Arc<AsyncMutex<Option<Connection>>>>;
@@ -275,11 +282,12 @@ impl ConnPool {
     }
 
     fn fire_tunnel_hook(&self, peer: EndpointId, conn: Connection) {
+        // Hook only: path watching lives in the canonical install path
+        // (exactly one watcher per canonical connection — see below).
         let hook = self.tunnel_hook.lock().clone();
         if let Some(hook) = hook {
             hook(peer, conn.clone());
         }
-        self.spawn_cloud_relay_path_watch(peer, conn);
     }
 
     /// Local EndpointId is the canonical initiator when `local < peer`.
@@ -339,9 +347,20 @@ impl ConnPool {
         guard.opened_by_us = opened_by_us;
         guard.state = PeerConnState::Connected;
         guard.touch();
+        // Exactly one path watcher per canonical connection: skip when
+        // this connection is already watched (re-entrant installs).
+        let watch = guard.watched_stable != Some(conn.stable_id());
+        if watch {
+            guard.watched_stable = Some(conn.stable_id());
+        }
         drop(guard);
         self.sync_fast_conn(peer, Some(conn.clone()));
-        self.spawn_cloud_relay_path_watch(peer, conn.clone());
+        if watch {
+            self.spawn_cloud_relay_path_watch(peer, conn.clone());
+            self.metrics
+                .path_watchers_spawned
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.fire_tunnel_hook(peer, conn.clone());
         InstallOutcome::Canonical(conn)
     }
@@ -364,6 +383,7 @@ impl ConnPool {
         guard.conn.take();
         guard.opened_by_us = false;
         guard.state = PeerConnState::Suspended;
+        guard.watched_stable = None;
         drop(guard);
         if let Some(reg) = self.peer_registry.lock().clone() {
             reg.clear_transport_conn(peer);
@@ -464,6 +484,7 @@ impl ConnPool {
                 .metrics
                 .reconnect_latency_max_us
                 .load(Ordering::Relaxed),
+            path_watchers_spawned: self.metrics.path_watchers_spawned.load(Ordering::Relaxed),
         }
     }
 

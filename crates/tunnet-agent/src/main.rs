@@ -13,6 +13,7 @@ mod daemon;
 mod dataplane;
 mod endpoint_tx;
 mod forward;
+mod frag_hold;
 mod ingress;
 mod magic_dns;
 mod metrics;

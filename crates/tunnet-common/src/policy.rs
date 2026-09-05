@@ -760,7 +760,7 @@ fn proto_port_ok(r: &PolicyRule, protocol: Protocol, dst_port: Option<u16>) -> b
     true
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Inbound,
     Outbound,

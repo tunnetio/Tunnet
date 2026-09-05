@@ -100,13 +100,40 @@ impl IngressRegistry {
         true
     }
 
-    pub fn abort_all(&self) {
+    /// Observed generation shutdown: abort every reader AND await their
+    /// termination (bounded, abort + await stragglers — never detach a
+    /// reader that can still touch generation state). After return, no
+    /// reader of this registry exists.
+    pub async fn shutdown(&self) {
         self.bump_generation();
         let keys: Vec<_> = self.readers.iter().map(|e| *e.key()).collect();
+        let mut pending: Vec<JoinHandle<()>> = Vec::with_capacity(keys.len());
         for k in keys {
             if let Some((_, (_, h))) = self.readers.remove(&k) {
                 h.abort();
+                pending.push(h);
             }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut i = 0;
+        while i < pending.len() {
+            if pending[i].is_finished() {
+                let h = pending.remove(i);
+                let _ = h.await;
+            } else if std::time::Instant::now() >= deadline {
+                break;
+            } else {
+                i += 1;
+                if i >= pending.len() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    i = 0;
+                }
+            }
+        }
+        // Stragglers are already aborted above; await their termination
+        // observably (aborted tasks finish promptly).
+        for h in pending {
+            let _ = h.await;
         }
     }
 
@@ -272,7 +299,11 @@ mod tests {
         let reg = IngressRegistry::new();
         let p = test_peer();
         assert!(!reg.has_reader(p, 1));
-        reg.abort_all();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(reg.shutdown());
         assert!(!reg.has_reader(p, 1));
     }
 
@@ -363,7 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn abort_all_clears_readers() {
+    fn shutdown_observes_reader_termination() {
+        // shutdown() must return promptly with no reader left behind —
+        // aborted tasks are awaited, never detached.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -377,7 +410,12 @@ mod tests {
             }));
             tokio::task::yield_now().await;
             assert!(reg.has_reader(p, 9));
-            reg.abort_all();
+            let start = std::time::Instant::now();
+            reg.shutdown().await;
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "shutdown must be bounded"
+            );
             assert!(!reg.has_reader(p, 9));
             drop(tx);
             tokio::task::yield_now().await;

@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
+use uuid::Uuid;
+
+use super::meta::PacketMeta;
 use super::{Fragmentation, Packet, TcpFlags, Transport};
-use crate::policy::Protocol;
+use crate::policy::{Direction, Protocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedL4 {
@@ -20,8 +23,14 @@ pub struct ResolvedL4 {
 pub const FRAGMENT_TTL: Duration = Duration::from_secs(2);
 pub const MAX_FRAGMENT_ENTRIES: usize = 4096;
 
+/// Fragment cache key: fragment datagram identity SCOPED by network and
+/// direction. Unscoped keys would let network A prime state for network B
+/// (overlapping Direct address spaces) or outbound traffic prime inbound
+/// state — so scope is part of the key, never ambient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FragKey {
+    pub network: Uuid,
+    pub direction: Direction,
     pub src: IpAddr,
     pub dst: IpAddr,
     pub protocol: u8,
@@ -176,9 +185,11 @@ impl FragmentTable {
         }
     }
 
-    pub fn key_for(packet: &Packet<'_>) -> Option<FragKey> {
+    pub fn key_for(packet: &Packet<'_>, network: Uuid, direction: Direction) -> Option<FragKey> {
         let identification = packet.fragmentation.identification()?;
         Some(FragKey {
+            network,
+            direction,
             src: packet.ip.src(),
             dst: packet.ip.dst(),
             protocol: packet.ip.ip_protocol(),
@@ -186,11 +197,24 @@ impl FragmentTable {
         })
     }
 
-    pub fn remember(&mut self, packet: &Packet<'_>) {
+    /// Metadata-based key (no reparse): the policy fast path and the
+    /// deferred-fragment holder share this constructor.
+    pub fn key_for_meta(meta: &PacketMeta, network: Uuid, direction: Direction) -> Option<FragKey> {
+        Some(FragKey {
+            network,
+            direction,
+            src: meta.src,
+            dst: meta.dst,
+            protocol: meta.proto,
+            identification: meta.fragmentation.identification()?,
+        })
+    }
+
+    pub fn remember(&mut self, packet: &Packet<'_>, network: Uuid, direction: Direction) {
         if !matches!(packet.fragmentation, Fragmentation::First { .. }) {
             return;
         }
-        let Some(key) = Self::key_for(packet) else {
+        let Some(key) = Self::key_for(packet, network, direction) else {
             return;
         };
         let Some(transport) = CachedTransport::from_transport(packet.transport) else {
@@ -213,8 +237,13 @@ impl FragmentTable {
     }
 
     /// Later-fragment lookup. `None` means fail-closed (no trustworthy state).
-    pub fn lookup(&mut self, packet: &Packet<'_>) -> Option<CachedTransport> {
-        let key = Self::key_for(packet)?;
+    pub fn lookup(
+        &mut self,
+        packet: &Packet<'_>,
+        network: Uuid,
+        direction: Direction,
+    ) -> Option<CachedTransport> {
+        let key = Self::key_for(packet, network, direction)?;
         self.evict_expired();
         let entry = self.map.get(&key)?;
         if Instant::now() >= entry.expires {
@@ -225,11 +254,18 @@ impl FragmentTable {
     }
 
     /// First fragments are cached; later fragments require a cache hit (fail-closed).
-    pub fn resolve(&mut self, packet: &Packet<'_>) -> Option<ResolvedL4> {
+    pub fn resolve(
+        &mut self,
+        packet: &Packet<'_>,
+        network: Uuid,
+        direction: Direction,
+    ) -> Option<ResolvedL4> {
         if packet.transport.is_later_fragment() {
-            return self.lookup(packet).map(CachedTransport::to_resolved);
+            return self
+                .lookup(packet, network, direction)
+                .map(CachedTransport::to_resolved);
         }
-        self.remember(packet);
+        self.remember(packet, network, direction);
         ResolvedL4::from_transport(packet.transport)
     }
 

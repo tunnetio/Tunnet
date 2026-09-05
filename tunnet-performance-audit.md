@@ -1865,3 +1865,41 @@ Validation: `cargo fmt --check`, `cargo check --workspace --all-targets --all-fe
 
 The only manual validation left is ONE final Windows <-> Linux benchmark (full run, no TCP-matrix abort): keep-alive ping with no first-packet black hole, TCP P1/P4 both directions, zero internal drop counters below capacity.
 
+# 20. Phase 2.3 closure (correctness/lifecycle fixes 1-15)
+
+Follow-up audit found bugs in the 2.3 architecture itself. All fixed, all with regression tests. No tuning, no MTU change (stays 1280).
+
+## 20.1 Worker-owned in-flight cursor (item 1)
+
+`TxOutcome::Reconnect/Hold` returned while the scheduler still recorded the packet as in-flight but the local cursor — including the `LogicalPacket` owner — was dropped. The worker now owns `Option<InFlightTx>` (key, length, member + epoch, cursor) outside the connection loop and never dequeues while one is unresolved. Connection loss preserves owner, geometry, accumulator, and timestamps; resume continues the same segment id. `send_datagram_wait` is raced against generation cancellation (item 2): a cancelled send resolves `GenerationEnd`, and no shutdown waits on QUIC buffer space. DATAGRAM-disabled/unsupported is a real transport failure: the worker closes + invalidates exactly that canonical connection and reconnects (cursor retained; queue caps bound memory). Mock-transport tests force loss before the first frame, between jumbo segments (same id/offset/bytes asserted), across mixed fates, and mid-block cancellation — exact scheduler conservation after every transition, original packet bytes asserted, not just counters.
+
+## 20.2 Deterministic task shutdown (items 3-4)
+
+`timeout(join).await` could detach a transmitting task. Now: signal cancellation, join boundedly (`join_bounded` helper, unit-tested with a permanently-blocked mock), abort stragglers AND await them, then purge + report every scheduler so gauges reconcile. `EndpointTxRegistry::shutdown`, `IngressRegistry::shutdown`, and actor teardown (reader, writer, preconnect, sweeper via a generic `join_task`, sweeper handle now returned) all follow this discipline. Generation N is provably dead before N+1 publishes. A stuck-dial shutdown test bounds termination and reconciles gauges.
+
+## 20.3 Fragments (items 5-8)
+
+- Scheduling identity (item 5): every fragmented packet — first or later — keys by (src, dst, proto, identification), never L4 pseudo-ports. One inner datagram stays in one FIFO; unfragmented keeps 5-tuple. Tested first/middle/last equality.
+- Scoped fragment policy (item 6): `FragKey` is (network, direction, src, dst, proto, id). Network A cannot prime network B; outbound cannot prime inbound. Tested at table and `check()` level.
+- Unordered tolerance (item 7): new agent `frag_hold` module — context-miss later fragments hold briefly (32 keys / 4 per key / 256 KiB / 2 s TTL); the first fragment's Allow releases followers in offset order (each re-evaluated), Deny/Reject discards them, expiry fails closed with a count. No IP reassembly; OS still gets original fragments. Wired into both TUN-reader and ingress paths. Tested: first->later, later->first, last->middle->first ordering, missing-first timeout, cross-network and cross-direction isolation, bound rejection fail-closed.
+- MTU stays 1280 (item 8); v3 overlay segmentation untouched.
+
+## 20.4 Benchmark corrections (items 9-12)
+
+- UDP matrix labels (item 9): `-l 1460/2700` are inner-fragmentation stress tests at MTU 1280, not overlay-segmentation tests. Documented in both scripts.
+- Capacity validity (item 10): a P4 repeat counts only with throughput > 0; ALL requested repeats per direction must be valid or the matrix is invalid and sweeps don't run. No more median-with-zero (the 0 + 104.1 -> 52.05 case is now fatal).
+- Peer telemetry (item 11): every row carries `local_sw_drops` + `peer_sw_drops` (peer defaults to the overlay metrics listener on tunnet runs), each `{available, sched, dropped, tun_write_drop}`. Unavailable reads as unavailable, never zero — sender scheduler drops and receiver TUN-writer drops are both observable.
+- PPS parsing (item 12): explicit property-existence checks; `packets_received` preferred, `packets` fallback, missing stays null (never 0), real zeros stay 0. Verified on four JSON shapes in PowerShell and in the shared bash parser.
+
+## 20.5 Pool lifecycle (items 13-15)
+
+- One path watcher per canonical connection (item 13): removed the duplicate spawn from the hook path; install records the watched stable id and skips re-spawns; a `path_watchers_spawned` counter proves it (lifecycle test asserts 1 across re-installs).
+- Preconnect (item 14): `buffer_unordered(8)` visits EVERY eligible peer (no try-acquire skip), explicit local exclusion in the function, cancellation stops pending/new dials.
+- Item 15 is the mock-transport suite in 20.1.
+
+## 20.6 Closure validation
+
+`cargo fmt --check`, `cargo check --workspace --all-targets --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features` (438 passed Windows, 441 passed Linux-excl-desktop), `cargo test --workspace --all-features` (exit 0), `bash -n` + PS parser + embedded-python AST/behavior checks on both bench scripts.
+
+Phase 2.3 is closed: every acceptance invariant from the closure spec holds by construction and is regression-tested. The only remaining manual step is the single final Windows<->Linux benchmark. Phase 3 not started.
+

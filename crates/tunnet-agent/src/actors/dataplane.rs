@@ -124,6 +124,7 @@ pub struct DataPlaneActor {
     writer: Option<tokio::task::JoinHandle<crate::tun_writer::WriterExit>>,
     tx_registry: Option<crate::endpoint_tx::EndpointTxRegistry>,
     preconnect: Option<tokio::task::JoinHandle<()>>,
+    sweeper: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
@@ -151,6 +152,7 @@ impl Actor for DataPlaneActor {
             writer: None,
             tx_registry: None,
             preconnect: None,
+            sweeper: None,
             generation_cancel: None,
         };
         if auto_up {
@@ -175,29 +177,41 @@ impl Actor for DataPlaneActor {
 }
 
 impl DataPlaneActor {
+    /// Bounded task stop with observed termination: join up to the timeout,
+    /// then abort stragglers AND await them. Never detaches a task that can
+    /// still touch generation state.
+    async fn join_task<T: Send + 'static>(handle: Option<tokio::task::JoinHandle<T>>) {
+        let Some(handle) = handle else { return };
+        tokio::pin!(handle);
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
     async fn teardown(&mut self) {
-        // Withdraw published generation first so new readers stop.
+        // Withdraw published generation first so new readers/installs stop.
         self.published.store(None);
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
-        if let Some(outbound) = self.outbound.take() {
-            outbound.abort();
-        }
-        if let Some(preconnect) = self.preconnect.take() {
-            preconnect.abort();
-        }
+        // Close tunnel connections so old ingress readers exit, then
+        // observe their termination (bounded, abort + await stragglers).
+        self.node.tunnel_pool.close_all().await;
+        self.ingress.shutdown().await;
+        Self::join_task(self.outbound.take()).await;
+        Self::join_task(self.preconnect.take()).await;
+        Self::join_task(self.sweeper.take()).await;
         // Observe endpoint worker termination (bounded): no queued packet
         // may cross into the next generation.
         if let Some(registry) = self.tx_registry.take() {
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(10), registry.shutdown()).await;
         }
-        if let Some(writer) = self.writer.take() {
-            writer.abort();
-        }
-        // Close tunnel connections so old ingress readers exit.
-        self.node.tunnel_pool.close_all().await;
+        Self::join_task(self.writer.take()).await;
         // Best-effort route/DNS cleanup; never fail shutdown.
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -347,10 +361,10 @@ impl DataPlaneActor {
             .clone()
             .expect("generation token published above");
         // Shared tunnel packet resources for this generation: pooled buffers and
-        // the runtime sweeper (tied to the generation token — no leaked tasks
-        // across bring-up cycles).
+        // the runtime sweeper (tied to the generation token AND observed at
+        // teardown — no leaked tasks across bring-up cycles).
         let packet_pool = self.packet_pool.clone();
-        self.node.policy.spawn_sweeper(exit_gen.clone());
+        self.sweeper = self.node.policy.spawn_sweeper(exit_gen.clone());
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
             tun,
@@ -423,10 +437,11 @@ impl DataPlaneActor {
         if !self.up {
             return Ok(());
         }
-        // Stop ingress readers first (registry abort), then withdraw the
-        // generation (token cancellation) in teardown. Both are idempotent;
-        // readers also self-remove from the registry on exit.
-        self.ingress.abort_all();
+        // Stop ingress readers first (observed shutdown, not fire-and-forget
+        // abort), then withdraw the generation (token cancellation) in
+        // teardown. Both are idempotent; readers also self-remove from the
+        // registry on exit.
+        self.ingress.shutdown().await;
         self.teardown().await;
         self.status.set_restarting(false);
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });

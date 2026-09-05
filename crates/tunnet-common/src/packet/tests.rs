@@ -156,28 +156,84 @@ fn first_fragment_keeps_tcp() {
 }
 
 #[test]
+fn fragments_share_one_scheduling_flow() {
+    // One inner UDP datagram fragmented into first/middle/last: every
+    // fragment must map to the SAME FlowKey (fragment identity, never L4
+    // pseudo-ports), so FQ keeps one datagram in one FIFO and cannot
+    // reorder it. Unfragmented traffic keeps 5-tuple keys.
+    let base = ipv4_udp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 443, &[0xABu8; 64]);
+    let mut first = base.clone();
+    first[4..6].copy_from_slice(&0xABCDu16.to_be_bytes());
+    first[6] |= 0x20; // MF, offset 0
+    let mut middle = base.clone();
+    middle[4..6].copy_from_slice(&0xABCDu16.to_be_bytes());
+    middle[6] |= 0x20; // MF
+    middle[6] &= 0xE0;
+    middle[7] = 8; // offset 64 bytes
+    let mut last = base.clone();
+    last[4..6].copy_from_slice(&0xABCDu16.to_be_bytes());
+    last[6] &= 0x1F; // no MF
+    last[7] = 16; // offset 128 bytes
+    let kf = FlowKey::for_packet(&parse(&first).unwrap());
+    let km = FlowKey::for_packet(&parse(&middle).unwrap());
+    let kl = FlowKey::for_packet(&parse(&last).unwrap());
+    assert!(!matches!(
+        parse(&first).unwrap().fragmentation,
+        Fragmentation::None
+    ));
+    assert!(parse(&middle).unwrap().fragmentation.is_later());
+    assert_eq!(kf, km, "first and middle share scheduling identity");
+    assert_eq!(km, kl, "middle and last share scheduling identity");
+    // Identity derives from the identification field: different datagrams
+    // never merge.
+    let mut other = base.clone();
+    other[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+    other[6] |= 0x20;
+    let ko = FlowKey::for_packet(&parse(&other).unwrap());
+    assert_ne!(kf, ko);
+    // Unfragmented keeps the real 5-tuple.
+    let whole = FlowKey::for_packet(&parse(&base).unwrap());
+    assert_eq!((whole.sport, whole.dport), (40000, 443));
+}
+
+#[test]
 fn fragment_table_fail_closed_and_capacity() {
+    use crate::policy::Direction;
+    let net = uuid::Uuid::from_u128(0x1);
     let mut table = FragmentTable::new(2, FRAGMENT_TTL);
     let mut first = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, &[]);
     first[6] |= 0x20;
     first[4..6].copy_from_slice(&1u16.to_be_bytes());
     let pkt = parse(&first).unwrap();
-    table.remember(&pkt);
+    table.remember(&pkt, net, Direction::Outbound);
 
     let mut later = first.clone();
     later[6] = 0;
     later[7] = 8;
     let later_pkt = parse(&later).unwrap();
     assert!(later_pkt.transport.is_later_fragment());
-    let cached = table.lookup(&later_pkt).unwrap();
+    let cached = table.lookup(&later_pkt, net, Direction::Outbound).unwrap();
     assert_eq!(cached.dst_port(), Some(80));
+
+    // Cross-network: network B never sees network A's context.
+    assert!(
+        table
+            .lookup(&later_pkt, uuid::Uuid::from_u128(0x2), Direction::Outbound)
+            .is_none()
+    );
+    // Cross-direction: inbound never sees outbound context.
+    assert!(table.lookup(&later_pkt, net, Direction::Inbound).is_none());
 
     let mut orphan = first.clone();
     orphan[4..6].copy_from_slice(&99u16.to_be_bytes());
     orphan[6] = 0;
     orphan[7] = 8;
     let orphan_pkt = parse(&orphan).unwrap();
-    assert!(table.lookup(&orphan_pkt).is_none());
+    assert!(
+        table
+            .lookup(&orphan_pkt, net, Direction::Outbound)
+            .is_none()
+    );
 }
 
 #[test]

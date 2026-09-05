@@ -27,6 +27,21 @@ impl FlowKey {
             IpMeta::V6 { src, dst, .. } => (IpAddr::V6(src), IpAddr::V6(dst)),
         };
         let proto = pkt.ip.ip_protocol();
+        // Fragmented packets (first AND later) schedule by fragment
+        // datagram identity — src/dst/proto/identification — never by L4
+        // ports. Later fragments carry no transport header (their payload
+        // bytes would invent pseudo-ports), so port-based keys would split
+        // one inner datagram across FQ flows and reorder it. The full
+        // 32-bit identification rides sport/dport; nothing is invented.
+        if let Some(id) = pkt.fragmentation.identification() {
+            return Self {
+                src,
+                dst,
+                proto,
+                sport: (id & 0xffff) as u16,
+                dport: ((id >> 16) & 0xffff) as u16,
+            };
+        }
         let (sport, dport) = match pkt.transport {
             Transport::Tcp {
                 src_port, dst_port, ..
@@ -37,14 +52,9 @@ impl FlowKey {
             Transport::Icmpv4 { echo_id, .. } => (echo_id.unwrap_or(0), 0),
             Transport::Icmpv6 { .. } => (0, 0),
             Transport::Other { .. } => (0, 0),
-            Transport::LaterFragment {
-                protocol,
-                identification,
-                ..
-            } => (
-                (identification & 0xffff) as u16,
-                (protocol as u16).wrapping_mul(31),
-            ),
+            // Unreachable: fragmented packets return above (identification
+            // is Some for every First/Later fragment).
+            Transport::LaterFragment { .. } => (0, 0),
         };
         Self {
             src,

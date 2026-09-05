@@ -94,19 +94,16 @@ pub struct OutboundDeps {
 /// a rewrite actually mutated the bytes. Policy uses the shared runtime with
 /// the peer's stable network slot — no per-packet map lookups. Accepted
 /// packets feed the endpoint TX queue; every shed packet is counted here.
-fn handle_outbound_one(packet: LogicalPacket, fast_ctx: &OutboundCtx<'_>) {
+fn handle_outbound_one(packet: LogicalPacket, ctx: &mut OutboundCtx<'_>) {
     let mut packet = packet;
-    let ctx = *fast_ctx;
-    let OutboundCtx {
-        routes,
-        runtime,
-        metrics,
-        tx_registry,
-        tun_writer,
-        bufs,
-        self_ip,
-        ..
-    } = ctx;
+    let routes = ctx.routes;
+    let runtime = ctx.runtime;
+    let metrics = ctx.metrics;
+    let tx_registry = ctx.tx_registry;
+    let tun_writer = ctx.tun_writer;
+    let bufs = ctx.bufs;
+    let self_ip = ctx.self_ip;
+    let frags: &mut crate::frag_hold::DeferredFragments = ctx.frags;
     // SSH NAT consumes existing metadata (no second parse) — and ONLY takes
     // the mutable/materializing path when metadata proves a rewrite is
     // required. Common packets stay immutable: zero copy.
@@ -153,34 +150,62 @@ fn handle_outbound_one(packet: LogicalPacket, fast_ctx: &OutboundCtx<'_>) {
     // One compiled verdict against the shared runtime. The firewall
     // snapshot loads from the peer's STABLE network slot inside check()
     // (ACL-then-firewall order) — publication swaps it in place, so no
-    // relink is ever needed.
+    // relink is ever needed. Later IP fragments without a first-fragment
+    // context hold briefly (unordered transport); the first fragment's
+    // verdict releases or discards them in offset order.
     let ident: Arc<PeerIdentity> = fast.identity.read().clone();
     let slot = fast.policy.load();
-    let verdict = runtime.check(
-        &packet.meta,
-        Direction::Outbound,
-        &ident.endpoint_hex,
-        &ident.tags,
-        Some(ident.hostname.as_str()),
-        Some(ident.network_id),
-        &slot,
-        &slot.counters,
-    );
-    match verdict {
-        PolicyVerdict::Allow => {}
-        PolicyVerdict::Deny => {
-            metrics.dropped_inc("policy_deny");
-            return;
+    let net = ident.network_id;
+    let check = |m: &tunnet_common::packet::PacketMeta| {
+        runtime.check(
+            m,
+            Direction::Outbound,
+            &ident.endpoint_hex,
+            &ident.tags,
+            Some(ident.hostname.as_str()),
+            Some(ident.network_id),
+            &slot,
+            &slot.counters,
+        )
+    };
+    let has_context = || {
+        runtime
+            .fragment_context(&meta, net, Direction::Outbound)
+            .is_some()
+    };
+    let (outcome, expired) = frags.eval(net, Direction::Outbound, meta, packet, has_context, check);
+    if expired > 0 {
+        metrics.dropped_add("frag_expired", expired);
+    }
+    match outcome {
+        crate::frag_hold::FragOutcome::Immediate(PolicyVerdict::Allow, packet) => {
+            // Into the endpoint TX queue (tail-rejection counted by the reporter).
+            enqueue_packet(tx_registry, &fast, packet);
         }
-        PolicyVerdict::Reject => {
+        crate::frag_hold::FragOutcome::Immediate(PolicyVerdict::Deny, _) => {
+            metrics.dropped_inc("policy_deny");
+        }
+        crate::frag_hold::FragOutcome::Immediate(PolicyVerdict::Reject, packet) => {
             metrics.dropped_inc("fw_reject_out");
             send_reject_reply(tun_writer, &packet, metrics);
-            return;
+        }
+        crate::frag_hold::FragOutcome::Held => {
+            // Waiting for the first fragment; resolves on release/expiry
+            // (both counted there). Not a drop.
+        }
+        crate::frag_hold::FragOutcome::Released(items) => {
+            for (verdict, packet) in items {
+                match verdict {
+                    PolicyVerdict::Allow => enqueue_packet(tx_registry, &fast, packet),
+                    PolicyVerdict::Deny => metrics.dropped_inc("policy_deny"),
+                    PolicyVerdict::Reject => {
+                        metrics.dropped_inc("fw_reject_out");
+                        send_reject_reply(tun_writer, &packet, metrics);
+                    }
+                }
+            }
         }
     }
-
-    // Into the endpoint TX queue (tail-rejection counted by the reporter).
-    enqueue_packet(tx_registry, &fast, packet);
 }
 
 struct OutboundCtx<'a> {
@@ -191,13 +216,7 @@ struct OutboundCtx<'a> {
     tun_writer: &'a TunWriterHandle,
     bufs: &'a Arc<tunnet_common::packet::PacketPool>,
     self_ip: std::net::Ipv4Addr,
-}
-
-impl Copy for OutboundCtx<'_> {}
-impl Clone for OutboundCtx<'_> {
-    fn clone(&self) -> Self {
-        *self
-    }
+    frags: &'a mut crate::frag_hold::DeferredFragments,
 }
 
 /// Reject replies are rare, but they must be protocol-correct: the peer
@@ -277,6 +296,9 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     let mut batch = tun_fast::LinuxBatchEngine::new(bufs.clone(), mtu as usize);
 
     tracing::info!("outbound TUN reader loop started");
+    // One deferred-fragment table for the outbound path (per-task bounds;
+    // keys are network+direction scoped).
+    let mut frags = crate::frag_hold::DeferredFragments::new();
     loop {
         #[cfg(target_os = "linux")]
         {
@@ -285,7 +307,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
             if packets.is_empty() {
                 continue;
             }
-            let ctx = OutboundCtx {
+            let mut ctx = OutboundCtx {
                 routes: &routes,
                 runtime: &runtime,
                 metrics: &metrics,
@@ -293,6 +315,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 tun_writer: &tun_writer,
                 bufs: &bufs,
                 self_ip,
+                frags: &mut frags,
             };
             for packet in packets {
                 if packet.len() > mtu as usize {
@@ -300,7 +323,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                     continue;
                 }
                 metrics.tun_rx_packets_inc();
-                handle_outbound_one(packet, &ctx);
+                handle_outbound_one(packet, &mut ctx);
             }
             continue;
         }
@@ -315,7 +338,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
             if burst.is_empty() {
                 continue;
             }
-            let ctx = OutboundCtx {
+            let mut ctx = OutboundCtx {
                 routes: &routes,
                 runtime: &runtime,
                 metrics: &metrics,
@@ -323,6 +346,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 tun_writer: &tun_writer,
                 bufs: &bufs,
                 self_ip,
+                frags: &mut frags,
             };
             for packet in burst {
                 if packet.len() > mtu as usize {
@@ -330,7 +354,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                     continue;
                 }
                 metrics.tun_rx_packets_inc();
-                handle_outbound_one(packet, &ctx);
+                handle_outbound_one(packet, &mut ctx);
             }
         }
     }
@@ -416,6 +440,9 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) -> ReaderExit {
     let mut fast_net = Uuid::nil();
     let mut fast_epoch = 0u64;
     let mut route_gen = routes.version();
+    // One deferred-fragment table per reader (per-task bounds; keys are
+    // network+direction scoped).
+    let mut frags = crate::frag_hold::DeferredFragments::new();
 
     let exit = loop {
         if generation_cancel.is_cancelled() {
@@ -538,6 +565,7 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) -> ReaderExit {
                 &tun_writer,
                 &tx_registry,
                 self_ip,
+                &mut frags,
             );
         }
     };
@@ -594,10 +622,11 @@ fn resolve_membership(
     Some(fast)
 }
 
-/// Handle one inbound DATAGRAM: reassemble → parse → antispoof → policy →
-/// NAT → enqueue the COMPLETE logical packet to the TUN writer. The frame
-/// (already decoded by the caller, which used its bound network to resolve
-/// `fast`) and the membership are passed in.
+/// Handle one inbound DATAGRAM: reassemble → parse → antispoof → policy
+/// (with unordered-fragment tolerance) → NAT → enqueue the COMPLETE
+/// logical packet to the TUN writer. The frame (already decoded by the
+/// caller, which used its bound network to resolve `fast`) and the
+/// membership are passed in.
 #[allow(clippy::too_many_arguments)]
 fn handle_inbound_one(
     dg: &Bytes,
@@ -610,6 +639,7 @@ fn handle_inbound_one(
     tun_writer: &TunWriterHandle,
     tx_registry: &EndpointTxRegistry,
     self_ip: std::net::Ipv4Addr,
+    frags: &mut crate::frag_hold::DeferredFragments,
 ) {
     use tunnet_core::reassembly::InsertOut;
     let now = std::time::Instant::now();
@@ -691,18 +721,88 @@ fn handle_inbound_one(
     }
     // Snapshot the policy slot (guards are not Send; Arcs are). check()
     // loads the firewall snapshot after the ACL snapshot inside, matching
-    // publish order — always current, no relink, no tear.
+    // publish order — always current, no relink, no tear. Later IP
+    // fragments without a first-fragment context hold briefly (unordered
+    // transport); the first fragment's verdict releases or discards them.
     let slot = fast.policy.load();
-    let verdict = runtime.check(
-        &logical.meta,
+    let net = ident.network_id;
+    let in_meta = logical.meta;
+    let check = |m: &tunnet_common::packet::PacketMeta| {
+        runtime.check(
+            m,
+            Direction::Inbound,
+            &ident.endpoint_hex,
+            &ident.tags,
+            Some(ident.hostname.as_str()),
+            Some(ident.network_id),
+            &slot,
+            &slot.counters,
+        )
+    };
+    let has_context = || {
+        runtime
+            .fragment_context(&in_meta, net, Direction::Inbound)
+            .is_some()
+    };
+    let (outcome, expired) = frags.eval(
+        net,
         Direction::Inbound,
-        &ident.endpoint_hex,
-        &ident.tags,
-        Some(ident.hostname.as_str()),
-        Some(ident.network_id),
-        &slot,
-        &slot.counters,
+        in_meta,
+        logical,
+        has_context,
+        check,
     );
+    if expired > 0 {
+        metrics.dropped_add("frag_expired", expired);
+    }
+    match outcome {
+        crate::frag_hold::FragOutcome::Immediate(verdict, packet) => {
+            apply_inbound_verdict(
+                verdict,
+                packet,
+                fast,
+                pool_bufs,
+                metrics,
+                tun_writer,
+                tx_registry,
+                self_ip,
+            );
+        }
+        crate::frag_hold::FragOutcome::Held => {
+            // Waiting for the first fragment; resolves on release/expiry
+            // (both counted there). Not a drop.
+        }
+        crate::frag_hold::FragOutcome::Released(items) => {
+            for (verdict, packet) in items {
+                apply_inbound_verdict(
+                    verdict,
+                    packet,
+                    fast,
+                    pool_bufs,
+                    metrics,
+                    tun_writer,
+                    tx_registry,
+                    self_ip,
+                );
+            }
+        }
+    }
+}
+
+/// Apply one inbound policy verdict: NAT (allowed only) then stage to the
+/// TUN writer, or count/reply the deny/reject.
+#[allow(clippy::too_many_arguments)]
+fn apply_inbound_verdict(
+    verdict: PolicyVerdict,
+    logical: LogicalPacket,
+    fast: &Arc<PeerMembershipState>,
+    pool_bufs: &Arc<tunnet_common::packet::PacketPool>,
+    metrics: &AgentMetrics,
+    tun_writer: &TunWriterHandle,
+    tx_registry: &EndpointTxRegistry,
+    self_ip: std::net::Ipv4Addr,
+) {
+    let mut logical = logical;
     match verdict {
         PolicyVerdict::Allow => {}
         PolicyVerdict::Deny => {
@@ -722,9 +822,6 @@ fn handle_inbound_one(
             return;
         }
     }
-    // Inbound SSH-NAT consumes parsed metadata (no second parse); shared
-    // storage materializes only when a rewrite actually applies.
-    let mut logical = logical;
     if ssh_nat::needs_inbound_rewrite_with_meta(&logical.meta, self_ip) {
         if !logical.materialize(pool_bufs) {
             metrics.dropped_inc("nat_materialize");
@@ -1063,6 +1160,7 @@ mod tests {
                 .get_membership(rx_conn.remote_id(), got_net)
                 .expect("receiver must resolve the membership");
             assert_eq!(rx_member.identity.read().network_id, net);
+            let mut frags = crate::frag_hold::DeferredFragments::new();
             handle_inbound_one(
                 &dg,
                 frame,
@@ -1074,6 +1172,7 @@ mod tests {
                 &writer,
                 &tx_registry,
                 rx_self_ip,
+                &mut frags,
             );
             if let Ok(staged) = wrx.try_recv() {
                 assert_eq!(&staged[..], &raw[..]);
@@ -1276,6 +1375,7 @@ mod tests {
             let rx_member = reg_b
                 .get_membership(conn_b.remote_id(), net)
                 .expect("receiver membership");
+            let mut frags = crate::frag_hold::DeferredFragments::new();
             handle_inbound_one(
                 &dg,
                 frame,
@@ -1287,6 +1387,7 @@ mod tests {
                 &writer,
                 &tx_registry,
                 std::net::Ipv4Addr::new(10, 7, 0, 2),
+                &mut frags,
             );
             while wrx.try_recv().is_ok() {
                 staged += 1;
@@ -1315,6 +1416,13 @@ mod tests {
         ));
         assert_eq!(fx.pool_a.canonical_stable_id(fx.id_b).await, Some(stable));
         assert!(fx.pool_a.has_live(fx.id_b));
+        // Exactly one path watcher per canonical connection: the fixture
+        // install plus this re-install must not spawn a second one.
+        assert_eq!(
+            fx.pool_a.on_demand_stats().path_watchers_spawned,
+            1,
+            "one watcher per canonical connection"
+        );
         let member = fx.reg_a.get_membership(fx.id_b, fx.net).unwrap();
         let epoch0 = member.epoch.load(std::sync::atomic::Ordering::Relaxed);
         // Stale id: nothing happens.

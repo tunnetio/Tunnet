@@ -139,8 +139,12 @@ impl EndpointTxRegistry {
         state
     }
 
-    /// Shut down every worker and purge every queue. Workers exit on the
-    /// generation token; this observes their termination (bounded).
+    /// Shut down every worker and reconcile every queue. Discipline:
+    /// signal cancellation, join boundedly, abort stragglers AND await
+    /// their termination (a timed-out join must never detach a task that
+    /// can still transmit), then purge + report every scheduler so gauges
+    /// reconcile. After return, no worker of this registry exists and no
+    /// packet of the generation can still be transmitted.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
         let handles: Vec<_> = self
@@ -149,8 +153,18 @@ impl EndpointTxRegistry {
             .iter()
             .filter_map(|e| e.value().worker.lock().take())
             .collect();
-        for h in handles {
-            let _ = tokio::time::timeout(Duration::from_secs(5), h).await;
+        let pending = join_bounded(handles, Duration::from_secs(5)).await;
+        for h in pending {
+            h.abort();
+            let _ = h.await;
+        }
+        // Workers that exited normally already purged + reported; aborted
+        // stragglers did not — purge + report here so no gauge leaks.
+        // Idempotent on empty schedulers (zero deltas).
+        for entry in self.inner.states.iter() {
+            let state = entry.value();
+            state.sched.lock().purge_all(DropReason::GenerationEnd);
+            report_state(state, &self.inner.metrics);
         }
         self.inner.states.clear();
     }
@@ -228,30 +242,66 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
         bufs: &inner.bufs,
         meter: &inner.meter,
     };
+    // The worker-owned cursor: Some from dequeue until scheduler
+    // resolution. NOTHING dequeues while this is set, and NOTHING drops
+    // it except explicit complete/discard below.
+    let mut inflight: Option<InFlightTx> = None;
     loop {
         if inner.cancel.is_cancelled() {
-            // Generation teardown: purge queued packets (recorded as drops
-            // under the generation reason) and exit. In-flight packets are
-            // resolved below by the exiting worker.
+            // Generation teardown: resolve the owned packet, purge the
+            // queue (both recorded under the generation reason), report,
+            // and exit. No packet crosses generations.
+            if let Some(it) = inflight.take() {
+                state
+                    .sched
+                    .lock()
+                    .discard_inflight(it.logical_len, DropReason::GenerationEnd);
+            }
             state.sched.lock().purge_all(DropReason::GenerationEnd);
             report_state(&state, &inner.metrics);
             state.running.store(false, Ordering::Release);
             return;
         }
-        // A live connection is required BEFORE dequeue: without one the
-        // worker parks on reconnect instead of holding packets hostage.
+        // Membership revocation is observed per attempt (not just at
+        // dequeue): a revoked member's packets never transmit.
+        if let Some(it) = inflight.as_ref() {
+            let revoked = match inner.peer_registry.get_membership(endpoint, it.key.net) {
+                Some(m) => {
+                    !Arc::ptr_eq(&m, &it.member)
+                        || m.epoch.load(Ordering::Relaxed) != it.member_epoch
+                }
+                None => true,
+            };
+            if revoked {
+                let it = inflight.take().expect("checked");
+                state
+                    .sched
+                    .lock()
+                    .discard_inflight(it.logical_len, DropReason::MembershipRevoked);
+                state
+                    .sched
+                    .lock()
+                    .purge_network(it.key.net, DropReason::MembershipRevoked);
+                report_state(&state, &inner.metrics);
+                continue;
+            }
+        }
+        // A live connection is required BEFORE a new dequeue: without one
+        // the worker parks on reconnect instead of holding packets hostage.
+        // (An already-owned cursor skips dequeue below and drives on the
+        // reconnected connection.)
+        let has_work = inflight.is_some() || state.sched.lock().has_queued_work();
         let conn = match ctx.transport.live_conn() {
-            Some(c) => c,
+            Some(c) => Some(c),
             None => {
-                let queued = state.sched.lock().has_queued_work();
-                if !queued {
+                if !has_work {
                     if idle_exit(&state, &inner).await {
                         return;
                     }
                     continue;
                 }
                 match ctx.pool.get(endpoint).await {
-                    Ok(_) => continue,
+                    Ok(c) => Some(c),
                     Err(_) => {
                         // Dial failed (5 s timeout paces retries): wait for
                         // new work or a settle delay, then retry.
@@ -265,39 +315,57 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 }
             }
         };
-        // Dequeue one owned packet (queued -> in-flight).
-        let item = {
-            let mut sched = state.sched.lock();
-            match sched.next(Instant::now()) {
-                Dequeue::Send(item) => Some(*item),
-                Dequeue::Empty => None,
-            }
-        };
-        let Some(item) = item else {
-            if idle_exit(&state, &inner).await {
-                return;
-            }
-            continue;
-        };
-        report_state(&state, &inner.metrics);
-        ctx.metrics.observe_sojourn(item.sojourn);
-        // Revoked membership: drop the in-flight packet and purge the rest
-        // of this network's queue. Live memberships send normally.
-        let member = inner.peer_registry.get_membership(endpoint, item.net);
-        let Some(member) = member else {
-            let len = item.packet.len();
-            state
-                .sched
-                .lock()
-                .discard_inflight(len, DropReason::MembershipRevoked);
-            state
-                .sched
-                .lock()
-                .purge_network(item.net, DropReason::MembershipRevoked);
+        let conn = conn.expect("live or just dialed");
+        // Dequeue only when nothing is in-flight: one owned packet at a
+        // time, never two.
+        if inflight.is_none() {
+            let item = {
+                let mut sched = state.sched.lock();
+                match sched.next(Instant::now()) {
+                    Dequeue::Send(item) => Some(*item),
+                    Dequeue::Empty => None,
+                }
+            };
+            let Some(item) = item else {
+                if idle_exit(&state, &inner).await {
+                    return;
+                }
+                continue;
+            };
             report_state(&state, &inner.metrics);
-            continue;
-        };
-        let _ = member;
+            ctx.metrics.observe_sojourn(item.sojourn);
+            // Revoked membership: drop the in-flight packet and purge the
+            // rest of this network's queue. Live memberships send normally.
+            let member = inner.peer_registry.get_membership(endpoint, item.net);
+            let Some(member) = member else {
+                let len = item.packet.len();
+                state
+                    .sched
+                    .lock()
+                    .discard_inflight(len, DropReason::MembershipRevoked);
+                state
+                    .sched
+                    .lock()
+                    .purge_network(item.net, DropReason::MembershipRevoked);
+                report_state(&state, &inner.metrics);
+                continue;
+            };
+            let key = tunnet_core::scheduler::SchedFlowKey {
+                net: item.net,
+                flow: item.flow,
+            };
+            let len = item.packet.len();
+            let member_epoch = member.epoch.load(Ordering::Relaxed);
+            let mps = ctx.transport.mps.load(Ordering::Relaxed);
+            let frame_id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
+            inflight = Some(InFlightTx {
+                key,
+                logical_len: len,
+                member,
+                member_epoch,
+                cur: PartialPacket::new(item.packet, item.net, mps, frame_id),
+            });
+        }
         // Periodic MPS refresh covers silent path changes (plus event-driven
         // refresh in the pool's path watcher and TooLarge recovery below).
         if ctx
@@ -312,34 +380,74 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 .store(0, Ordering::Relaxed);
             state.sched.lock().set_quantum(mps.max(512));
         }
-        let key = tunnet_core::scheduler::SchedFlowKey {
-            net: item.net,
-            flow: item.flow,
-        };
-        let len = item.packet.len();
-        match transmit_owned(&ctx, &conn, item).await {
-            TxOutcome::Done { wire, frames } => {
-                state.sched.lock().complete(&key, len, wire);
+        // Periodic MPS refresh covers silent path changes (plus
+        // event-driven refresh in the pool's path watcher and TooLarge
+        // recovery inside the drive).
+        if ctx
+            .transport
+            .sends_since_mps_check
+            .fetch_add(1, Ordering::Relaxed)
+            >= 512
+            && let Some(mps) = ctx.transport.refresh_mps()
+        {
+            ctx.transport
+                .sends_since_mps_check
+                .store(0, Ordering::Relaxed);
+            state.sched.lock().set_quantum(mps.max(512));
+        }
+        let mut sender = ConnSender { conn: &conn };
+        match drive_inflight(
+            &ctx,
+            &mut sender,
+            inflight.as_mut().expect("dequeued above"),
+            &inner.cancel,
+        )
+        .await
+        {
+            Drive::Done { wire, frames } => {
+                let it = inflight.take().expect("driven");
+                state.sched.lock().complete(&it.key, it.logical_len, wire);
                 ctx.metrics.overlay_tx_datagrams_add(frames);
                 report_state(&state, &inner.metrics);
             }
-            TxOutcome::Dropped { reason } => {
-                state.sched.lock().discard_inflight(len, reason);
+            Drive::Dropped { reason } => {
+                let it = inflight.take().expect("driven");
+                state.sched.lock().discard_inflight(it.logical_len, reason);
                 report_state(&state, &inner.metrics);
             }
-            TxOutcome::Reconnect => {
-                // Connection died mid-packet: the packet stays in-flight
-                // (worker-owned) while the loop redials above. Nothing to
-                // resolve yet.
-            }
-            TxOutcome::Hold => {
-                // Degenerate transport (datagrams disabled/unsupported):
-                // park instead of hot-spinning; the packet stays in-flight.
+            Drive::ConnLost => {
+                // Cursor retained with owner, geometry, and accumulator
+                // intact; the loop redials above and resumes. Park briefly
+                // so an instantly-failing connection cannot hot-spin.
                 tokio::select! {
                     _ = state.notify.notified() => {}
                     _ = inner.cancel.cancelled() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
+            }
+            Drive::Fatal => {
+                // Real transport/protocol failure (datagrams disabled or
+                // unsupported): close and invalidate exactly this canonical
+                // connection so reconnect starts clean. The cursor is
+                // retained; queue caps bound memory while parked.
+                let sid = conn.stable_id();
+                conn.close(0u32.into(), b"datagrams_unsupported");
+                ctx.pool.invalidate_canonical(endpoint, sid).await;
+                tokio::select! {
+                    _ = state.notify.notified() => {}
+                    _ = inner.cancel.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+            Drive::Cancelled => {
+                // The send itself observed cancellation: resolve and let
+                // the loop top observe it and exit.
+                let it = inflight.take().expect("driven");
+                state
+                    .sched
+                    .lock()
+                    .discard_inflight(it.logical_len, DropReason::GenerationEnd);
+                report_state(&state, &inner.metrics);
             }
         }
     }
@@ -375,17 +483,92 @@ async fn idle_exit(state: &Arc<EndpointTxState>, inner: &Arc<Inner>) -> bool {
     }
 }
 
-enum TxOutcome {
+/// One owned in-flight packet: the worker holds this from dequeue to
+/// scheduler resolution. The cursor (including the actual `LogicalPacket`
+/// owner) lives here — never in a transient transmit call — so connection
+/// loss, holds, and cancellation can never drop it.
+struct InFlightTx {
+    key: tunnet_core::scheduler::SchedFlowKey,
+    logical_len: usize,
+    member: Arc<PeerMembershipState>,
+    member_epoch: u64,
+    cur: PartialPacket,
+}
+
+enum Drive {
     /// Logical packet fully transmitted (total wire bytes, frame count).
     Done { wire: usize, frames: u64 },
-    /// Dropped with reason (resolved in the scheduler).
+    /// Dropped with reason (worker resolves via `discard_inflight`).
     Dropped { reason: DropReason },
-    /// Connection died mid-packet: packet stays worker-owned (in-flight)
-    /// while the outer loop reconnects. No scheduler resolution yet.
-    Reconnect,
-    /// Datagrams unusable on this connection (disabled/unsupported):
-    /// park briefly instead of hot-spinning, packet stays in-flight.
-    Hold,
+    /// Connection died mid-packet: cursor retained, worker reconnects.
+    ConnLost,
+    /// Datagrams unusable on this connection: worker closes/invalidates
+    /// it and reconnects (cursor retained).
+    Fatal,
+    /// Generation cancelled mid-send: worker resolves `GenerationEnd`.
+    Cancelled,
+}
+
+impl std::fmt::Debug for Drive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Done { wire, frames } => {
+                write!(f, "Done {{ wire: {wire}, frames: {frames} }}")
+            }
+            Self::Dropped { reason } => write!(f, "Dropped({})", reason.as_str()),
+            Self::ConnLost => write!(f, "ConnLost"),
+            Self::Fatal => write!(f, "Fatal"),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+enum FrameError {
+    TooLarge,
+    ConnLost,
+    /// Datagrams disabled/unsupported on this connection (degenerate).
+    Fatal,
+    Cancelled,
+}
+
+/// DATAGRAM submit behind a trait so tests can drive the exact cursor
+/// state machine against a scripted mock transport (success / loss /
+/// oversize / unsupported / blocked-until-cancel) while production uses
+/// the real connection with cancel-aware `send_datagram_wait`.
+#[async_trait::async_trait]
+trait FrameSender: Send {
+    async fn send_frame(
+        &mut self,
+        frame: Bytes,
+        cancel: &CancellationToken,
+    ) -> Result<(), FrameError>;
+}
+
+/// Production sender: `send_datagram_wait` (waits for buffer space, never
+/// drop-oldest, never a precheck race — this worker is the only submitter)
+/// raced against generation cancellation so shutdown never waits on QUIC.
+struct ConnSender<'a> {
+    conn: &'a Connection,
+}
+
+#[async_trait::async_trait]
+impl FrameSender for ConnSender<'_> {
+    async fn send_frame(
+        &mut self,
+        frame: Bytes,
+        cancel: &CancellationToken,
+    ) -> Result<(), FrameError> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(FrameError::Cancelled),
+            res = self.conn.send_datagram_wait(frame) => match res {
+                Ok(()) => Ok(()),
+                Err(SendDatagramError::TooLarge) => Err(FrameError::TooLarge),
+                Err(SendDatagramError::ConnectionLost(_)) => Err(FrameError::ConnLost),
+                Err(_) => Err(FrameError::Fatal),
+            },
+        }
+    }
 }
 
 /// Mid-packet transmit cursor: the worker owns the logical packet from
@@ -499,44 +682,50 @@ fn usable_seg_cap(mps: usize) -> Option<usize> {
     (cap >= MIN_SEGMENT_PAYLOAD).then_some(cap)
 }
 
-/// Transmit one dequeued packet to completion, reconnect-hold, or drop.
-/// The logical packet stays worker-owned throughout: singles encode from a
-/// staged copy and segments from borrows, so a TooLarge replan restarts from
-/// the ORIGINAL packet — never reconstructed from a wire frame.
-async fn transmit_owned(
+/// Drive the worker-owned cursor to completion, connection hold, fatal,
+/// cancellation, or explicit drop. The logical packet stays in the cursor
+/// throughout: singles encode from a staged copy and segments from
+/// borrows, so a TooLarge replan restarts from the ORIGINAL packet — never
+/// reconstructed from a wire frame, never re-timestamped.
+async fn drive_inflight(
     ctx: &TxCtx<'_>,
-    conn: &Connection,
-    item: tunnet_core::scheduler::DequeuedPacket,
-) -> TxOutcome {
-    let mps = ctx.transport.mps.load(Ordering::Relaxed);
-    let frame_id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
-    let mut cur = PartialPacket::new(item.packet, item.net, mps, frame_id);
-    transmit_cursor(ctx, conn, &mut cur).await
+    sender: &mut impl FrameSender,
+    it: &mut InFlightTx,
+    cancel: &CancellationToken,
+) -> Drive {
+    transmit_cursor(ctx, sender, &mut it.cur, cancel).await
 }
 
-async fn transmit_cursor(ctx: &TxCtx<'_>, conn: &Connection, cur: &mut PartialPacket) -> TxOutcome {
+async fn transmit_cursor(
+    ctx: &TxCtx<'_>,
+    sender: &mut impl FrameSender,
+    cur: &mut PartialPacket,
+    cancel: &CancellationToken,
+) -> Drive {
     if cur.next_index == 0 {
         let mps = ctx.transport.mps.load(Ordering::Relaxed);
         match plan_for_mps(cur.total, mps) {
-            SegmentPlan::Single => return transmit_single(ctx, conn, cur).await,
+            SegmentPlan::Single => return transmit_single(ctx, sender, cur, cancel).await,
             plan @ SegmentPlan::Segmented { .. } => {
                 let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
                 cur.adopt(plan, id);
-                return transmit_segmented(ctx, conn, cur, 0).await;
+                return transmit_segmented(ctx, sender, cur, 0, cancel).await;
             }
             SegmentPlan::Impossible => {
                 // Degenerate path: refresh once, then give up if useless.
                 ctx.transport.refresh_mps();
                 let mps2 = ctx.transport.mps.load(Ordering::Relaxed);
                 match plan_for_mps(cur.total, mps2) {
-                    SegmentPlan::Single => return transmit_single(ctx, conn, cur).await,
+                    SegmentPlan::Single => {
+                        return transmit_single(ctx, sender, cur, cancel).await;
+                    }
                     plan @ SegmentPlan::Segmented { .. } => {
                         let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
                         cur.adopt(plan, id);
-                        return transmit_segmented(ctx, conn, cur, 0).await;
+                        return transmit_segmented(ctx, sender, cur, 0, cancel).await;
                     }
                     SegmentPlan::Impossible => {
-                        return TxOutcome::Dropped {
+                        return Drive::Dropped {
                             reason: DropReason::TooLarge,
                         };
                     }
@@ -548,21 +737,26 @@ async fn transmit_cursor(ctx: &TxCtx<'_>, conn: &Connection, cur: &mut PartialPa
         matches!(cur.plan, SegmentPlan::Segmented { .. }),
         "resumed cursors are always segmented (singles never hold across reconnect)"
     );
-    transmit_segmented(ctx, conn, cur, 0).await
+    transmit_segmented(ctx, sender, cur, 0, cancel).await
 }
 
 /// Encode one frame as a staged copy and wait for buffer space. The logical
 /// owner stays in the cursor, so any failure below keeps the packet.
-async fn transmit_single(ctx: &TxCtx<'_>, conn: &Connection, cur: &mut PartialPacket) -> TxOutcome {
+async fn transmit_single(
+    ctx: &TxCtx<'_>,
+    sender: &mut impl FrameSender,
+    cur: &mut PartialPacket,
+    cancel: &CancellationToken,
+) -> Drive {
     let frame = stage_single(ctx.bufs, cur.net, cur.packet.owner.as_bytes());
     let wire = frame.len();
-    match send_frame(conn, frame).await {
+    match sender.send_frame(frame, cancel).await {
         Ok(()) => {
             if ctx.transport.relay.load(Ordering::Relaxed) {
                 ctx.meter.record(wire as u64);
             }
             ctx.transport.record_tx(wire as u64);
-            TxOutcome::Done { wire, frames: 1 }
+            Drive::Done { wire, frames: 1 }
         }
         Err(FrameError::TooLarge) => {
             // Stale MPS: refresh and replan from the ORIGINAL packet.
@@ -570,55 +764,38 @@ async fn transmit_single(ctx: &TxCtx<'_>, conn: &Connection, cur: &mut PartialPa
             let mps = ctx.transport.mps.load(Ordering::Relaxed);
             let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
             match cur.replan(mps, id) {
-                Replan::Restarted => Box::pin(transmit_cursor(ctx, conn, cur)).await,
-                Replan::Retry => Box::pin(transmit_single(ctx, conn, cur)).await,
-                Replan::Impossible => TxOutcome::Dropped {
+                Replan::Restarted => Box::pin(transmit_cursor(ctx, sender, cur, cancel)).await,
+                Replan::Retry => Box::pin(transmit_single(ctx, sender, cur, cancel)).await,
+                Replan::Impossible => Drive::Dropped {
                     reason: DropReason::TooLarge,
                 },
             }
         }
-        Err(FrameError::ConnLost) => TxOutcome::Reconnect,
-        Err(FrameError::Fatal) => TxOutcome::Hold,
-    }
-}
-
-enum FrameError {
-    TooLarge,
-    ConnLost,
-    /// Datagrams disabled/unsupported on this connection (degenerate).
-    Fatal,
-}
-
-/// One DATAGRAM submit with wait semantics: waits for buffer space instead
-/// of racing a precheck (no drop-oldest, no interleaved-submitter race —
-/// this worker is the only submitter on the connection).
-async fn send_frame(conn: &Connection, frame: Bytes) -> Result<(), FrameError> {
-    match conn.send_datagram_wait(frame).await {
-        Ok(()) => Ok(()),
-        Err(SendDatagramError::TooLarge) => Err(FrameError::TooLarge),
-        Err(SendDatagramError::ConnectionLost(_)) => Err(FrameError::ConnLost),
-        Err(_) => Err(FrameError::Fatal),
+        Err(FrameError::ConnLost) => Drive::ConnLost,
+        Err(FrameError::Fatal) => Drive::Fatal,
+        Err(FrameError::Cancelled) => Drive::Cancelled,
     }
 }
 
 /// Transmit the cursor's remainder segment by segment, encoding incrementally
 /// from the retained logical owner under the cursor's STORED geometry.
-/// Connection loss holds (resume on the fresh connection with the same id —
-/// orphaned prefix segments on the dead connection simply expire);
-/// TooLarge re-plans against fresh MPS (full geometry compare).
+/// Connection loss retains everything (resume on the fresh connection with
+/// the same id — orphaned prefix segments on the dead connection simply
+/// expire); TooLarge re-plans against fresh MPS (full geometry compare).
 async fn transmit_segmented(
     ctx: &TxCtx<'_>,
-    conn: &Connection,
+    sender: &mut impl FrameSender,
     cur: &mut PartialPacket,
     mut restarts: u8,
-) -> TxOutcome {
+    cancel: &CancellationToken,
+) -> Drive {
     let (count, seg_cap) = match cur.plan {
         SegmentPlan::Segmented { count, seg_cap } => (count, seg_cap),
         // A TooLarge replan can adopt Single — route out, boxed to break
         // the async cycle.
-        SegmentPlan::Single => return Box::pin(transmit_single(ctx, conn, cur)).await,
+        SegmentPlan::Single => return Box::pin(transmit_single(ctx, sender, cur, cancel)).await,
         SegmentPlan::Impossible => {
-            return TxOutcome::Dropped {
+            return Drive::Dropped {
                 reason: DropReason::TooLarge,
             };
         }
@@ -628,7 +805,7 @@ async fn transmit_segmented(
     loop {
         if cur.next_index >= count {
             // Completion: the whole logical packet with total wire bytes.
-            return TxOutcome::Done {
+            return Drive::Done {
                 wire: cur.wire_bytes as usize,
                 frames,
             };
@@ -637,7 +814,7 @@ async fn transmit_segmented(
         let off = i * seg_cap;
         let end = (off + seg_cap).min(cur.total);
         if off >= cur.total || end <= off {
-            return TxOutcome::Dropped {
+            return Drive::Dropped {
                 reason: DropReason::TooLarge,
             };
         }
@@ -661,7 +838,7 @@ async fn transmit_segmented(
         }
         let frame = Bytes::from_owner(buf);
         let wire = frame.len();
-        match send_frame(conn, frame).await {
+        match sender.send_frame(frame, cancel).await {
             Ok(()) => {
                 frames += 1;
                 cur.wire_bytes += wire as u64;
@@ -675,7 +852,7 @@ async fn transmit_segmented(
                 ctx.transport.refresh_mps();
                 restarts += 1;
                 if restarts > 2 {
-                    return TxOutcome::Dropped {
+                    return Drive::Dropped {
                         reason: DropReason::TooLarge,
                     };
                 }
@@ -683,25 +860,29 @@ async fn transmit_segmented(
                 let id = ctx.transport.next_frame_id.fetch_add(1, Ordering::Relaxed);
                 match cur.replan(mps, id) {
                     Replan::Restarted => {
-                        return Box::pin(transmit_segmented(ctx, conn, cur, restarts)).await;
+                        return Box::pin(transmit_segmented(ctx, sender, cur, restarts, cancel))
+                            .await;
                     }
                     Replan::Retry => {
                         // Same geometry: retry this segment in place.
                     }
                     Replan::Impossible => {
-                        return TxOutcome::Dropped {
+                        return Drive::Dropped {
                             reason: DropReason::TooLarge,
                         };
                     }
                 }
             }
             Err(FrameError::ConnLost) => {
-                // Owner, accumulator, and geometry intact: hold while the
-                // outer loop reconnects, then resume on the new connection.
-                return TxOutcome::Reconnect;
+                // Owner, accumulator, and geometry intact: the worker-owned
+                // cursor survives; the outer loop reconnects and resumes.
+                return Drive::ConnLost;
             }
             Err(FrameError::Fatal) => {
-                return TxOutcome::Hold;
+                return Drive::Fatal;
+            }
+            Err(FrameError::Cancelled) => {
+                return Drive::Cancelled;
             }
         }
     }
@@ -716,10 +897,47 @@ fn stage_single(pool: &Arc<PacketPool>, net: Uuid, payload: &[u8]) -> Bytes {
     Bytes::from_owner(buf)
 }
 
+/// Join every handle boundedly. Returns the handles that did not finish in
+/// time (the caller aborts them AND awaits termination — never detaches).
+async fn join_bounded(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    if handles.is_empty() {
+        return Vec::new();
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut pending = handles;
+    let mut done_idx = Vec::new();
+    loop {
+        done_idx.clear();
+        for (i, h) in pending.iter_mut().enumerate() {
+            if h.is_finished() {
+                let _ = (&mut *h).await;
+                done_idx.push(i);
+            }
+        }
+        for i in done_idx.drain(..).rev() {
+            pending.swap_remove(i);
+        }
+        if pending.is_empty() {
+            return pending;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return pending;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+}
+
 /// Keep-alive preconnect: dial known peers NOW so the first real packet
 /// doesn't pay connection setup. Gated on ingress readiness — no preconnect
 /// may run before the ingress installer exists, otherwise dials become
-/// canonical with no reader. `dial` is injectable for tests.
+/// canonical with no reader. Bounded concurrency (8) visits EVERY eligible
+/// peer (no skip-past-the-window); cancellation stops pending/new dials.
+/// `dial` is injectable for tests.
 pub async fn preconnect_peers<Fut>(
     peers: Vec<EndpointId>,
     local: EndpointId,
@@ -732,24 +950,27 @@ pub async fn preconnect_peers<Fut>(
     if !ingress_ready {
         return;
     }
-    let _ = local;
+    use futures_util::StreamExt as _;
     let dial = Arc::new(dial);
-    let sem = Arc::new(tokio::sync::Semaphore::new(8));
-    let mut set = tokio::task::JoinSet::new();
-    for peer in peers {
-        if cancel.is_cancelled() {
-            break;
-        }
-        let Ok(permit) = sem.clone().try_acquire_owned() else {
-            continue;
-        };
+    let dials = futures_util::stream::iter(peers.into_iter().filter(|p| *p != local).map(|peer| {
         let make_dial = dial.clone();
-        set.spawn(async move {
-            let _permit = permit;
+        async move {
             (make_dial(peer)).await;
-        });
+        }
+    }))
+    .buffer_unordered(8);
+    tokio::pin!(dials);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            next = dials.next() => {
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
     }
-    while set.join_next().await.is_some() {}
 }
 
 #[cfg(test)]
@@ -795,14 +1016,195 @@ mod tests {
     }
 
     fn test_packet(size: usize) -> LogicalPacket {
+        test_packet_fill(size, 0xAB)
+    }
+
+    fn test_packet_fill(size: usize, fill: u8) -> LogicalPacket {
         let pool = PacketPool::new(8);
         let b = etherparse::PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).udp(40000, 443);
         let mut raw = Vec::new();
-        b.write(&mut raw, &vec![0xABu8; size.saturating_sub(28)])
+        b.write(&mut raw, &vec![fill; size.saturating_sub(28)])
             .unwrap();
         let mut buf = pool.acquire(raw.len());
         buf.recv_region(raw.len()).copy_from_slice(&raw);
         LogicalPacket::from_pooled(buf, raw.len()).unwrap()
+    }
+
+    /// Scripted mock transport: success / loss / oversize / unsupported /
+    /// blocked-until-cancel, recording every submitted frame. Drives the
+    /// EXACT production cursor state machine (`drive_inflight`).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum FrameScript {
+        Ok,
+        TooLarge,
+        ConnLost,
+        Fatal,
+        BlockForever,
+    }
+
+    struct ScriptSender {
+        script: std::collections::VecDeque<FrameScript>,
+        sent: Vec<Bytes>,
+    }
+
+    impl ScriptSender {
+        fn new(script: Vec<FrameScript>) -> Self {
+            Self {
+                script: script.into(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FrameSender for ScriptSender {
+        async fn send_frame(
+            &mut self,
+            frame: Bytes,
+            cancel: &CancellationToken,
+        ) -> Result<(), FrameError> {
+            match self.script.pop_front().unwrap_or(FrameScript::Ok) {
+                FrameScript::Ok => {
+                    self.sent.push(frame);
+                    Ok(())
+                }
+                FrameScript::TooLarge => Err(FrameError::TooLarge),
+                FrameScript::ConnLost => Err(FrameError::ConnLost),
+                FrameScript::Fatal => Err(FrameError::Fatal),
+                FrameScript::BlockForever => {
+                    cancel.cancelled().await;
+                    Err(FrameError::Cancelled)
+                }
+            }
+        }
+    }
+
+    /// Exact-conservation tracker across drive/resolve transitions:
+    /// offered == completed + dropped + owned (packets and bytes) after
+    /// EVERY transition, and the surviving packet bytes are asserted.
+    struct Conservation {
+        offered_packets: u64,
+        offered_bytes: u64,
+        completed: u64,
+        dropped: u64,
+    }
+
+    impl Conservation {
+        fn new() -> Self {
+            Self {
+                offered_packets: 0,
+                offered_bytes: 0,
+                completed: 0,
+                dropped: 0,
+            }
+        }
+
+        fn offered(&mut self, len: usize) {
+            self.offered_packets += 1;
+            self.offered_bytes += len as u64;
+        }
+
+        fn check(&self, sched: &EndpointScheduler) {
+            let snap = sched.snapshot();
+            assert!(
+                snap.conserves(self.offered_packets, self.offered_bytes),
+                "conservation violated: offered=({},{}) completed={} dropped={} snapshot={:?}",
+                self.offered_packets,
+                self.offered_bytes,
+                self.completed,
+                self.dropped,
+                snap,
+            );
+            assert_eq!(
+                snap.owned_packets(),
+                self.offered_packets - self.completed - self.dropped,
+                "exactly-one-current-inflight ownership"
+            );
+        }
+    }
+
+    fn drive_ctx<'a>(
+        tx_reg: &'a EndpointTxRegistry,
+        transport: &'a Arc<PeerTransportState>,
+    ) -> TxCtx<'a> {
+        TxCtx {
+            transport,
+            pool: &tx_reg.inner.pool,
+            metrics: &tx_reg.inner.metrics,
+            bufs: &tx_reg.inner.bufs,
+            meter: &tx_reg.inner.meter,
+        }
+    }
+
+    fn dequeue_inflight(
+        sched: &mut EndpointScheduler,
+        member: &Arc<PeerMembershipState>,
+        mps: usize,
+        frame_id: u32,
+    ) -> InFlightTx {
+        let item = match sched.next(Instant::now()) {
+            Dequeue::Send(item) => *item,
+            Dequeue::Empty => panic!("expected queued packet"),
+        };
+        let key = tunnet_core::scheduler::SchedFlowKey {
+            net: item.net,
+            flow: item.flow,
+        };
+        let len = item.packet.len();
+        let epoch = member.epoch.load(Ordering::Relaxed);
+        InFlightTx {
+            key,
+            logical_len: len,
+            member: member.clone(),
+            member_epoch: epoch,
+            cur: PartialPacket::new(item.packet, item.net, mps, frame_id),
+        }
+    }
+
+    /// Resolve one drive outcome exactly like the worker layer, returning
+    /// the cursor for re-drive on `ConnLost`. Conservation is asserted
+    /// after EVERY transition.
+    async fn resolve_drive(
+        sched: &mut EndpointScheduler,
+        acc: &mut Conservation,
+        it: InFlightTx,
+        drive: Drive,
+    ) -> Option<InFlightTx> {
+        match drive {
+            Drive::Done { wire, .. } => {
+                sched.complete(&it.key, it.logical_len, wire);
+                acc.completed += 1;
+                acc.check(sched);
+                None
+            }
+            Drive::Dropped { .. } => {
+                sched.discard_inflight(it.logical_len, DropReason::TooLarge);
+                acc.dropped += 1;
+                acc.check(sched);
+                None
+            }
+            Drive::Fatal | Drive::Cancelled => {
+                // The worker closes/invalidates (Fatal) or observes
+                // generation end (Cancelled); the harness records the
+                // explicit drop the worker layer performs.
+                sched.discard_inflight(
+                    it.logical_len,
+                    match drive {
+                        Drive::Cancelled => DropReason::GenerationEnd,
+                        _ => DropReason::NoConnection,
+                    },
+                );
+                acc.dropped += 1;
+                acc.check(sched);
+                None
+            }
+            Drive::ConnLost => {
+                // Retained: conservation must hold with the packet still
+                // owned (exactly one in-flight).
+                acc.check(sched);
+                Some(it)
+            }
+        }
     }
 
     #[tokio::test]
@@ -983,5 +1385,249 @@ mod tests {
     fn cursor_binds_network_at_enqueue() {
         let cur = PartialPacket::new(test_packet(200), Uuid::nil(), 1280, 1);
         assert_eq!(cur.net, Uuid::nil());
+    }
+
+    fn drive_sched() -> EndpointScheduler {
+        // Direct scheduler (no worker): the harness owns dequeue/resolve
+        // exactly like run_endpoint_worker.
+        EndpointScheduler::new(1536)
+    }
+
+    #[tokio::test]
+    async fn conn_loss_before_first_frame_retains_packet() {
+        // Loss before any frame: cursor retained with owner, geometry, and
+        // accumulator untouched; resume completes; bytes identical.
+        let (_peer_reg, tx_reg) = test_registry().await;
+        let dead = iroh::SecretKey::generate().public();
+        let transport = tx_reg.inner.peer_registry.ensure_transport(dead);
+        let ctx = drive_ctx(&tx_reg, &transport);
+        let mut sched = drive_sched();
+        let peer_reg = PeerRegistry::new();
+        let ep = iroh::SecretKey::generate().public();
+        let net = Uuid::from_u128(0xaa);
+        let member = test_member(&peer_reg, ep, net, [10, 0, 0, 2]);
+        let mut acc = Conservation::new();
+        let pkt = test_packet_fill(300, 0x11);
+        let want = pkt.owner.as_bytes().to_vec();
+        acc.offered(pkt.len());
+        assert!(sched.enqueue(net, pkt, Instant::now()).is_accepted());
+        let cancel = CancellationToken::new();
+        let mut sender = ScriptSender::new(vec![FrameScript::ConnLost]);
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 7);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::ConnLost));
+        // Nothing sent, cursor pristine, packet bytes intact.
+        assert!(sender.sent.is_empty());
+        assert_eq!(it.cur.next_index, 0);
+        assert_eq!(it.cur.wire_bytes, 0);
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        let mut it = resolve_drive(&mut sched, &mut acc, it, drive)
+            .await
+            .expect("retained");
+        // Resume on the fresh connection: completes, same packet.
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Done { .. }));
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        assert_eq!(sender.sent.len(), 1);
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.completed, 1);
+    }
+
+    #[tokio::test]
+    async fn conn_loss_between_jumbo_segments_resumes_same_id() {
+        // 2700 B at MPS 1280 -> 3 segments. Loss after two: resume keeps
+        // the SAME frame id and offset, accumulator intact; total wire
+        // covers all frames exactly once; bytes identical.
+        let (_peer_reg, tx_reg) = test_registry().await;
+        let dead = iroh::SecretKey::generate().public();
+        let transport = tx_reg.inner.peer_registry.ensure_transport(dead);
+        let ctx = drive_ctx(&tx_reg, &transport);
+        let mut sched = drive_sched();
+        let peer_reg = PeerRegistry::new();
+        let ep = iroh::SecretKey::generate().public();
+        let net = Uuid::from_u128(0xbb);
+        let member = test_member(&peer_reg, ep, net, [10, 0, 0, 2]);
+        let mut acc = Conservation::new();
+        let pkt = test_packet_fill(2700, 0x22);
+        let want = pkt.owner.as_bytes().to_vec();
+        acc.offered(pkt.len());
+        assert!(sched.enqueue(net, pkt, Instant::now()).is_accepted());
+        let cancel = CancellationToken::new();
+        let mut sender = ScriptSender::new(vec![
+            FrameScript::Ok,
+            FrameScript::Ok,
+            FrameScript::ConnLost,
+        ]);
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 41);
+        assert!(matches!(
+            it.cur.plan,
+            SegmentPlan::Segmented { count: 3, .. }
+        ));
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::ConnLost));
+        assert_eq!(sender.sent.len(), 2);
+        assert_eq!(it.cur.next_index, 2, "resume offset preserved");
+        let fid = it.cur.frame_id;
+        let two_seg_wire: usize = sender.sent.iter().map(|b| b.len()).sum();
+        assert_eq!(it.cur.wire_bytes, two_seg_wire as u64);
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        let mut it = resolve_drive(&mut sched, &mut acc, it, drive)
+            .await
+            .expect("retained");
+        // Remaining script defaults to Ok: third segment sends, Done.
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert_eq!(it.cur.frame_id, fid, "same packet id on resume");
+        let wire = match drive {
+            Drive::Done { wire, frames } => {
+                assert_eq!(frames, 1, "only the resumed segment in this drive");
+                wire
+            }
+            other => panic!("expected Done, got {other:?}"),
+        };
+        assert_eq!(sender.sent.len(), 3);
+        let total_wire: usize = sender.sent.iter().map(|b| b.len()).sum();
+        assert_eq!(wire, total_wire, "wire covers every frame exactly once");
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want[..]);
+        resolve_drive(&mut sched, &mut acc, it, Drive::Done { wire, frames: 1 }).await;
+        assert_eq!(acc.completed, 1);
+    }
+
+    #[tokio::test]
+    async fn several_packets_mixed_fates_conserve() {
+        // Four packets: clean send, repeated TooLarge -> explicit drop,
+        // Fatal -> explicit worker-layer drop, cancel-mid-block ->
+        // GenerationEnd. Conservation after EVERY transition.
+        let (_peer_reg, tx_reg) = test_registry().await;
+        let dead = iroh::SecretKey::generate().public();
+        let transport = tx_reg.inner.peer_registry.ensure_transport(dead);
+        let ctx = drive_ctx(&tx_reg, &transport);
+        let mut sched = drive_sched();
+        let peer_reg = PeerRegistry::new();
+        let ep = iroh::SecretKey::generate().public();
+        let net = Uuid::from_u128(0xcc);
+        let member = test_member(&peer_reg, ep, net, [10, 0, 0, 2]);
+        let mut acc = Conservation::new();
+        let cancel = CancellationToken::new();
+
+        // p0: clean single-frame send.
+        let p0 = test_packet_fill(200, 0x01);
+        acc.offered(p0.len());
+        assert!(sched.enqueue(net, p0, Instant::now()).is_accepted());
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 1);
+        let mut sender = ScriptSender::new(vec![]);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Done { frames: 1, .. }));
+        assert_eq!(sender.sent.len(), 1);
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.completed, 1);
+
+        // p1: persistently shrinking path (TooLarge x3) -> explicit drop.
+        // No connection is needed: the MPS refresh is a no-op without one
+        // and the geometry never fits a shrinking script... use a jumbo
+        // packet with a tiny scripted MPS? The mock has no MPS: TooLarge
+        // comes from the script. Replan against the unchanged real MPS
+        // (1280) retries in place until the restart budget drops it.
+        let p1 = test_packet_fill(2700, 0x02);
+        acc.offered(p1.len());
+        assert!(sched.enqueue(net, p1, Instant::now()).is_accepted());
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 2);
+        let mut sender = ScriptSender::new(vec![
+            FrameScript::TooLarge,
+            FrameScript::TooLarge,
+            FrameScript::TooLarge,
+        ]);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(
+            matches!(
+                drive,
+                Drive::Dropped {
+                    reason: DropReason::TooLarge
+                }
+            ),
+            "restart budget must bound flapping paths"
+        );
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.dropped, 1);
+
+        // p2: Fatal (unsupported) -> worker-layer explicit drop.
+        let p2 = test_packet_fill(200, 0x03);
+        acc.offered(p2.len());
+        assert!(sched.enqueue(net, p2, Instant::now()).is_accepted());
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 3);
+        let mut sender = ScriptSender::new(vec![FrameScript::Fatal]);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Fatal));
+        // The worker closes/invalidates and reconnects; the harness
+        // records the explicit drop the worker layer performs.
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.dropped, 2);
+
+        // p3: blocked send + generation cancel -> GenerationEnd.
+        let p3 = test_packet_fill(200, 0x04);
+        let want3 = p3.owner.as_bytes().to_vec();
+        acc.offered(p3.len());
+        assert!(sched.enqueue(net, p3, Instant::now()).is_accepted());
+        let mut it = dequeue_inflight(&mut sched, &member, 1280, 4);
+        let cancel3 = CancellationToken::new();
+        let canceller = cancel3.clone();
+        let canceller_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+        let mut sender = ScriptSender::new(vec![FrameScript::BlockForever]);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel3).await;
+        assert!(matches!(drive, Drive::Cancelled));
+        // Cancellation never consumes the logical packet.
+        assert_eq!(it.cur.packet.owner.as_bytes(), &want3[..]);
+        let _ = canceller_task.await;
+        resolve_drive(&mut sched, &mut acc, it, drive).await;
+        assert_eq!(acc.dropped, 3);
+
+        // End state: everything resolved, nothing owned.
+        let snap = sched.snapshot();
+        assert_eq!(snap.owned_packets(), 0);
+        assert!(snap.conserves(acc.offered_packets, acc.offered_bytes));
+    }
+
+    #[tokio::test]
+    async fn join_bounded_aborts_stragglers_and_never_detaches() {
+        // Item 3: a permanently-blocked mock sender stands in for a stuck
+        // worker. join_bounded returns it; the caller aborts AND awaits
+        // termination — the task is never detached.
+        let quick = tokio::spawn(async {});
+        let stuck = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let pending = join_bounded(vec![quick, stuck], Duration::from_millis(200)).await;
+        assert_eq!(pending.len(), 1, "the stuck task must be reported");
+        for h in pending {
+            h.abort();
+            let res = h.await;
+            assert!(
+                res.unwrap_err().is_cancelled(),
+                "aborted task must terminate observably"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_stuck_dial_reconciles() {
+        // A worker parked in pool.get (5 s dial timeout for an undiallable
+        // peer) cannot exit promptly: shutdown must still return bounded,
+        // leave no worker behind, and reconcile every gauge.
+        let (peer_reg, tx_reg) = test_registry().await;
+        let dead = iroh::SecretKey::generate().public();
+        let net = Uuid::from_u128(0xdd);
+        let member = test_member(&peer_reg, dead, net, [10, 0, 0, 9]);
+        enqueue_packet(&tx_reg, &member, test_packet_fill(200, 0x05));
+        // Let the worker spawn and enter its dial.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let start = Instant::now();
+        tx_reg.shutdown().await;
+        assert!(
+            start.elapsed() < Duration::from_secs(12),
+            "shutdown must be bounded even with a stuck worker"
+        );
+        assert_eq!(tx_reg.state_count(), 0, "no worker may survive");
     }
 }
