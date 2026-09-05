@@ -1929,3 +1929,55 @@ No new tuning matrix. Capacity measurement defaults to 3 P4 repeats and records 
 
 `cargo fmt --check`, `cargo check --workspace --all-targets --all-features`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo nextest run --workspace --all-features` (439 passed Windows, 442 passed Linux-excl-desktop), `cargo test --workspace --all-features` (exit 0), `bash -n` + PS parser + embedded-python AST checks on both bench scripts.
 
+## 22. Session-lifecycle closure (items 1-16, bench 14-15)
+
+One-way poisoning after a transient (Linux→Windows collapse, receiver bytes 0 while loss reads 0.24%) traced to session ownership, not the scheduler: a canonical connection could exist with no live reader, a reconnect could install while teardown was in flight, and redundant dials could displace the working accepted connection. Fixed by making the session a first-class record with one unified failure transition. No Phase 3 work; no scheduler/MTU/queue tuning.
+
+## 22.1 Canonical reconnect rule (item 1)
+
+Same `stable_id` reinstalls are idempotent. Non-preferred→preferred replaces; preferred→non-preferred keeps the existing. Preferred→preferred resolves by initiative: a newly ACCEPTED connection from the canonical initiator (local id < peer id) replaces a redundant local dial; a redundant local dial keeps the existing. Reconnects bump the per-peer record. Regression: `canonical_reconnect_supersedes_stale_same_orientation`.
+
+## 22.2 Install hook fires once (item 2)
+
+`install_canonical(..., fire_hook)` takes an explicit flag: dial-wins installs fire the `install_hook` exactly once (the reader spawn point), accepted-side installs never fire it. Accept-path duplicates can no longer spawn readerless canonicals or double readers. `invalidate_canonical` returns the removed `Connection` so callers close exactly what they removed; `canonical_sessions`/`canonical_orientation` expose sid + direction for the manager.
+
+## 22.3 Unified failure transition (item 3)
+
+`session_failed(peer, stable_id, reason)` is the single op for `TxConnLost`, `RxConnFailed`, `ReaderPanicked`, `TransportFatal`: invalidate the exact sid (no-op when already replaced), remove the registry reader, close best-effort, wake the TX worker, bump the session record, push vitals. The TX worker resolves its fatal handler through the manager first (direct pool invalidation only when unattached, i.e. tests). Regression: `session_failed_clears_canonical_and_reader` (failed → no canonical, no reader, closed, record kept with error).
+
+## 22.4 Lifecycle gate (item 4)
+
+`GateState::Down/Starting(g)/Up(g)/Stopping(g)` (derived `Default = Down`). Installs proceed only in `Up(generation)` with the generation still current; everything else closes the candidate immediately. Bring-up order is `Starting → publish → reconcile → Up → preconnect`; teardown is `Stopping → cancel → join → invalidate_all → status Down → publish down`. Connections can no longer slip between `close_all()` and the next generation. The `TUNNEL_ALPN` match arm reads the gate instead of a boolean, so non-tunnel ALPNs are untouched.
+
+## 22.5 Ingress manager owns the session record (item 5)
+
+`IngressManager` holds only a `Weak<ConnPool>` (the pool's stored hook captures the manager strong; no cycle). Per-peer `SessionRecord{canonical, generation, reconnects, last_error, opened_by_us}`; `spawn_reader_for` checks gate + published-generation currency, installs the reader synchronously with publication, rolls back on any gate loss. `ReaderMonitor` reports `ReaderEnd::{Completed, Panicked}`; panics are classified, never silent (`panic_is_classified_and_cleans_up`).
+
+## 22.6 Repair-or-escalate, never healthy-readerless (item 6)
+
+After every `session_failed`, the manager verifies: canonical sid without a live same-sid reader triggers one repair per 10s cooldown (`reinstall_reader` from the pool's current connection, orientation preserved), then escalates via `on_session_invalid` (actor restarts the generation). `reconcile_generation` at bring-up drops records from older generations. Status snapshot degrades (`Degraded`) on any readerless canonical instead of reporting healthy.
+
+## 22.7 Stale metric zeroing (item 7)
+
+Per-peer pushed session-metric combos are tracked; combos absent from the new snapshot are explicitly zeroed, so a dead peer's `canonical=1/reader=1` can never linger at 1 after the session moved or died.
+
+## 22.8 Worker supervision (item 8)
+
+`supervise_worker` wraps every endpoint TX worker: normal return leaves `running` untouched (an older task must not clobber a newer worker's flag); panic clears `running` and escalates endpoint + reason. `start_if_idle` order is create-state → spawn → store handle, so a racing second caller never orphans a handle. Regressions: `supervise_worker_clears_running`, `start_if_idle_never_leaks_handle`, `shutdown_with_stuck_dial_reconciles`.
+
+## 22.9 Transport fatal + incompatible parking (item 9)
+
+`on_transport_fatal` funnels `TransportFatal` through `session_failed` and clears `running` so the next packet redials. `UnsupportedByPeer`/`Disabled` sets the persistent incompatible flag and parks 5s (no redial loop, no error spam): `incompatible_endpoint_never_redials`, `transport_fatal_clears_running_and_session`, `transport_fatal_for_unknown_session_still_clears`.
+
+## 22.10 Session health exposure (item 10)
+
+`SessionHealth{peer, generation, canonical, reader, orientation, alive}` rides `DataPlaneInfo.sessions` and `tunnet_session_info{...}` (value 1 alive / 0 dead), plus `tunnet_dataplane_{generation,restart_count,up,outbound_alive,writer_alive}` and `tunnet_reader_panics_total`. Bench and operators read the same source the actor publishes.
+
+## 22.11 Bench: session before/after + delivery ratio (items 14-15)
+
+Every row now carries `local/peer_session_before/after/changed` (generation, restarts, per-peer canonical/reader/orientation/alive; unavailable reads as unavailable) alongside `local/peer_sw_drops`. UDP rows additionally carry `delivery_ratio`, `undelivered_pct`, and sender/receiver byte+packet counts parsed from one shared parser — the poisoning signature (sent 32.4 Mbps, delivered 0, loss 0.24%) now renders as `delivery_ratio=0.0/undelivered=100%` instead of hiding behind loss. A mid-run session change flags the row. Path state on tunnet runs derives from the same metrics snapshot (the legacy `/api/status` HTTP endpoint does not exist; the Local API is a local socket).
+
+## 22.12 Validation
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` (fixed: redundant field, manual `Default`, two `type_complexity` aliases `FatalHandler`/`SessionInvalidHandler`, two collapsible `let-chains`, oneshot-`Fn` `Mutex<Option<...>>` guard), `cargo nextest run --workspace --all-features` (447 passed Windows, 450 passed Linux-excl-desktop, 2 consecutive green runs each), `cargo test --workspace --all-features` (exit 0 both platforms), `bash -n` + PS parser + embedded-python AST checks on both bench scripts (all 7 heredocs parse; poisoning signature asserted). One nextest-only flake under full-workspace parallel load (`loopback_congestion_waits_with_tiny_buffer` receiver starvation, 0.5s alone / green in-package / green under `cargo test`): given a machine-wide reservation via `.config/nextest.toml` (`threads-required = "num-cpus"`) — the harness's explicit mechanism for resource-heavy tests, not a product change. Genuine stalls still fail; contention no longer invents them.
+

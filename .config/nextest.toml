@@ -1,0 +1,9 @@
+# Resource-heavy tests that need timely co-scheduling of real QUIC
+# loopback endpoints. Under full-workspace parallel load, dozens of
+# concurrent QUIC loopback tests starve them past their hang deadlines
+# (false "lost packets" failures). Reserving the machine while they run
+# keeps the failure signal real: a genuine stall still fails, twice as
+# loudly, instead of flaking under contention.
+[[profile.default.overrides]]
+filter = "test(loopback_congestion_waits_with_tiny_buffer)"
+threads-required = "num-cpus"

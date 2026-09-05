@@ -237,6 +237,36 @@ pub struct DataPlaneInfo {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Per-peer canonical tunnel sessions (empty when the dataplane is
+    /// down or the agent predates session exposure).
+    #[serde(default)]
+    pub sessions: Vec<SessionHealth>,
+}
+
+/// One canonical tunnel session: connection + reader + generation binding.
+/// A canonical connection with no live current-generation reader is never
+/// healthy — the benchmark and `tunnet status` use this to expose
+/// one-way session poisoning directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionHealth {
+    pub peer_endpoint: String,
+    /// Stable id of the canonical connection, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_stable_id: Option<usize>,
+    /// `live` | `reconnecting` | `absent`.
+    pub canonical_state: String,
+    /// Stable id the live reader serves, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_stable_id: Option<usize>,
+    pub reader_alive: bool,
+    /// `dialed` | `accepted`, when a canonical connection exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_orientation: Option<String>,
+    pub connection_generation: u64,
+    pub reconnect_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

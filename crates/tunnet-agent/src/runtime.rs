@@ -295,9 +295,43 @@ pub async fn run(
 
     // Single event bus shared by the actors, the updater, and the Local API.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    // Ingress reader registry: shared by the dialer pump, the accept router,
-    // and the DataPlaneActor (which aborts readers on BringDown).
+    // Ingress reader registry: shared by the dialer hook, the accept router,
+    // and the DataPlaneActor (which shuts readers down on BringDown).
     let ingress = IngressRegistry::new();
+    // Explicit lifecycle gate: installs allowed only in Up (actor owns
+    // transitions; the session manager refuses everything else).
+    let lifecycle_gate = crate::actors::dataplane::LifecycleGate::default();
+    // Session manager BEFORE the supervisor (the actor needs it for
+    // bring-up reconcile): shared reader context (same auth cache for
+    // accepted and dialed connections) + pool hook. No preconnect may
+    // run before this point.
+    let spoofs: HashMap<_, _> = node
+        .direct
+        .iter()
+        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
+        .collect();
+    let ingress_ctx = crate::ingress::IngressContext {
+        routes: node.routes.clone(),
+        acl: node.acl.clone(),
+        runtime: node.policy.clone(),
+        spoofs: spoofs.clone(),
+        bufs: packet_pool.clone(),
+        metrics: metrics.clone(),
+        auth: node.direct_auth.clone(),
+    };
+    let pool_arc = Arc::new(node.tunnel_pool.clone());
+    let ingress_manager = Arc::new(crate::ingress::IngressManager::new(
+        &pool_arc,
+        ingress.clone(),
+        ingress_ctx,
+        published.clone(),
+        status_snapshot.clone(),
+        lifecycle_gate.clone(),
+        None,
+    ));
+    node.tunnel_pool
+        .set_tunnel_hook(ingress_manager.dial_hook());
+    ingress_gate.store(true, std::sync::atomic::Ordering::SeqCst);
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
     let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(UpdateState::Idle));
     let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
@@ -315,6 +349,8 @@ pub async fn run(
                 ingress: ingress.clone(),
                 packet_pool: packet_pool.clone(),
                 ingress_gate: ingress_gate.clone(),
+                lifecycle_gate: lifecycle_gate.clone(),
+                session_manager: ingress_manager.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
@@ -394,34 +430,8 @@ pub async fn run(
     // NOTE: readiness (`on_ready` / sd_notify) fires at the END of this
     // function, after BringUp + the ALPN router: `up` means the TUN
     // generation and its mandatory reader/writer tasks are alive.
-
-    // Ingress installation BEFORE BringUp (§13): shared reader context
-    // (same auth cache for accepted and dialed connections), the ingress
-    // manager, and the pool hook. No preconnect may run before this point.
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-    let ingress_ctx = crate::ingress::IngressContext {
-        routes: node.routes.clone(),
-        acl: node.acl.clone(),
-        runtime: node.policy.clone(),
-        spoofs: spoofs.clone(),
-        bufs: packet_pool.clone(),
-        metrics: metrics.clone(),
-        auth: node.direct_auth.clone(),
-    };
-    let pool_arc = Arc::new(node.tunnel_pool.clone());
-    let ingress_manager = crate::ingress::IngressManager::new(
-        &pool_arc,
-        ingress.clone(),
-        ingress_ctx,
-        published.clone(),
-    );
-    node.tunnel_pool
-        .set_tunnel_hook(ingress_manager.dial_hook());
-    ingress_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    // (Session manager + pool hook were installed before the supervisor
+    // above, so no preconnect can precede ingress readiness.)
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.

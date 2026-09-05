@@ -79,6 +79,11 @@ pub struct PeerTransportState {
     pub next_frame_id: AtomicU32,
     /// Sends since the last MPS refresh (periodic re-measurement).
     pub sends_since_mps_check: AtomicU64,
+    /// Permanent DATAGRAM incompatibility observed for this endpoint
+    /// (UnsupportedByPeer/Disabled): the TX worker must not redial-loop.
+    /// Cleared when a new canonical connection is installed (meaningful
+    /// change) or a new generation starts (fresh state).
+    pub datagram_incompatible: AtomicBool,
 }
 
 impl PeerTransportState {
@@ -96,6 +101,7 @@ impl PeerTransportState {
             rtt_ms: AtomicU64::new(90),
             next_frame_id: AtomicU32::new(rand::random()),
             sends_since_mps_check: AtomicU64::new(0),
+            datagram_incompatible: AtomicBool::new(false),
         })
     }
 
@@ -316,6 +322,12 @@ impl PeerRegistry {
                     .next_frame_id
                     .store(rand::random(), Ordering::Relaxed);
                 transport.sends_since_mps_check.store(0, Ordering::Relaxed);
+                // A new canonical connection is a meaningful change: a
+                // previously observed DATAGRAM incompatibility may no
+                // longer hold, so the worker may try again.
+                transport
+                    .datagram_incompatible
+                    .store(false, Ordering::Relaxed);
                 drop(transport);
                 self.refresh_transport_path(peer, None);
             }

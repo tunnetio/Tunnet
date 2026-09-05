@@ -34,6 +34,10 @@ use crate::system_routes::desired_from_membership;
 /// reader can never observe new state because it holds the old `Arc` +
 /// old token only.
 pub struct PublishedDataPlane {
+    /// Monotonic dataplane generation this publication belongs to. Reader
+    /// installation pins (generation, connection) together: a reader bound
+    /// to a stale generation is refused and rolled back.
+    pub generation: u64,
     pub cancel: tokio_util::sync::CancellationToken,
     /// Generation-owned TUN writer (the only TUN write path).
     pub tun_writer: crate::tun_writer::TunWriterHandle,
@@ -45,6 +49,45 @@ pub type PublishedPlane = Arc<ArcSwapOption<PublishedDataPlane>>;
 
 pub fn new_published_plane() -> PublishedPlane {
     Arc::new(ArcSwapOption::empty())
+}
+
+/// Explicit dataplane lifecycle gate (item 4): TUNNEL_ALPN connections may
+/// become canonical only in `Up(generation)`. Arrivals while Down, Starting,
+/// or Stopping are closed immediately and never installed into the pool or
+/// the transport — no connection slips between `close_all()` and the next
+/// generation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GateState {
+    #[default]
+    Down,
+    Starting(u64),
+    Up(u64),
+    Stopping(u64),
+}
+
+/// Shared lifecycle gate: the actor owns transitions; the session manager
+/// refuses installs outside `Up`.
+#[derive(Clone, Default, Debug)]
+pub struct LifecycleGate {
+    state: Arc<std::sync::RwLock<GateState>>,
+}
+
+impl LifecycleGate {
+    pub fn set(&self, state: GateState) {
+        *self.state.write().expect("gate lock") = state;
+    }
+
+    pub fn get(&self) -> GateState {
+        *self.state.read().expect("gate lock")
+    }
+
+    /// Current generation iff the dataplane is fully up.
+    pub fn up_generation(&self) -> Option<u64> {
+        match self.get() {
+            GateState::Up(generation) => Some(generation),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +135,11 @@ pub struct DataPlaneActorArgs {
     /// never runs before this: dials without an installer become canonical
     /// with no reader.
     pub ingress_gate: Arc<AtomicBool>,
+    /// Explicit lifecycle gate (item 4): installs allowed only in Up.
+    pub lifecycle_gate: LifecycleGate,
+    /// Session manager for bring-up reconcile (orphan canonical sessions
+    /// are closed, never inherited).
+    pub session_manager: Arc<crate::ingress::IngressManager>,
     /// Start in up state (initial plane already published by bootstrap).
     pub initially_up: bool,
     pub initial_generation: u64,
@@ -118,6 +166,8 @@ pub struct DataPlaneActor {
     ingress: crate::ingress::IngressRegistry,
     packet_pool: Arc<PacketPool>,
     ingress_gate: Arc<AtomicBool>,
+    lifecycle_gate: LifecycleGate,
+    session_manager: Arc<crate::ingress::IngressManager>,
     up: bool,
     generation: u64,
     outbound: Option<tokio::task::JoinHandle<()>>,
@@ -148,6 +198,8 @@ impl Actor for DataPlaneActor {
             ingress: args.ingress,
             packet_pool: args.packet_pool,
             ingress_gate: args.ingress_gate,
+            lifecycle_gate: args.lifecycle_gate,
+            session_manager: args.session_manager,
             outbound: None,
             writer: None,
             tx_registry: None,
@@ -193,6 +245,12 @@ impl DataPlaneActor {
     }
 
     async fn teardown(&mut self) {
+        // Teardown order (item 4): gate -> Stopping FIRST so no connection
+        // can slip between close_all() and the next generation. Then
+        // withdraw publication, cancel, close sessions, join everything,
+        // and only then gate -> Down.
+        let stopping_gen = self.generation;
+        self.lifecycle_gate.set(GateState::Stopping(stopping_gen));
         // Withdraw published generation first so new readers/installs stop.
         self.published.store(None);
         if let Some(cancel) = self.generation_cancel.take() {
@@ -232,6 +290,8 @@ impl DataPlaneActor {
         self.status.set_up(false);
         self.status.set_outbound_alive(false);
         self.status.set_writer_alive(false);
+        self.status.set_sessions(Vec::new());
+        self.lifecycle_gate.set(GateState::Down);
         // NOTE: `restarting` is deliberately left alone here: teardown runs
         // on every stop including crashes, and a crash must keep reporting
         // `restarting` until the next successful bring-up clears it.
@@ -260,6 +320,9 @@ impl DataPlaneActor {
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        // Bring-up order (item 4): gate leaves Down FIRST so no connection
+        // can slip in while services are constructed.
+        self.lifecycle_gate.set(GateState::Starting(generation));
         let cancel = tokio_util::sync::CancellationToken::new();
         // Generation-owned I/O: one TUN writer task + one endpoint TX
         // registry. Created BEFORE publishing so readers/installers never
@@ -272,6 +335,36 @@ impl DataPlaneActor {
             self.packet_pool.clone(),
             self.node.tunnel_pool.cloud_relay_meter(),
         );
+        tx_registry.set_session_manager(self.session_manager.clone());
+        // Session-invalid escalation restarts the generation via
+        // supervision (same pattern as writer/outbound death).
+        {
+            let invalid_weak = self_ref.clone();
+            let invalid_gen = cancel.clone();
+            self.session_manager
+                .set_invalid_handler(Arc::new(move |reason: String| {
+                    if !invalid_gen.is_cancelled()
+                        && let Some(actor) = invalid_weak.upgrade()
+                    {
+                        let _ = actor.tell(SessionInvalid(reason)).try_send();
+                    }
+                }));
+        }
+        // TX-worker panic escalation: a dead worker with running=true is a
+        // one-way black hole — restart the generation, never just respawn.
+        {
+            let fatal_weak = self_ref.clone();
+            let fatal_gen = cancel.clone();
+            tx_registry.set_fatal_handler(Arc::new(move |endpoint, reason: String| {
+                if !fatal_gen.is_cancelled()
+                    && let Some(actor) = fatal_weak.upgrade()
+                {
+                    let _ = actor
+                        .tell(TxWorkerFailed(format!("{endpoint}: {reason}")))
+                        .try_send();
+                }
+            }));
+        }
         let writer_weak = self_ref.clone();
         let writer_gen = cancel.clone();
         let (tun_writer, writer_join) = crate::tun_writer::spawn_tun_writer(
@@ -287,6 +380,7 @@ impl DataPlaneActor {
             },
         );
         self.published.store(Some(Arc::new(PublishedDataPlane {
+            generation,
             cancel: cancel.clone(),
             tun_writer: tun_writer.clone(),
             tx_registry: tx_registry.clone(),
@@ -386,7 +480,12 @@ impl DataPlaneActor {
             }),
         });
         self.outbound = Some(outbound);
+        // Bring-up reconcile (item 11, fail-safe behind the gate): close
+        // any pool canonical session without a live current reader instead
+        // of inheriting ambiguity. Only then open the gate.
+        self.session_manager.reconcile_generation(generation).await;
         self.up = true;
+        self.lifecycle_gate.set(GateState::Up(generation));
         self.status.set_up(true);
         self.status.set_restarting(false);
         self.status.set_outbound_alive(true);
@@ -557,6 +656,40 @@ impl Message<TunWriterFailed> for DataPlaneActor {
     }
 }
 
+/// An endpoint TX worker died abnormally (panic). `running` was cleared by
+/// the supervisor wrapper, but the in-flight cursor's ownership is
+/// ambiguous after a panic — do NOT just respawn the worker. Escalate:
+/// restart the entire generation cleanly. Normal idle exit and generation
+/// cancellation never send this.
+struct TxWorkerFailed(String);
+
+impl Message<TxWorkerFailed> for DataPlaneActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: TxWorkerFailed, _ctx: &mut Context<Self, Self::Reply>) {
+        self.status
+            .note_restart(format!("endpoint TX worker failed: {}", msg.0));
+        self.status.set_restarting(true);
+        panic!("endpoint TX worker failed: {}", msg.0);
+    }
+}
+
+/// A readerless canonical session could not be repaired: restart the
+/// generation so preconnect establishes fresh sessions. Never report a
+/// readerless canonical session as healthy.
+struct SessionInvalid(String);
+
+impl Message<SessionInvalid> for DataPlaneActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: SessionInvalid, _ctx: &mut Context<Self, Self::Reply>) {
+        self.status
+            .note_restart(format!("invalid canonical session: {}", msg.0));
+        self.status.set_restarting(true);
+        panic!("invalid canonical session: {}", msg.0);
+    }
+}
+
 impl Message<BringDown> for DataPlaneActor {
     type Reply = Result<(), DataPlaneError>;
 
@@ -642,7 +775,12 @@ impl DataPlaneControl for ActorDataPlaneControl {
             restart_count: self.status.restart_count(),
             generation: self.status.generation(),
             last_error: self.status.last_error(),
+            sessions: self.status.sessions(),
         }
+    }
+
+    fn session_health(&self) -> Vec<tunnet_common::local_api::SessionHealth> {
+        self.status.sessions()
     }
 
     async fn bring_up(&self) -> Result<(), String> {
@@ -672,12 +810,53 @@ mod tests {
     use crate::actors::test_support::{test_metrics, test_node};
     use kameo::actor::Spawn;
 
+    fn test_manager(
+        node: &CoreNode,
+        metrics: AgentMetrics,
+        published: PublishedPlane,
+        status: DataPlaneStatusSnapshot,
+        gate: LifecycleGate,
+        pool_arc: &Arc<tunnet_core::ConnPool>,
+    ) -> Arc<crate::ingress::IngressManager> {
+        let ctx = crate::ingress::IngressContext {
+            routes: node.routes.clone(),
+            acl: node.acl.clone(),
+            runtime: node.policy.clone(),
+            spoofs: std::collections::HashMap::new(),
+            bufs: tunnet_common::packet::PacketPool::new(8),
+            metrics,
+            auth: None,
+        };
+        Arc::new(crate::ingress::IngressManager::new(
+            pool_arc,
+            crate::ingress::IngressRegistry::new(),
+            ctx,
+            published,
+            status,
+            gate,
+            None,
+        ))
+    }
+
     fn test_args(node: CoreNode) -> DataPlaneActorArgs {
         let (events_tx, _) = tokio::sync::broadcast::channel(4);
         // Route actor ref unused on the down-path; wire a real one lazily.
         let route = RouteActor::spawn_with_mailbox(
             RouteActorArgs,
             kameo::mailbox::bounded(crate::actors::ROUTE_MAILBOX),
+        );
+        let metrics = test_metrics();
+        let published = new_published_plane();
+        let status = DataPlaneStatusSnapshot::new(false);
+        let gate = LifecycleGate::default();
+        let pool_arc = Arc::new(node.tunnel_pool.clone());
+        let session_manager = test_manager(
+            &node,
+            metrics.clone(),
+            published.clone(),
+            status.clone(),
+            gate.clone(),
+            &pool_arc,
         );
         DataPlaneActorArgs {
             config: DataPlaneActorConfig {
@@ -692,15 +871,17 @@ mod tests {
                 underlay_hosts: vec![],
             },
             node,
-            metrics: test_metrics(),
+            metrics,
             peer_dns_active: Arc::new(AtomicBool::new(false)),
             events: events_tx,
             route_actor: route,
-            published: new_published_plane(),
-            status: DataPlaneStatusSnapshot::new(false),
+            published,
+            status,
             ingress: crate::ingress::IngressRegistry::new(),
             packet_pool: tunnet_common::packet::PacketPool::new(8),
             ingress_gate: Arc::new(AtomicBool::new(true)),
+            lifecycle_gate: gate,
+            session_manager,
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.
@@ -828,6 +1009,19 @@ mod tests {
 
         let (node, _tmp) = test_node().await;
         let (events_tx, _) = tokio::sync::broadcast::channel(4);
+        let metrics = test_metrics();
+        let published = new_published_plane();
+        let status = DataPlaneStatusSnapshot::new(false);
+        let gate = LifecycleGate::default();
+        let pool_arc = Arc::new(node.tunnel_pool.clone());
+        let session_manager = test_manager(
+            &node,
+            metrics.clone(),
+            published.clone(),
+            status.clone(),
+            gate.clone(),
+            &pool_arc,
+        );
         let dp_args = DataPlaneSupervisorArgs {
             route_args: RouteActorArgs,
             dataplane_config: DataPlaneActorConfig {
@@ -842,14 +1036,16 @@ mod tests {
                 underlay_hosts: vec![],
             },
             node,
-            metrics: test_metrics(),
+            metrics,
             peer_dns_active: Arc::new(AtomicBool::new(false)),
             events: events_tx,
-            published: new_published_plane(),
-            status: DataPlaneStatusSnapshot::new(false),
+            published,
+            status,
             ingress: crate::ingress::IngressRegistry::new(),
             packet_pool: tunnet_common::packet::PacketPool::new(8),
             ingress_gate: Arc::new(AtomicBool::new(true)),
+            lifecycle_gate: gate,
+            session_manager,
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.

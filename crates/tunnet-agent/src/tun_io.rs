@@ -938,6 +938,8 @@ mod tests {
     struct Loopback {
         conn_a: iroh::endpoint::Connection,
         conn_b: iroh::endpoint::Connection,
+        ep_a: iroh::Endpoint,
+        ep_b: iroh::Endpoint,
         reg_a: PeerRegistry,
         reg_b: PeerRegistry,
         rt_a: PolicyRuntime,
@@ -1028,8 +1030,8 @@ mod tests {
         }));
         reg_a.relink_policy(&rt_a);
         reg_b.relink_policy(&rt_b);
-        let pool_a = ConnPool::new(ep_a, alpn);
-        let pool_b = ConnPool::new(ep_b, alpn);
+        let pool_a = ConnPool::new(ep_a.clone(), alpn);
+        let pool_b = ConnPool::new(ep_b.clone(), alpn);
         // Link pools to registries (slow path, as bootstrap does) so the
         // canonical install mirrors the live conn into the transport.
         pool_a.set_peer_registry(Arc::new(reg_a.clone()));
@@ -1037,16 +1039,22 @@ mod tests {
         // Install the live conns as canonical (slow path, as the pool does).
         use tunnet_core::InstallOutcome;
         assert!(matches!(
-            pool_a.install_canonical(id_b, conn_a.clone(), true).await,
+            pool_a
+                .install_canonical(id_b, conn_a.clone(), true, false)
+                .await,
             InstallOutcome::Canonical(_)
         ));
         assert!(matches!(
-            pool_b.install_canonical(id_a, conn_b.clone(), false).await,
+            pool_b
+                .install_canonical(id_a, conn_b.clone(), false, false)
+                .await,
             InstallOutcome::Canonical(_)
         ));
         Loopback {
             conn_a,
             conn_b,
+            ep_a,
+            ep_b,
             reg_a,
             reg_b,
             rt_a,
@@ -1322,7 +1330,9 @@ mod tests {
         pool_a.set_peer_registry(Arc::new(reg_a.clone()));
         use tunnet_core::InstallOutcome;
         assert!(matches!(
-            pool_a.install_canonical(id_b, conn_a.clone(), true).await,
+            pool_a
+                .install_canonical(id_b, conn_a.clone(), true, false)
+                .await,
             InstallOutcome::Canonical(_)
         ));
 
@@ -1410,7 +1420,7 @@ mod tests {
         // Same connection installs idempotently (no second reader owed).
         assert!(matches!(
             fx.pool_a
-                .install_canonical(fx.id_b, fx.conn_a.clone(), true)
+                .install_canonical(fx.id_b, fx.conn_a.clone(), true, false)
                 .await,
             InstallOutcome::Canonical(_)
         ));
@@ -1427,14 +1437,20 @@ mod tests {
         let epoch0 = member.epoch.load(std::sync::atomic::Ordering::Relaxed);
         // Stale id: nothing happens.
         assert!(
-            !fx.pool_a
+            fx.pool_a
                 .invalidate_canonical(fx.id_b, stable.wrapping_add(1))
                 .await
+                .is_none()
         );
         assert!(fx.pool_a.has_live(fx.id_b));
         // Current connection dies unexpectedly: invalidated, transport
         // cleared, memberships untouched (worker holds packets + redials).
-        assert!(fx.pool_a.invalidate_canonical(fx.id_b, stable).await);
+        assert!(
+            fx.pool_a
+                .invalidate_canonical(fx.id_b, stable)
+                .await
+                .is_some()
+        );
         assert!(!fx.pool_a.has_live(fx.id_b));
         let transport = fx.reg_a.get_transport(fx.id_b).unwrap();
         assert!(transport.live_conn().is_none());
@@ -1444,5 +1460,452 @@ mod tests {
             "invalidation must not deactivate memberships"
         );
         assert!(fx.reg_a.get_membership(fx.id_b, fx.net).is_some());
+    }
+
+    #[tokio::test]
+    async fn canonical_reconnect_supersedes_stale_same_orientation() {
+        // Item 2/16: the initiator detects loss and redials while the
+        // acceptor still sees the old connection as live. The acceptor
+        // must install the reconnect as canonical (not reject it for the
+        // old connection's preferred orientation), retire the old one,
+        // and carry bidirectional datagrams on the replacement.
+        use tunnet_core::InstallOutcome;
+        let fx = loopback_fixture().await;
+        // Canonical initiator dials; the other side accepts. Works for
+        // either key ordering.
+        let a_initiator = fx.id_a < fx.id_b;
+        let (dial_ep, accept_ep, dial_pool, accept_pool, dial_id, accept_id) = if a_initiator {
+            (
+                fx.ep_a.clone(),
+                fx.ep_b.clone(),
+                fx.pool_a.clone(),
+                fx.pool_b.clone(),
+                fx.id_a,
+                fx.id_b,
+            )
+        } else {
+            (
+                fx.ep_b.clone(),
+                fx.ep_a.clone(),
+                fx.pool_b.clone(),
+                fx.pool_a.clone(),
+                fx.id_b,
+                fx.id_a,
+            )
+        };
+        let alpn = tunnet_common::TUNNEL_ALPN;
+        // Second connection pair (the reconnect).
+        let accept_ep2 = accept_ep.clone();
+        let accept_y =
+            tokio::spawn(async move { accept_ep2.accept().await.unwrap().await.unwrap() });
+        let conn_dialer_y = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dial_ep.connect(accept_ep.addr(), alpn),
+        )
+        .await
+        .expect("redial must succeed")
+        .unwrap();
+        let conn_acceptor_y = tokio::time::timeout(std::time::Duration::from_secs(10), accept_y)
+            .await
+            .expect("re-accept")
+            .unwrap();
+        // Initiator side marks X lost (as TX-observed loss would).
+        let old_dialer = if a_initiator {
+            fx.conn_a.stable_id()
+        } else {
+            fx.conn_b.stable_id()
+        };
+        assert!(
+            dial_pool
+                .invalidate_canonical(accept_id, old_dialer)
+                .await
+                .is_some()
+        );
+        // Acceptor still sees X live — yet must accept Y as canonical.
+        let old_acceptor = if a_initiator {
+            fx.conn_b.stable_id()
+        } else {
+            fx.conn_a.stable_id()
+        };
+        assert_eq!(
+            accept_pool.canonical_stable_id(dial_id).await,
+            Some(old_acceptor)
+        );
+        let installed = accept_pool
+            .install_canonical(dial_id, conn_acceptor_y.clone(), false, false)
+            .await;
+        let stable_y = conn_acceptor_y.stable_id();
+        assert!(
+            matches!(installed, InstallOutcome::Canonical(_)),
+            "reconnect from the canonical initiator must supersede stale X"
+        );
+        assert_eq!(
+            accept_pool.canonical_stable_id(dial_id).await,
+            Some(stable_y)
+        );
+        // X is retired on the acceptor.
+        let old_conn = if a_initiator { &fx.conn_b } else { &fx.conn_a };
+        assert!(
+            old_conn.close_reason().is_some(),
+            "stale connection must be closed"
+        );
+        // Replacement carries bidirectional datagrams. Install the dialer
+        // side canonically, then run both legs on the fresh pair.
+        assert!(matches!(
+            dial_pool
+                .install_canonical(accept_id, conn_dialer_y.clone(), true, false)
+                .await,
+            InstallOutcome::Canonical(_)
+        ));
+        // NOTE: directed_leg borrows per-side fixtures; run the two legs
+        // explicitly per ordering instead of threading tuples.
+        if a_initiator {
+            let raw_ab = icmp_echo([10, 7, 0, 1], [10, 7, 0, 2]);
+            let _ = directed_leg(Leg {
+                tx_reg: &fx.reg_a,
+                tx_rt: &fx.rt_a,
+                tx_pool: &fx.pool_a,
+                tx_peer: fx.id_b,
+                tx_hex: &fx.hex_b,
+                tx_host: "b",
+                rx_conn: &conn_acceptor_y,
+                rx_reg: &fx.reg_b,
+                rx_rt: &fx.rt_b,
+                rx_self_ip: std::net::Ipv4Addr::new(10, 7, 0, 2),
+                net: fx.net,
+                raw: raw_ab,
+            })
+            .await;
+            let raw_ba = icmp_echo([10, 7, 0, 2], [10, 7, 0, 1]);
+            let _ = directed_leg(Leg {
+                tx_reg: &fx.reg_b,
+                tx_rt: &fx.rt_b,
+                tx_pool: &fx.pool_b,
+                tx_peer: fx.id_a,
+                tx_hex: &fx.hex_a,
+                tx_host: "a",
+                rx_conn: &conn_dialer_y,
+                rx_reg: &fx.reg_a,
+                rx_rt: &fx.rt_a,
+                rx_self_ip: std::net::Ipv4Addr::new(10, 7, 0, 1),
+                net: fx.net,
+                raw: raw_ba,
+            })
+            .await;
+        } else {
+            let raw_ba = icmp_echo([10, 7, 0, 2], [10, 7, 0, 1]);
+            let _ = directed_leg(Leg {
+                tx_reg: &fx.reg_b,
+                tx_rt: &fx.rt_b,
+                tx_pool: &fx.pool_b,
+                tx_peer: fx.id_a,
+                tx_hex: &fx.hex_a,
+                tx_host: "a",
+                rx_conn: &conn_acceptor_y,
+                rx_reg: &fx.reg_a,
+                rx_rt: &fx.rt_a,
+                rx_self_ip: std::net::Ipv4Addr::new(10, 7, 0, 1),
+                net: fx.net,
+                raw: raw_ba,
+            })
+            .await;
+            let raw_ab = icmp_echo([10, 7, 0, 1], [10, 7, 0, 2]);
+            let _ = directed_leg(Leg {
+                tx_reg: &fx.reg_a,
+                tx_rt: &fx.rt_a,
+                tx_pool: &fx.pool_a,
+                tx_peer: fx.id_b,
+                tx_hex: &fx.hex_b,
+                tx_host: "b",
+                rx_conn: &conn_dialer_y,
+                rx_reg: &fx.reg_b,
+                rx_rt: &fx.rt_b,
+                rx_self_ip: std::net::Ipv4Addr::new(10, 7, 0, 2),
+                net: fx.net,
+                raw: raw_ab,
+            })
+            .await;
+        }
+    }
+
+    /// Minimal session manager for lifecycle tests: real pool + gate +
+    /// status, stub context (routes resolve the given peers so admission
+    /// passes; default bundles admit).
+    #[allow(clippy::too_many_arguments)]
+    fn test_session_manager(
+        pool_arc: &std::sync::Arc<ConnPool>,
+        published: crate::actors::dataplane::PublishedPlane,
+        status: tunnet_core::local_api::DataPlaneStatusSnapshot,
+        gate: crate::actors::dataplane::LifecycleGate,
+        metrics: crate::metrics::AgentMetrics,
+        ingress: crate::ingress::IngressRegistry,
+        peers: &[(String, std::net::Ipv4Addr, Uuid)],
+    ) -> std::sync::Arc<crate::ingress::IngressManager> {
+        use tunnet_core::acl::SelfIdentity;
+        let routes = RoutingTable::new();
+        for (i, (hex, ip, net)) in peers.iter().enumerate() {
+            routes.replace_network(
+                *net,
+                i as u64,
+                &[tunnet_common::PeerEntry {
+                    ip: *ip,
+                    endpoint_id: hex.clone(),
+                    hostname: "p".into(),
+                    tags: vec![],
+                    ssh_host_key: None,
+                }],
+                &tunnet_common::DnsConfig::default(),
+                "net",
+                &"a".repeat(64),
+                i as u64 + 1,
+            );
+        }
+        let self_id = SelfIdentity {
+            endpoint_hex: "aa".into(),
+            ip: std::net::Ipv4Addr::new(10, 9, 0, 1),
+            tags: vec![],
+            network: "test".into(),
+        };
+        let acl = tunnet_core::AclEngine::new(
+            self_id.clone(),
+            routes.clone(),
+            tunnet_common::policy::PolicyBundle::default(),
+        );
+        let runtime = PolicyRuntime::bootstrap(
+            &Default::default(),
+            &Default::default(),
+            &self_id,
+            true,
+            false,
+        );
+        let ctx = crate::ingress::IngressContext {
+            routes,
+            acl,
+            runtime,
+            spoofs: std::collections::HashMap::new(),
+            bufs: tunnet_common::packet::PacketPool::new(8),
+            metrics,
+            auth: None,
+        };
+        // NOTE: the caller must keep `pool_arc` alive for the test's
+        // duration: the manager holds only a Weak pool reference (no
+        // ownership cycle), so a dropped Arc silently disables it.
+        let pool_arc: &std::sync::Arc<ConnPool> = pool_arc;
+        std::sync::Arc::new(crate::ingress::IngressManager::new(
+            pool_arc, ingress, ctx, published, status, gate, None,
+        ))
+    }
+
+    fn publish_gen(
+        published: &crate::actors::dataplane::PublishedPlane,
+        generation: u64,
+        metrics: &crate::metrics::AgentMetrics,
+        pool: &ConnPool,
+        peer_registry: &PeerRegistry,
+    ) {
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<bytes::Bytes>(16);
+        let writer = crate::tun_writer::TunWriterHandle::new(tx, metrics.clone());
+        let tx_registry = crate::endpoint_tx::EndpointTxRegistry::new(
+            tokio_util::sync::CancellationToken::new(),
+            pool.clone(),
+            std::sync::Arc::new(peer_registry.clone()),
+            metrics.clone(),
+            tunnet_common::packet::PacketPool::new(8),
+            tunnet_core::CloudRelayMeter::new(),
+        );
+        published.store(Some(Arc::new(
+            crate::actors::dataplane::PublishedDataPlane {
+                generation,
+                cancel: tokio_util::sync::CancellationToken::new(),
+                tun_writer: writer,
+                tx_registry,
+            },
+        )));
+    }
+
+    #[tokio::test]
+    async fn generation_gap_rejects_stale_installs() {
+        // Item 4/16: candidates arriving while Down/Starting/Stopping never
+        // become canonical (closed, pool untouched). After N+1 starts,
+        // reconcile drops orphans and a fresh install yields exactly one
+        // reader.
+        use crate::actors::dataplane::{GateState, LifecycleGate};
+        use tunnet_core::local_api::DataPlaneStatusSnapshot;
+        let fx = loopback_fixture().await;
+        let metrics = test_metrics();
+        let gate = LifecycleGate::default();
+        let published = crate::actors::dataplane::new_published_plane();
+        let status = DataPlaneStatusSnapshot::new(false);
+        let ingress = crate::ingress::IngressRegistry::new();
+        // Keep alive: the manager holds only a Weak pool reference.
+        let pool_arc = std::sync::Arc::new(fx.pool_b.clone());
+        let manager = test_session_manager(
+            &pool_arc,
+            published.clone(),
+            status.clone(),
+            gate.clone(),
+            metrics.clone(),
+            ingress.clone(),
+            &[(
+                fx.hex_a.clone(),
+                std::net::Ipv4Addr::new(10, 7, 0, 1),
+                fx.net,
+            )],
+        );
+        // Fresh candidate pair for the gap attempts.
+        let accept_b = tokio::spawn({
+            let ep = fx.ep_b.clone();
+            async move { ep.accept().await.unwrap().await.unwrap() }
+        });
+        let cand_dial = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fx.ep_a.connect(fx.ep_b.addr(), tunnet_common::TUNNEL_ALPN),
+        )
+        .await
+        .expect("dial")
+        .unwrap();
+        let cand_accept = tokio::time::timeout(std::time::Duration::from_secs(10), accept_b)
+            .await
+            .expect("accept")
+            .unwrap();
+        let peer = fx.id_a;
+        let fixture_stable = fx.conn_b.stable_id();
+        // Down (default): closed immediately, pool untouched (fixture
+        // session stays canonical).
+        manager.install_accepted(cand_accept.clone()).await;
+        assert_eq!(
+            fx.pool_b.canonical_stable_id(peer).await,
+            Some(fixture_stable)
+        );
+        // Stopping: same refusal.
+        gate.set(GateState::Stopping(5));
+        manager.install_accepted(cand_accept.clone()).await;
+        assert_eq!(
+            fx.pool_b.canonical_stable_id(peer).await,
+            Some(fixture_stable)
+        );
+        // Up(8) but no plane published: rollback, pool untouched, closed.
+        gate.set(GateState::Up(8));
+        manager.install_accepted(cand_accept.clone()).await;
+        assert_eq!(
+            fx.pool_b.canonical_stable_id(peer).await,
+            Some(fixture_stable)
+        );
+        assert!(cand_accept.close_reason().is_some());
+        // N+1 healthy needs a FRESH candidate (the gap conn is closed):
+        // dial another pair.
+        let accept_b2 = tokio::spawn({
+            let ep = fx.ep_b.clone();
+            async move { ep.accept().await.unwrap().await.unwrap() }
+        });
+        let cand_dial2 = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fx.ep_a.connect(fx.ep_b.addr(), tunnet_common::TUNNEL_ALPN),
+        )
+        .await
+        .expect("dial")
+        .unwrap();
+        let cand_accept2 = tokio::time::timeout(std::time::Duration::from_secs(10), accept_b2)
+            .await
+            .expect("accept")
+            .unwrap();
+        // Plane gen 8 published: install succeeds with exactly one live
+        // reader. (The fixture session is torn down first so the winner
+        // is deterministic regardless of key ordering; tie-break
+        // replacement itself is covered by the reconnect test.)
+        assert!(
+            fx.pool_b
+                .invalidate_canonical(peer, fixture_stable)
+                .await
+                .is_some()
+        );
+        publish_gen(&published, 8, &metrics, &fx.pool_b, &fx.reg_b);
+        manager.install_accepted(cand_accept2.clone()).await;
+        assert_eq!(
+            fx.pool_b.canonical_stable_id(peer).await,
+            Some(cand_accept2.stable_id())
+        );
+        assert_eq!(
+            ingress.current_reader(peer),
+            Some((cand_accept2.stable_id(), true))
+        );
+        // Reconcile keeps the bound session (no-op, still canonical).
+        manager.reconcile_generation(8).await;
+        assert_eq!(
+            fx.pool_b.canonical_stable_id(peer).await,
+            Some(cand_accept2.stable_id())
+        );
+        // N+2: teardown stops readers first (as do_bring_down does), then
+        // the new generation reconciles the orphan closed + invalidated.
+        // Preconnect afterwards would establish a fresh session.
+        ingress.shutdown().await;
+        gate.set(GateState::Up(9));
+        publish_gen(&published, 9, &metrics, &fx.pool_b, &fx.reg_b);
+        manager.reconcile_generation(9).await;
+        assert!(!fx.pool_b.has_live(peer));
+        assert!(cand_accept2.close_reason().is_some());
+        let _ = (cand_dial, cand_dial2);
+    }
+
+    #[tokio::test]
+    async fn session_failed_clears_canonical_and_reader() {
+        // Item 3/16: the unified op clears the exact canonical slot +
+        // transport, removes exactly that reader, records bookkeeping,
+        // pushes health — and a second call is harmless.
+        use crate::actors::dataplane::LifecycleGate;
+        use crate::ingress::SessionFailReason;
+        use tunnet_core::local_api::DataPlaneStatusSnapshot;
+        let fx = loopback_fixture().await;
+        let metrics = test_metrics();
+        let gate = LifecycleGate::default();
+        gate.set(crate::actors::dataplane::GateState::Up(3));
+        let published = crate::actors::dataplane::new_published_plane();
+        let status = DataPlaneStatusSnapshot::new(false);
+        let ingress = crate::ingress::IngressRegistry::new();
+        // Keep alive: the manager holds only a Weak pool reference.
+        let pool_arc = std::sync::Arc::new(fx.pool_a.clone());
+        let manager = test_session_manager(
+            &pool_arc,
+            published.clone(),
+            status.clone(),
+            gate.clone(),
+            metrics.clone(),
+            ingress.clone(),
+            &[],
+        );
+        let peer = fx.id_b;
+        let sid = fx.conn_a.stable_id();
+        // Simulate the live reader registration for this session.
+        let (_hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        assert!(ingress.install(
+            peer,
+            sid,
+            async move {
+                let _ = hold_rx.await;
+            },
+            None
+        ));
+        manager
+            .session_failed(peer, sid, SessionFailReason::RxConnFailed)
+            .await;
+        assert!(!fx.pool_a.has_live(peer), "canonical must clear");
+        assert!(
+            ingress.current_reader(peer).is_none(),
+            "this sid's reader must go"
+        );
+        let snap = status.sessions();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].canonical_stable_id, None);
+        assert_eq!(snap[0].canonical_state, "reconnecting");
+        assert_eq!(snap[0].reconnect_count, 1);
+        assert!(snap[0].last_error.is_some());
+        // Idempotent second call: no panic, no double count.
+        manager
+            .session_failed(peer, sid, SessionFailReason::RxConnFailed)
+            .await;
+        let snap = status.sessions();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].reconnect_count, 1);
     }
 }

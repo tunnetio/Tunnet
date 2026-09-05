@@ -62,7 +62,11 @@ import json
 def parse_udp_summary(d):
     """Shared UDP/load summary parser: receiver-delivered throughput is
     sum_received (never sender-side sum); loss/jitter/pps from receiver.
-    Returns dict with ok/actual/sent/loss/jitter/pps_sent/pps_recv/error."""
+    Returns dict with ok/actual/sent/loss/jitter/pps_sent/pps_recv/error
+    plus independent delivery accounting: sender/receiver bytes+packets,
+    delivery_ratio (receiver_bps/sender_bps) and undelivered_pct — so a
+    row like sent=32Mbps delivered=0 loss=0.2% still reads as ~100%
+    undelivered regardless of iperf's loss counter."""
     if isinstance(d.get('error'), str):
         return {'ok': False, 'error': 'iperf error: %s' % d['error']}
     try:
@@ -96,12 +100,24 @@ def parse_udp_summary(d):
     out['jitter'] = round(jm, 3) if jm is not None else None
     out['pps_sent'] = num(send, 'packets')
     out['pps_recv'] = num(recv, 'packets_received', 'packets')
+    out['sender_bytes'] = num(send, 'bytes')
+    out['receiver_bytes'] = num(recv, 'bytes')
+    out['sender_packets'] = num(send, 'packets')
+    out['receiver_packets'] = num(recv, 'packets_received', 'packets')
+    if sbps:
+        out['delivery_ratio'] = round(bps / sbps, 4)
+        out['undelivered_pct'] = round(100.0 * (1.0 - bps / sbps), 2)
+    else:
+        out['delivery_ratio'] = None
+        out['undelivered_pct'] = None
     return out
 
 
 def sw_diff(before, after):
     """Delta of software-drop counters between two snapshots.
-    Unavailable on either side reads as unavailable — never as zero."""
+    Unavailable on either side reads as unavailable — never as zero.
+    Session objects ride along for change detection (compared, not
+    subtracted)."""
     if not before.get('available') or not after.get('available'):
         return {'available': False}
     d = {'available': True}
@@ -113,30 +129,82 @@ def sw_diff(before, after):
     return d
 
 
+def sessions_equal(a, b):
+    """True when two session snapshots describe the same live sessions."""
+    if (a is None) != (b is None):
+        return False
+    if a is None:
+        return True
+    for k in ('generation', 'restart_count', 'up', 'outbound_alive', 'writer_alive'):
+        if a.get(k) != b.get(k):
+            return False
+    sa = sorted((s.get('peer'), s.get('generation'), s.get('canonical'),
+                 s.get('reader'), s.get('orientation'), s.get('alive'))
+                for s in (a.get('sessions') or []))
+    sb = sorted((s.get('peer'), s.get('generation'), s.get('canonical'),
+                 s.get('reader'), s.get('orientation'), s.get('alive'))
+                for s in (b.get('sessions') or []))
+    return sa == sb
+
+
 def sw_pair_drops(sw0l, sw0p, sw1l, sw1p):
-    """Local + peer deltas from four snapshot files."""
-    return {
-        'local_sw_drops': sw_diff(json.load(open(sw0l)), json.load(open(sw1l))),
-        'peer_sw_drops': sw_diff(json.load(open(sw0p)), json.load(open(sw1p))),
+    """Local + peer deltas from four snapshot files, with session
+    before/after objects and change flags for poisoning detection."""
+    b0l, b0p = json.load(open(sw0l)), json.load(open(sw0p))
+    b1l, b1p = json.load(open(sw1l)), json.load(open(sw1p))
+    out = {
+        'local_sw_drops': sw_diff(b0l, b1l),
+        'peer_sw_drops': sw_diff(b0p, b1p),
     }
+    for name, b0, b1 in (('local', b0l, b1l), ('peer', b0p, b1p)):
+        s0 = b0.get('session')
+        s1 = b1.get('session')
+        key = name + '_session'
+        out[key + '_before'] = s0
+        out[key + '_after'] = s1
+        out[key + '_changed'] = not sessions_equal(s0, s1)
+    return out
 PYEOF
 export BENCH_LIB="$RESULTS_DIR/benchlib.py"
 
-# Software-drop snapshot (tunnet runs only): low-cardinality counters for
-# per-scenario self-diagnosis. Uploads drop on the local sender, downloads
-# on the remote sender — both sides are scraped. Availability is explicit:
-# {"available":false} when unreachable; zero is written only after a
-# successful scrape, never as a substitute for "unknown".
+# Software-drop snapshot (tunnet runs only): low-cardinality counters plus
+# dataplane vitals and canonical session series, for per-scenario
+# self-diagnosis AND session-poisoning detection. Uploads drop on the
+# local sender, downloads on the remote sender — both sides are scraped.
+# Availability is explicit: {"available":false} when unreachable; zero is
+# written only after a successful scrape, never as "unknown".
 sw_snapshot() { # OUTFILE URL
   local out="$1" url="${2:-}"
   if [ "$PRODUCT" = "tunnet" ] && [ -n "$url" ]; then
     curl -s --max-time 5 "$url" 2>/dev/null | python3 -c "
-import json,sys
+import json,sys,re
 sched=dropped=twd=0.0
-    ok=False
+ok=False
+vitals={}
+sessions=[]
 for line in sys.stdin:
     line=line.strip()
     if not line or line.startswith('#'):
+        continue
+    m = re.match(r'^(tunnet_dataplane_(generation|restart_count|up|outbound_alive|writer_alive))\s+(\S+)\s*$', line)
+    if m:
+        try:
+            vitals[m.group(2)] = float(m.group(3)); ok=True
+        except Exception:
+            pass
+        continue
+    m = re.match(r'^tunnet_session_info\{([^}]*)\}\s+(\S+)\s*$', line)
+    if m:
+        labels = dict(kv.split('=', 1) for kv in m.group(1).split(','))
+        labels = {k.strip(): v.strip().strip(chr(34)) for k, v in labels.items()}
+        try:
+            alive = float(m.group(2)) > 0
+        except Exception:
+            continue
+        ok=True
+        sessions.append({'peer': labels.get('peer'), 'generation': labels.get('generation'),
+                         'canonical': labels.get('canonical'), 'reader': labels.get('reader'),
+                         'orientation': labels.get('orientation'), 'alive': alive})
         continue
     try:
         head, val = line.rsplit(None, 1)
@@ -150,7 +218,9 @@ for line in sys.stdin:
     elif head.startswith('tunnet_tun_write_queue_drop_total'):
         twd += v; ok=True
 if ok:
-    print(json.dumps({'available':True,'sched':sched,'dropped':dropped,'tun_write_drop':twd}))
+    session = {'available': True, 'sessions': sessions}
+    session.update(vitals)
+    print(json.dumps({'available':True,'sched':sched,'dropped':dropped,'tun_write_drop':twd,'session':session}))
 else:
     print(json.dumps({'available':False}))" > "$out" 2>/dev/null || echo '{"available":false}' > "$out"
   else
@@ -439,22 +509,39 @@ except Exception as e:
     actual, loss = -1, -1
     valid = False
     print(f"  {name} {frac}: LOAD ERROR {e}", flush=True)
+    ps = {}
 lat = json.load(open(latpath))
 b = json.load(open(p0path)); a = json.load(open(p1path))
 sw = sw_pair_drops(os.environ['BENCH_SW0L'], os.environ['BENCH_SW0P'], os.environ['BENCH_SW1L'], os.environ['BENCH_SW1P'])
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
-if actual > 0 and actual < rate*0.7 and frac <= 1.0:
+# Session poisoning detection: any generation/stable/reader move on
+# either side during the scenario is annotated, never hidden.
+for _side in ('local', 'peer'):
+    if sw.get(_side + '_session_changed'):
+        notes.append('SESSION CHANGED mid-run (generation/stable/reader moved); result flagged')
+# actual==0 MUST count: a successfully executed but fully undelivered
+# load is catastrophic under-delivery, not a parser failure (valid stays
+# true, load_met goes false).
+under = valid and actual < rate*0.7 and frac <= 1.0
+if under:
     notes.append('under-delivered load')
 if not valid:
     notes.append('LOAD FAILED: row invalid, values are placeholders')
 note = '; '.join(notes)
-print(f"  actual={actual}Mbps loss={loss}% p50={lat.get('p50')} p95={lat.get('p95')} p99={lat.get('p99')} max={lat.get('max')} {note}")
+dr = ps.get('delivery_ratio') if valid else None
+udpct = ps.get('undelivered_pct') if valid else None
+print(f"  actual={actual}Mbps loss={loss}% delivered={dr} undelivered={udpct}% p50={lat.get('p50')} p95={lat.get('p95')} p99={lat.get('p99')} max={lat.get('max')} {note}")
 row = {'scenario': 'loaded-latency', 'direction': name, 'fraction': frac,
        'offered_mbps': rate, 'actual_mbps': actual, 'loss_pct': loss,
+       'delivery_ratio': dr, 'undelivered_pct': udpct,
+       'sender_bytes': ps.get('sender_bytes') if valid else None,
+       'receiver_bytes': ps.get('receiver_bytes') if valid else None,
+       'sender_packets': ps.get('sender_packets') if valid else None,
+       'receiver_packets': ps.get('receiver_packets') if valid else None,
        'latency': lat, 'path': b, 'path_after': a, 'note': note,
-       'valid': valid}
+       'valid': valid, 'load_met': valid and not under}
 row.update(sw)
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
@@ -496,11 +583,24 @@ def loadsum(p):
         ps = parse_udp_summary(json.load(open(p)))
         if not ps['ok']:
             raise ValueError(ps['error'])
-        return ps['actual'], ps['loss'], None
+        return ps, None
     except Exception as e:
-        return -1, -1, str(e)[:200]
-actual_up, loss_up, err_up = loadsum(uppath)
-actual_down, loss_down, err_down = loadsum(downpath)
+        return None, str(e)[:200]
+actual_up, loss_up, err_up = None, None, None
+actual_down, loss_down, err_down = None, None, None
+ps_up = ps_down = {}
+t = loadsum(uppath)
+if t[1] is None:
+    ps_up = t[0]
+    actual_up, loss_up = ps_up['actual'], ps_up['loss']
+else:
+    actual_up, loss_up, err_up = -1, -1, t[1]
+t = loadsum(downpath)
+if t[1] is None:
+    ps_down = t[0]
+    actual_down, loss_down = ps_down['actual'], ps_down['loss']
+else:
+    actual_down, loss_down, err_down = -1, -1, t[1]
 if up_ok != 0:
     err_up = (err_up + '; ' if err_up else '') + f'iperf up client exited {up_ok}'
 if down_ok != 0:
@@ -511,12 +611,18 @@ sw = sw_pair_drops(os.environ['BENCH_SW0L'], os.environ['BENCH_SW0P'], os.enviro
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
-if actual_up > 0 and actual_up < rate_up*0.7 and frac <= 1.0:
+for _side in ('local', 'peer'):
+    if sw.get(_side + '_session_changed'):
+        notes.append('SESSION CHANGED mid-run (generation/stable/reader moved); result flagged')
+under_up = err_up is None and actual_up < rate_up*0.7 and frac <= 1.0
+under_down = err_down is None and actual_down < rate_down*0.7 and frac <= 1.0
+if under_up:
     notes.append('under-delivered up load')
-if actual_down > 0 and actual_down < rate_down*0.7 and frac <= 1.0:
+if under_down:
     notes.append('under-delivered down load')
 # A bidirectional row is only produced when BOTH directions ran: errors
 # mark the row invalid explicitly instead of hiding behind -1 values.
+# Catastrophic under-delivery keeps valid=true with load_met=false.
 valid = err_up is None and err_down is None
 if err_up:
     notes.append(f'BIDIR INVALID: up load failed ({err_up})')
@@ -528,8 +634,16 @@ row = {'scenario': 'loaded-latency', 'direction': 'bidir', 'fraction': frac,
        'offered_up_mbps': rate_up, 'offered_down_mbps': rate_down,
        'actual_up_mbps': actual_up, 'actual_down_mbps': actual_down,
        'loss_up_pct': loss_up, 'loss_down_pct': loss_down,
+       'delivery_ratio_up': ps_up.get('delivery_ratio'),
+       'undelivered_up_pct': ps_up.get('undelivered_pct'),
+       'delivery_ratio_down': ps_down.get('delivery_ratio'),
+       'undelivered_down_pct': ps_down.get('undelivered_pct'),
+       'up_sender_bytes': ps_up.get('sender_bytes'),
+       'up_receiver_bytes': ps_up.get('receiver_bytes'),
+       'down_sender_bytes': ps_down.get('sender_bytes'),
+       'down_receiver_bytes': ps_down.get('receiver_bytes'),
        'latency': lat, 'path': b, 'path_after': a, 'note': note,
-       'valid': valid}
+       'valid': valid, 'load_met': valid and not (under_up or under_down)}
 row.update(sw)
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']
@@ -588,11 +702,22 @@ pps_sent = pps(ps.get('pps_sent')) if valid else None
 pps_recv = pps(ps.get('pps_recv')) if valid else None
 loss = ps.get('loss', -1) if valid else -1
 jitter = ps.get('jitter') if valid else None
+dr = ps.get('delivery_ratio') if valid else None
+udpct = ps.get('undelivered_pct') if valid else None
 note = '' if valid else err
-print(f"  {direction} offered={rate}Mbps sent={sent_mbps}Mbps delivered={actual}Mbps pps_sent={pps_sent} pps_recv={pps_recv} len={length}B loss={loss}% jitter={jitter}ms valid={valid} {note}")
+for _side in ('local', 'peer'):
+    if sw.get(_side + '_session_changed'):
+        note = (note + '; ' if note else '') + 'SESSION CHANGED mid-run (generation/stable/reader moved); result flagged'
+print(f"  {direction} offered={rate}Mbps sent={sent_mbps}Mbps delivered={actual}Mbps undelivered={udpct}% pps_sent={pps_sent} pps_recv={pps_recv} len={length}B loss={loss}% jitter={jitter}ms valid={valid} {note}")
 row = {'scenario': 'udp', 'direction': direction, 'offered_mbps': rate, 'packet_len': length,
        'sent_mbps': sent_mbps, 'actual_mbps': actual, 'pps_sent': pps_sent, 'pps_received': pps_recv,
-       'loss_pct': loss, 'jitter_ms': jitter, 'path': path, 'note': note, 'valid': valid}
+       'loss_pct': loss, 'jitter_ms': jitter,
+       'delivery_ratio': dr, 'undelivered_pct': udpct,
+       'sender_bytes': ps.get('sender_bytes') if valid else None,
+       'receiver_bytes': ps.get('receiver_bytes') if valid else None,
+       'sender_packets': ps.get('sender_packets') if valid else None,
+       'receiver_packets': ps.get('receiver_packets') if valid else None,
+       'path': path, 'note': note, 'valid': valid}
 row.update(sw)
 row['ts'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 row['product'] = os.environ['BENCH_PRODUCT']

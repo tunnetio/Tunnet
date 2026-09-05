@@ -44,6 +44,9 @@ pub struct AgentMetrics {
     drop_sched_emergency: Counter,
     drop_sched_revoke: Counter,
     drop_sched_genend: Counter,
+    drop_sched_incompatible: Counter,
+    tx_incompatible: Counter,
+    reader_panics: Counter,
     drop_policy: Counter,
     drop_too_large: Counter,
     drop_no_conn: Counter,
@@ -165,6 +168,9 @@ impl AgentMetrics {
             drop_sched_emergency: counter!("tunnet_sched_drops_total", "reason" => "sched_emergency"),
             drop_sched_revoke: counter!("tunnet_sched_drops_total", "reason" => "sched_membership_revoked"),
             drop_sched_genend: counter!("tunnet_sched_drops_total", "reason" => "sched_generation_end"),
+            drop_sched_incompatible: counter!("tunnet_sched_drops_total", "reason" => "sched_incompatible"),
+            tx_incompatible: counter!("tunnet_tx_incompatible_total"),
+            reader_panics: counter!("tunnet_reader_panics_total"),
             drop_policy: counter!("tunnet_dropped_packets_total", "reason" => "policy_deny"),
             drop_too_large: counter!("tunnet_dropped_packets_total", "reason" => "datagram_too_large"),
             drop_no_conn: counter!("tunnet_dropped_packets_total", "reason" => "no_connection"),
@@ -178,6 +184,46 @@ impl AgentMetrics {
         }
     }
 
+    /// Dataplane vitals for session-poisoning detection (item 14): plain
+    /// gauges scraped beside the drop counters, local and peer side.
+    pub fn dataplane_vitals(
+        &self,
+        generation: u64,
+        restart_count: u64,
+        up: bool,
+        outbound_alive: bool,
+        writer_alive: bool,
+    ) {
+        gauge!("tunnet_dataplane_generation").set(generation as f64);
+        gauge!("tunnet_dataplane_restart_count").set(restart_count as f64);
+        gauge!("tunnet_dataplane_up").set(u8::from(up) as f64);
+        gauge!("tunnet_dataplane_outbound_alive").set(u8::from(outbound_alive) as f64);
+        gauge!("tunnet_dataplane_writer_alive").set(u8::from(writer_alive) as f64);
+    }
+
+    /// Canonical session state series (item 14): value 1 marks the current
+    /// series for a peer (0 = stale/superseded — set explicitly when a
+    /// combo is replaced so old series never read as live). The benchmark
+    /// diffs label sets + values across scenarios to flag session changes.
+    pub fn session_set(
+        &self,
+        peer_hex: &str,
+        generation: u64,
+        canonical: &str,
+        reader: &str,
+        orientation: &str,
+        alive: bool,
+    ) {
+        gauge!("tunnet_session_info",
+            "peer" => peer_hex.to_string(),
+            "generation" => generation.to_string(),
+            "canonical" => canonical.to_string(),
+            "reader" => reader.to_string(),
+            "orientation" => orientation.to_string(),
+        )
+        .set(u8::from(alive) as f64);
+    }
+
     pub fn new() -> anyhow::Result<Self> {
         let handle = PrometheusBuilder::new()
             .with_recommended_naming(true)
@@ -187,6 +233,23 @@ impl AgentMetrics {
         describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
         describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
         describe_counter!("tunnet_sched_drops_total", "Scheduler drops by reason");
+        describe_counter!(
+            "tunnet_tx_incompatible_total",
+            "Endpoints with permanent DATAGRAM incompatibility"
+        );
+        describe_counter!("tunnet_reader_panics_total", "Ingress reader panics");
+        describe_gauge!(
+            "tunnet_dataplane_generation",
+            "Current dataplane generation"
+        );
+        describe_gauge!("tunnet_dataplane_restart_count", "Dataplane restarts");
+        describe_gauge!("tunnet_dataplane_up", "Dataplane up (1/0)");
+        describe_gauge!("tunnet_dataplane_outbound_alive", "TUN reader alive (1/0)");
+        describe_gauge!("tunnet_dataplane_writer_alive", "TUN writer alive (1/0)");
+        describe_gauge!(
+            "tunnet_session_info",
+            "Canonical tunnel session state by peer (1 = current)"
+        );
         describe_counter!(
             "tunnet_overlay_tx_logical_total",
             "Logical packets transmitted to the overlay"
@@ -347,11 +410,23 @@ impl AgentMetrics {
             "sched_codel" => self.drop_sched_codel.increment(n),
             "sched_membership_revoked" => self.drop_sched_revoke.increment(n),
             "sched_generation_end" => self.drop_sched_genend.increment(n),
+            "sched_incompatible" => self.drop_sched_incompatible.increment(n),
             "policy_deny" | "policy_deny_in" => self.drop_policy.increment(n),
             "datagram_too_large" => self.drop_too_large.increment(n),
             "no_connection" => self.drop_no_conn.increment(n),
             _ => self.drop_other.increment(n),
         }
+    }
+
+    /// Permanent DATAGRAM incompatibility surfaced for an endpoint: no
+    /// redial loop, packet resolved explicitly, waits for a new connection.
+    pub fn endpoint_incompatible_inc(&self) {
+        self.tx_incompatible.increment(1);
+    }
+
+    /// Ingress reader panic (session failure + internal-error telemetry).
+    pub fn reader_panic_inc(&self) {
+        self.reader_panics.increment(1);
     }
 
     /// Aggregate queue levels across all endpoints (signed deltas, never

@@ -42,6 +42,7 @@ use tunnet_core::scheduler::{Dequeue, DropReason, EndpointScheduler, SchedReport
 use tunnet_core::{CloudRelayMeter, ConnPool};
 use uuid::Uuid;
 
+use crate::ingress::{IngressManager, SessionFailReason};
 use crate::metrics::AgentMetrics;
 
 /// One endpoint's transmit state: scheduler + worker lifecycle. Created on
@@ -71,13 +72,21 @@ impl EndpointTxState {
         }
     }
 
-    /// Start the worker if idle (exactly one runner per state).
+    /// Start the worker if idle (exactly one runner per state). The task
+    /// is supervised: a panic clears `running` and escalates to a full
+    /// generation restart (never a silent dead worker with `running=true`).
     fn start_if_idle(self: &Arc<Self>, inner: &Arc<Inner>) {
         if !self.running.swap(true, Ordering::AcqRel) {
             let state = self.clone();
             let inner = inner.clone();
+            let fatal = inner
+                .fatal_handler
+                .lock()
+                .expect("fatal handler lock")
+                .clone();
+            let worker = run_endpoint_worker(state.clone(), inner);
             let handle = tokio::spawn(async move {
-                run_endpoint_worker(state, inner).await;
+                supervise_worker(state, fatal, worker).await;
             });
             *self.worker.lock() = Some(handle);
         } else {
@@ -85,6 +94,32 @@ impl EndpointTxState {
         }
     }
 }
+
+/// Worker supervision wrapper (item 9): normal exits (idle/cancel) already
+/// cleared `running` on their own paths and are untouched here; a panic
+/// clears `running` and escalates with the endpoint + reason. Never touches
+/// `running` on success: an older task must not clobber a newer worker's
+/// flag (see start_if_idle ordering).
+async fn supervise_worker(
+    state: Arc<EndpointTxState>,
+    fatal: Option<FatalHandler>,
+    worker: impl std::future::Future<Output = ()> + Send,
+) {
+    let endpoint = state.endpoint;
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(worker)).await {
+        Ok(()) => {}
+        Err(_) => {
+            state.running.store(false, Ordering::Release);
+            tracing::error!(%endpoint, "endpoint TX worker panicked");
+            if let Some(fatal) = fatal {
+                fatal(endpoint, "endpoint TX worker panicked".to_string());
+            }
+        }
+    }
+}
+
+/// Escalation for abnormal worker death (actor restarts the generation).
+type FatalHandler = Arc<dyn Fn(EndpointId, String) + Send + Sync + 'static>;
 
 struct Inner {
     states: DashMap<EndpointId, Arc<EndpointTxState>>,
@@ -94,6 +129,12 @@ struct Inner {
     metrics: AgentMetrics,
     bufs: Arc<PacketPool>,
     meter: CloudRelayMeter,
+    /// Session manager for the unified failure transition (TX path).
+    /// None in unit tests (worker falls back to direct pool invalidation).
+    session_mgr: std::sync::Mutex<Option<Arc<IngressManager>>>,
+    /// Escalation for abnormal worker death (actor restarts the
+    /// generation). None in tests.
+    fatal_handler: std::sync::Mutex<Option<FatalHandler>>,
 }
 
 /// Generation-owned registry of endpoint TX workers. A fresh registry per
@@ -121,8 +162,26 @@ impl EndpointTxRegistry {
                 metrics,
                 bufs,
                 meter,
+                session_mgr: std::sync::Mutex::new(None),
+                fatal_handler: std::sync::Mutex::new(None),
             }),
         }
+    }
+
+    /// Attach the session manager for the unified TX failure transition
+    /// (item 3): TX-observed loss/incompatibility funnels through the same
+    /// `session_failed` op as reader failures. Must be called before the
+    /// registry publishes (actor does this at bring-up); without it the
+    /// worker falls back to direct pool invalidation (tests).
+    pub fn set_session_manager(&self, manager: Arc<IngressManager>) {
+        *self.inner.session_mgr.lock().expect("session lock") = Some(manager);
+    }
+
+    /// Attach abnormal-worker-death escalation (actor restarts the whole
+    /// generation). Must be called before publishing; without it a panic
+    /// still clears `running` but escalates nowhere (tests).
+    pub fn set_fatal_handler(&self, handler: FatalHandler) {
+        *self.inner.fatal_handler.lock().expect("fatal lock") = Some(handler);
     }
 
     /// Get-or-create the endpoint state and ensure its worker runs.
@@ -261,6 +320,24 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
             report_state(&state, &inner.metrics);
             state.running.store(false, Ordering::Release);
             return;
+        }
+        // Permanent DATAGRAM incompatibility (item 13): never redial-loop
+        // an incompatible peer. A live connection is a meaningful change
+        // (accept path or reconfiguration installed one) — clear and try
+        // it. Otherwise park without dialing; new generations start fresh.
+        if ctx.transport.datagram_incompatible.load(Ordering::Relaxed) {
+            if ctx.transport.live_conn().is_some() {
+                ctx.transport
+                    .datagram_incompatible
+                    .store(false, Ordering::Relaxed);
+            } else {
+                tokio::select! {
+                    _ = state.notify.notified() => {}
+                    _ = inner.cancel.cancelled() => continue,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                continue;
+            }
         }
         // Membership revocation is observed per attempt (not just at
         // dequeue): a revoked member's packets never transmit.
@@ -417,16 +494,20 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 report_state(&state, &inner.metrics);
             }
             Drive::ConnLost => {
-                // TX-observed loss on THIS connection: invalidate exactly
-                // this canonical connection (same path as Fatal) so the
-                // worker never re-obtains or retries a connection that
-                // already produced ConnectionLost. The cursor is retained
-                // with everything intact; the loop redials and replays
-                // from byte 0. Park briefly so an instantly-failing
-                // connection cannot hot-spin.
-                ctx.pool
-                    .invalidate_canonical(endpoint, conn.stable_id())
-                    .await;
+                // TX-observed loss on THIS connection: the unified session
+                // transition (same op as reader failures) invalidates
+                // exactly this canonical connection, so the worker never
+                // re-obtains or retries it. The cursor is retained with
+                // everything intact; the loop redials and replays from
+                // byte 0. Park briefly so an instantly-failing connection
+                // cannot hot-spin.
+                session_failed_for_worker(
+                    &inner,
+                    endpoint,
+                    conn.stable_id(),
+                    SessionFailReason::TxConnLost,
+                )
+                .await;
                 tokio::select! {
                     _ = state.notify.notified() => {}
                     _ = inner.cancel.cancelled() => {}
@@ -434,13 +515,13 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
                 }
             }
             Drive::Fatal => {
-                // Real transport/protocol failure (datagrams disabled or
-                // unsupported): close and invalidate exactly this canonical
-                // connection so reconnect starts clean. The cursor is
-                // retained; queue caps bound memory while parked.
-                let sid = conn.stable_id();
-                conn.close(0u32.into(), b"datagrams_unsupported");
-                ctx.pool.invalidate_canonical(endpoint, sid).await;
+                // Permanent DATAGRAM incompatibility (peer or local config
+                // cannot carry DATAGRAMs): close + invalidate exactly this
+                // canonical connection, mark the endpoint incompatible (no
+                // redial loop), and resolve the packet explicitly. A new
+                // canonical connection or generation clears the mark.
+                let it = inflight.take().expect("driven");
+                on_transport_fatal(&inner, &ctx, &state, endpoint, &conn, it).await;
                 tokio::select! {
                     _ = state.notify.notified() => {}
                     _ = inner.cancel.cancelled() => {}
@@ -461,8 +542,57 @@ async fn run_endpoint_worker(state: Arc<EndpointTxState>, inner: Arc<Inner>) {
     }
 }
 
-/// Idle parking: wait for work, else exit after a quiet period (running flag
-/// dance keeps exactly one worker).
+/// Unified session-failure transition for the TX path (item 3): funnels
+/// TX-observed loss through the session manager's op when attached.
+/// Falls back to direct pool invalidation in unit tests (no manager).
+async fn session_failed_for_worker(
+    inner: &Arc<Inner>,
+    endpoint: EndpointId,
+    stable_id: usize,
+    reason: SessionFailReason,
+) {
+    let manager = inner.session_mgr.lock().expect("session lock").clone();
+    if let Some(manager) = manager {
+        manager.session_failed(endpoint, stable_id, reason).await;
+    } else {
+        ctx_pool_fallback(inner, endpoint, stable_id).await;
+    }
+}
+
+async fn ctx_pool_fallback(inner: &Arc<Inner>, endpoint: EndpointId, stable_id: usize) {
+    if let Some(dead) = inner.pool.invalidate_canonical(endpoint, stable_id).await {
+        dead.close(0u32.into(), b"session_failed");
+    }
+}
+
+/// Permanent DATAGRAM incompatibility (item 13): close + invalidate the
+/// exact canonical connection through the unified op, mark the endpoint
+/// incompatible so the worker never redial-loops, surface an explicit
+/// counter, and resolve the packet explicitly with `Incompatible`.
+async fn on_transport_fatal(
+    inner: &Arc<Inner>,
+    ctx: &TxCtx<'_>,
+    state: &Arc<EndpointTxState>,
+    endpoint: EndpointId,
+    conn: &Connection,
+    it: InFlightTx,
+) {
+    let sid = conn.stable_id();
+    conn.close(0u32.into(), b"datagrams_unsupported");
+    session_failed_for_worker(inner, endpoint, sid, SessionFailReason::TransportFatal).await;
+    ctx.transport
+        .datagram_incompatible
+        .store(true, Ordering::Relaxed);
+    ctx.metrics.endpoint_incompatible_inc();
+    state
+        .sched
+        .lock()
+        .discard_inflight(it.logical_len, DropReason::Incompatible);
+    // Report through this state's reporter (single-sourced diffs).
+    let snapshot = state.sched.lock().snapshot();
+    let diff = state.reporter.lock().diff(snapshot);
+    report_diff(ctx.metrics, &diff);
+}
 async fn idle_exit(state: &Arc<EndpointTxState>, inner: &Arc<Inner>) -> bool {
     report_state(state, &inner.metrics);
     tokio::select! {
@@ -1844,5 +1974,195 @@ mod tests {
             "shutdown must be bounded even with a stuck worker"
         );
         assert_eq!(tx_reg.state_count(), 0, "no worker may survive");
+    }
+
+    #[tokio::test]
+    async fn supervise_worker_clears_running_and_escalates_on_panic() {
+        // Item 9/16: a panicking worker must clear `running` (never a
+        // one-way black hole with running=true on a dead task) and invoke
+        // the escalation hook exactly once with the endpoint + reason.
+        // A normal exit must NOT touch `running` (no clobbering a newer
+        // worker's flag).
+        let (peer_reg, _tx_reg) = test_registry().await;
+        let ep = iroh::SecretKey::generate().public();
+        let transport = peer_reg.ensure_transport(ep);
+        let state = Arc::new(EndpointTxState::new(ep, transport, 1536));
+        let fired = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fired_ep = Arc::new(std::sync::Mutex::new(None));
+        let fired2 = fired.clone();
+        let fired_ep2 = fired_ep.clone();
+        let handler: FatalHandler = Arc::new(move |endpoint, _reason| {
+            fired2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *fired_ep2.lock().unwrap() = Some(endpoint);
+        });
+        // Panic path.
+        state.running.store(true, Ordering::Release);
+        supervise_worker(state.clone(), Some(handler.clone()), async {
+            panic!("injected TX worker panic");
+        })
+        .await;
+        assert!(
+            !state.running.load(Ordering::Acquire),
+            "running must clear on panic"
+        );
+        assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(*fired_ep.lock().unwrap(), Some(ep));
+        // Normal path: untouched.
+        state.running.store(true, Ordering::Release);
+        supervise_worker(state.clone(), Some(handler), async {}).await;
+        assert!(
+            state.running.load(Ordering::Acquire),
+            "normal exit must not clobber running"
+        );
+        assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Real connected pair for transport-fatal tests (sender side only
+    /// needs a live Connection object + canonical pool slot).
+    async fn fatal_fixture() -> (
+        ConnPool,
+        iroh::endpoint::Connection,
+        EndpointId,
+        Arc<PeerTransportState>,
+    ) {
+        use iroh::endpoint::presets::N0;
+        let alpn = tunnet_common::TUNNEL_ALPN;
+        let ep_a = iroh::Endpoint::builder(N0)
+            .alpns(vec![alpn.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let ep_b = iroh::Endpoint::builder(N0)
+            .alpns(vec![alpn.to_vec()])
+            .relay_mode(iroh::RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let id_b = ep_b.id();
+        let addr_b = ep_b.addr();
+        let ep_b2 = ep_b.clone();
+        let accept_b = tokio::spawn(async move { ep_b2.accept().await.unwrap().await.unwrap() });
+        let conn_a = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ep_a.connect(addr_b, alpn),
+        )
+        .await
+        .expect("dial must succeed")
+        .unwrap();
+        let _conn_b: iroh::endpoint::Connection =
+            tokio::time::timeout(std::time::Duration::from_secs(10), accept_b)
+                .await
+                .expect("accept")
+                .unwrap();
+        let pool_a = ConnPool::new(ep_a, alpn);
+        let reg = PeerRegistry::new();
+        pool_a.set_peer_registry(Arc::new(reg.clone()));
+        use tunnet_core::InstallOutcome;
+        assert!(matches!(
+            pool_a
+                .install_canonical(id_b, conn_a.clone(), true, false)
+                .await,
+            InstallOutcome::Canonical(_)
+        ));
+        let transport = reg.ensure_transport(id_b);
+        (pool_a, conn_a, id_b, transport)
+    }
+
+    #[tokio::test]
+    async fn transport_fatal_invalidates_sets_flag_and_drops() {
+        // Item 13/16: the exact production path (not the harness):
+        // close + invalidate the canonical conn, mark incompatible,
+        // explicit Incompatible drop, exact conservation — and the flag
+        // provably stops redialing below. The canonical slot lives in the
+        // registry's own pool (as in production).
+        let (_peer_reg, tx_reg) = test_registry().await;
+        let (_pool_a, conn_a, id_b, _transport) = fatal_fixture().await;
+        let tx_pool = tx_reg.inner.pool.clone();
+        tx_pool.set_peer_registry(Arc::new(PeerRegistry::new()));
+        use tunnet_core::InstallOutcome;
+        assert!(matches!(
+            tx_pool
+                .install_canonical(id_b, conn_a.clone(), true, false)
+                .await,
+            InstallOutcome::Canonical(_)
+        ));
+        let transport = tx_reg.inner.peer_registry.ensure_transport(id_b);
+        let peer_reg = PeerRegistry::new();
+        let net = Uuid::from_u128(0xee);
+        let member = test_member(&peer_reg, id_b, net, [10, 0, 0, 2]);
+        let ctx = TxCtx {
+            transport: &transport,
+            pool: &tx_pool,
+            metrics: &tx_reg.inner.metrics,
+            bufs: &tx_reg.inner.bufs,
+            meter: &tx_reg.inner.meter,
+        };
+        let mut acc = Conservation::new();
+        let pkt = test_packet_fill(200, 0x06);
+        acc.offered(pkt.len());
+        // Production invariant: dequeue and discard hit the SAME
+        // scheduler (state.sched). Drive through it directly.
+        let state = Arc::new(EndpointTxState::new(id_b, transport.clone(), 1536));
+        let mut it = {
+            let mut guard = state.sched.lock();
+            assert!(guard.enqueue(net, pkt, Instant::now()).is_accepted());
+            dequeue_inflight(&mut guard, &member, 1280, 9)
+        };
+        // Dequeue + drive with a Fatal script, then the production
+        // incompatibility path (as the worker calls it).
+        let cancel = CancellationToken::new();
+        let mut sender = ScriptSender::new(vec![FrameScript::Fatal]);
+        let drive = drive_inflight(&ctx, &mut sender, &mut it, &cancel).await;
+        assert!(matches!(drive, Drive::Fatal));
+        // Cursor fully intact across the Fatal observation.
+        assert_eq!(it.cur.next_index, 0);
+        // Exact production path: invalidate + flag + explicit drop.
+        on_transport_fatal(&tx_reg.inner, &ctx, &state, id_b, &conn_a, it).await;
+        assert!(
+            !tx_pool.has_live(id_b),
+            "canonical session must be invalidated"
+        );
+        assert!(
+            transport.datagram_incompatible.load(Ordering::Relaxed),
+            "endpoint must be marked incompatible (no redial loop)"
+        );
+        let snap = state.sched.lock().snapshot();
+        assert_eq!(
+            snap.drop_packets[DropReason::Incompatible.index()],
+            1,
+            "explicit Incompatible resolution"
+        );
+        acc.dropped += 1;
+        acc.check(&state.sched.lock());
+        assert_eq!(snap.owned_packets(), 0);
+    }
+
+    #[tokio::test]
+    async fn incompatible_endpoint_never_redials() {
+        // Item 13/16: with the incompatibility mark set and no connection,
+        // the worker parks without dialing — reconnect_attempts stays zero
+        // while the packet waits queued (bounded by caps, never a loop).
+        let (peer_reg, tx_reg) = test_registry().await;
+        let dead = iroh::SecretKey::generate().public();
+        let transport = peer_reg.ensure_transport(dead);
+        transport
+            .datagram_incompatible
+            .store(true, Ordering::Relaxed);
+        let net = Uuid::from_u128(0xef);
+        let member = test_member(&peer_reg, dead, net, [10, 0, 0, 9]);
+        enqueue_packet(&tx_reg, &member, test_packet_fill(200, 0x07));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let pool = tx_reg.inner.pool.clone();
+        assert_eq!(
+            pool.on_demand_stats().reconnect_attempts,
+            0,
+            "incompatible peer must never be redialed"
+        );
+        let state = tx_reg.inner.states.get(&dead).unwrap().clone();
+        let snap = state.sched.lock().snapshot();
+        assert_eq!(snap.queued_packets, 1, "packet waits queued, not lost");
+        assert_eq!(snap.dropped_packets(), 0);
+        tx_reg.shutdown().await;
     }
 }

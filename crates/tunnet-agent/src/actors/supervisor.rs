@@ -52,6 +52,8 @@ pub struct DataPlaneSupervisorArgs {
     pub ingress: crate::ingress::IngressRegistry,
     pub packet_pool: Arc<tunnet_common::packet::PacketPool>,
     pub ingress_gate: Arc<std::sync::atomic::AtomicBool>,
+    pub lifecycle_gate: crate::actors::dataplane::LifecycleGate,
+    pub session_manager: Arc<crate::ingress::IngressManager>,
     pub initially_up: bool,
     pub initial_generation: u64,
     /// Reconstruct the up state after a supervised restart (see
@@ -91,6 +93,8 @@ impl Actor for DataPlaneSupervisor {
             ingress: args.ingress.clone(),
             packet_pool: args.packet_pool.clone(),
             ingress_gate: args.ingress_gate.clone(),
+            lifecycle_gate: args.lifecycle_gate.clone(),
+            session_manager: args.session_manager.clone(),
             initially_up: args.initially_up,
             initial_generation: args.initial_generation,
             auto_up: args.auto_up,
@@ -633,6 +637,29 @@ mod tests {
         let (events_tx, _) = tokio::sync::broadcast::channel(8);
         let published = new_published_plane();
         let status = DataPlaneStatusSnapshot::new(false);
+        let metrics = test_metrics();
+        let gate = crate::actors::dataplane::LifecycleGate::default();
+        let pool_arc = Arc::new(node.tunnel_pool.clone());
+        let session_manager = {
+            let ctx = crate::ingress::IngressContext {
+                routes: node.routes.clone(),
+                acl: node.acl.clone(),
+                runtime: node.policy.clone(),
+                spoofs: std::collections::HashMap::new(),
+                bufs: tunnet_common::packet::PacketPool::new(8),
+                metrics: metrics.clone(),
+                auth: None,
+            };
+            std::sync::Arc::new(crate::ingress::IngressManager::new(
+                &pool_arc,
+                crate::ingress::IngressRegistry::new(),
+                ctx,
+                published.clone(),
+                status.clone(),
+                gate.clone(),
+                None,
+            ))
+        };
         let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
         let _ = tmp;
         let args = AgentSupervisorArgs {
@@ -650,7 +677,7 @@ mod tests {
                     underlay_hosts: vec![],
                 },
                 node,
-                metrics: test_metrics(),
+                metrics,
                 peer_dns_active: Arc::new(AtomicBool::new(false)),
                 events: events_tx,
                 published: published.clone(),
@@ -658,6 +685,8 @@ mod tests {
                 ingress: crate::ingress::IngressRegistry::new(),
                 packet_pool: tunnet_common::packet::PacketPool::new(8),
                 ingress_gate: Arc::new(AtomicBool::new(true)),
+                lifecycle_gate: gate,
+                session_manager,
                 initially_up: false,
                 initial_generation: 0,
                 auto_up: false,

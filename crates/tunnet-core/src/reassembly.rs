@@ -30,6 +30,15 @@ pub const MAX_BYTES_PER_PEER: usize = 256 * 1024;
 pub const MAX_BYTES_GLOBAL: usize = 4 * 1024 * 1024;
 /// Reassembly lifetime: a missing segment kills the packet after this.
 pub const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
+/// Recently-completed frame IDs remembered for replay dedup: a sender that
+/// lost its connection replays from byte 0 with the same frame id, and the
+/// prefix it "lost" may in fact have arrived (DATAGRAM delivery is never
+/// acknowledged). Without this cache the replay would complete a second
+/// time and deliver one inner packet twice. TTL covers the maximum
+/// reconnect-replay window (dial timeouts plus drive time).
+pub const RECENT_COMPLETED_TTL: Duration = Duration::from_secs(10);
+/// Bound on remembered completions (tiny: id + shape + expiry, no bytes).
+pub const MAX_RECENT_COMPLETED: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReassemblyDrop {
@@ -62,12 +71,22 @@ struct Entry {
     deadline: Instant,
 }
 
+/// A completed frame ID remembered for replay dedup (no bytes held).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedId {
+    id: u32,
+    count: u16,
+    total: u16,
+    expires: Instant,
+}
+
 pub struct ReassemblyTable {
     entries: HashMap<u32, Entry>,
     order: VecDeque<u32>,
     bytes: usize,
     global_bytes: Arc<AtomicU64>,
     max_bytes_global: u64,
+    recent: VecDeque<CompletedId>,
 }
 
 impl ReassemblyTable {
@@ -82,6 +101,7 @@ impl ReassemblyTable {
             bytes: 0,
             global_bytes,
             max_bytes_global,
+            recent: VecDeque::new(),
         }
     }
 
@@ -112,6 +132,15 @@ impl ReassemblyTable {
             || payload.len() > total
         {
             return InsertOut::Dropped(ReassemblyDrop::Malformed);
+        }
+        // Replay dedup: a recently completed identical frame id is a
+        // redelivery after connection loss, never a second logical packet.
+        // Same shape → Duplicate; conflicting shape → fail closed.
+        if let Some(r) = self.recent.iter().find(|r| r.id == h.id) {
+            if r.count == h.count && r.total == h.total {
+                return InsertOut::Duplicate;
+            }
+            return InsertOut::Dropped(ReassemblyDrop::Conflict);
         }
         // ID collision with incompatible shape: drop the old generation and
         // start over (bounded loss, never mixed bytes).
@@ -214,6 +243,7 @@ impl ReassemblyTable {
             return InsertOut::Dropped(ReassemblyDrop::Incomplete);
         }
         self.remove(h.id);
+        self.remember_completed(h.id, h.count, h.total, now);
         InsertOut::Complete(out)
     }
 
@@ -275,6 +305,24 @@ impl ReassemblyTable {
         }
         for id in timed_out {
             self.remove(id);
+        }
+        // The replay window is bounded too.
+        while self.recent.front().is_some_and(|r| now >= r.expires) {
+            self.recent.pop_front();
+        }
+    }
+
+    /// Remember a completion for replay dedup (bounded, no bytes held).
+    fn remember_completed(&mut self, id: u32, count: u16, total: u16, now: Instant) {
+        self.recent.retain(|r| r.id != id);
+        self.recent.push_back(CompletedId {
+            id,
+            count,
+            total,
+            expires: now + RECENT_COMPLETED_TTL,
+        });
+        while self.recent.len() > MAX_RECENT_COMPLETED {
+            self.recent.pop_front();
         }
     }
 
@@ -383,6 +431,66 @@ mod tests {
             other => panic!("expected complete, got {other:?}"),
         }
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn completed_id_replay_never_completes_twice() {
+        // Old connection fully delivers a segmented frame; the sender,
+        // uncertain after connection loss, replays the same frame id.
+        // The replay must never produce a second logical packet.
+        let mut t = table();
+        let now = Instant::now();
+        let first = |index: u16| SegmentHeader {
+            id: 21,
+            index,
+            count: 2,
+            total: 200,
+        };
+        let (h, p) = seg(first(0), &[1u8; 100]);
+        assert!(matches!(t.insert(h, p, now), InsertOut::Pending));
+        let (h, p) = seg(first(1), &[2u8; 100]);
+        match t.insert(h, p, now) {
+            InsertOut::Complete(v) => assert_eq!(v.len(), 200),
+            other => panic!("expected first completion, got {other:?}"),
+        }
+        // Replay of the identical frame set: duplicates only, exactly one
+        // logical delivery total.
+        let mut completions = 0;
+        for index in [0u16, 1] {
+            let (h, p) = seg(first(index), &[1u8 + index as u8; 100]);
+            match t.insert(h, p, now) {
+                InsertOut::Duplicate => {}
+                InsertOut::Complete(_) => completions += 1,
+                other => panic!("replay must dedup, got {other:?}"),
+            }
+        }
+        assert_eq!(completions, 0, "replay must never complete twice");
+        assert!(t.is_empty());
+        // Same id, conflicting shape (a different packet reusing the id):
+        // fail closed, never a mixed completion.
+        let (h, p) = seg(
+            SegmentHeader {
+                id: 21,
+                index: 0,
+                count: 3,
+                total: 300,
+            },
+            &[9u8; 100],
+        );
+        assert!(matches!(
+            t.insert(h, p, now),
+            InsertOut::Dropped(ReassemblyDrop::Conflict)
+        ));
+        // Past the replay window the id is forgotten: a fresh packet with
+        // a recycled id completes normally again (documents the boundary).
+        let late = now + RECENT_COMPLETED_TTL + Duration::from_secs(1);
+        let (h, p) = seg(first(0), &[1u8; 100]);
+        assert!(matches!(t.insert(h, p, late), InsertOut::Pending));
+        let (h, p) = seg(first(1), &[2u8; 100]);
+        match t.insert(h, p, late) {
+            InsertOut::Complete(v) => assert_eq!(v.len(), 200),
+            other => panic!("recycled id must work past TTL, got {other:?}"),
+        }
     }
 
     #[test]

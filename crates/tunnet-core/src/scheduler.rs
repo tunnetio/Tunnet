@@ -86,10 +86,13 @@ pub enum DropReason {
     MembershipRevoked,
     /// Packet belonged to a torn-down dataplane generation.
     GenerationEnd,
+    /// Packet shed because the endpoint cannot carry DATAGRAMs at all
+    /// (peer/local incompatibility): redialing would loop forever.
+    Incompatible,
 }
 
 impl DropReason {
-    pub const ALL: [DropReason; 8] = [
+    pub const ALL: [DropReason; 9] = [
         DropReason::EndpointByteCap,
         DropReason::EndpointPacketCap,
         DropReason::Codel,
@@ -98,6 +101,7 @@ impl DropReason {
         DropReason::NoConnection,
         DropReason::MembershipRevoked,
         DropReason::GenerationEnd,
+        DropReason::Incompatible,
     ];
 
     pub fn index(self) -> usize {
@@ -110,6 +114,7 @@ impl DropReason {
             Self::NoConnection => 5,
             Self::MembershipRevoked => 6,
             Self::GenerationEnd => 7,
+            Self::Incompatible => 8,
         }
     }
 
@@ -123,6 +128,7 @@ impl DropReason {
             Self::NoConnection => "no_connection",
             Self::MembershipRevoked => "sched_membership_revoked",
             Self::GenerationEnd => "sched_generation_end",
+            Self::Incompatible => "sched_incompatible",
         }
     }
 }
@@ -192,8 +198,8 @@ pub struct SchedSnapshot {
     pub sent_packets: u64,
     pub sent_bytes: u64,
     pub wire_bytes: u64,
-    pub drop_packets: [u64; 8],
-    pub drop_bytes: [u64; 8],
+    pub drop_packets: [u64; 9],
+    pub drop_bytes: [u64; 9],
 }
 
 impl SchedSnapshot {
@@ -238,8 +244,8 @@ pub struct SchedDiff {
     pub sent_packets: u64,
     pub sent_bytes: u64,
     pub wire_bytes: u64,
-    pub drop_packets: [u64; 8],
-    pub drop_bytes: [u64; 8],
+    pub drop_packets: [u64; 9],
+    pub drop_bytes: [u64; 9],
 }
 
 /// Diffs scheduler snapshots into exact telemetry deltas. Owned by the single
@@ -334,8 +340,8 @@ pub struct EndpointScheduler {
     sent_packets: u64,
     sent_bytes: u64,
     wire_bytes: u64,
-    drop_packets: [u64; 8],
-    drop_bytes: [u64; 8],
+    drop_packets: [u64; 9],
+    drop_bytes: [u64; 9],
 }
 
 impl EndpointScheduler {
@@ -361,8 +367,8 @@ impl EndpointScheduler {
             sent_packets: 0,
             sent_bytes: 0,
             wire_bytes: 0,
-            drop_packets: [0; 8],
-            drop_bytes: [0; 8],
+            drop_packets: [0; 9],
+            drop_bytes: [0; 9],
         }
     }
 
@@ -392,8 +398,8 @@ impl EndpointScheduler {
     }
 
     fn record_drop(
-        drop_packets: &mut [u64; 8],
-        drop_bytes: &mut [u64; 8],
+        drop_packets: &mut [u64; 9],
+        drop_bytes: &mut [u64; 9],
         reason: DropReason,
         packets: u64,
         bytes: u64,
@@ -1616,6 +1622,6 @@ mod tests {
         let d = r.diff(s.snapshot());
         assert_eq!(d.dq_packets, 0);
         assert_eq!(d.sent_packets, 0);
-        assert_eq!(d.drop_packets, [0; 8]);
+        assert_eq!(d.drop_packets, [0; 9]);
     }
 }

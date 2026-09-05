@@ -223,10 +223,10 @@ impl ConnPool {
         }
     }
 
-    /// Register a hook invoked whenever this pool dials a tunnel connection.
-    /// Dialed connections are read ONLY by this hook (single ownership);
-    /// accepted connections are read ONLY by the accept path (`adopt`
-    /// never fires the hook).
+    /// Register the dial hook: invoked when this pool dials AND WINS a
+    /// canonical connection, so the session manager installs the dialed
+    /// reader. Accepted connections never fire the hook (the accept path
+    /// installs its reader explicitly) — one reader-install per path.
     pub fn set_tunnel_hook(&self, hook: TunnelConnHook) {
         *self.tunnel_hook.lock() = Some(hook);
     }
@@ -292,6 +292,11 @@ impl ConnPool {
 
     /// Local EndpointId is the canonical initiator when `local < peer`.
     /// Prefer the connection opened by that initiator so both ends converge.
+    /// A newly ACCEPTED connection from the canonical initiator additionally
+    /// supersedes a stale same-orientation connection: after a reconnect the
+    /// accepting side may still see the old connection as live while the
+    /// initiator has already replaced it. A redundant locally-opened
+    /// connection never supersedes the existing local canonical one.
     fn prefer_incoming(
         local: EndpointId,
         peer: EndpointId,
@@ -301,7 +306,17 @@ impl ConnPool {
         let want_opened_by_us = local < peer;
         let existing_ok = existing_opened_by_us == want_opened_by_us;
         let incoming_ok = incoming_opened_by_us == want_opened_by_us;
-        matches!((existing_ok, incoming_ok), (false, true))
+        match (existing_ok, incoming_ok) {
+            // Existing non-preferred, candidate preferred: replace.
+            (false, true) => true,
+            // Existing preferred, candidate non-preferred: keep.
+            (true, false) => false,
+            // Both preferred: only a newly accepted connection (a reconnect
+            // from the canonical initiator) supersedes the stale one.
+            (true, true) => !incoming_opened_by_us,
+            // Neither preferred: keep the existing one (deterministic).
+            (false, false) => false,
+        }
     }
 
     /// Outcome of the canonical connection-install operation.
@@ -309,7 +324,9 @@ impl ConnPool {
     /// Install a canonical tunnel connection: the ONE install path for
     /// accepted and dialed connections. Atomically decides the tie-break
     /// winner, mirrors the winner into the endpoint transport, and fires
-    /// the ingress installer when a NEW canonical connection wins.
+    /// the dial hook when a NEW canonical connection wins and `fire_hook`
+    /// is set (dial path only — the accept path installs its reader
+    /// explicitly, so the hook must not fire twice).
     /// Same-connection installs are idempotent no-ops (touch + re-mirror,
     /// no second reader).
     ///
@@ -321,6 +338,7 @@ impl ConnPool {
         peer: EndpointId,
         conn: Connection,
         opened_by_us: bool,
+        fire_hook: bool,
     ) -> InstallOutcome {
         let local = self.endpoint.id();
         let slot = self.slot(peer);
@@ -361,16 +379,24 @@ impl ConnPool {
                 .path_watchers_spawned
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.fire_tunnel_hook(peer, conn.clone());
+        if fire_hook {
+            self.fire_tunnel_hook(peer, conn.clone());
+        }
         InstallOutcome::Canonical(conn)
     }
 
-    /// Invalidate the canonical connection after its reader died unexpectedly
-    /// (QUIC failure while still canonical). Clears the slot and the endpoint
-    /// transport WITHOUT deactivating memberships — the endpoint worker holds
-    /// its packets and reconnects normally. Returns false when the slot
-    /// already moved on (a replacement won; nothing to do).
-    pub async fn invalidate_canonical(&self, peer: EndpointId, stable_id: usize) -> bool {
+    /// Invalidate the canonical connection after its session failed
+    /// unexpectedly (QUIC failure or transport incompatibility while still
+    /// canonical). Clears the slot and the endpoint transport WITHOUT
+    /// deactivating memberships — the endpoint worker holds its packets and
+    /// reconnects normally. Returns the removed live connection (for
+    /// best-effort close) or `None` when the slot already moved on
+    /// (a replacement won; nothing to do — idempotent).
+    pub async fn invalidate_canonical(
+        &self,
+        peer: EndpointId,
+        stable_id: usize,
+    ) -> Option<Connection> {
         let slot = self.slot(peer);
         let mut guard = slot.lock().await;
         let matches = guard
@@ -378,9 +404,9 @@ impl ConnPool {
             .as_ref()
             .is_some_and(|c| c.stable_id() == stable_id);
         if !matches {
-            return false;
+            return None;
         }
-        guard.conn.take();
+        let conn = guard.conn.take();
         guard.opened_by_us = false;
         guard.state = PeerConnState::Suspended;
         guard.watched_stable = None;
@@ -388,15 +414,40 @@ impl ConnPool {
         if let Some(reg) = self.peer_registry.lock().clone() {
             reg.clear_transport_conn(peer);
         }
-        true
+        conn
     }
 
-    /// Stable id of the current canonical connection, if any (reader-death
-    /// check: only invalidate when the dead reader's connection is still it).
+    /// Stable id of the current canonical connection, if any (session
+    /// checks: only act when the subject connection is still it).
     pub async fn canonical_stable_id(&self, peer: EndpointId) -> Option<usize> {
         let slot = self.slot(peer);
         let guard = slot.lock().await;
         guard.live_conn().map(|c| c.stable_id())
+    }
+
+    /// Opened-by-us orientation of the current canonical connection, if any
+    /// (session health exposure).
+    pub async fn canonical_orientation(&self, peer: EndpointId) -> Option<bool> {
+        let slot = self.slot(peer);
+        let guard = slot.lock().await;
+        guard.live_conn().map(|_| guard.opened_by_us)
+    }
+
+    /// Best-effort snapshot of every live canonical session
+    /// (peer, stable id, connection): bring-up reconcile and diagnostics.
+    /// Slots locked at poll time are skipped and retried by the caller.
+    pub fn canonical_sessions(&self) -> Vec<(EndpointId, usize, Connection)> {
+        let mut out = Vec::new();
+        for entry in self.entries.iter() {
+            let peer = *entry.key();
+            let Ok(guard) = entry.value().try_lock() else {
+                continue;
+            };
+            if let Some(conn) = guard.live_conn() {
+                out.push((peer, conn.stable_id(), conn));
+            }
+        }
+        out
     }
 
     /// Close every default-ALPN peer connection (e.g. data plane down).
@@ -643,7 +694,9 @@ impl ConnPool {
                 }
 
                 // One canonical install path (same as accepted connections).
-                match self.install_canonical(peer, conn.clone(), true).await {
+                // Dial path: fire the hook so the manager installs the
+                // dialed reader (the accept path installs explicitly).
+                match self.install_canonical(peer, conn.clone(), true, true).await {
                     InstallOutcome::Canonical(canonical) => {
                         let mut guard = slot.lock().await;
                         if let Some(tx) = guard.dial_waiters.take() {
@@ -837,6 +890,13 @@ mod tests {
         // High endpoint is not initiator: wants accepted (opened_by_us=false).
         assert!(ConnPool::prefer_incoming(high, low, true, false));
         assert!(!ConnPool::prefer_incoming(high, low, false, true));
+
+        // Reconnect: a newly ACCEPTED connection with the preferred
+        // orientation supersedes a stale same-orientation one, so a stale
+        // half-open connection can never block the initiator's redial.
+        assert!(ConnPool::prefer_incoming(high, low, false, false));
+        // A redundant locally-opened connection never supersedes.
+        assert!(!ConnPool::prefer_incoming(low, high, true, true));
     }
 
     #[tokio::test]

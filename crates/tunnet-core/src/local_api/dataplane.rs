@@ -29,7 +29,14 @@ pub trait DataPlaneControl: Send + Sync {
             restart_count: 0,
             generation: 0,
             last_error: None,
+            sessions: Vec::new(),
         }
+    }
+
+    /// Canonical tunnel sessions for status rendering. Defaults to empty;
+    /// the actor-backed implementation reads the shared snapshot mirror.
+    fn session_health(&self) -> Vec<tunnet_common::local_api::SessionHealth> {
+        Vec::new()
     }
 }
 
@@ -49,6 +56,10 @@ pub struct DataPlaneStatusSnapshot {
     restart_count: Arc<AtomicU64>,
     generation: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// Canonical session mirror, maintained by the session manager on
+    /// every transition. `state()` degrades on any readerless canonical
+    /// session; status rendering exposes the full list.
+    sessions: Arc<Mutex<Vec<tunnet_common::local_api::SessionHealth>>>,
 }
 
 /// Dataplane health state (rendered by `tunnet status`).
@@ -81,6 +92,7 @@ impl DataPlaneStatusSnapshot {
             restart_count: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -138,12 +150,30 @@ impl DataPlaneStatusSnapshot {
         self.last_error.lock().clone()
     }
 
+    /// Replace the canonical session mirror (session manager calls this on
+    /// every transition: install, reader end, failure, generation change).
+    pub fn set_sessions(&self, sessions: Vec<tunnet_common::local_api::SessionHealth>) {
+        *self.sessions.lock() = sessions;
+    }
+
+    pub fn sessions(&self) -> Vec<tunnet_common::local_api::SessionHealth> {
+        self.sessions.lock().clone()
+    }
+
     pub fn state(&self) -> DataPlaneState {
         if self.restarting.load(Ordering::SeqCst) {
             DataPlaneState::Restarting
         } else if self.up.load(Ordering::SeqCst) {
+            // A readerless canonical session is never healthy: degrade
+            // immediately instead of masking a one-way black hole as up.
+            let readerless = self
+                .sessions
+                .lock()
+                .iter()
+                .any(|s| s.canonical_stable_id.is_some() && !s.reader_alive);
             if self.outbound_alive.load(Ordering::SeqCst)
                 && self.writer_alive.load(Ordering::SeqCst)
+                && !readerless
             {
                 DataPlaneState::Up
             } else {
@@ -195,6 +225,22 @@ mod tests {
         s.set_generation(7);
         assert_eq!(s.state(), DataPlaneState::Up);
         assert_eq!(s.generation(), 7);
+        // A readerless canonical session degrades immediately, even with
+        // reader and writer alive: never report it as healthy.
+        s.set_sessions(vec![tunnet_common::local_api::SessionHealth {
+            peer_endpoint: "aa".into(),
+            canonical_stable_id: Some(9),
+            canonical_state: "live".into(),
+            reader_stable_id: None,
+            reader_alive: false,
+            connection_orientation: Some("dialed".into()),
+            connection_generation: 7,
+            reconnect_count: 1,
+            last_error: Some("reader ConnFailed".into()),
+        }]);
+        assert_eq!(s.state(), DataPlaneState::Degraded);
+        s.set_sessions(vec![]);
+        assert_eq!(s.state(), DataPlaneState::Up);
         // Intentional shutdown: plain down.
         s.set_up(false);
         s.set_restarting(false);

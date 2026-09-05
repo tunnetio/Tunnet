@@ -24,7 +24,9 @@ param(
 # line to results.jsonl with fields:
 #   {ts, product, scenario, direction, fraction, offered_mbps, actual_mbps,
 #    loss_pct, retransmits, latency:{n,p50,p95,p99,p999,max}, path:{...},
-#    meta:{...}, note, valid, local_sw_drops, peer_sw_drops}
+#    meta:{...}, note, valid, load_met, delivery_ratio, undelivered_pct,
+#    *_bytes, *_packets, local_sw_drops, peer_sw_drops,
+#    local_session_before/after/changed, peer_session_before/after/changed}
 # Throughput matrix (TCP 1/4, up/down/bidir with explicit JSON parse),
 # loaded-latency sweeps per direction plus full-duplex bidir at fractions
 # of independently measured directional capacity (download load uses -R),
@@ -39,12 +41,13 @@ param(
 # of inventing 50 Mbps.
 # "server is busy" listener contention retries boundedly (infrastructure,
 # never Tunnet loss). One shared UDP parser (Parse-UdpSummary) reports
-# receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
-# Every row carries local_sw_drops + peer_sw_drops (scheduler/TUN
-# software-drop deltas from both agents on tunnet runs, each with explicit
-# availability), so one benchmark is self-diagnosing without manual A/B
-# runs: sender scheduler drops and receiver TUN-writer drops are both
-# observable, and unavailable telemetry never reads as zero.
+# receiver-delivered throughput everywhere, PLUS independent
+# delivery_ratio/undelivered_pct and byte/packet counts; downloads offer
+# against CAP_DOWN; loaded rows carry load_met (valid stays true on
+# catastrophic under-delivery).
+# Path/session state comes from the metrics endpoint (local + peer):
+# every row carries software-drop deltas AND session before/after/change,
+# so one-way session poisoning shows immediately without manual A/B runs.
 
 $ErrorActionPreference = "Continue"
 
@@ -76,10 +79,16 @@ $META_JSON = $META | ConvertTo-Json -Compress
 function Get-PathState {
     $state = [ordered]@{ product = $Product; mode = "unknown"; detail = "" }
     if ($Product -eq "tunnet") {
-        try {
-            $status = Invoke-RestMethod -Uri "$TunnetApi/api/status" -TimeoutSec 5
-            $state.mode = "$($status.path_state)"; $state.detail = "$($status.selected_path)"
-        } catch { $state.detail = "tunnet api unreachable" }
+        # Session/vitals come from the metrics endpoint (the legacy
+        # /api/status HTTP endpoint does not exist; the Local API is a
+        # local socket). Detail carries generation + session count.
+        $snap = Get-SessionSnapshot $MetricsUrl
+        if ($snap.available) {
+            $state.mode = "tunnet"
+            $state.detail = "gen=$($snap.generation) restarts=$($snap.restart_count) sessions=$($snap.sessions.Count)"
+        } else {
+            $state.detail = "tunnet metrics unreachable"
+        }
     } else {
         try {
             $peers = zerotier-cli peers 2>$null
@@ -194,8 +203,22 @@ function Parse-UdpSummary($j) {
         if ($null -ne $sp) { $ppsSent = [math]::Round($sp / $Duration, 0) }
         $rp = Get-JsonProp $recv @("packets_received", "packets")
         if ($null -ne $rp) { $ppsRecv = [math]::Round($rp / $Duration, 0) }
+        # Independent delivery accounting: receiver vs sender, so
+        # sent=32/delivered=0/loss=0.2% still reads ~100% undelivered.
+        $sBytes = Get-JsonProp $send @("bytes")
+        $rBytes = Get-JsonProp $recv @("bytes")
+        $sPkts = Get-JsonProp $send @("packets")
+        $rPkts = Get-JsonProp $recv @("packets_received", "packets")
+        $ratio = $null; $undel = $null
+        if ($null -ne $sbps -and $sbps -gt 0) {
+            $ratio = [math]::Round($recv.bits_per_second / $sbps, 4)
+            $undel = [math]::Round(100.0 * (1.0 - $recv.bits_per_second / $sbps), 2)
+        }
         return @{ ok = $true; actual = $actual; sent = $sent; loss = $loss; jitter = $jitter
-            pps_sent = $ppsSent; pps_received = $ppsRecv; error = "" }
+            pps_sent = $ppsSent; pps_received = $ppsRecv; error = ""
+            delivery_ratio = $ratio; undelivered_pct = $undel
+            sender_bytes = $sBytes; receiver_bytes = $rBytes
+            sender_packets = $sPkts; receiver_packets = $rPkts }
     } catch {
         return @{ ok = $false; error = $_.Exception.Message }
     }
@@ -213,6 +236,37 @@ if ([string]::IsNullOrWhiteSpace($PeerMetricsUrl) -and $Product -eq "tunnet") {
 # remote sender — one side alone cannot see both. Availability is explicit:
 # @{available=$false} when an endpoint is unreachable; zero is reported
 # only after a successful scrape, never as a substitute for "unknown".
+# Canonical session + dataplane vitals snapshot (item 14): generation,
+# restarts, liveness, and per-peer (canonical, reader, orientation,
+# alive). Unavailable reads as unavailable, never as healthy/zero.
+function Get-SessionSnapshot([string]$Url) {
+    $s = [ordered]@{ available = $false; sessions = @() }
+    if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) { return $s }
+    try {
+        $text = Invoke-RestMethod -Uri $Url -TimeoutSec 5
+        if ($text -isnot [string]) { return $s }
+        $s.available = $true
+        foreach ($line in ($text -split "`n")) {
+            if ($line -match "^tunnet_dataplane_(generation|restart_count|up|outbound_alive|writer_alive)\s+([0-9.eE+-]+)") {
+                $s[$Matches[1]] = [double]$Matches[2]
+            }
+            elseif ($line -match '^tunnet_session_info\{([^}]*)\}\s+([0-9.eE+-]+)') {
+                $labels = @{}
+                foreach ($kv in ($Matches[1] -split ",")) {
+                    $k, $v = $kv -split "=", 2
+                    $labels[$k.Trim()] = $v.Trim().Trim('"')
+                }
+                $s.sessions += [ordered]@{
+                    peer = $labels["peer"]; generation = $labels["generation"]
+                    canonical = $labels["canonical"]; reader = $labels["reader"]
+                    orientation = $labels["orientation"]; alive = ([double]$Matches[2] -gt 0)
+                }
+            }
+        }
+        return $s
+    } catch { return [ordered]@{ available = $false; sessions = @() } }
+}
+
 function Get-SwSnapshot([string]$Url) {
     if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) {
         return [ordered]@{ available = $false }
@@ -226,6 +280,7 @@ function Get-SwSnapshot([string]$Url) {
             elseif ($line -match "^tunnet_dropped_packets_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.dropped += [double]$Matches[1] }
             elseif ($line -match "^tunnet_tun_write_queue_drop_total\s+([0-9.eE+-]+)") { $out.tun_write_drop += [double]$Matches[1] }
         }
+        $out.session = (Get-SessionSnapshot $Url)
         return $out
     } catch { return [ordered]@{ available = $false } }
 }
@@ -249,13 +304,35 @@ function Diff-Sw($Before, $After) {
     }
 }
 
-# Capture the "after" side and return both deltas for the row.
+function Sessions-Equal($A, $B) {
+    if (($null -eq $A) -ne ($null -eq $B)) { return $false }
+    if ($null -eq $A) { return $true }
+    foreach ($k in @("generation", "restart_count", "up", "outbound_alive", "writer_alive")) {
+        if ($A[$k] -ne $B[$k]) { return $false }
+    }
+    $sa = @($A.sessions | ForEach-Object { "$($_.peer)|$($_.generation)|$($_.canonical)|$($_.reader)|$($_.orientation)|$($_.alive)" } | Sort-Object)
+    $sb = @($B.sessions | ForEach-Object { "$($_.peer)|$($_.generation)|$($_.canonical)|$($_.reader)|$($_.orientation)|$($_.alive)" } | Sort-Object)
+    if ($sa.Count -ne $sb.Count) { return $false }
+    for ($i = 0; $i -lt $sa.Count; $i++) { if ($sa[$i] -ne $sb[$i]) { return $false } }
+    return $true
+}
+
+# Capture the "after" side and return deltas + session before/after/change
+# for the row (session poisoning detection, both sides).
 function SwDelta($Before) {
     $after = Get-ScenarioSw
-    return [ordered]@{
+    $out = [ordered]@{
         local_sw_drops = (Diff-Sw $Before.local $after.local)
         peer_sw_drops = (Diff-Sw $Before.peer $after.peer)
     }
+    foreach ($side in @("local", "peer")) {
+        $s0 = $Before[$side].session
+        $s1 = $after[$side].session
+        $out["${side}_session_before"] = $s0
+        $out["${side}_session_after"] = $s1
+        $out["${side}_session_changed"] = -not (Sessions-Equal $s0 $s1)
+    }
+    return $out
 }
 
 # High-frequency latency probe: asynchronous/staggered ICMP via a runspace
@@ -507,19 +584,38 @@ foreach ($d in $dirs) {
             $ps = Parse-UdpSummary $lj
             if (-not $ps.ok) { throw $ps.error }
             $actual = $ps.actual; $loss = $ps.loss
-        } catch { $actual = -1; $loss = -1; $valid = $false; if (-not $loadErr) { $loadErr = $_.Exception.Message } }
+        } catch { $actual = -1; $loss = -1; $valid = $false; $ps = $null; if (-not $loadErr) { $loadErr = $_.Exception.Message } }
         $pathAfter = Get-PathState
+        $sw = SwDelta $sw0
         $note = ""
         if ($pathBefore.mode -ne $pathAfter.mode) { $note = "PATH CHANGED mid-run; result flagged" }
-        if ($actual -gt 0 -and $actual -lt $rate * 0.7 -and $f -le 1.0) { $note += " under-delivered load" }
+        if ($sw.local_session_changed -or $sw.peer_session_changed) { $note += " SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
+        # actual==0 MUST count: a successfully executed but fully
+        # undelivered load is catastrophic under-delivery (valid stays
+        # true, load_met goes false), not a parser failure.
+        $under = $valid -and ($actual -lt $rate * 0.7) -and ($f -le 1.0)
+        if ($under) { $note += " under-delivered load" }
         if (-not $valid) { $note += " LOAD FAILED ($loadErr): row invalid, values are placeholders" }
-        Write-Host "  $($d.name) ${pct}%: actual=${actual}Mbps loss=${loss}% p50=$($lat.p50) p95=$($lat.p95) p99=$($lat.p99) max=$($lat.max) valid=$valid $note"
-        $sw = SwDelta $sw0
+        $dr = $null; $udpct = $null
+        if ($null -ne $ps) { $dr = $ps.delivery_ratio; $udpct = $ps.undelivered_pct }
+        Write-Host "  $($d.name) ${pct}%: actual=${actual}Mbps loss=${loss}% delivered=${dr} undelivered=${udpct}% p50=$($lat.p50) p95=$($lat.p95) p99=$($lat.p99) max=$($lat.max) valid=$valid $note"
         Write-Row @{ scenario = "loaded-latency"; direction = $d.name; fraction = $f
             offered_mbps = $rate; actual_mbps = $actual; loss_pct = $loss
+            delivery_ratio = $dr; undelivered_pct = $udpct
+            sender_bytes = $(if ($null -ne $ps) { $ps.sender_bytes } else { $null })
+            receiver_bytes = $(if ($null -ne $ps) { $ps.receiver_bytes } else { $null })
+            sender_packets = $(if ($null -ne $ps) { $ps.sender_packets } else { $null })
+            receiver_packets = $(if ($null -ne $ps) { $ps.receiver_packets } else { $null })
             latency = $lat; path = $pathBefore; path_after = $pathAfter; note = $note.Trim(); valid = $valid
+            load_met = ($valid -and (-not $under))
             local_sw_drops = $sw.local_sw_drops
-            peer_sw_drops = $sw.peer_sw_drops }
+            peer_sw_drops = $sw.peer_sw_drops
+            local_session_before = $sw.local_session_before
+            local_session_after = $sw.local_session_after
+            local_session_changed = $sw.local_session_changed
+            peer_session_before = $sw.peer_session_before
+            peer_session_after = $sw.peer_session_after
+            peer_session_changed = $sw.peer_session_changed }
     }
 }
 
@@ -582,7 +678,8 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
             $ps = Parse-UdpSummary $uj
             if (-not $ps.ok) { throw $ps.error }
             $actualUp = $ps.actual; $lossUp = $ps.loss
-        } catch { $errUp = $_.Exception.Message }
+            $psUp = $ps
+        } catch { $errUp = $_.Exception.Message; $psUp = $null }
     }
     if (-not $errDown) {
         try {
@@ -590,25 +687,43 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
             $ps = Parse-UdpSummary $dj
             if (-not $ps.ok) { throw $ps.error }
             $actualDown = $ps.actual; $lossDown = $ps.loss
-        } catch { $errDown = $_.Exception.Message }
+            $psDown = $ps
+        } catch { $errDown = $_.Exception.Message; $psDown = $null }
     }
     $pathAfter = Get-PathState
+    $sw = SwDelta $sw0
     $note = ""
     if ($pathBefore.mode -ne $pathAfter.mode) { $note = "PATH CHANGED mid-run; result flagged" }
-    if ($actualUp -gt 0 -and $actualUp -lt $rateUp * 0.7 -and $f -le 1.0) { $note += " under-delivered up load" }
-    if ($actualDown -gt 0 -and $actualDown -lt $rateDown * 0.7 -and $f -le 1.0) { $note += " under-delivered down load" }
+    if ($sw.local_session_changed -or $sw.peer_session_changed) { $note += " SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
+    $underUp = ($null -eq $errUp) -and ($actualUp -lt $rateUp * 0.7) -and ($f -le 1.0)
+    $underDown = ($null -eq $errDown) -and ($actualDown -lt $rateDown * 0.7) -and ($f -le 1.0)
+    if ($underUp) { $note += " under-delivered up load" }
+    if ($underDown) { $note += " under-delivered down load" }
     $valid = ($null -eq $errUp) -and ($null -eq $errDown)
     if ($errUp) { $note += " BIDIR INVALID: up load failed ($errUp)" }
     if ($errDown) { $note += " BIDIR INVALID: down load failed ($errDown)" }
+    $duUp = $null; $duDown = $null
+    if ($null -ne $psUp) { $duUp = $psUp.undelivered_pct }
+    if ($null -ne $psDown) { $duDown = $psDown.undelivered_pct }
     Write-Host "  bidir ${pct}%: up=${actualUp}Mbps loss=${lossUp}% down=${actualDown}Mbps loss=${lossDown}% p50=$($lat.p50) p95=$($lat.p95) p99=$($lat.p99) valid=$valid $note"
-    $sw = SwDelta $sw0
     Write-Row @{ scenario = "loaded-latency"; direction = "bidir"; fraction = $f
         offered_up_mbps = $rateUp; offered_down_mbps = $rateDown
         actual_up_mbps = $actualUp; actual_down_mbps = $actualDown
         loss_up_pct = $lossUp; loss_down_pct = $lossDown
+        delivery_ratio_up = $(if ($null -ne $psUp) { $psUp.delivery_ratio } else { $null })
+        undelivered_up_pct = $duUp
+        delivery_ratio_down = $(if ($null -ne $psDown) { $psDown.delivery_ratio } else { $null })
+        undelivered_down_pct = $duDown
         latency = $lat; path = $pathBefore; path_after = $pathAfter; note = $note.Trim(); valid = $valid
+        load_met = ($valid -and (-not $underUp) -and (-not $underDown))
         local_sw_drops = $sw.local_sw_drops
-        peer_sw_drops = $sw.peer_sw_drops }
+        peer_sw_drops = $sw.peer_sw_drops
+        local_session_before = $sw.local_session_before
+        local_session_after = $sw.local_session_after
+        local_session_changed = $sw.local_session_changed
+        peer_session_before = $sw.peer_session_before
+        peer_session_after = $sw.peer_session_after
+        peer_session_changed = $sw.peer_session_changed }
 }
 
 # --- UDP sweep: rates x sizes x directions, sender vs receiver split ---
@@ -656,13 +771,25 @@ foreach ($ud in $udpDirs) {
                 $ppsSent = $ps.pps_sent; $ppsRecv = $ps.pps_received
                 $loss = $ps.loss
                 $jitter = $ps.jitter
-                Write-Host ("  $($ud.name) offered={0}Mbps sent={1}Mbps delivered={2}Mbps pps_sent={3} pps_recv={4} loss={5}% jitter={6}ms len={7}B" -f $rate, $sentMbps, $del, $ppsSent, $ppsRecv, $loss, $jitter, $len)
+                $note = ""
                 $sw = SwDelta $sw0
+                if ($sw.local_session_changed -or $sw.peer_session_changed) { $note = "SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
+                Write-Host ("  $($ud.name) offered={0}Mbps sent={1}Mbps delivered={2}Mbps undelivered={3}% pps_sent={4} pps_recv={5} loss={6}% jitter={7}ms len={8}B" -f $rate, $sentMbps, $del, $ps.undelivered_pct, $ppsSent, $ppsRecv, $loss, $jitter, $len)
                 Write-Row @{ scenario = "udp"; direction = $ud.name; offered_mbps = $rate; packet_len = $len
                     sent_mbps = $sentMbps; actual_mbps = $del; pps_sent = $ppsSent; pps_received = $ppsRecv
-                    loss_pct = $loss; jitter_ms = $jitter; path = (Get-PathState); valid = $true
+                    loss_pct = $loss; jitter_ms = $jitter
+                    delivery_ratio = $ps.delivery_ratio; undelivered_pct = $ps.undelivered_pct
+                    sender_bytes = $ps.sender_bytes; receiver_bytes = $ps.receiver_bytes
+                    sender_packets = $ps.sender_packets; receiver_packets = $ps.receiver_packets
+                    path = (Get-PathState); note = $note; valid = $true
                     local_sw_drops = $sw.local_sw_drops
-                    peer_sw_drops = $sw.peer_sw_drops }
+                    peer_sw_drops = $sw.peer_sw_drops
+                    local_session_before = $sw.local_session_before
+                    local_session_after = $sw.local_session_after
+                    local_session_changed = $sw.local_session_changed
+                    peer_session_before = $sw.peer_session_before
+                    peer_session_after = $sw.peer_session_after
+                    peer_session_changed = $sw.peer_session_changed }
             } else {
                 Write-Host "  $($ud.name) offered=${rate}Mbps len=${len}B : FAILED: $($r.error)" -ForegroundColor Red
                 $sw = SwDelta $sw0
@@ -671,7 +798,13 @@ foreach ($ud in $udpDirs) {
                     loss_pct = -1; jitter_ms = $null; path = (Get-PathState)
                     note = "UDP FAILED: $($r.error)"; valid = $false
                     local_sw_drops = $sw.local_sw_drops
-                    peer_sw_drops = $sw.peer_sw_drops }
+                    peer_sw_drops = $sw.peer_sw_drops
+                    local_session_before = $sw.local_session_before
+                    local_session_after = $sw.local_session_after
+                    local_session_changed = $sw.local_session_changed
+                    peer_session_before = $sw.peer_session_before
+                    peer_session_after = $sw.peer_session_after
+                    peer_session_changed = $sw.peer_session_changed }
             }
         }
     }

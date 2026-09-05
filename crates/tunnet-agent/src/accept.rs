@@ -39,7 +39,7 @@ pub struct AcceptDeps {
     pub docs: HashMap<Uuid, DocsMembership>,
     pub agent_gossip: Option<iroh_gossip::net::Gossip>,
     pub shared_docs: Option<Docs>,
-    pub ingress_manager: IngressManager,
+    pub ingress_manager: Arc<IngressManager>,
     /// Direct auth cache for the AUTH_ALPN server (same cache the ingress
     /// context carries for tunnel readers).
     pub direct_auth: Option<tunnet_core::direct::AuthCache>,
@@ -98,7 +98,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
 
 #[derive(Clone)]
 struct TunnelHandler {
-    ingress_manager: IngressManager,
+    ingress_manager: Arc<IngressManager>,
 }
 
 impl fmt::Debug for TunnelHandler {
