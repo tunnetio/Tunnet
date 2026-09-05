@@ -495,7 +495,10 @@ mod tests {
             upstream: vec!["system".into()],
             ..DnsConfig::default()
         };
-        assert_eq!(dns.magic_ip, Ipv4Addr::new(100, 100, 100, 53));
+        // The default resolver address must stay clear of ranges other
+        // overlays drop by source address, or DNS fails silently on any host
+        // also running one.
+        assert!(!tunnet_common::magic_ip_is_contested(dns.magic_ip));
         // Must run BEFORE the osdns overlay is installed; afterwards the OS
         // state points at PeerDNS and only the explicit snapshot is safe.
         let pinned = with_underlay_upstream(&dns);

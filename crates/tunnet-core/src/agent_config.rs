@@ -494,9 +494,32 @@ impl DirectDnsSection {
             },
             dnssec: self.dnssec,
             synthetic_base: DnsConfig::default().synthetic_base,
-            magic_ip: self.magic_ip,
+            magic_ip: usable_magic_ip(self.magic_ip),
         }
     }
+}
+
+/// Keep the resolver address off ranges another overlay silently drops.
+///
+/// Changing the default only helps new installs: `magic_ip` is serialized into
+/// the config file, so an existing host keeps its stored address forever. That
+/// address is not network-wide state (nothing else derives it, no peer needs to
+/// agree on it), so relocating it locally is safe and is strictly better than
+/// leaving DNS silently broken.
+fn usable_magic_ip(configured: Ipv4Addr) -> Ipv4Addr {
+    if !tunnet_common::magic_ip_is_contested(configured) {
+        return configured;
+    }
+    let replacement = DnsConfig::default().magic_ip;
+    tracing::warn!(
+        %configured,
+        %replacement,
+        "MagicDNS address sits inside {}, which CGNAT-based overlays such as \
+         Tailscale drop by source address even over loopback; relocating so DNS \
+         does not fail silently. Set dns.magic_ip explicitly to override.",
+        tunnet_common::overlay_contested_range()
+    );
+    replacement
 }
 
 impl DirectFirewallSection {
@@ -799,5 +822,30 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod magic_ip_relocation_tests {
+    use super::*;
+
+    #[test]
+    fn a_stored_contested_address_is_relocated() {
+        let stored = Ipv4Addr::new(100, 100, 100, 53);
+        let got = usable_magic_ip(stored);
+        assert_ne!(got, stored);
+        assert!(!tunnet_common::magic_ip_is_contested(got));
+    }
+
+    #[test]
+    fn a_deliberate_override_outside_the_range_is_respected() {
+        let chosen = Ipv4Addr::new(192, 168, 9, 53);
+        assert_eq!(usable_magic_ip(chosen), chosen);
+    }
+
+    #[test]
+    fn relocation_is_idempotent() {
+        let once = usable_magic_ip(Ipv4Addr::new(100, 100, 100, 53));
+        assert_eq!(usable_magic_ip(once), once);
     }
 }

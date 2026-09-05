@@ -169,8 +169,35 @@ pub struct HostnameRoute {
     pub target_ip: Option<Ipv4Addr>,
 }
 
+/// Range that other CGNAT-based overlays police with anti-spoof filters.
+///
+/// Tailscale claims `100.64.0.0/10` and installs a SOURCE-matched drop:
+/// `-s 100.64.0.0/10 ! -i tailscale0 -j DROP`. Because it matches on source,
+/// it also discards the host's own traffic to any of our addresses in that
+/// range, including over loopback. A resolver addressed inside it therefore
+/// stays listening and never receives a query, so DNS fails with no error and
+/// no log line on either side.
+pub fn overlay_contested_range() -> ipnet::Ipv4Net {
+    ipnet::Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 10).expect("static CGNAT")
+}
+
+/// True when a resolver address would be silently unreachable on a host that
+/// also runs a CGNAT-based overlay.
+pub fn magic_ip_is_contested(ip: Ipv4Addr) -> bool {
+    overlay_contested_range().contains(&ip)
+}
+
+/// Link-local resolver address, outside every contested range.
+///
+/// `169.254.0.0/24` is reserved by RFC 3927 and is explicitly NOT used by IPv4
+/// link-local autoconfiguration (which allocates from `169.254.1.0` through
+/// `169.254.254.255`), so nothing else on the link can take it. Link-local is
+/// never routed, never policed by an overlay's anti-spoof filter, and does not
+/// collide with LAN RFC1918 or with Managed mode's `10.x`. Addressing a
+/// host-local resolver this way follows existing practice, for example AWS's
+/// resolver at `169.254.169.253`.
 fn default_magic_ip() -> Ipv4Addr {
-    Ipv4Addr::new(100, 100, 100, 53)
+    Ipv4Addr::new(169, 254, 0, 53)
 }
 
 fn default_synthetic_base() -> Ipv4Addr {
@@ -468,4 +495,56 @@ pub fn mdns_relay_topic_hex(id: &uuid::Uuid) -> String {
     hasher.update(id.as_bytes());
     hasher.update(b"mdns-relay");
     hex::encode(hasher.finalize().as_bytes())
+}
+
+#[cfg(test)]
+mod magic_ip_tests {
+    use super::*;
+
+    /// The address that was silently unreachable on hosts running Tailscale:
+    /// 50 of 50 probe packets to it were dropped by the overlay's anti-spoof
+    /// rule while a loopback control was untouched.
+    #[test]
+    fn the_old_default_was_inside_the_contested_range() {
+        assert!(magic_ip_is_contested(Ipv4Addr::new(100, 100, 100, 53)));
+    }
+
+    #[test]
+    fn the_new_default_is_outside_it() {
+        assert!(!magic_ip_is_contested(default_magic_ip()));
+    }
+
+    /// RFC 3927 allocates link-local autoconfiguration from 169.254.1.0 to
+    /// 169.254.254.255 and reserves 169.254.0.0/24, so nothing on the link can
+    /// claim our address.
+    #[test]
+    fn the_new_default_cannot_collide_with_ipv4ll() {
+        let ip = default_magic_ip();
+        assert_eq!(ip.octets()[0], 169);
+        assert_eq!(ip.octets()[1], 254);
+        assert_eq!(ip.octets()[2], 0, "must be in the reserved 169.254.0.0/24");
+        assert!(ip.is_link_local());
+    }
+
+    /// It must also dodge the ranges CGNAT was originally chosen to avoid.
+    #[test]
+    fn the_new_default_avoids_lan_and_managed_ranges() {
+        let ip = default_magic_ip();
+        assert!(!ip.is_private(), "would risk colliding with a LAN or 10.x");
+        assert!(!ip.is_loopback());
+        assert!(!ip.is_unspecified());
+    }
+
+    #[test]
+    fn tailscale_own_resolver_is_recognised_as_contested() {
+        // One digit from the address Tunnet used to use.
+        assert!(magic_ip_is_contested(Ipv4Addr::new(100, 100, 100, 100)));
+    }
+
+    #[test]
+    fn addresses_outside_cgnat_are_left_alone() {
+        for ip in ["192.168.1.53", "10.0.0.53", "1.1.1.1", "169.254.0.53"] {
+            assert!(!magic_ip_is_contested(ip.parse().unwrap()), "{ip}");
+        }
+    }
 }
