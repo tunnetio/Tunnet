@@ -212,8 +212,16 @@ mod tests {
     fn starting_against_an_unwritable_path_fails_rather_than_panicking() {
         // A wrong state dir must surface as an error the app can show, not a
         // panic that takes the VpnService process down.
-        let err = match AgentSession::start("/proc/tunnet-cannot-create-this", "test-device") {
-            Ok(_) => panic!("creating a state dir under /proc must fail"),
+        //
+        // Derive the unwritable path from a regular file: creating a directory
+        // beneath a file fails on every platform. A hardcoded Unix path such as
+        // `/proc/...` does not work here, because Windows treats it as an
+        // ordinary relative path and creates it happily, so the call succeeds
+        // and the test panics.
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let under_a_file = file.path().join("tunnet-state");
+        let err = match AgentSession::start(under_a_file, "test-device") {
+            Ok(_) => panic!("creating a state dir beneath a file must fail"),
             Err(e) => e,
         };
         assert!(
