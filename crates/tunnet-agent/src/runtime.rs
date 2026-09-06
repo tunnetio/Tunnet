@@ -186,6 +186,26 @@ pub async fn run(
         )
     };
 
+    // Mesh CIDR collision check. Another overlay holding an address in our
+    // range (Tailscale also uses 100.64.0.0/10) makes both sides drop traffic
+    // silently, so name it at start instead of leaving it to be found as
+    // unexplained drops. Observation only: never fatal.
+    if let Some(mesh) = ipnet::Ipv4Net::new(assigned_ipv4, prefix)
+        .ok()
+        .map(|n| n.trunc())
+    {
+        let ifname = args.ifname.clone();
+        let magic_dns = is_direct.then_some(dns_cfg.magic_ip);
+        match tokio::task::spawn_blocking(move || {
+            crate::cidr_collision::report(mesh, &ifname, assigned_ipv4, magic_dns)
+        })
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "mesh CIDR collision check failed"),
+        }
+    }
+
     // One long-lived osdns manager for the agent lifetime. Owned by the
     // DataPlaneActor via config; created here because it needs blocking init.
     let dns_controller: Option<Arc<DnsController>> = {

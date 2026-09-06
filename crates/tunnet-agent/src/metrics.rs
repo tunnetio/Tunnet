@@ -29,6 +29,14 @@ impl AgentMetrics {
         describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
         describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
         describe_gauge!("tunnet_active_connections", "Live peer connections");
+        describe_gauge!(
+            "tunnet_mesh_cidr_collisions",
+            "Interface addresses outside the mesh interface that overlap the mesh CIDR"
+        );
+        describe_gauge!(
+            "tunnet_mesh_cidr_collision",
+            "1 per interface claiming an address inside the mesh CIDR"
+        );
 
         let upkeep = handle.clone();
         tokio::spawn(async move {

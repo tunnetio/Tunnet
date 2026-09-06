@@ -112,7 +112,16 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
         }
 
         let Some(peer) = routes.lookup_ip(&dst) else {
-            metrics.dropped_inc("no_route");
+            // Multicast/broadcast is unroutable on the mesh by design. LAN
+            // discovery apps (mDNS, Ableton Link, SSDP) beacon on every
+            // interface including ours, at a steady rate and forever. Counting
+            // that as `no_route` buries genuine "mesh peer missing" drops under
+            // millions of benign packets.
+            if dst.is_multicast() || dst.is_broadcast() {
+                metrics.dropped_inc("multicast");
+            } else {
+                metrics.dropped_inc("no_route");
+            }
             continue;
         };
 
