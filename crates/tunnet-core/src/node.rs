@@ -114,15 +114,14 @@ pub struct CoreNode {
     pub identity: AgentIdentity,
     pub persisted: PersistedState,
     pub endpoint: Endpoint,
-    /// Stream pool (`TUNNEL_STREAM_ALPN`).
+    /// Stream pool (`TUNNEL_STREAM_ALPN`). Tunnel DATAGRAM connections are
+    /// owned by the agent peer transport, not this pool.
     pub pool: ConnPool,
-    /// Datagram tunnel pool (`TUNNEL_ALPN`), shares keep-alive policy with [`Self::pool`].
-    pub tunnel_pool: ConnPool,
     /// Live effective agent config (local TOML + remote org policy).
     pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
     pub acl: AclEngine,
-    /// Shared packet-policy runtime (dataplane authority, §0.1).
+    /// Shared packet-policy runtime.
     pub policy: PolicyRuntime,
     pub version: Arc<ArcSwap<u64>>,
     pub self_ipv4: std::net::Ipv4Addr,
@@ -411,7 +410,6 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
         pool.set_cloud_relay_urls(
             snapshot
                 .connectivity_relays
@@ -470,7 +468,6 @@ impl CoreNode {
             persisted: PersistedState::Managed(managed),
             endpoint,
             pool,
-            tunnel_pool,
             effective_config,
             routes,
             acl,
@@ -565,7 +562,6 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(self_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
         let effective_config = cfg.effective_config.clone().unwrap_or_default();
         pool.set_keep_alive(cfg.keep_alive);
         #[cfg(feature = "tunnel")]
@@ -721,7 +717,6 @@ impl CoreNode {
             },
             endpoint,
             pool,
-            tunnel_pool,
             effective_config,
             routes,
             acl,
@@ -768,8 +763,6 @@ impl CoreNode {
         self.routes.set_policy_runtime(self.policy.clone());
         self.routes.peer_registry().relink_policy(&self.policy);
         self.pool
-            .set_peer_registry(self.routes.peer_registry().clone());
-        self.tunnel_pool
             .set_peer_registry(self.routes.peer_registry().clone());
     }
 

@@ -1,8 +1,4 @@
-//! Connection pool with optional on-demand (idle suspend / reconnect) behavior.
-//!
-//! Direct mode defaults to on-demand (`keep_alive = false`): idle connections are
-//! closed after [`DEFAULT_IDLE_SECS`] and reopened when traffic resumes.
-//! Managed mode defaults to keep-alive (connections stay open).
+//! Stream connection pool and shared connection preferences. Tunnel connections are owned by the agent.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use dashmap::DashMap;
-use futures_util::StreamExt;
-use iroh::TransportAddr;
-use iroh::endpoint::{Connection, PathEvent};
+use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -53,42 +47,22 @@ pub struct PeerConnSnapshot {
     pub path: String,
 }
 
-/// Outcome of the canonical connection-install operation.
-#[derive(Debug)]
-pub enum InstallOutcome {
-    /// This connection is canonical (newly installed or already current):
-    /// the caller owns installing exactly one ingress reader for it.
-    Canonical(Connection),
-    /// Tie-break kept another connection: close the candidate, use this one
-    /// (it already has its reader).
-    KeepExisting(Connection),
-}
-
 struct PeerSlot {
     conn: Option<Connection>,
-    /// True if the live connection was opened by our dial (not accepted).
-    opened_by_us: bool,
     state: PeerConnState,
     last_activity: Instant,
     peer_keep_alive: bool,
-    /// Shared dial in flight: first waiter dials, others subscribe and await the result.
     dial_waiters: Option<DialWaiters>,
-    /// Stable id of the connection a path watcher was last spawned for.
-    /// Guards exactly-one-watcher per canonical connection even if install
-    /// is re-entered.
-    watched_stable: Option<usize>,
 }
 
 impl PeerSlot {
     fn new() -> Self {
         Self {
             conn: None,
-            opened_by_us: false,
             state: PeerConnState::Suspended,
             last_activity: Instant::now(),
             peer_keep_alive: false,
             dial_waiters: None,
-            watched_stable: None,
         }
     }
 
@@ -109,11 +83,8 @@ struct PoolMetrics {
     reconnect_attempts: AtomicU64,
     reconnect_success: AtomicU64,
     reconnect_fail: AtomicU64,
-    packets_buffered: AtomicU64,
-    packets_dropped_timeout: AtomicU64,
     reconnect_latency_sum_us: AtomicU64,
     reconnect_latency_max_us: AtomicU64,
-    path_watchers_spawned: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,55 +92,25 @@ pub struct OnDemandStats {
     pub reconnect_attempts: u64,
     pub reconnect_success: u64,
     pub reconnect_fail: u64,
-    pub packets_buffered: u64,
-    pub packets_dropped_timeout: u64,
     pub reconnect_latency_avg_us: u64,
     pub reconnect_latency_max_us: u64,
-    pub path_watchers_spawned: u64,
 }
 
 type ExtraConnMap = DashMap<(EndpointId, Vec<u8>), Arc<AsyncMutex<Option<Connection>>>>;
 
-/// Invoked when this pool dials a live tunnel connection.
-///
-/// The dialer must read datagrams on that connection (the accept path only
-/// reads accepted sockets). Without this hook, reverse-path IP traffic on a
-/// keep-alive/dialed connection is never delivered to the local TUN.
-pub type TunnelConnHook = Arc<dyn Fn(EndpointId, Connection) + Send + Sync>;
-
 fn normalize_relay_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
-}
-
-fn selected_path_is_cloud_relay(conn: &Connection, urls: &HashSet<String>) -> bool {
-    let paths = conn.paths();
-    let Some(path) = paths.iter().find(|p| p.is_selected()) else {
-        return false;
-    };
-    if !path.is_relay() {
-        return false;
-    }
-    match path.remote_addr() {
-        TransportAddr::Relay(url) => urls.contains(&normalize_relay_url(url.as_str())),
-        _ => false,
-    }
 }
 
 #[derive(Clone)]
 pub struct ConnPool {
     endpoint: Endpoint,
     alpn: &'static [u8],
-    /// Keyed by endpoint only for the pool's default ALPN (on-demand state).
-    /// Secondary ALPNs use `extra` without idle management.
     entries: Arc<DashMap<EndpointId, Arc<AsyncMutex<PeerSlot>>>>,
-    /// Established fast states (owned by routing; slow paths only: adopt,
-    /// dial, close, drop, heartbeats). The established packet path never
-    /// touches this — it uses the `Arc<PeerMembershipState>` from routing.
     peer_registry: Arc<Mutex<Option<Arc<crate::peers::PeerRegistry>>>>,
     extra: Arc<ExtraConnMap>,
     policy: Arc<PoolPolicy>,
     metrics: Arc<PoolMetrics>,
-    tunnel_hook: Arc<Mutex<Option<TunnelConnHook>>>,
     cloud_relay_meter: CloudRelayMeter,
     cloud_relay_urls: Arc<RwLock<HashSet<String>>>,
 }
@@ -196,285 +137,44 @@ impl ConnPool {
                 keep_alive_peers: DashMap::new(),
             }),
             metrics: Arc::new(PoolMetrics::default()),
-            tunnel_hook: Arc::new(Mutex::new(None)),
             cloud_relay_meter: CloudRelayMeter::new(),
             cloud_relay_urls: Arc::new(RwLock::new(HashSet::new())),
         };
         pool.spawn_idle_sweeper();
         pool
     }
-
-    /// Create a pool that shares keep-alive / idle policy with `other` (different ALPN).
-    ///
-    /// Does **not** spawn an idle sweeper - only [`Self::new`] owns the sweeper for a
-    /// given policy Arc.
-    pub fn with_shared_policy(endpoint: Endpoint, alpn: &'static [u8], other: &ConnPool) -> Self {
-        Self {
-            endpoint,
-            alpn,
-            entries: Arc::new(DashMap::new()),
-            peer_registry: other.peer_registry.clone(),
-            extra: Arc::new(DashMap::new()),
-            policy: other.policy.clone(),
-            metrics: other.metrics.clone(),
-            tunnel_hook: Arc::new(Mutex::new(None)),
-            cloud_relay_meter: other.cloud_relay_meter.clone(),
-            cloud_relay_urls: other.cloud_relay_urls.clone(),
-        }
-    }
-
-    /// Register the dial hook: invoked when this pool dials AND WINS a
-    /// canonical connection, so the session manager installs the dialed
-    /// reader. Accepted connections never fire the hook (the accept path
-    /// installs its reader explicitly) — one reader-install per path.
-    pub fn set_tunnel_hook(&self, hook: TunnelConnHook) {
-        *self.tunnel_hook.lock() = Some(hook);
-    }
-
-    /// Attach the shared established-peer registry (slow-path mirror for
-    /// adopt/dial/close/drop; the packet path never touches it).
     pub fn set_peer_registry(&self, registry: Arc<crate::peers::PeerRegistry>) {
         *self.peer_registry.lock() = Some(registry);
-    }
-
-    /// Mirror a live connection into its endpoint transport (slow paths only).
-    fn sync_fast_conn(&self, peer: EndpointId, conn: Option<Connection>) {
-        if let Some(reg) = self.peer_registry.lock().clone() {
-            reg.set_transport_conn(peer, conn);
-        }
     }
 
     pub fn cloud_relay_meter(&self) -> CloudRelayMeter {
         self.cloud_relay_meter.clone()
     }
-
-    /// Replace the set of billable Tunnet Cloud deployment relay URLs.
     pub fn set_cloud_relay_urls(&self, urls: impl IntoIterator<Item = String>) {
         let normalized: HashSet<String> =
             urls.into_iter().map(|u| normalize_relay_url(&u)).collect();
         *self.cloud_relay_urls.write() = normalized;
     }
 
-    fn spawn_cloud_relay_path_watch(&self, peer: EndpointId, conn: Connection) {
-        let urls = self.cloud_relay_urls.clone();
-        let registry = self.peer_registry.lock().clone();
-        tokio::spawn(async move {
-            let refresh = |conn: &Connection| {
-                let metered = selected_path_is_cloud_relay(conn, &urls.read());
-                if let Some(reg) = &registry {
-                    reg.refresh_transport_path(peer, Some(metered));
-                }
-            };
-            refresh(&conn);
-            let mut events = conn.path_events();
-            while let Some(ev) = events.next().await {
-                match ev {
-                    PathEvent::Selected { .. }
-                    | PathEvent::Lagged { .. }
-                    | PathEvent::Opened { .. }
-                    | PathEvent::Closed { .. } => {
-                        refresh(&conn);
-                    }
-                    _ => {}
-                }
-            }
-        });
+    pub fn peer_keep_alive(&self, peer: EndpointId) -> bool {
+        self.policy.keep_alive.load(Ordering::Relaxed)
+            || self.policy.keep_alive_peers.contains_key(&peer)
     }
-
-    fn fire_tunnel_hook(&self, peer: EndpointId, conn: Connection) {
-        // Hook only: path watching lives in the canonical install path
-        // (exactly one watcher per canonical connection — see below).
-        let hook = self.tunnel_hook.lock().clone();
-        if let Some(hook) = hook {
-            hook(peer, conn.clone());
-        }
+    pub fn idle_timeout(&self) -> Duration {
+        *self.policy.idle_timeout.lock()
     }
-
-    /// Local EndpointId is the canonical initiator when `local < peer`.
-    /// Prefer the connection opened by that initiator so both ends converge.
-    /// A newly ACCEPTED connection from the canonical initiator additionally
-    /// supersedes a stale same-orientation connection: after a reconnect the
-    /// accepting side may still see the old connection as live while the
-    /// initiator has already replaced it. A redundant locally-opened
-    /// connection never supersedes the existing local canonical one.
-    fn prefer_incoming(
-        local: EndpointId,
-        peer: EndpointId,
-        existing_opened_by_us: bool,
-        incoming_opened_by_us: bool,
-    ) -> bool {
-        let want_opened_by_us = local < peer;
-        let existing_ok = existing_opened_by_us == want_opened_by_us;
-        let incoming_ok = incoming_opened_by_us == want_opened_by_us;
-        match (existing_ok, incoming_ok) {
-            // Existing non-preferred, candidate preferred: replace.
-            (false, true) => true,
-            // Existing preferred, candidate non-preferred: keep.
-            (true, false) => false,
-            // Both preferred: only a newly accepted connection (a reconnect
-            // from the canonical initiator) supersedes the stale one.
-            (true, true) => !incoming_opened_by_us,
-            // Neither preferred: keep the existing one (deterministic).
-            (false, false) => false,
-        }
-    }
-
-    /// Outcome of the canonical connection-install operation.
-    ///
-    /// Install a canonical tunnel connection: the ONE install path for
-    /// accepted and dialed connections. Atomically decides the tie-break
-    /// winner, mirrors the winner into the endpoint transport, and fires
-    /// the dial hook when a NEW canonical connection wins and `fire_hook`
-    /// is set (dial path only — the accept path installs its reader
-    /// explicitly, so the hook must not fire twice).
-    /// Same-connection installs are idempotent no-ops (touch + re-mirror,
-    /// no second reader).
-    ///
-    /// Ownership rule: the caller that receives `Canonical` owns installing
-    /// exactly one ingress reader for it; `KeepExisting` means the candidate
-    /// must be closed (the surviving connection already has its reader).
-    pub async fn install_canonical(
-        &self,
-        peer: EndpointId,
-        conn: Connection,
-        opened_by_us: bool,
-        fire_hook: bool,
-    ) -> InstallOutcome {
-        let local = self.endpoint.id();
-        let slot = self.slot(peer);
-        let mut guard = slot.lock().await;
-        if let Some(existing) = guard.live_conn() {
-            if existing.stable_id() == conn.stable_id() {
-                guard.touch();
-                guard.state = PeerConnState::Connected;
-                drop(guard);
-                self.sync_fast_conn(peer, Some(existing.clone()));
-                return InstallOutcome::Canonical(existing);
-            }
-            if !Self::prefer_incoming(local, peer, guard.opened_by_us, opened_by_us) {
-                guard.touch();
-                let existing = existing.clone();
-                drop(guard);
-                return InstallOutcome::KeepExisting(existing);
-            }
-            if let Some(old) = guard.conn.take() {
-                old.close(0u32.into(), b"tie_break");
-            }
-        }
-        guard.conn = Some(conn.clone());
-        guard.opened_by_us = opened_by_us;
-        guard.state = PeerConnState::Connected;
-        guard.touch();
-        // Exactly one path watcher per canonical connection: skip when
-        // this connection is already watched (re-entrant installs).
-        let watch = guard.watched_stable != Some(conn.stable_id());
-        if watch {
-            guard.watched_stable = Some(conn.stable_id());
-        }
-        drop(guard);
-        self.sync_fast_conn(peer, Some(conn.clone()));
-        if watch {
-            self.spawn_cloud_relay_path_watch(peer, conn.clone());
-            self.metrics
-                .path_watchers_spawned
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if fire_hook {
-            self.fire_tunnel_hook(peer, conn.clone());
-        }
-        InstallOutcome::Canonical(conn)
-    }
-
-    /// Invalidate the canonical connection after its session failed
-    /// unexpectedly (QUIC failure or transport incompatibility while still
-    /// canonical). Clears the slot and the endpoint transport WITHOUT
-    /// deactivating memberships — the endpoint worker holds its packets and
-    /// reconnects normally. Returns the removed live connection (for
-    /// best-effort close) or `None` when the slot already moved on
-    /// (a replacement won; nothing to do — idempotent).
-    pub async fn invalidate_canonical(
-        &self,
-        peer: EndpointId,
-        stable_id: usize,
-    ) -> Option<Connection> {
-        let slot = self.slot(peer);
-        let mut guard = slot.lock().await;
-        let matches = guard
-            .conn
-            .as_ref()
-            .is_some_and(|c| c.stable_id() == stable_id);
-        if !matches {
-            return None;
-        }
-        let conn = guard.conn.take();
-        guard.opened_by_us = false;
-        guard.state = PeerConnState::Suspended;
-        guard.watched_stable = None;
-        drop(guard);
-        if let Some(reg) = self.peer_registry.lock().clone() {
-            reg.clear_transport_conn(peer);
-        }
-        conn
-    }
-
-    /// Stable id of the current canonical connection, if any (session
-    /// checks: only act when the subject connection is still it).
-    pub async fn canonical_stable_id(&self, peer: EndpointId) -> Option<usize> {
-        let slot = self.slot(peer);
-        let guard = slot.lock().await;
-        guard.live_conn().map(|c| c.stable_id())
-    }
-
-    /// Opened-by-us orientation of the current canonical connection, if any
-    /// (session health exposure).
-    pub async fn canonical_orientation(&self, peer: EndpointId) -> Option<bool> {
-        let slot = self.slot(peer);
-        let guard = slot.lock().await;
-        guard.live_conn().map(|_| guard.opened_by_us)
-    }
-
-    /// Best-effort snapshot of every live canonical session
-    /// (peer, stable id, connection): bring-up reconcile and diagnostics.
-    /// Slots locked at poll time are skipped and retried by the caller.
-    pub fn canonical_sessions(&self) -> Vec<(EndpointId, usize, Connection)> {
-        let mut out = Vec::new();
-        for entry in self.entries.iter() {
-            let peer = *entry.key();
-            let Ok(guard) = entry.value().try_lock() else {
-                continue;
-            };
-            if let Some(conn) = guard.live_conn() {
-                out.push((peer, conn.stable_id(), conn));
-            }
-        }
-        out
-    }
-
-    /// Close every default-ALPN peer connection (e.g. data plane down).
-    pub async fn close_all(&self) {
-        let peers: Vec<_> = self
-            .entries
+    pub fn uses_cloud_relay(&self, conn: &Connection) -> bool {
+        conn.paths()
             .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for (peer, slot) in peers {
-            let mut g = slot.lock().await;
-            if let Some(c) = g.conn.take() {
-                c.close(0u32.into(), b"dataplane_down");
-            }
-            g.opened_by_us = false;
-            g.state = PeerConnState::Suspended;
-            tracing::debug!(%peer, "closed tunnel pool connection");
-            self.sync_fast_conn(peer, None);
-        }
-        for entry in self.extra.iter() {
-            let mut g = entry.value().lock().await;
-            if let Some(c) = g.take() {
-                c.close(0u32.into(), b"dataplane_down");
-            }
-        }
+            .find(|p| p.is_selected())
+            .is_some_and(|path| match path.remote_addr() {
+                iroh::TransportAddr::Relay(url) => self
+                    .cloud_relay_urls
+                    .read()
+                    .contains(&normalize_relay_url(url.as_str())),
+                _ => false,
+            })
     }
-
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
     }
@@ -528,14 +228,11 @@ impl ConnPool {
             reconnect_attempts: self.metrics.reconnect_attempts.load(Ordering::Relaxed),
             reconnect_success: success,
             reconnect_fail: self.metrics.reconnect_fail.load(Ordering::Relaxed),
-            packets_buffered: self.metrics.packets_buffered.load(Ordering::Relaxed),
-            packets_dropped_timeout: self.metrics.packets_dropped_timeout.load(Ordering::Relaxed),
             reconnect_latency_avg_us: sum.checked_div(success).unwrap_or(0),
             reconnect_latency_max_us: self
                 .metrics
                 .reconnect_latency_max_us
                 .load(Ordering::Relaxed),
-            path_watchers_spawned: self.metrics.path_watchers_spawned.load(Ordering::Relaxed),
         }
     }
 
@@ -631,7 +328,6 @@ impl ConnPool {
                     if let Some(c) = guard.live_conn() {
                         return Ok(c);
                     }
-                    // Dialer vanished without a result - retry as dialer.
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     let guard = slot.lock().await;
@@ -640,7 +336,6 @@ impl ConnPool {
                     }
                 }
             }
-            // Fall through: become dialer if nobody else is dialing.
             let mut guard = slot.lock().await;
             if let Some(c) = guard.live_conn() {
                 return Ok(c);
@@ -693,27 +388,14 @@ impl ConnPool {
                         .store(latency_us, Ordering::Relaxed);
                 }
 
-                // One canonical install path (same as accepted connections).
-                // Dial path: fire the hook so the manager installs the
-                // dialed reader (the accept path installs explicitly).
-                match self.install_canonical(peer, conn.clone(), true, true).await {
-                    InstallOutcome::Canonical(canonical) => {
-                        let mut guard = slot.lock().await;
-                        if let Some(tx) = guard.dial_waiters.take() {
-                            let _ = tx.send(Ok(canonical.clone()));
-                        }
-                        Ok(canonical)
-                    }
-                    InstallOutcome::KeepExisting(existing) => {
-                        let mut guard = slot.lock().await;
-                        if let Some(tx) = guard.dial_waiters.take() {
-                            let _ = tx.send(Ok(existing.clone()));
-                        }
-                        drop(guard);
-                        conn.close(0u32.into(), b"tie_break");
-                        Ok(existing)
-                    }
+                let mut guard = slot.lock().await;
+                guard.conn = Some(conn.clone());
+                guard.state = PeerConnState::Connected;
+                guard.touch();
+                if let Some(tx) = guard.dial_waiters.take() {
+                    let _ = tx.send(Ok(conn.clone()));
                 }
+                Ok(conn)
             }
             Err(err) => {
                 self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
@@ -759,10 +441,6 @@ impl ConnPool {
             }
         }
     }
-
-    /// Hard-drop a peer (§2.1-9, §2.2-1): close the live tunnel connection,
-    /// deactivate ALL of its memberships (epoch bumps close readers/pumps
-    /// holding Arcs), and forget the slot. Idempotent.
     pub async fn drop_peer(&self, peer: EndpointId) {
         if let Some((_, slot)) = self.entries.remove(&peer) {
             let mut g = slot.lock().await;
@@ -775,9 +453,6 @@ impl ConnPool {
         }
         self.extra.retain(|(p, _), _| *p != peer);
     }
-
-    /// True only if the peer slot has a connection with no close reason.
-    /// If the slot mutex is held, returns true tentatively (likely mid-dial/send).
     pub fn has_live(&self, peer: EndpointId) -> bool {
         let Some(slot) = self.entries.get(&peer) else {
             return false;
@@ -794,9 +469,6 @@ impl ConnPool {
             Err(_) => true,
         })
     }
-
-    /// Counts live on-demand slots plus aggregated byte counters for heartbeats.
-    /// Byte totals come from the shared fast-state registry (slow path only).
     pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
         let active_conns = self
             .entries
@@ -826,8 +498,6 @@ impl ConnPool {
             .map(|r| r.peer_bytes(peer))
             .unwrap_or((0, 0))
     }
-
-    /// Best-effort snapshot of a peer's on-demand connection state.
     pub fn peer_snapshot(&self, peer: EndpointId) -> PeerConnSnapshot {
         let keep_alive = self.policy.keep_alive.load(Ordering::Relaxed)
             || self.policy.keep_alive_peers.contains_key(&peer);
@@ -840,7 +510,6 @@ impl ConnPool {
                 path: "unknown".into(),
             };
         };
-        // Try non-blocking; if locked, return coarse has_live info.
         match slot.try_lock() {
             Ok(g) => PeerConnSnapshot {
                 state: g.state.as_str().into(),
@@ -876,29 +545,6 @@ mod tests {
             .expect("bind test endpoint")
     }
 
-    #[test]
-    fn tie_break_prefers_canonical_initiator_side() {
-        let a = SecretKey::generate().public();
-        let b = SecretKey::generate().public();
-        let (low, high) = if a < b { (a, b) } else { (b, a) };
-
-        // Low endpoint is initiator: wants opened_by_us=true.
-        assert!(ConnPool::prefer_incoming(low, high, false, true));
-        assert!(!ConnPool::prefer_incoming(low, high, true, false));
-        assert!(!ConnPool::prefer_incoming(low, high, true, true));
-
-        // High endpoint is not initiator: wants accepted (opened_by_us=false).
-        assert!(ConnPool::prefer_incoming(high, low, true, false));
-        assert!(!ConnPool::prefer_incoming(high, low, false, true));
-
-        // Reconnect: a newly ACCEPTED connection with the preferred
-        // orientation supersedes a stale same-orientation one, so a stale
-        // half-open connection can never block the initiator's redial.
-        assert!(ConnPool::prefer_incoming(high, low, false, false));
-        // A redundant locally-opened connection never supersedes.
-        assert!(!ConnPool::prefer_incoming(low, high, true, true));
-    }
-
     #[tokio::test]
     async fn has_live_false_without_entry() {
         let ep = bind_endpoint().await;
@@ -918,7 +564,6 @@ mod tests {
         let (r1, r2) = tokio::join!(p1.get(peer), p2.get(peer));
         assert!(r1.is_err(), "expected dial failure");
         assert!(r2.is_err(), "expected dial failure");
-        // Both should observe the same coalesced failure path (no live conn left).
         assert!(!pool.has_live(peer));
         assert_eq!(
             pool.on_demand_stats().reconnect_fail,

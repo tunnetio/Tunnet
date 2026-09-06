@@ -476,8 +476,6 @@ export interface OnDemandStatusInfo {
   reconnect_attempts: number;
   reconnect_success: number;
   reconnect_fail: number;
-  packets_buffered: number;
-  packets_dropped_timeout: number;
 }
 
 export interface DnsStatusInfo {

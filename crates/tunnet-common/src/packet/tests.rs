@@ -240,7 +240,7 @@ fn fragment_table_fail_closed_and_capacity() {
 fn reject_rst_checksum_valid() {
     let p = ipv4_tcp([10, 0, 0, 2], [10, 0, 0, 1], 9999, 22, &[]);
     let pkt = parse(&p).unwrap();
-    let reply = synthesize_reject(&pkt).unwrap();
+    let reply = synthesize_reject(&PacketMeta::from_packet(&pkt), pkt.raw).unwrap();
     let parsed = parse(&reply).unwrap();
     match parsed.transport {
         Transport::Tcp { flags, .. } => assert!(flags.rst() && flags.ack()),

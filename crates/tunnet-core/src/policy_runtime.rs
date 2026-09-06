@@ -550,7 +550,7 @@ pub struct AclDenyRecord {
     pub at_unix: i64,
 }
 
-/// One dataplane-generation-owned packet-policy runtime (§0.1).
+/// One dataplane-generation-owned packet-policy runtime.
 ///
 /// A single `PolicyRuntime` is shared by outbound processing and every
 /// inbound connection: one canonical conntrack, one fragment table, one
@@ -1039,7 +1039,7 @@ impl PolicyRuntime {
         };
         let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
 
-        // Single canonical established lookup, shared both directions (§0.1).
+        // Single established lookup, shared both directions.
         // Entries admitted under older generations revalidate once (§0.4,
         // §2.2-2: ANY generation mismatch — ACL or firewall — revalidates).
         if let Some(key) = canon_key(net, l4.protocol, src, dst, l4.src_port, l4.dst_port)
@@ -2045,7 +2045,7 @@ mod tests {
         );
         let reg = PeerRegistry::new();
         let ep = SecretKey::generate().public();
-        let fast = reg.ensure(Arc::new(PeerIdentity {
+        let fast = reg.ensure_membership(Arc::new(PeerIdentity {
             endpoint: ep,
             endpoint_hex: format!("{ep}"),
             hostname: "peer".into(),

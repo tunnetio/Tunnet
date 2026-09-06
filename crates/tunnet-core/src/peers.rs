@@ -1,46 +1,16 @@
-//! Established-peer state.
-//!
-//! Transport identity and network membership are SEPARATE objects because
-//! one endpoint may belong to many networks (Direct mode):
-//!
-//! ```text
-//! PeerTransportState (key: EndpointId)
-//!   live QUIC connection, MPS/RTT/path state, transport counters,
-//!   frame-ID counter (unique across the endpoint's memberships)
-//!
-//! PeerMembershipState (key: (EndpointId, NetworkId))
-//!   network_id, mesh IP, hostname/tags, network firewall slot,
-//!   per-membership reassembly, epoch/revocation state
-//! ```
-//!
-//! Outbound queueing is owned by the endpoint TX worker (one scheduler per
-//! endpoint, flows keyed by network + 5-tuple); memberships carry no
-//! scheduler and no pump. There is no mutable network identity inside
-//! endpoint-global transport state. Routing hands out
-//! `Arc<PeerMembershipState>` clones embedded in peer handles; inbound
-//! readers resolve (endpoint, frame network) per connection and switch
-//! membership when the frame network changes.
-//!
-//! The registries (transport + membership DashMaps) are touched only on
-//! slow paths: creation, reconnect, teardown, policy relink, heartbeats.
+//! Network-scoped membership, revocation, and endpoint traffic observations. No connection ownership.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use iroh::EndpointId;
-use iroh::endpoint::Connection;
 use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::policy_runtime::{FwSlot, PolicyRuntime};
-use crate::reassembly::ReassemblyTable;
-
-/// Per-network peer identity: who this endpoint IS in one network.
-/// The same endpoint has one of these per network it belongs to — never a
-/// single mutable network context shared across networks.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity {
     pub endpoint: EndpointId,
@@ -51,87 +21,29 @@ pub struct PeerIdentity {
     pub network_id: Uuid,
     pub network_name: String,
 }
-
-/// Default DRR quantum: one logical MTU-ish chunk (retuned with MPS).
-pub const DEFAULT_QUANTUM: usize = 1536;
-/// Default effective DATAGRAM payload before the first measurement.
-pub const DEFAULT_MPS: usize = 1280;
-
-/// Endpoint-global transport state: the live QUIC connection and path
-/// measurements shared by all of the endpoint's network memberships.
-/// Carries NO network identity, NO firewall state, NO scheduler. The single
-/// endpoint TX worker submits DATAGRAMs with `send_datagram_wait`; no other
-/// task touches the connection's send path.
 pub struct PeerTransportState {
     pub endpoint: EndpointId,
-    pub conn: ArcSwapOption<Connection>,
+    pub connected: AtomicBool,
     pub tx_packets: AtomicU64,
     pub tx_bytes: AtomicU64,
     pub rx_packets: AtomicU64,
     pub rx_bytes: AtomicU64,
     pub last_activity_ms: AtomicU64,
     pub relay: AtomicBool,
-    /// Effective DATAGRAM payload size (frame bytes), adapted to path MTU.
-    pub mps: AtomicUsize,
-    /// Cached RTT millis (updated by path watcher; informational).
-    pub rtt_ms: AtomicU64,
-    /// Frame-ID counter shared across memberships (unique per endpoint).
-    pub next_frame_id: AtomicU32,
-    /// Sends since the last MPS refresh (periodic re-measurement).
-    pub sends_since_mps_check: AtomicU64,
-    /// Permanent DATAGRAM incompatibility observed for this endpoint
-    /// (UnsupportedByPeer/Disabled): the TX worker must not redial-loop.
-    /// Cleared when a new canonical connection is installed (meaningful
-    /// change) or a new generation starts (fresh state).
-    pub datagram_incompatible: AtomicBool,
 }
 
 impl PeerTransportState {
     fn new(endpoint: EndpointId) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
-            conn: ArcSwapOption::empty(),
+            connected: AtomicBool::new(false),
             tx_packets: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
             rx_packets: AtomicU64::new(0),
             rx_bytes: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_millis()),
             relay: AtomicBool::new(false),
-            mps: AtomicUsize::new(DEFAULT_MPS),
-            rtt_ms: AtomicU64::new(90),
-            next_frame_id: AtomicU32::new(rand::random()),
-            sends_since_mps_check: AtomicU64::new(0),
-            datagram_incompatible: AtomicBool::new(false),
         })
-    }
-
-    /// Refresh the cached MPS from the live connection (slow-ish: locks the
-    /// QUIC connection state; called periodically, not per packet).
-    pub fn refresh_mps(&self) -> Option<usize> {
-        let conn = self.conn.load_full()?;
-        let mps = conn.max_datagram_size()?;
-        self.mps.store(mps, Ordering::Relaxed);
-        // Sample RTT from the selected path for adaptive backoff.
-        if let Some(rtt) = conn
-            .paths()
-            .iter()
-            .find(|p| p.is_selected())
-            .map(|p| p.stats().rtt)
-        {
-            self.rtt_ms.store(
-                rtt.as_millis().min(u128::from(u64::MAX)) as u64,
-                Ordering::Relaxed,
-            );
-        }
-        Some(mps)
-    }
-
-    pub fn live_conn(&self) -> Option<Connection> {
-        let conn = self.conn.load_full()?;
-        if conn.close_reason().is_some() {
-            return None;
-        }
-        Some(conn.as_ref().clone())
     }
 
     pub fn touch(&self) {
@@ -147,58 +59,28 @@ impl PeerTransportState {
         self.tx_bytes.fetch_add(n, Ordering::Relaxed);
         self.touch();
     }
-
-    /// Overlay receive accounting: call when a complete logical packet is
-    /// accepted into the TUN writer queue — NOT on DATAGRAM arrival, and
-    /// never as proof of OS delivery (see the writer's `tun_write_packets`).
     pub fn record_rx(&self, n: u64) {
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
         self.rx_bytes.fetch_add(n, Ordering::Relaxed);
         self.touch();
     }
 }
-
-/// Per-(endpoint, network) membership state: everything the packet path
-/// needs for ONE network, so after routing there are no map lookups, no
-/// async mutexes, and no string conversions. Queueing lives in the
-/// endpoint TX worker; this state carries network identity, policy slot,
-/// reassembly, and revocation epoch only.
 pub struct PeerMembershipState {
-    /// Shared endpoint transport (connection, MPS, counters).
     pub transport: Arc<PeerTransportState>,
     pub identity: RwLock<Arc<PeerIdentity>>,
-    /// Stable network firewall slot: assigned once per network
-    /// (re)resolution, swapped in place by firewall publication. The hot
-    /// path loads set + counters with two atomic loads — no map lookup,
-    /// no relink.
     pub policy: ArcSwap<FwSlot>,
-    pub reassembly: parking_lot::Mutex<ReassemblyTable>,
-    /// Membership epoch: bumped when THIS membership is revoked. Readers
-    /// holding this Arc observe the change; the endpoint worker drops this
-    /// network's queued and in-flight packets. Other memberships of the same
-    /// endpoint are unaffected.
     pub epoch: AtomicU64,
 }
 
 impl PeerMembershipState {
-    pub fn new(
-        transport: Arc<PeerTransportState>,
-        identity: Arc<PeerIdentity>,
-        reassembly_budget: Arc<AtomicU64>,
-    ) -> Arc<Self> {
+    pub fn new(transport: Arc<PeerTransportState>, identity: Arc<PeerIdentity>) -> Arc<Self> {
         Arc::new(Self {
             transport,
             identity: RwLock::new(identity),
             policy: ArcSwap::from_pointee(FwSlot::default()),
-            reassembly: parking_lot::Mutex::new(ReassemblyTable::new(reassembly_budget)),
             epoch: AtomicU64::new(0),
         })
     }
-
-    /// Hard-deactivate THIS membership: epoch bump (readers holding this Arc
-    /// observe it and exit; the endpoint worker purges this network).
-    /// Never touches the shared transport connection — sibling memberships
-    /// keep working. Idempotent.
     pub fn deactivate(&self) {
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
@@ -210,15 +92,10 @@ fn now_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
-
-/// Slow-path-only registries. Packet paths never touch these maps: routing
-/// embeds `Arc<PeerMembershipState>` in peer handles and inbound readers
-/// cache one `Arc` per (endpoint, network).
 #[derive(Clone, Default)]
 pub struct PeerRegistry {
     transports: Arc<DashMap<EndpointId, Arc<PeerTransportState>>>,
     memberships: Arc<DashMap<(EndpointId, Uuid), Arc<PeerMembershipState>>>,
-    reassembly_budget: Arc<AtomicU64>,
 }
 
 impl PeerRegistry {
@@ -226,28 +103,14 @@ impl PeerRegistry {
         Self {
             transports: Arc::new(DashMap::new()),
             memberships: Arc::new(DashMap::new()),
-            reassembly_budget: Arc::new(AtomicU64::new(0)),
         }
     }
-
-    /// Shared reassembly byte counter (global cap denominator).
-    pub fn reassembly_budget(&self) -> &Arc<AtomicU64> {
-        &self.reassembly_budget
-    }
-
-    /// Get-or-create the endpoint transport (slow path).
     pub fn ensure_transport(&self, endpoint: EndpointId) -> Arc<PeerTransportState> {
         self.transports
             .entry(endpoint)
             .or_insert_with(|| PeerTransportState::new(endpoint))
             .clone()
     }
-
-    /// Get-or-create the (endpoint, network) membership (slow path:
-    /// routing rebuild, adopt, dial). The transport is shared across the
-    /// endpoint's memberships; identity refreshes in place. Refreshing with
-    /// a DIFFERENT network id is a caller bug — memberships are keyed by
-    /// network, so assert instead of silently mutating (no last-writer-wins).
     pub fn ensure_membership(&self, identity: Arc<PeerIdentity>) -> Arc<PeerMembershipState> {
         let key = (identity.endpoint, identity.network_id);
         if let Some(existing) = self.memberships.get(&key) {
@@ -256,28 +119,17 @@ impl PeerRegistry {
                 current.network_id, identity.network_id,
                 "membership key/network mismatch"
             );
-            // Refresh mutable context in place; the object stays stable.
             *existing.identity.write() = identity;
             return existing.value().clone();
         }
         let transport = self.ensure_transport(identity.endpoint);
-        let state =
-            PeerMembershipState::new(transport, identity.clone(), self.reassembly_budget.clone());
+        let state = PeerMembershipState::new(transport, identity.clone());
         self.memberships.entry(key).or_insert(state).clone()
-    }
-
-    /// Backwards-compatible single-network ensure (tests, legacy callers):
-    /// exactly `ensure_membership`.
-    pub fn ensure(&self, identity: Arc<PeerIdentity>) -> Arc<PeerMembershipState> {
-        self.ensure_membership(identity)
     }
 
     pub fn get_transport(&self, peer: EndpointId) -> Option<Arc<PeerTransportState>> {
         self.transports.get(&peer).map(|e| e.value().clone())
     }
-
-    /// True when the endpoint holds any network membership (reader-exit
-    /// check: a connection with zero memberships left is dead).
     pub fn has_any_membership(&self, peer: EndpointId) -> bool {
         self.memberships.iter().any(|e| e.key().0 == peer)
     }
@@ -291,102 +143,12 @@ impl PeerRegistry {
             .get(&(peer, network))
             .map(|e| e.value().clone())
     }
-
-    /// Backwards-compatible get (legacy callers that only know the
-    /// endpoint): returns a membership only when the endpoint has EXACTLY
-    /// ONE — ambiguous endpoints must resolve with a network. Never guesses.
-    pub fn get(&self, peer: EndpointId) -> Option<Arc<PeerMembershipState>> {
-        let mut found = None;
-        for entry in self.memberships.iter() {
-            if entry.key().0 == peer {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(entry.value().clone());
-            }
-        }
-        found
-    }
-
-    /// Mirror a live connection into the endpoint transport (slow paths
-    /// only). `Some` stores + re-measures + resets frame pacing; `None`
-    /// clears the connection and deactivates all of the endpoint's
-    /// memberships (teardown without replacement).
-    pub fn set_transport_conn(&self, peer: EndpointId, conn: Option<Connection>) {
-        let transport = self.ensure_transport(peer);
-        match conn {
-            Some(c) => {
-                transport.conn.store(Some(Arc::new(c.clone())));
-                // Fresh connection: reset pacing state to measured values.
-                transport
-                    .next_frame_id
-                    .store(rand::random(), Ordering::Relaxed);
-                transport.sends_since_mps_check.store(0, Ordering::Relaxed);
-                // A new canonical connection is a meaningful change: a
-                // previously observed DATAGRAM incompatibility may no
-                // longer hold, so the worker may try again.
-                transport
-                    .datagram_incompatible
-                    .store(false, Ordering::Relaxed);
-                drop(transport);
-                self.refresh_transport_path(peer, None);
-            }
-            None => {
-                transport.conn.store(None);
-                drop(transport);
-                for entry in self.memberships.iter() {
-                    if entry.key().0 == peer {
-                        entry.value().deactivate();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Clear a dead canonical connection WITHOUT deactivating memberships:
-    /// the QUIC connection failed, but the endpoint is still a member — the
-    /// endpoint worker holds its packets and reconnects. Used by reader-death
-    /// invalidation only; teardown uses `set_transport_conn(None)`.
-    pub fn clear_transport_conn(&self, peer: EndpointId) {
-        if let Some(t) = self.transports.get(&peer).map(|e| e.value().clone()) {
-            t.conn.store(None);
-        }
-    }
-
-    /// Path-event refresh (slow path): re-measure transport MPS/RTT and
-    /// optionally update the relay flag. Scheduler quanta are retuned by the
-    /// endpoint worker itself from the shared transport MPS.
-    pub fn refresh_transport_path(&self, peer: EndpointId, metered: Option<bool>) {
-        let Some(t) = self.transports.get(&peer).map(|e| e.value().clone()) else {
-            return;
-        };
-        if let Some(m) = metered {
-            t.relay.store(m, Ordering::Relaxed);
-        }
-        t.refresh_mps();
-    }
-
-    /// Legacy single-peer set_conn (pool slow path): delegates to
-    /// `set_transport_conn`.
-    pub fn set_conn(&self, peer: EndpointId, conn: Option<Connection>) {
-        self.set_transport_conn(peer, conn);
-    }
-
-    /// Remove ONE membership (network revoked, endpoint stays for others):
-    /// deactivate it, forget it. The shared transport connection is
-    /// untouched — sibling memberships keep working.
     pub fn remove_membership(&self, peer: EndpointId, network: Uuid) {
         if let Some((_, state)) = self.memberships.remove(&(peer, network)) {
-            // Hard revoke (§2.2-1): readers holding the Arc observe the
-            // epoch bump and exit; its pump drains and stops.
             state.deactivate();
         }
         self.prune_empty_transport(peer);
     }
-
-    /// Remove the endpoint entirely (all memberships + transport):
-    /// deactivate every membership, close the live tunnel connection,
-    /// forget everything.
     pub fn remove_transport(&self, peer: EndpointId) {
         let mut members = Vec::new();
         self.memberships.retain(|k, v| {
@@ -400,23 +162,8 @@ impl PeerRegistry {
         for m in members {
             m.deactivate();
         }
-        if let Some((_, t)) = self.transports.remove(&peer)
-            && let Some(conn) = t.conn.swap(None)
-        {
-            conn.close(0u32.into(), b"membership_removed");
-        }
+        self.transports.remove(&peer);
     }
-
-    /// Legacy remove: full endpoint removal.
-    pub fn remove(&self, peer: EndpointId) {
-        self.remove_transport(peer);
-    }
-
-    /// Retain only live (endpoint, network) memberships (slow path: routing
-    /// rebuild prunes departed memberships). Removed memberships are
-    /// hard-deactivated first, so no stale Arc keeps forwarding through
-    /// dead identity/policy state. Transports left with no memberships are
-    /// closed and forgotten.
     pub fn retain(&self, live: &std::collections::HashSet<(EndpointId, Uuid)>) {
         let mut departed = Vec::new();
         self.memberships.retain(|k, v| {
@@ -431,61 +178,14 @@ impl PeerRegistry {
         }
         let live_eps: std::collections::HashSet<EndpointId> =
             live.iter().map(|(ep, _)| *ep).collect();
-        let mut closed = Vec::new();
-        self.transports.retain(|ep, t| {
-            let keep = live_eps.contains(ep);
-            if !keep {
-                closed.push(t.clone());
-            }
-            keep
-        });
-        for t in closed {
-            if let Some(conn) = t.conn.swap(None) {
-                conn.close(0u32.into(), b"membership_removed");
-            }
-        }
-    }
 
-    /// Legacy retain by endpoint set (pool-era callers): keeps every
-    /// membership of a live endpoint. Prefer the (endpoint, network) form.
-    pub fn retain_endpoints(&self, live: &std::collections::HashSet<EndpointId>) {
-        let mut departed = Vec::new();
-        self.memberships.retain(|k, v| {
-            let keep = live.contains(&k.0);
-            if !keep {
-                departed.push(v.clone());
-            }
-            keep
-        });
-        for state in departed {
-            state.deactivate();
-        }
-        let mut closed = Vec::new();
-        self.transports.retain(|ep, t| {
-            let keep = live.contains(ep);
-            if !keep {
-                closed.push(t.clone());
-            }
-            keep
-        });
-        for t in closed {
-            if let Some(conn) = t.conn.swap(None) {
-                conn.close(0u32.into(), b"membership_removed");
-            }
-        }
+        self.transports.retain(|ep, _| live_eps.contains(ep));
     }
-
-    /// Drop a transport left with no memberships (after single-membership
-    /// removal): close its connection so no orphan conn lingers.
     fn prune_empty_transport(&self, peer: EndpointId) {
         if self.memberships.iter().any(|e| e.key().0 == peer) {
             return;
         }
-        if let Some((_, t)) = self.transports.remove(&peer)
-            && let Some(conn) = t.conn.swap(None)
-        {
-            conn.close(0u32.into(), b"membership_removed");
-        }
+        self.transports.remove(&peer);
     }
 
     pub fn clear(&self) {
@@ -494,18 +194,8 @@ impl PeerRegistry {
         for state in all {
             state.deactivate();
         }
-        let conns: Vec<_> = self.transports.iter().map(|e| e.value().clone()).collect();
         self.transports.clear();
-        for t in conns {
-            if let Some(conn) = t.conn.swap(None) {
-                conn.close(0u32.into(), b"membership_removed");
-            }
-        }
     }
-
-    /// Install-time policy slot assignment (slow/control path): every
-    /// membership points at its network's stable slot. Firewall publication
-    /// NEVER needs this — slots swap in place (§2.1-3).
     pub fn relink_policy(&self, runtime: &PolicyRuntime) {
         for entry in self.memberships.iter() {
             let state = entry.value();
@@ -513,15 +203,13 @@ impl PeerRegistry {
             state.policy.store(runtime.slot_for_network(network));
         }
     }
-
-    /// Heartbeat aggregates (slow path only).
     pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
         let mut conns = 0u32;
         let mut tx = 0u64;
         let mut rx = 0u64;
         for entry in self.transports.iter() {
             let s = entry.value();
-            if s.live_conn().is_some() {
+            if s.connected.load(Ordering::Relaxed) {
                 conns += 1;
             }
             tx += s.tx_bytes.load(Ordering::Relaxed);
@@ -573,55 +261,47 @@ mod tests {
     fn registry_reuses_stable_state() {
         let reg = PeerRegistry::new();
         let ep = test_endpoint();
-        let a = reg.ensure(identity(ep));
-        let b = reg.ensure(identity(ep));
+        let a = reg.ensure_membership(identity(ep));
+        let b = reg.ensure_membership(identity(ep));
         assert!(Arc::ptr_eq(&a, &b), "same stable object");
-        // Identity refresh keeps the object.
         let mut id = identity(ep);
         let idm = Arc::get_mut(&mut id).unwrap();
         idm.hostname = "renamed".into();
-        let c = reg.ensure(id);
+        let c = reg.ensure_membership(id);
         assert!(Arc::ptr_eq(&a, &c));
         assert_eq!(c.identity.read().hostname, "renamed");
     }
 
     #[test]
     fn removal_deactivates_fast_state() {
-        // §2.1-9: removing a peer hard-revokes its fast state — epoch
-        // bumped (pumps/readers holding the Arc observe it and exit),
-        // connection cleared. A subsequent resolve finds nothing.
         use std::collections::HashSet;
         let reg = PeerRegistry::new();
         let ep = test_endpoint();
-        let s = reg.ensure(identity(ep));
+        let s = reg.ensure_membership(identity(ep));
         let epoch0 = s.epoch.load(Ordering::Relaxed);
-        // Simulate a live peer: epoch + scheduler contents (pump-owned).
         s.epoch.fetch_add(0, Ordering::Relaxed);
-        assert!(reg.get(ep).is_some());
-        reg.remove(ep);
-        assert!(reg.get(ep).is_none(), "removed peer must not resolve");
+        assert!(reg.get_membership(ep, Uuid::nil()).is_some());
+        reg.remove_transport(ep);
+        assert!(
+            reg.get_membership(ep, Uuid::nil()).is_none(),
+            "removed peer must not resolve"
+        );
         assert!(reg.get_transport(ep).is_none(), "transport forgotten too");
         assert_eq!(
             s.epoch.load(Ordering::Relaxed),
             epoch0 + 1,
             "reader/pump exit signal"
         );
-        assert!(s.transport.conn.load_full().is_none());
-        // Retain with an empty live set deactivates too.
         let ep2 = test_endpoint();
-        let s2 = reg.ensure(identity(ep2));
+        let s2 = reg.ensure_membership(identity(ep2));
         let epoch2 = s2.epoch.load(Ordering::Relaxed);
         reg.retain(&HashSet::new());
-        assert!(reg.get(ep2).is_none());
+        assert!(reg.get_membership(ep2, Uuid::nil()).is_none());
         assert_eq!(s2.epoch.load(Ordering::Relaxed), epoch2 + 1);
     }
 
     #[test]
     fn same_endpoint_two_networks_isolated() {
-        // §2.2-1 (tests 1, 2, 10): one EndpointId in networks A and B gets
-        // two independent membership states sharing one transport. Ensuring
-        // B never mutates A's identity (no last-writer-wins), in either
-        // insertion order (reverse order covered by the next test).
         let reg = PeerRegistry::new();
         let ep = test_endpoint();
         let id_a = identity_in(ep, NET_A, [10, 0, 0, 2]);
@@ -629,13 +309,11 @@ mod tests {
         let a = reg.ensure_membership(id_a);
         let b = reg.ensure_membership(id_b);
         assert!(!Arc::ptr_eq(&a, &b), "distinct membership objects");
-        // Shared transport, distinct memberships.
         assert!(Arc::ptr_eq(&a.transport, &b.transport));
         assert_eq!(a.identity.read().network_id, NET_A);
         assert_eq!(b.identity.read().network_id, NET_B);
         assert_eq!(a.identity.read().ip, std::net::Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(b.identity.read().ip, std::net::Ipv4Addr::new(10, 0, 1, 2));
-        // Exact resolution per (endpoint, network).
         assert!(
             reg.get_membership(ep, NET_A)
                 .is_some_and(|m| Arc::ptr_eq(&m, &a))
@@ -644,13 +322,14 @@ mod tests {
             reg.get_membership(ep, NET_B)
                 .is_some_and(|m| Arc::ptr_eq(&m, &b))
         );
-        // Bare endpoint resolve refuses to guess across networks.
-        assert!(reg.get(ep).is_none(), "ambiguous endpoint must not resolve");
+        assert!(
+            reg.get_membership(ep, Uuid::nil()).is_none(),
+            "ambiguous endpoint must not resolve"
+        );
     }
 
     #[test]
     fn same_endpoint_two_networks_reverse_order() {
-        // Insert B before A: A must still resolve exactly, with its own IP.
         let reg = PeerRegistry::new();
         let ep = test_endpoint();
         let b = reg.ensure_membership(identity_in(ep, NET_B, [10, 0, 1, 2]));
@@ -665,8 +344,6 @@ mod tests {
 
     #[test]
     fn removing_one_membership_leaves_sibling() {
-        // §2.2-1 (tests 8, 9): revoking A deactivates only A; B keeps its
-        // epoch, transport, and resolvability.
         let reg = PeerRegistry::new();
         let ep = test_endpoint();
         let a = reg.ensure_membership(identity_in(ep, NET_A, [10, 0, 0, 2]));
@@ -675,14 +352,11 @@ mod tests {
         reg.remove_membership(ep, NET_A);
         assert!(reg.get_membership(ep, NET_A).is_none());
         assert_eq!(a.epoch.load(Ordering::Relaxed), 1);
-        // Sibling untouched: same epoch, still resolvable, transport alive.
         assert_eq!(b.epoch.load(Ordering::Relaxed), epoch_b);
         assert!(
             reg.get_membership(ep, NET_B)
                 .is_some_and(|m| Arc::ptr_eq(&m, &b))
         );
         assert!(reg.get_transport(ep).is_some());
-        // Endpoint-wide get() now unambiguous again.
-        assert!(reg.get(ep).is_some_and(|m| Arc::ptr_eq(&m, &b)));
     }
 }

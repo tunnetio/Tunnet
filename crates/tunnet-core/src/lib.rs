@@ -22,11 +22,11 @@ pub mod node;
 pub mod peers;
 pub mod ping;
 pub mod policy_runtime;
-pub mod reassembly;
+
 #[cfg(feature = "recording")]
 pub mod recording;
 pub mod routing;
-pub mod scheduler;
+
 pub mod secret_store;
 #[cfg(feature = "send")]
 pub mod send;
@@ -57,7 +57,7 @@ pub use control::{ManagementClient, SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
 #[cfg(feature = "direct")]
 pub use iroh_docs::protocol::Docs;
-pub use iroh_pool::{ConnPool, InstallOutcome};
+pub use iroh_pool::ConnPool;
 pub use leave::leave_direct_network;
 #[cfg(feature = "direct")]
 pub use node::DirectNetworkRuntime;

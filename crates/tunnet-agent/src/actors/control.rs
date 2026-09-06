@@ -261,7 +261,7 @@ impl ControlPlaneActor {
         let node = self.cfg.node.clone();
         match msg {
             ServerMsg::Snapshot(snap) => {
-                node.tunnel_pool.set_cloud_relay_urls(
+                node.pool.set_cloud_relay_urls(
                     snap.connectivity_relays
                         .iter()
                         .filter(|r| r.metering)
@@ -731,13 +731,13 @@ struct SendHeartbeat;
 impl Message<SendHeartbeat> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, _msg: SendHeartbeat, _ctx: &mut Context<Self, Self::Reply>) {
-        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel_pool.heartbeat_counters();
+        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.pool.heartbeat_counters();
         self.send_client(ClientMsg::Heartbeat {
             active_conns,
             bytes_tx,
             bytes_rx,
         });
-        let bytes = self.cfg.node.tunnel_pool.cloud_relay_meter().take();
+        let bytes = self.cfg.node.pool.cloud_relay_meter().take();
         if bytes > 0 {
             self.send_client(ClientMsg::CloudRelayUsage { bytes });
         }

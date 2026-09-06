@@ -6,7 +6,7 @@
 
 use std::net::Ipv4Addr;
 
-use tunnet_common::packet::{PacketMeta, SshNatClass, set_tcp_ipv4_checksum};
+use tunnet_common::packet::{PacketMeta, SshNatClass};
 
 pub const SSH_EXTERNAL_PORT: u16 = 22;
 pub const SSH_INTERNAL_PORT: u16 = 30022;
@@ -19,17 +19,12 @@ pub fn needs_outbound_rewrite_with_meta(meta: &PacketMeta, self_ip: Ipv4Addr) ->
 }
 
 /// Parse-once outbound rewrite using already-parsed metadata.
-/// Returns true when a rewrite was applied (caller must refresh metadata).
+/// Returns true when a rewrite was applied (caller updates the known port in metadata).
 pub fn rewrite_outbound_with_meta(packet: &mut [u8], meta: &PacketMeta, self_ip: Ipv4Addr) -> bool {
     match meta.ssh_nat_class(self_ip) {
         SshNatClass::OutboundToExternal => {
             let ip_len = meta.ip_header_len;
-            if packet.len() < ip_len + 2 {
-                return false;
-            }
-            packet[ip_len] = (SSH_EXTERNAL_PORT >> 8) as u8;
-            packet[ip_len + 1] = (SSH_EXTERNAL_PORT & 0xff) as u8;
-            set_tcp_ipv4_checksum(packet, ip_len)
+            replace_port(packet, ip_len, ip_len, SSH_EXTERNAL_PORT)
         }
         _ => false,
     }
@@ -44,15 +39,27 @@ pub fn rewrite_inbound_with_meta(packet: &mut [u8], meta: &PacketMeta, self_ip: 
     match meta.ssh_nat_class(self_ip) {
         SshNatClass::InboundToInternal => {
             let ip_len = meta.ip_header_len;
-            if packet.len() < ip_len + 4 {
-                return false;
-            }
-            packet[ip_len + 2] = (SSH_INTERNAL_PORT >> 8) as u8;
-            packet[ip_len + 3] = (SSH_INTERNAL_PORT & 0xff) as u8;
-            set_tcp_ipv4_checksum(packet, ip_len)
+            replace_port(packet, ip_len, ip_len + 2, SSH_INTERNAL_PORT)
         }
         _ => false,
     }
+}
+
+// RFC 1624: update the checksum for the changed 16-bit word. This also
+// works on a first IP fragment, whose remaining TCP payload is unavailable.
+fn replace_port(packet: &mut [u8], ip_len: usize, offset: usize, port: u16) -> bool {
+    if packet.len() < ip_len + 18 {
+        return false;
+    }
+    let old = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+    let checksum = u16::from_be_bytes([packet[ip_len + 16], packet[ip_len + 17]]);
+    let mut sum = u32::from(!checksum) + u32::from(!old) + u32::from(port);
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    packet[offset..offset + 2].copy_from_slice(&port.to_be_bytes());
+    packet[ip_len + 16..ip_len + 18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    true
 }
 
 #[cfg(test)]
@@ -126,5 +133,22 @@ mod tests {
             assert!(!needs_inbound_rewrite_with_meta(&meta, self_ip));
             assert!(!rewrite_inbound_with_meta(&mut later, &meta, self_ip));
         }
+    }
+    #[test]
+    fn first_fragment_checksum_accounts_for_missing_payload() {
+        let local = Ipv4Addr::new(10, 7, 0, 1);
+        let remote = Ipv4Addr::new(10, 7, 0, 2);
+        let complete = sample_tcp(remote, local, 4242, 22, &[3; 800]);
+        let mut first = complete[..48].to_vec();
+        first[2..4].copy_from_slice(&48u16.to_be_bytes());
+        first[6] = 0x20;
+        let meta = meta_of(&first);
+        assert!(rewrite_inbound_with_meta(&mut first, &meta, local));
+        let mut assembled = complete;
+        assembled[20..48].copy_from_slice(&first[20..]);
+        assert_eq!(
+            u16::from_be_bytes([assembled[36], assembled[37]]),
+            tcp_ipv4_checksum_of(&assembled).unwrap()
+        );
     }
 }

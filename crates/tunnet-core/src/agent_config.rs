@@ -445,9 +445,9 @@ impl TunnetConfig {
             errs.push("update.check-interval-hours: must be >= 1".into());
         }
         if let Some(mtu) = self.network.tunnel_mtu
-            && !(576..=9000).contains(&mtu)
+            && !(576..=1100).contains(&mtu)
         {
-            errs.push("network.tunnel-mtu: must be 576-9000".into());
+            errs.push("network.tunnel-mtu: must be 576-1100".into());
         }
 
         if errs.is_empty() { Ok(()) } else { Err(errs) }

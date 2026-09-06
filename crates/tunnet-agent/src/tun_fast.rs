@@ -3,7 +3,7 @@
 //! Linux: offload + `recv_multiple` into pool-owned batch slots (ownership
 //! transferred to logical packets, no per-packet copy) and genuine
 //! multi-packet `send_multiple` batches that let GSO coalesce.
-//! Windows: Wintun ring drained as bursts into pooled buffers; the
+//! Windows: one receive loop moves pooled buffers; the
 //! generation-owned TUN writer (see `tun_writer`) owns the pending packet
 //! until success — `try_send` only, no blocking send, no silent loss. Ring
 //! capacity stays deliberate; bigger rings only mask queueing.
@@ -21,8 +21,6 @@ use tunnet_common::packet::{LogicalPacket, MAX_LOGICAL_LEN, PacketPool};
 /// Desired TUN batch depth (starting point; tun-rs `IDEAL_BATCH_SIZE` = 128).
 #[cfg(target_os = "linux")]
 pub const BATCH_SIZE: usize = tun_rs::IDEAL_BATCH_SIZE;
-/// Windows burst budget per readiness wakeup.
-pub const BURST_BUDGET: usize = 64;
 /// Inbound TUN write batch: packets accumulated per drain iteration.
 /// Linux-only sizing now (the generation-owned writer drains this many per
 /// `send_multiple`); kept visible for tests on all platforms.
@@ -55,13 +53,8 @@ pub struct LinuxBatchEngine {
 ///
 /// tun-rs `recv_multiple` contract (see `tun-rs/src/platform/linux/device.rs`
 /// `handle_virtio_read` / `gso_split`): `as_ref().len()` is the RECEIVE
-/// CAPACITY tun-rs checks writes against, and packets land at
-/// `as_mut()[offset..]`. The two views therefore differ on purpose:
-/// - `AsRef` reports the WHOLE backing storage (headroom + sized area),
-///   independent of the current packet length (fresh slots hold no packet
-///   yet — reporting the packet view here fails every batch with
-///   "overflows bufs element len");
-/// - `AsMut` exposes the headroomed receive area sized by `prepare`.
+/// CAPACITY tun-rs checks writes against. AsRef and AsMut expose exactly
+/// the same writable receive region, excluding tunnel framing headroom.
 ///
 /// Receipt transfers the whole buffer into a logical packet with ownership
 /// and headroom intact. Platform-independent by design so the contract is
@@ -154,7 +147,7 @@ impl LinuxBatchEngine {
     }
 }
 
-/// Genuine multi-packet TUN writer for Linux (§9).
+/// Genuine multi-packet TUN writer for Linux.
 ///
 /// Accumulates decoded logical packets and flushes with ONE
 /// `send_multiple`, letting GSO coalesce same-flow segments into fewer
@@ -205,7 +198,8 @@ impl LinuxTunBatchWriter {
             return Ok(0);
         }
         const HDR: usize = tun_rs::VIRTIO_NET_HDR_LEN;
-        let n = dev
+        let n = self.staging.len();
+        let _bytes = dev
             .send_multiple(&mut self.gro, &mut self.staging, HDR)
             .await?;
         for mut buf in std::mem::take(&mut self.staging) {
@@ -225,41 +219,21 @@ impl Default for LinuxTunBatchWriter {
     }
 }
 
-/// Windows burst drain into pooled buffers: after readiness, `try_recv`
-/// until WouldBlock/budget. Each packet owns its pooled storage (no copy).
-pub async fn windows_recv_burst(
+/// One Windows/fallback receive operation into movable pooled storage.
+#[cfg(not(target_os = "linux"))]
+pub async fn recv_one(
     dev: &AsyncDevice,
     pool: &Arc<PacketPool>,
     mtu: usize,
-    budget: usize,
-) -> anyhow::Result<Vec<LogicalPacket>> {
-    let slot_cap = slot_cap_for_mtu(mtu);
-    let mut out = Vec::with_capacity(budget.min(BURST_BUDGET));
-    // Prime with one async recv so we wait only when the ring is empty.
-    {
-        let mut buf = pool.acquire(slot_cap);
-        let n = dev.recv(buf.recv_region(slot_cap)).await?;
-        if n == 0 {
-            return Ok(out);
-        }
-        if let Some(p) = LogicalPacket::from_pooled(buf, n) {
-            out.push(p);
-        }
-    }
-    for _ in 1..budget.min(BURST_BUDGET) {
-        let mut buf = pool.acquire(slot_cap);
-        match dev.try_recv(buf.recv_region(slot_cap)) {
-            Ok(0) => break,
-            Ok(n) => {
-                if let Some(p) = LogicalPacket::from_pooled(buf, n) {
-                    out.push(p);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(out)
+) -> anyhow::Result<Option<LogicalPacket>> {
+    let cap = slot_cap_for_mtu(mtu);
+    let mut buf = pool.acquire(cap);
+    let n = dev.recv(buf.recv_region(cap)).await?;
+    Ok(if n == 0 {
+        None
+    } else {
+        LogicalPacket::from_pooled(buf, n)
+    })
 }
 
 #[cfg(test)]
@@ -267,7 +241,6 @@ mod tests {
     use super::*;
 
     const _: () = {
-        assert!(BURST_BUDGET >= 16 && BURST_BUDGET <= 256);
         assert!(TUN_WRITE_BATCH >= 8);
     };
 
@@ -309,7 +282,7 @@ mod tests {
     ///
     /// Ignored by default: needs `CAP_NET_ADMIN` (real TUN device). Run on
     /// a Linux dev machine with privileges:
-    /// `sudo -E cargo test -p tunnet-agent --lib tun_kernel_round_trip -- --ignored --nocapture`
+    /// `sudo -E cargo test -p tunnet-agent --bin tunnetd tun_kernel_round_trip -- --ignored --nocapture`
     #[test]
     #[cfg(target_os = "linux")]
     #[ignore = "needs CAP_NET_ADMIN + real TUN device"]
@@ -319,15 +292,17 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let ip = std::net::Ipv4Addr::new(10, 99, 0, 1);
+            let local = std::net::Ipv4Addr::new(10, 99, 0, 1);
+            let peer = std::net::Ipv4Addr::new(10, 99, 0, 2);
             let ifname = format!("tnt{:x}", std::process::id() & 0xffff);
             let dev = std::sync::Arc::new(
-                crate::tun_io::build_tun(&ifname, ip, 30, 2800)
+                crate::tun_io::build_tun(&ifname, local, 30, 1100)
                     .expect("TUN device (need CAP_NET_ADMIN)"),
             );
-            // Echo request to self: the kernel answers locally.
+            // Packet arrives from the peer address so the kernel sends the
+            // echo reply back out this TUN instead of delivering it locally.
             let echo_id = 0xbeefu16;
-            let b = etherparse::PacketBuilder::ipv4(ip.octets(), ip.octets(), 64)
+            let b = etherparse::PacketBuilder::ipv4(peer.octets(), local.octets(), 64)
                 .icmpv4_echo_request(echo_id, 1);
             let mut req = Vec::new();
             b.write(&mut req, &[0xCCu8; 32]).unwrap();
@@ -337,9 +312,8 @@ mod tests {
                 .flush(&dev)
                 .await
                 .expect("flush echo request into the kernel");
-            // Read back through the REAL batch engine (pooled slots).
             let pool = PacketPool::new(8);
-            let mut engine = LinuxBatchEngine::new(pool, 2800);
+            let mut engine = LinuxBatchEngine::new(pool, 1100);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 assert!(
@@ -366,8 +340,8 @@ mod tests {
                     if !is_reply {
                         continue;
                     }
-                    assert_eq!(meta.src_v4, Some(ip));
-                    assert_eq!(meta.dst_v4, Some(ip));
+                    assert_eq!(meta.src_v4, Some(local));
+                    assert_eq!(meta.dst_v4, Some(peer));
                     assert_eq!(
                         &p.owner.as_bytes()[p.owner.as_bytes().len() - 32..],
                         &[0xCCu8; 32]

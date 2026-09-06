@@ -20,7 +20,7 @@ use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_AL
 use tunnet_core::{AclEngine, RoutingTable, SendManager, SignedClient};
 use uuid::Uuid;
 
-use crate::ingress::IngressManager;
+use crate::actors::dataplane::PublishedPlane;
 use crate::recorder::{RecordingStore, serve_recording_connection};
 
 pub struct AcceptDeps {
@@ -39,7 +39,7 @@ pub struct AcceptDeps {
     pub docs: HashMap<Uuid, DocsMembership>,
     pub agent_gossip: Option<iroh_gossip::net::Gossip>,
     pub shared_docs: Option<Docs>,
-    pub ingress_manager: Arc<IngressManager>,
+    pub published: PublishedPlane,
     /// Direct auth cache for the AUTH_ALPN server (same cache the ingress
     /// context carries for tunnel readers).
     pub direct_auth: Option<tunnet_core::direct::AuthCache>,
@@ -48,7 +48,7 @@ pub struct AcceptDeps {
 /// Spawn the unified ALPN router. Keep the returned [`Router`] alive for the process lifetime.
 pub fn spawn(deps: AcceptDeps) -> Router {
     let tunnel = TunnelHandler {
-        ingress_manager: deps.ingress_manager,
+        published: deps.published,
     };
     let stream = StreamProtocolHandler::new(deps.stream_handler);
     let auth = AuthHandler {
@@ -98,7 +98,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
 
 #[derive(Clone)]
 struct TunnelHandler {
-    ingress_manager: Arc<IngressManager>,
+    published: PublishedPlane,
 }
 
 impl fmt::Debug for TunnelHandler {
@@ -109,10 +109,11 @@ impl fmt::Debug for TunnelHandler {
 
 impl ProtocolHandler for TunnelHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        // One canonical install path (tie-break + single reader install
-        // inside the manager). No dataplane-down check here: the manager
-        // skips reader install when no generation is published.
-        self.ingress_manager.install_accepted(conn).await;
+        if let Some(plane) = self.published.load_full() {
+            plane.accept(conn);
+        } else {
+            conn.close(0u32.into(), b"dataplane_down");
+        }
         Ok(())
     }
 }

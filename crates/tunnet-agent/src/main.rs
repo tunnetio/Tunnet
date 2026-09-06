@@ -11,10 +11,10 @@ mod cmds_update;
 mod core_update;
 mod daemon;
 mod dataplane;
-mod endpoint_tx;
 mod forward;
 mod frag_hold;
-mod ingress;
+mod peer_transport;
+
 mod magic_dns;
 mod metrics;
 mod policy_api;

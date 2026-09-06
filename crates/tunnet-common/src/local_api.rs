@@ -216,7 +216,7 @@ pub struct NodeSummary {
     /// stale-daemon traps (fresh CLI, old service binary).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_git: Option<String>,
-    /// Tunnel ALPN the daemon speaks (e.g. `tunnet/tunnel/3`).
+    /// Tunnel ALPN the daemon speaks (e.g. `tunnet/tunnel/4`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_alpn: Option<String>,
     /// Dataplane health detail (never "up" with a dead packet worker).
@@ -228,6 +228,7 @@ pub struct NodeSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DataPlaneInfo {
+    pub connected_peers: u32,
     /// `up` | `degraded` | `restarting` | `down`.
     pub state: String,
     pub outbound_alive: bool,
@@ -235,36 +236,6 @@ pub struct DataPlaneInfo {
     pub writer_alive: bool,
     pub restart_count: u64,
     pub generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    /// Per-peer canonical tunnel sessions (empty when the dataplane is
-    /// down or the agent predates session exposure).
-    #[serde(default)]
-    pub sessions: Vec<SessionHealth>,
-}
-
-/// One canonical tunnel session: connection + reader + generation binding.
-/// A canonical connection with no live current-generation reader is never
-/// healthy — the benchmark and `tunnet status` use this to expose
-/// one-way session poisoning directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct SessionHealth {
-    pub peer_endpoint: String,
-    /// Stable id of the canonical connection, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canonical_stable_id: Option<usize>,
-    /// `live` | `reconnecting` | `absent`.
-    pub canonical_state: String,
-    /// Stable id the live reader serves, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reader_stable_id: Option<usize>,
-    pub reader_alive: bool,
-    /// `dialed` | `accepted`, when a canonical connection exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_orientation: Option<String>,
-    pub connection_generation: u64,
-    pub reconnect_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -1024,8 +995,6 @@ pub struct OnDemandStatusInfo {
     pub reconnect_attempts: u64,
     pub reconnect_success: u64,
     pub reconnect_fail: u64,
-    pub packets_buffered: u64,
-    pub packets_dropped_timeout: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

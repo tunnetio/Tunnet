@@ -30,7 +30,6 @@ use crate::actors::supervisor::{
 };
 use crate::actors::update::{UpdateActorArgs, UpdateState};
 use crate::daemon::RunArgs;
-use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::recorder::{RecordingStore, recordings_dir};
 use crate::system_dns::DnsController;
@@ -164,7 +163,7 @@ pub async fn run(
                 .effective
                 .tunnel_mtu
                 .value
-                .clamp(576, 9000),
+                .clamp(576, tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16),
             tunnet_core::load_dns(&node.paths),
         )
     } else {
@@ -180,7 +179,7 @@ pub async fn run(
             .effective
             .tunnel_mtu
             .value
-            .clamp(576, 9000);
+            .clamp(576, tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16);
         (
             membership_snap.assigned_ipv4,
             membership_snap.prefix,
@@ -234,10 +233,6 @@ pub async fn run(
             }
         });
     }
-    // Ingress-install gate: set when the pool hook is registered (before
-    // BringUp). Preconnect never runs before this.
-    let ingress_gate = Arc::new(AtomicBool::new(false));
-
     // Child configs for the supervisor tree.
     let dataplane_cfg = DataPlaneActorConfig {
         ifname: args.ifname.clone(),
@@ -295,43 +290,6 @@ pub async fn run(
 
     // Single event bus shared by the actors, the updater, and the Local API.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    // Ingress reader registry: shared by the dialer hook, the accept router,
-    // and the DataPlaneActor (which shuts readers down on BringDown).
-    let ingress = IngressRegistry::new();
-    // Explicit lifecycle gate: installs allowed only in Up (actor owns
-    // transitions; the session manager refuses everything else).
-    let lifecycle_gate = crate::actors::dataplane::LifecycleGate::default();
-    // Session manager BEFORE the supervisor (the actor needs it for
-    // bring-up reconcile): shared reader context (same auth cache for
-    // accepted and dialed connections) + pool hook. No preconnect may
-    // run before this point.
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-    let ingress_ctx = crate::ingress::IngressContext {
-        routes: node.routes.clone(),
-        acl: node.acl.clone(),
-        runtime: node.policy.clone(),
-        spoofs: spoofs.clone(),
-        bufs: packet_pool.clone(),
-        metrics: metrics.clone(),
-        auth: node.direct_auth.clone(),
-    };
-    let pool_arc = Arc::new(node.tunnel_pool.clone());
-    let ingress_manager = Arc::new(crate::ingress::IngressManager::new(
-        &pool_arc,
-        ingress.clone(),
-        ingress_ctx,
-        published.clone(),
-        status_snapshot.clone(),
-        lifecycle_gate.clone(),
-        None,
-    ));
-    node.tunnel_pool
-        .set_tunnel_hook(ingress_manager.dial_hook());
-    ingress_gate.store(true, std::sync::atomic::Ordering::SeqCst);
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
     let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(UpdateState::Idle));
     let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
@@ -346,11 +304,7 @@ pub async fn run(
                 events: events_tx.clone(),
                 published: published.clone(),
                 status: status_snapshot.clone(),
-                ingress: ingress.clone(),
                 packet_pool: packet_pool.clone(),
-                ingress_gate: ingress_gate.clone(),
-                lifecycle_gate: lifecycle_gate.clone(),
-                session_manager: ingress_manager.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
@@ -395,6 +349,7 @@ pub async fn run(
     let data_plane_control = Arc::new(ActorDataPlaneControl::new(
         status_snapshot.clone(),
         dataplane_ref.clone(),
+        published.clone(),
     ));
     let bootstrap: Arc<dyn tunnet_core::local_api::BootstrapOps> = Arc::new(
         crate::api_bootstrap::AgentBootstrapOps::new(paths.clone(), events_tx.clone()),
@@ -570,7 +525,7 @@ pub async fn run(
         docs: docs_map,
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
-        ingress_manager: ingress_manager.clone(),
+        published: published.clone(),
         direct_auth: node.direct_auth.clone(),
     });
 

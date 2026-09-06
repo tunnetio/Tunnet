@@ -19,9 +19,7 @@
 # "server is busy" listener contention retries boundedly (infrastructure,
 # never Tunnet loss). One shared parser (benchlib.py) reports
 # receiver-delivered throughput everywhere; downloads offer against CAP_DOWN.
-# Every row carries local_sw_drops + peer_sw_drops (scheduler/TUN
 # software-drop deltas from both agents on tunnet runs, each with explicit
-# availability): one benchmark is self-diagnosing — sender scheduler drops
 # and receiver TUN-writer drops are both observable, and unavailable
 # telemetry never reads as zero.
 set -u
@@ -116,12 +114,11 @@ def parse_udp_summary(d):
 def sw_diff(before, after):
     """Delta of software-drop counters between two snapshots.
     Unavailable on either side reads as unavailable — never as zero.
-    Session objects ride along for change detection (compared, not
-    subtracted)."""
+"""
     if not before.get('available') or not after.get('available'):
         return {'available': False}
     d = {'available': True}
-    for k in ('sched', 'dropped', 'tun_write_drop'):
+    for k in ('dropped', 'tun_write_drop'):
         try:
             d[k] = round(float(after.get(k, 0)) - float(before.get(k, 0)), 0)
         except Exception:
@@ -129,48 +126,19 @@ def sw_diff(before, after):
     return d
 
 
-def sessions_equal(a, b):
-    """True when two session snapshots describe the same live sessions."""
-    if (a is None) != (b is None):
-        return False
-    if a is None:
-        return True
-    for k in ('generation', 'restart_count', 'up', 'outbound_alive', 'writer_alive'):
-        if a.get(k) != b.get(k):
-            return False
-    sa = sorted((s.get('peer'), s.get('generation'), s.get('canonical'),
-                 s.get('reader'), s.get('orientation'), s.get('alive'))
-                for s in (a.get('sessions') or []))
-    sb = sorted((s.get('peer'), s.get('generation'), s.get('canonical'),
-                 s.get('reader'), s.get('orientation'), s.get('alive'))
-                for s in (b.get('sessions') or []))
-    return sa == sb
-
-
 def sw_pair_drops(sw0l, sw0p, sw1l, sw1p):
-    """Local + peer deltas from four snapshot files, with session
-    before/after objects and change flags for poisoning detection."""
+    """Local and peer software-drop deltas from four snapshot files."""
     b0l, b0p = json.load(open(sw0l)), json.load(open(sw0p))
     b1l, b1p = json.load(open(sw1l)), json.load(open(sw1p))
     out = {
         'local_sw_drops': sw_diff(b0l, b1l),
         'peer_sw_drops': sw_diff(b0p, b1p),
     }
-    for name, b0, b1 in (('local', b0l, b1l), ('peer', b0p, b1p)):
-        s0 = b0.get('session')
-        s1 = b1.get('session')
-        key = name + '_session'
-        out[key + '_before'] = s0
-        out[key + '_after'] = s1
-        out[key + '_changed'] = not sessions_equal(s0, s1)
     return out
 PYEOF
 export BENCH_LIB="$RESULTS_DIR/benchlib.py"
 
-# Software-drop snapshot (tunnet runs only): low-cardinality counters plus
-# dataplane vitals and canonical session series, for per-scenario
-# self-diagnosis AND session-poisoning detection. Uploads drop on the
-# local sender, downloads on the remote sender — both sides are scraped.
+# Software-drop snapshots from both the local and remote endpoint.
 # Availability is explicit: {"available":false} when unreachable; zero is
 # written only after a successful scrape, never as "unknown".
 sw_snapshot() { # OUTFILE URL
@@ -178,49 +146,23 @@ sw_snapshot() { # OUTFILE URL
   if [ "$PRODUCT" = "tunnet" ] && [ -n "$url" ]; then
     curl -s --max-time 5 "$url" 2>/dev/null | python3 -c "
 import json,sys,re
-sched=dropped=twd=0.0
+dropped=twd=0.0
 ok=False
-vitals={}
-sessions=[]
 for line in sys.stdin:
     line=line.strip()
     if not line or line.startswith('#'):
-        continue
-    m = re.match(r'^(tunnet_dataplane_(generation|restart_count|up|outbound_alive|writer_alive))\s+(\S+)\s*$', line)
-    if m:
-        try:
-            vitals[m.group(2)] = float(m.group(3)); ok=True
-        except Exception:
-            pass
-        continue
-    m = re.match(r'^tunnet_session_info\{([^}]*)\}\s+(\S+)\s*$', line)
-    if m:
-        labels = dict(kv.split('=', 1) for kv in m.group(1).split(','))
-        labels = {k.strip(): v.strip().strip(chr(34)) for k, v in labels.items()}
-        try:
-            alive = float(m.group(2)) > 0
-        except Exception:
-            continue
-        ok=True
-        sessions.append({'peer': labels.get('peer'), 'generation': labels.get('generation'),
-                         'canonical': labels.get('canonical'), 'reader': labels.get('reader'),
-                         'orientation': labels.get('orientation'), 'alive': alive})
         continue
     try:
         head, val = line.rsplit(None, 1)
         v = float(val)
     except Exception:
         continue
-    if head.startswith('tunnet_sched_drops_total{'):
-        sched += v; ok=True
-    elif head.startswith('tunnet_dropped_packets_total{'):
+    if head.startswith('tunnet_dropped_packets_total{'):
         dropped += v; ok=True
     elif head.startswith('tunnet_tun_write_queue_drop_total'):
         twd += v; ok=True
 if ok:
-    session = {'available': True, 'sessions': sessions}
-    session.update(vitals)
-    print(json.dumps({'available':True,'sched':sched,'dropped':dropped,'tun_write_drop':twd,'session':session}))
+    print(json.dumps({'available':True,'dropped':dropped,'tun_write_drop':twd}))
 else:
     print(json.dumps({'available':False}))" > "$out" 2>/dev/null || echo '{"available":false}' > "$out"
   else
@@ -244,18 +186,25 @@ print(json.dumps({'commit':sha,'mtu':$MTU,'os':platform.platform(),'cpu':platfor
 META=$(meta_json)
 export BENCH_META="$META"
 
-# Product-aware path collection: the Tunnet API only exists for tunnet runs.
+# Path state from agent metrics (the Local API is a local socket, not HTTP).
 path_json() {
   if [ "$PRODUCT" = "tunnet" ]; then
     python3 -c "
-import json,subprocess
-mode='unknown'; detail=''
+import json,urllib.request,re
+mode='unknown'; detail='tunnet metrics unreachable'
 try:
-  import urllib.request
-  st=json.load(urllib.request.urlopen('http://127.0.0.1:8899/api/status',timeout=5))
-  mode=str(st.get('path_state','unknown')); detail=str(st.get('selected_path',''))
-except Exception as e:
-  detail='tunnet api unreachable'
+  text=urllib.request.urlopen('$LOCAL_METRICS_URL',timeout=5).read().decode()
+  gen=restarts=None
+  for line in text.splitlines():
+    if line.startswith('tunnet_dataplane_generation '):
+      gen=int(float(line.split()[-1]))
+    elif line.startswith('tunnet_dataplane_restart_count '):
+      restarts=int(float(line.split()[-1]))
+  if gen is not None:
+    mode='tunnet'
+    detail='gen=%s restarts=%s' % (gen, restarts or 0)
+except Exception:
+  pass
 print(json.dumps({'product':'$PRODUCT','mode':mode,'detail':detail[:400]}))"
   else
     # e.g. zerotier: summarize peer path states instead of querying Tunnet.
@@ -516,11 +465,6 @@ sw = sw_pair_drops(os.environ['BENCH_SW0L'], os.environ['BENCH_SW0P'], os.enviro
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
-# Session poisoning detection: any generation/stable/reader move on
-# either side during the scenario is annotated, never hidden.
-for _side in ('local', 'peer'):
-    if sw.get(_side + '_session_changed'):
-        notes.append('SESSION CHANGED mid-run (generation/stable/reader moved); result flagged')
 # actual==0 MUST count: a successfully executed but fully undelivered
 # load is catastrophic under-delivery, not a parser failure (valid stays
 # true, load_met goes false).
@@ -611,9 +555,6 @@ sw = sw_pair_drops(os.environ['BENCH_SW0L'], os.environ['BENCH_SW0P'], os.enviro
 notes = []
 if b.get('mode') != a.get('mode'):
     notes.append('PATH CHANGED mid-run; result flagged')
-for _side in ('local', 'peer'):
-    if sw.get(_side + '_session_changed'):
-        notes.append('SESSION CHANGED mid-run (generation/stable/reader moved); result flagged')
 under_up = err_up is None and actual_up < rate_up*0.7 and frac <= 1.0
 under_down = err_down is None and actual_down < rate_down*0.7 and frac <= 1.0
 if under_up:
@@ -705,9 +646,6 @@ jitter = ps.get('jitter') if valid else None
 dr = ps.get('delivery_ratio') if valid else None
 udpct = ps.get('undelivered_pct') if valid else None
 note = '' if valid else err
-for _side in ('local', 'peer'):
-    if sw.get(_side + '_session_changed'):
-        note = (note + '; ' if note else '') + 'SESSION CHANGED mid-run (generation/stable/reader moved); result flagged'
 print(f"  {direction} offered={rate}Mbps sent={sent_mbps}Mbps delivered={actual}Mbps undelivered={udpct}% pps_sent={pps_sent} pps_recv={pps_recv} len={length}B loss={loss}% jitter={jitter}ms valid={valid} {note}")
 row = {'scenario': 'udp', 'direction': direction, 'offered_mbps': rate, 'packet_len': length,
        'sent_mbps': sent_mbps, 'actual_mbps': actual, 'pps_sent': pps_sent, 'pps_received': pps_recv,

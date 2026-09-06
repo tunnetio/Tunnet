@@ -1,7 +1,7 @@
 //! Generation-owned TUN writer: the ONLY task that writes to the OS TUN.
 //!
 //! QUIC ingress readers never await TUN write capacity — they decode,
-//! authorize, reassemble, and enqueue COMPLETE logical IP packets here via
+//! authorize, and enqueue COMPLETE logical IP packets here via
 //! the cheap non-blocking [`TunWriterHandle::try_enqueue`]. If the OS cannot
 //! consume fast enough, the intentional software drop happens at this
 //! complete-IP-packet boundary (`tun_write_queue_full`), never by letting
@@ -21,14 +21,13 @@
 //!   `send_multiple` error has ambiguous partial-write semantics: treat as
 //!   a generation failure (report + exit) rather than guessing.
 
-#[cfg(any(not(target_os = "linux"), test))]
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(any(not(target_os = "linux"), test))]
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tun_rs::AsyncDevice;
@@ -119,9 +118,13 @@ pub fn spawn_tun_writer(
     let pending = handle.pending_bytes.clone();
     let join = tokio::spawn(async move {
         #[cfg(target_os = "linux")]
-        let exit = run_linux_writer(rx, &device, &cancel, &metrics, &pending).await;
+        let run = run_linux_writer(rx, &device, &cancel, &metrics, &pending);
         #[cfg(not(target_os = "linux"))]
-        let exit = run_windows_writer(rx, &device, &cancel, &metrics, &pending).await;
+        let run = run_windows_writer(rx, &device, &cancel, &metrics, &pending);
+        let exit = std::panic::AssertUnwindSafe(run)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| WriterExit::Fatal("TUN writer panicked".into()));
         if let WriterExit::Fatal(ref e) = exit {
             on_fatal(e.clone());
         }
@@ -173,9 +176,14 @@ async fn run_linux_writer(
             }
         }
         metrics.tun_syscall_inc("send_batch");
-        match batch.flush(device).await {
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return WriterExit::Cancelled,
+            result = batch.flush(device) => result,
+        };
+        match result {
             Ok(n) => {
-                metrics.tun_write_packets_add(n as u64);
+                metrics.tun_write_packets_add(n as u64, lens.iter().sum());
                 for len in lens.drain(..) {
                     release(pending, len);
                 }
@@ -197,49 +205,56 @@ async fn run_linux_writer(
 /// backoff; the tail drains even with zero new ingress.
 #[cfg(not(target_os = "linux"))]
 async fn run_windows_writer(
-    mut rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::Receiver<Bytes>,
     device: &Arc<AsyncDevice>,
     cancel: &CancellationToken,
     metrics: &AgentMetrics,
     pending: &AtomicUsize,
 ) -> WriterExit {
-    let mut tail: VecDeque<Bytes> = VecDeque::new();
+    run_packet_writer(
+        rx,
+        |packet| device.try_send(packet),
+        cancel,
+        metrics,
+        pending,
+    )
+    .await
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+async fn run_packet_writer(
+    mut rx: mpsc::Receiver<Bytes>,
+    mut send: impl FnMut(&[u8]) -> std::io::Result<usize>,
+    cancel: &CancellationToken,
+    metrics: &AgentMetrics,
+    pending: &AtomicUsize,
+) -> WriterExit {
+    let mut front: Option<Bytes> = None;
     let mut backoff = WRITE_BACKOFF_START;
     loop {
         if cancel.is_cancelled() {
             return WriterExit::Cancelled;
         }
-        // Fill the tail without ever awaiting while work remains.
-        while tail.len() < WRITER_PACKET_CAP {
-            match rx.try_recv() {
-                Ok(pkt) => tail.push_back(pkt),
-                Err(_) => break,
-            }
-        }
-        let Some(front) = tail.front().cloned() else {
-            // Nothing pending: await new work (cancellable).
-            let next = tokio::select! {
+        if front.is_none() {
+            front = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return WriterExit::Cancelled,
-                res = rx.recv() => res,
+                next = rx.recv() => next,
             };
-            match next {
-                Some(pkt) => {
-                    tail.push_back(pkt);
-                    continue;
-                }
-                None => return WriterExit::Cancelled,
-            }
+        }
+        let Some(packet) = front.as_ref() else {
+            return WriterExit::Cancelled;
         };
         metrics.tun_syscall_inc("tun_writer_send");
-        match device.try_send(&front) {
+        match send(packet) {
             Ok(_) => {
-                tail.pop_front();
-                release(pending, front.len());
-                metrics.tun_write_packets_add(1);
+                release(pending, packet.len());
+                metrics.tun_write_packets_add(1, packet.len());
+                front = None;
                 backoff = WRITE_BACKOFF_START;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                metrics::counter!("tunnet_tun_write_would_block_total").increment(1);
                 // Same front packet retained; bounded backoff, then retry.
                 tokio::select! {
                     biased;
@@ -249,190 +264,82 @@ async fn run_windows_writer(
                 backoff = (backoff * 2).min(WRITE_BACKOFF_MAX);
             }
             Err(e) => {
-                let dropped = tail.len() as u64;
-                tail.clear();
-                metrics.dropped_add("tun_send_failed", dropped.max(1));
+                metrics.dropped_inc("tun_send_failed");
                 return WriterExit::Fatal(format!("windows TUN write failed: {e}"));
             }
         }
     }
 }
 
-/// Packet sink abstraction for the writer state machine (tests drive a
-/// mock; production wraps the TUN device).
-#[cfg(test)]
-pub(crate) trait PacketSink {
-    fn try_send(&mut self, pkt: &[u8]) -> std::io::Result<()>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct MockSink {
-        /// WouldBlock countdown: blocks this many sends, then succeeds.
-        block_for: usize,
-        fatal_after: Option<usize>,
-        pub written: Vec<Vec<u8>>,
-    }
-
-    impl MockSink {
-        fn new() -> Self {
-            Self {
-                block_for: 0,
-                fatal_after: None,
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl PacketSink for MockSink {
-        fn try_send(&mut self, pkt: &[u8]) -> std::io::Result<()> {
-            if let Some(n) = self.fatal_after
-                && self.written.len() >= n
-            {
-                return Err(std::io::Error::other("mock device dead"));
-            }
-            if self.block_for > 0 {
-                self.block_for -= 1;
-                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-            }
-            self.written.push(pkt.to_vec());
-            Ok(())
-        }
-    }
-
-    /// Steppable Windows writer core over a generic sink (same discipline
-    /// as the production loop: try_send-only, front retained on WouldBlock,
-    /// bounded backoff, tail drains without new ingress).
-    struct StepWriter<S> {
-        tail: VecDeque<Bytes>,
-        backoff: Duration,
-        sink: S,
-    }
-
-    impl<S: PacketSink> StepWriter<S> {
-        fn new(sink: S) -> Self {
-            Self {
-                tail: VecDeque::new(),
-                backoff: WRITE_BACKOFF_START,
-                sink,
-            }
-        }
-
-        fn push(&mut self, pkt: Bytes) {
-            self.tail.push_back(pkt);
-        }
-
-        /// One step: attempt the front packet. Returns true on progress.
-        /// WouldBlock retains the front and grows the backoff exactly like
-        /// the production loop (bounded, reset on progress).
-        fn step(&mut self) -> bool {
-            let Some(front) = self.tail.front().cloned() else {
-                return true;
-            };
-            match self.sink.try_send(&front) {
-                Ok(()) => {
-                    self.tail.pop_front();
-                    self.backoff = WRITE_BACKOFF_START;
-                    true
+    #[tokio::test]
+    async fn production_writer_retains_front_until_capacity_returns() {
+        let (tx, rx) = mpsc::channel(4);
+        let metrics = AgentMetrics::for_tests();
+        let handle = TunWriterHandle::new(tx, metrics.clone());
+        let cancel = CancellationToken::new();
+        assert!(handle.try_enqueue(Bytes::from_static(b"first")));
+        assert!(handle.try_enqueue(Bytes::from_static(b"second")));
+        let mut attempts = 0;
+        let mut written = Vec::new();
+        let result = run_packet_writer(
+            rx,
+            |packet| {
+                attempts += 1;
+                if attempts <= 3 {
+                    assert_eq!(packet, b"first");
+                    return Err(std::io::ErrorKind::WouldBlock.into());
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.backoff = (self.backoff * 2).min(WRITE_BACKOFF_MAX);
-                    false
+                written.push(packet.to_vec());
+                if written.len() == 2 {
+                    cancel.cancel();
                 }
-                Err(_) => false,
-            }
-        }
-
-        fn drain(&mut self) {
-            let mut guard = 1_000_000;
-            while !self.tail.is_empty() && guard > 0 {
-                guard -= 1;
-                self.step();
-            }
-            assert!(self.tail.is_empty(), "tail must drain without new ingress");
-        }
+                Ok(packet.len())
+            },
+            &cancel,
+            &metrics,
+            &handle.pending_bytes,
+        )
+        .await;
+        assert!(matches!(result, WriterExit::Cancelled));
+        assert_eq!(written, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(handle.pending_bytes(), 0);
     }
-
     #[test]
-    fn writer_retries_tail_without_new_ingress() {
-        // QUIC ingress must never await this: WouldBlock x N retains the
-        // SAME front packet; the tail then drains with no new pushes.
-        let mut w = StepWriter::new(MockSink::new());
-        w.sink.block_for = 5;
-        for i in 0..8u8 {
-            w.push(Bytes::from(vec![i; 64]));
-        }
-        // Blocked steps make no progress but lose nothing.
-        for _ in 0..5 {
-            assert!(!w.step());
-            assert_eq!(w.tail.len(), 8);
-        }
-        // Unblocked: the whole tail drains, same packets, in order.
-        w.drain();
-        assert_eq!(w.sink.written.len(), 8);
-        for (i, pkt) in w.sink.written.iter().enumerate() {
-            assert_eq!(pkt, &vec![i as u8; 64], "ordering preserved");
-        }
-    }
-
-    #[test]
-    fn writer_retains_front_packet_on_wouldblock() {
-        let mut w = StepWriter::new(MockSink::new());
-        w.sink.block_for = 3;
-        w.push(Bytes::from_static(b"front"));
-        w.push(Bytes::from_static(b"second"));
-        let front_before = w.tail.front().cloned().unwrap();
-        for _ in 0..3 {
-            assert!(!w.step());
-        }
-        // Exactly the same front packet, never skipped or duplicated.
-        assert_eq!(w.tail.front().cloned().unwrap(), front_before);
-        w.drain();
-        assert_eq!(w.sink.written.len(), 2);
-        assert_eq!(w.sink.written[0], b"front");
-    }
-
-    #[test]
-    fn handle_bounds_packets_and_bytes() {
-        // No worker: pending bytes never release, so both bounds trigger.
-        let metrics = crate::actors::test_support::test_metrics();
-        let (tx, _rx) = mpsc::channel::<Bytes>(WRITER_PACKET_CAP);
-        let h = TunWriterHandle::new(tx, metrics);
-        // Byte bound first: 9000 B packets exceed 1 MiB well before 512.
+    fn writer_queue_has_hard_byte_limit() {
+        let (tx, _rx) = mpsc::channel(WRITER_PACKET_CAP);
+        let handle = TunWriterHandle::new(tx, AgentMetrics::for_tests());
+        let packet = Bytes::from(vec![0; 9000]);
         let mut accepted = 0;
-        for _ in 0..200 {
-            if h.try_enqueue(Bytes::from(vec![0x45u8; 9000])) {
-                accepted += 1;
-            } else {
-                break;
-            }
+        for _ in 0..WRITER_PACKET_CAP {
+            accepted += usize::from(handle.try_enqueue(packet.clone()));
         }
-        assert!(accepted > 0 && accepted < 200, "byte bound must trip");
-        assert!(h.pending_bytes() <= WRITER_BYTE_CAP);
-        // Packet bound: 512 small packets fill the channel, the 513th drops.
-        let (tx2, _rx2) = mpsc::channel::<Bytes>(WRITER_PACKET_CAP);
-        let h2 = TunWriterHandle::new(tx2, crate::actors::test_support::test_metrics());
-        let mut n = 0;
-        for _ in 0..(WRITER_PACKET_CAP + 16) {
-            if h2.try_enqueue(Bytes::from_static(b"tiny")) {
-                n += 1;
-            }
-        }
-        assert_eq!(n, WRITER_PACKET_CAP, "packet bound is exact");
-        assert!(!h2.try_enqueue(Bytes::from_static(b"tiny")));
+        assert_eq!(accepted, WRITER_BYTE_CAP / 9000);
+        assert_eq!(handle.pending_bytes(), accepted * 9000);
     }
-
-    #[test]
-    fn handle_never_blocks_reader() {
-        // try_enqueue on a full/closed queue returns immediately (the QUIC
-        // reader path must never await TUN capacity).
-        let (tx, rx) = mpsc::channel::<Bytes>(1);
-        let h = TunWriterHandle::new(tx, crate::actors::test_support::test_metrics());
-        drop(rx);
-        let start = std::time::Instant::now();
-        assert!(!h.try_enqueue(Bytes::from_static(b"x")));
-        assert!(start.elapsed() < Duration::from_secs(1));
+    #[tokio::test]
+    async fn cancellation_stops_a_full_sink() {
+        let (tx, rx) = mpsc::channel(4);
+        let metrics = AgentMetrics::for_tests();
+        let handle = TunWriterHandle::new(tx, metrics.clone());
+        let cancel = CancellationToken::new();
+        assert!(handle.try_enqueue(Bytes::from_static(b"first")));
+        let mut attempts = 0;
+        let result = run_packet_writer(
+            rx,
+            |_| {
+                attempts += 1;
+                cancel.cancel();
+                Err(std::io::ErrorKind::WouldBlock.into())
+            },
+            &cancel,
+            &metrics,
+            &handle.pending_bytes,
+        )
+        .await;
+        assert!(matches!(result, WriterExit::Cancelled));
+        assert_eq!(attempts, 1);
     }
 }

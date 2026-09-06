@@ -1,7 +1,6 @@
 //! Dataplane packet ownership: zero/minimal-copy logical packets.
 //!
-//! One packet owner moves through TUN receive → parse → scheduler →
-//! segmentation → Iroh without repeated allocation:
+//! One packet owner moves through TUN receive → parse → policy → Iroh without repeated allocation:
 //!
 //! ```text
 //! PooledBuffer (Vec storage + pool handle, AsRef<[u8]>)
@@ -17,18 +16,15 @@ use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
 
-use super::{FlowKey, PacketMeta, parse};
+use super::{PacketMeta, parse};
 
-/// Headroom reserved at the front of every pooled buffer for the tunnel
-/// frame header, so single-frame encoding never copies the payload.
-pub const FRAME_HEADROOM: usize = 32;
+/// Headroom reserved at the front of every pooled buffer for the `/4`
+/// tunnel header (`SINGLE_OVERHEAD` bytes), so encoding never copies the payload.
+pub const FRAME_HEADROOM: usize = 17;
 
-/// Logical/virtual MTU default for the dataplane: 1280, so ordinary inner
-/// packets travel as single frames on normal paths instead of depending on
-/// multi-DATAGRAM reassembly. Larger MTUs remain configurable up to
-/// [`MAX_LOGICAL_LEN`]; segmentation covers jumbo configs and small paths.
-pub const DEFAULT_VIRTUAL_MTU: usize = 1280;
-/// Hard ceiling for a logical packet (framing `total_len` is u16-compatible).
+/// IPv4 virtual MTU fitting the 1200-byte QUIC path minimum with framing.
+pub const DEFAULT_VIRTUAL_MTU: usize = 1100;
+/// Hard ceiling for a logical packet.
 pub const MAX_LOGICAL_LEN: usize = 9000;
 /// Smallest usable logical MTU.
 pub const MIN_VIRTUAL_MTU: usize = 576;
@@ -275,72 +271,62 @@ impl PacketOwner {
     }
 }
 
-/// Owned logical (inner IP) packet: bytes + parse-once metadata + flow key.
+/// Owned logical (inner IP) packet: bytes + parse-once metadata.
 #[derive(Debug)]
 pub struct LogicalPacket {
     pub owner: PacketOwner,
     pub meta: PacketMeta,
-    pub flow: FlowKey,
-    pub enqueued_at: std::time::Instant,
 }
 
 impl LogicalPacket {
     /// Parse-and-own from a slice (copies once; prefer the pooled constructors
     /// on hot paths).
     pub fn from_slice(data: &[u8]) -> Option<Self> {
-        let (meta, flow) = {
+        let meta = {
             let pkt = parse(data).ok()?;
-            (PacketMeta::from_packet(&pkt), FlowKey::for_packet(&pkt))
+            PacketMeta::from_packet(&pkt)
         };
         Some(Self {
             owner: PacketOwner::Shared(Bytes::copy_from_slice(data)),
             meta,
-            flow,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 
     /// Take ownership of pooled storage filled with exactly `len` bytes.
     pub fn from_pooled(mut buf: PooledBuffer, len: usize) -> Option<Self> {
         buf.set_len(len);
-        let (meta, flow) = {
+        let meta = {
             let pkt = parse(buf.as_ref()).ok()?;
-            (PacketMeta::from_packet(&pkt), FlowKey::for_packet(&pkt))
+            PacketMeta::from_packet(&pkt)
         };
         Some(Self {
             owner: PacketOwner::Pooled(buf),
             meta,
-            flow,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 
     /// Zero-copy inbound: retain the DATAGRAM's bytes, parse directly.
     pub fn from_shared(bytes: Bytes) -> Option<Self> {
-        let (meta, flow) = {
+        let meta = {
             let pkt = parse(&bytes).ok()?;
-            (PacketMeta::from_packet(&pkt), FlowKey::for_packet(&pkt))
+            PacketMeta::from_packet(&pkt)
         };
         Some(Self {
             owner: PacketOwner::Shared(bytes),
             meta,
-            flow,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 
     /// Take ownership of a `Vec<u8>` without copying (`Bytes::from` moves
-    /// the allocation). Used for batch-slot transfers and reassembly output.
+    /// the allocation). Used for callers transferring an existing allocation.
     pub fn from_vec(data: Vec<u8>) -> Option<Self> {
-        let (meta, flow) = {
+        let meta = {
             let pkt = parse(&data).ok()?;
-            (PacketMeta::from_packet(&pkt), FlowKey::for_packet(&pkt))
+            PacketMeta::from_packet(&pkt)
         };
         Some(Self {
             owner: PacketOwner::Shared(Bytes::from(data)),
             meta,
-            flow,
-            enqueued_at: std::time::Instant::now(),
         })
     }
 
@@ -350,10 +336,6 @@ impl LogicalPacket {
 
     pub fn is_empty(&self) -> bool {
         self.owner.is_empty()
-    }
-
-    pub fn sojourn(&self) -> std::time::Duration {
-        self.enqueued_at.elapsed()
     }
 
     /// Materialize mutable pooled storage (NAT rewrite and other rare
@@ -370,16 +352,6 @@ impl LogicalPacket {
         // Re-derive metadata only if a later mutation needs it; the caller
         // refreshes after mutating.
         self.owner = PacketOwner::Pooled(buf);
-        true
-    }
-
-    /// Refresh metadata/flow after an in-place mutation (rare path).
-    pub fn refresh(&mut self) -> bool {
-        let Ok(pkt) = parse(self.owner.as_bytes()) else {
-            return false;
-        };
-        self.meta = PacketMeta::from_packet(&pkt);
-        self.flow = FlowKey::for_packet(&pkt);
         true
     }
 }
@@ -455,14 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn production_default_mtu_is_1280() {
-        // Ordinary inner packets must travel as single frames on normal
-        // paths, not depend on multi-DATAGRAM reassembly. Larger MTUs stay
-        // configurable up to MAX_LOGICAL_LEN.
+    fn production_default_mtu_fits_minimum_quic_path() {
         const {
-            assert!(super::DEFAULT_VIRTUAL_MTU == 1280);
-            assert!(MAX_LOGICAL_LEN >= 9000);
-            assert!(MIN_VIRTUAL_MTU <= 1280);
+            assert!(FRAME_HEADROOM >= super::super::SINGLE_OVERHEAD);
+            assert!(DEFAULT_VIRTUAL_MTU + super::super::SINGLE_OVERHEAD < 1200);
+            assert!(MIN_VIRTUAL_MTU <= DEFAULT_VIRTUAL_MTU);
         }
     }
 

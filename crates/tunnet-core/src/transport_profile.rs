@@ -11,7 +11,7 @@ use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
 
 /// Tunnet DATAGRAM send buffer: 64 KiB. Large enough for pacing/bursts,
 /// small enough that ~80 Mbps serializes it in ~6 ms instead of ~100 ms.
-/// One correct default: the endpoint TX worker waits on buffer space with
+/// One correct default: the peer sender waits on buffer space with
 /// `send_datagram_wait` instead of racing a precheck, so no tuning knob.
 pub const DATAGRAM_SEND_BUFFER: usize = 64 * 1024;
 /// Receive buffer: 256 KiB (generous inbound headroom, still bounded).
@@ -59,7 +59,7 @@ impl TunnetTransportProfile {
     }
 
     /// Override the DATAGRAM send buffer (tests only: tiny buffers prove
-    /// the endpoint TX worker waits instead of displacing queued DATAGRAMs).
+    /// the peer sender waits instead of displacing queued DATAGRAMs).
     /// Production uses the fixed default.
     pub fn with_send_buffer(mut self, bytes: usize) -> Self {
         self.datagram_send_buffer = bytes.clamp(4096, 1024 * 1024);

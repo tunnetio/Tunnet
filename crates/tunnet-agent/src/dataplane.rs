@@ -4,6 +4,7 @@
 //! module keeps only high-throughput task constructors that must stay plain
 //! Tokio: the outbound TUN loop and underlay helpers.
 
+use futures_util::FutureExt;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -11,18 +12,19 @@ use tun_rs::AsyncDevice;
 use tunnet_common::packet::PacketPool;
 use tunnet_core::{PolicyRuntime, RoutingTable};
 
-use crate::endpoint_tx::EndpointTxRegistry;
 use crate::metrics::AgentMetrics;
+use crate::peer_transport::PeerTransports;
 use crate::tun_writer::TunWriterHandle;
 
 pub struct OutboundSpawn {
+    pub cancel: tokio_util::sync::CancellationToken,
     pub tun: Arc<AsyncDevice>,
     pub routes: RoutingTable,
     pub runtime: PolicyRuntime,
     pub metrics: AgentMetrics,
     pub bufs: Arc<PacketPool>,
     pub mtu: u16,
-    pub tx_registry: EndpointTxRegistry,
+    pub transports: PeerTransports,
     pub tun_writer: TunWriterHandle,
     /// Called when the loop ends without shutdown (abnormal service death).
     pub on_unexpected_end: Box<dyn FnOnce() + Send + 'static>,
@@ -30,31 +32,38 @@ pub struct OutboundSpawn {
 
 pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
     let OutboundSpawn {
+        cancel,
         tun,
         routes,
         runtime,
         metrics,
         bufs,
         mtu,
-        tx_registry,
+        transports,
         tun_writer,
         on_unexpected_end,
     } = spawn;
     tokio::spawn(async move {
-        if let Err(e) = crate::tun_io::run_outbound(crate::tun_io::OutboundDeps {
-            tun,
-            routes,
-            runtime,
-            metrics,
-            bufs,
-            mtu,
-            tx_registry,
-            tun_writer,
-        })
-        .await
-        {
-            tracing::error!(?e, "outbound TUN loop exited");
-            on_unexpected_end();
+        let run = std::panic::AssertUnwindSafe(crate::tun_io::run_outbound(
+            crate::tun_io::OutboundDeps {
+                tun,
+                routes,
+                runtime,
+                metrics,
+                bufs,
+                mtu,
+                transports,
+                tun_writer,
+            },
+        ))
+        .catch_unwind();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {},
+            result = run => {
+                tracing::error!(?result, "outbound TUN loop exited unexpectedly");
+                on_unexpected_end();
+            }
         }
     })
 }

@@ -477,7 +477,12 @@ fn print_status(
     // daemons that do not report it yet.
     let dp_line = match node.data_plane.as_ref() {
         Some(dp) => match dp.state.as_str() {
-            "up" => format!("  data plane {}", out.green("up")),
+            "up" => format!(
+                "  data plane {}  gen {}  peers {}",
+                out.green("up"),
+                dp.generation,
+                dp.connected_peers
+            ),
             "degraded" => format!(
                 "  data plane {} (outbound worker dead, restarts: {}){}",
                 out.yellow("degraded"),
@@ -551,8 +556,8 @@ fn print_status(
 
     if let Some(od) = &node.on_demand {
         out.writeln(format!(
-            "  on-demand  {} ok / {} fail · {} buffered",
-            od.reconnect_success, od.reconnect_fail, od.packets_buffered
+            "  on-demand  {} ok / {} fail",
+            od.reconnect_success, od.reconnect_fail
         ));
     }
 

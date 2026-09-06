@@ -108,6 +108,7 @@ pub struct Tables {
     pub by_hostname: std::collections::HashMap<String, Arc<PeerInfo>>,
     /// Longest-prefix-match subnet routes (via PrefixMap).
     pub subnets: PrefixMap<Ipv4Net, Arc<PeerInfo>>,
+    pub ingress_subnets: std::collections::HashMap<Uuid, PrefixMap<Ipv4Net, EndpointId>>,
     /// CIDRs this node itself advertises, as a prefix structure (§12: no
     /// linear scan on the hot path).
     pub advertised: PrefixMap<Ipv4Net, ()>,
@@ -164,6 +165,7 @@ impl RoutingTable {
                 by_endpoint: Default::default(),
                 by_hostname: Default::default(),
                 subnets: PrefixMap::new(),
+                ingress_subnets: std::collections::HashMap::new(),
                 advertised: PrefixMap::new(),
                 hostname_exact: Default::default(),
                 hostname_wildcards: Default::default(),
@@ -219,7 +221,7 @@ impl RoutingTable {
         network_id: Uuid,
         network_name: &str,
     ) -> Arc<PeerMembershipState> {
-        let state = self.fast_registry.ensure(Arc::new(PeerIdentity {
+        let state = self.fast_registry.ensure_membership(Arc::new(PeerIdentity {
             endpoint,
             endpoint_hex: endpoint_hex.to_string(),
             hostname: hostname.to_string(),
@@ -301,6 +303,25 @@ impl RoutingTable {
 
     pub fn exit_node(&self) -> Option<Arc<PeerInfo>> {
         self.inner.load().exit_node.clone()
+    }
+
+    /// Validate a gateway source within the frame's network. Mesh identities
+    /// take precedence over subnet/default routes, so an exit cannot spoof a peer.
+    pub fn accepts_gateway_source(
+        &self,
+        network: Uuid,
+        endpoint: EndpointId,
+        src: Ipv4Addr,
+    ) -> bool {
+        let tables = self.inner.load();
+        if let Some(owner) = tables.by_network_ip.get(&(network, src)) {
+            return owner.endpoint == endpoint;
+        }
+        tables
+            .ingress_subnets
+            .get(&network)
+            .and_then(|routes| routes.get_lpm(&Ipv4Net::from(src)))
+            .is_some_and(|(_, owner)| *owner == endpoint)
     }
 
     pub fn is_exit_node(&self) -> bool {
@@ -702,6 +723,8 @@ impl RoutingTable {
         let mut by_hostname: std::collections::HashMap<String, Arc<PeerInfo>> =
             std::collections::HashMap::new();
         let mut subnets: PrefixMap<Ipv4Net, Arc<PeerInfo>> = PrefixMap::new();
+        let mut ingress_subnets: std::collections::HashMap<Uuid, PrefixMap<Ipv4Net, EndpointId>> =
+            std::collections::HashMap::new();
         let mut advertised: PrefixMap<Ipv4Net, ()> = PrefixMap::new();
         let mut hostname_exact: std::collections::HashMap<String, Arc<HostnameRouteInfo>> =
             std::collections::HashMap::new();
@@ -810,6 +833,10 @@ impl RoutingTable {
                     &slice.network_name,
                 );
                 let Some(peer) = peer else { continue };
+                ingress_subnets
+                    .entry(*network_id)
+                    .or_default()
+                    .insert(route.cidr, peer.endpoint);
                 // First-joined wins on overlapping exact prefixes.
                 if !subnets.contains_key(&route.cidr) {
                     subnets.insert(route.cidr, peer);
@@ -836,6 +863,10 @@ impl RoutingTable {
                 );
                 if let Some(peer) = peer {
                     for cidr in &exit.allowed_cidrs {
+                        ingress_subnets
+                            .entry(*network_id)
+                            .or_default()
+                            .insert(*cidr, peer.endpoint);
                         if !subnets.contains_key(cidr) {
                             subnets.insert(*cidr, peer.clone());
                         }
@@ -911,6 +942,7 @@ impl RoutingTable {
             by_endpoint,
             by_hostname,
             subnets,
+            ingress_subnets,
             advertised,
             hostname_exact,
             hostname_wildcards,
@@ -1186,7 +1218,7 @@ mod tests {
         );
         let ep: EndpointId = peer_id.parse().unwrap();
         assert!(
-            table.peer_registry().get(ep).is_none(),
+            !table.peer_registry().has_any_membership(ep),
             "inbound resolve finds nothing → reader exits"
         );
         assert_eq!(
@@ -1499,6 +1531,18 @@ mod tests {
         );
         let found = table.lookup_ip(&"8.8.8.8".parse().unwrap()).unwrap();
         assert_eq!(found.endpoint_hex, exit);
+        let endpoint = exit.parse().unwrap();
+        assert!(table.accepts_gateway_source(Uuid::nil(), endpoint, "8.8.8.8".parse().unwrap()));
+        assert!(!table.accepts_gateway_source(
+            Uuid::new_v4(),
+            endpoint,
+            "8.8.8.8".parse().unwrap()
+        ));
+        assert!(!table.accepts_gateway_source(
+            Uuid::nil(),
+            iroh::SecretKey::generate().public(),
+            "8.8.8.8".parse().unwrap()
+        ));
     }
 
     #[test]

@@ -414,7 +414,7 @@ pub(crate) fn peer_summaries(
     state: &LocalApiState,
     network_id: Option<uuid::Uuid>,
 ) -> Vec<PeerSummary> {
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.pool;
     let self_id = state.node.endpoint_id_hex();
     state
         .node
@@ -424,7 +424,23 @@ pub(crate) fn peer_summaries(
         .filter(|p| p.endpoint_hex != self_id)
         .filter(|p| network_id.is_none_or(|nid| p.network_id == nid))
         .map(|p| {
-            let snap = pool.peer_snapshot(p.endpoint);
+            let mut snap = pool.peer_snapshot(p.endpoint);
+            let traffic = &p.fast.transport;
+            snap.live = traffic.connected.load(std::sync::atomic::Ordering::Relaxed);
+            snap.state = if snap.live {
+                "connected"
+            } else {
+                "disconnected"
+            }
+            .into();
+            snap.path = if !snap.live {
+                "unknown"
+            } else if traffic.relay.load(std::sync::atomic::Ordering::Relaxed) {
+                "relay"
+            } else {
+                "direct"
+            }
+            .into();
             let (bytes_in, bytes_out) = pool.peer_bytes(p.endpoint);
             let latency_ms = state.peer_rtt.get(&p.endpoint_hex).map(|v| *v);
             let presence_online = state.node.peer_presence_online(&p.endpoint_hex);
@@ -434,7 +450,7 @@ pub(crate) fn peer_summaries(
             } else {
                 Some(snap.last_activity_secs_ago)
             };
-            let pool_online = snap.live || pool.has_live(p.endpoint);
+            let pool_online = snap.live;
             // None = unknown (cold start / no beacon yet); do not treat as offline.
             let online = if pool_online {
                 Some(true)
@@ -469,7 +485,7 @@ pub(crate) fn build_network_summary(
     let peers = peer_summaries(state, Some(network_id));
     let peers_total = peers.len();
     let peers_online = peers.iter().filter(|p| p.online.unwrap_or(false)).count();
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.pool;
     let (expires_at, expires_in_secs) = expiry_fields(state);
     let control = control_plane_status(state);
 
@@ -538,7 +554,7 @@ pub(crate) fn build_network_summary(
 }
 
 pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.pool;
     let od = pool.on_demand_stats();
     let control = control_plane_status(state);
     let networks: Vec<NetworkSummary> = match &state.node.persisted {
@@ -586,8 +602,6 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             reconnect_attempts: od.reconnect_attempts,
             reconnect_success: od.reconnect_success,
             reconnect_fail: od.reconnect_fail,
-            packets_buffered: od.packets_buffered,
-            packets_dropped_timeout: od.packets_dropped_timeout,
         }),
         control,
         daemon_git: Some(tunnet_common::git_hash().to_string()),

@@ -55,6 +55,7 @@ pub struct DeferredFragments {
 }
 
 /// Policy evaluation outcome with fragment deferral.
+#[derive(Debug)]
 pub enum FragOutcome {
     /// Evaluate-now verdict for this packet.
     Immediate(PolicyVerdict, LogicalPacket),
@@ -125,6 +126,9 @@ impl DeferredFragments {
         has_context: impl Fn() -> bool,
         check: impl Fn(&PacketMeta) -> PolicyVerdict,
     ) -> (FragOutcome, u64) {
+        if matches!(meta.fragmentation, Fragmentation::None) {
+            return (FragOutcome::Immediate(check(&meta), packet), 0);
+        }
         let now = Instant::now();
         let expired = self.sweep(now);
         if meta.is_later_fragment() {
@@ -175,11 +179,17 @@ impl DeferredFragments {
                     (FragOutcome::Released(out), expired)
                 }
                 _ => {
-                    // Denied first poisons the key: discard followers.
+                    let mut denied = vec![(verdict, packet)];
                     if let Some(entry) = self.keys.remove(&key) {
                         self.bytes -= entry.bytes;
+                        denied.extend(
+                            entry
+                                .queue
+                                .into_iter()
+                                .map(|held| (PolicyVerdict::Deny, held.packet)),
+                        );
                     }
-                    (FragOutcome::Immediate(verdict, packet), expired)
+                    (FragOutcome::Released(denied), expired)
                 }
             }
         }
@@ -367,7 +377,10 @@ mod tests {
             deny,
         );
         match o {
-            FragOutcome::Immediate(PolicyVerdict::Deny, _) => {}
+            FragOutcome::Released(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(items.iter().all(|(v, _)| *v == PolicyVerdict::Deny));
+            }
             _ => panic!("denied first must evaluate immediately"),
         }
         assert_eq!(t.held_keys(), 0, "followers discarded with the verdict");
@@ -453,7 +466,8 @@ mod tests {
     #[test]
     fn bounds_reject_without_consume_or_panic() {
         // Per-key cap: the 5th later fragment for one key cannot hold;
-        // it evaluates now (fail-closed deny via the check stub).
+        // it evaluates now (fail-closed deny). Already-held packets stay
+        // until a first fragment or expiry.
         let mut t = DeferredFragments::new();
         let (_, middle, _) = frag_trio();
         for _ in 0..DEFERRED_PER_KEY {
@@ -477,7 +491,8 @@ mod tests {
         );
         match o {
             FragOutcome::Immediate(PolicyVerdict::Deny, _) => {}
-            _ => panic!("bounds-hit must fail closed through check"),
+            other => panic!("bounds-hit later fragment must deny immediately, got {other:?}"),
         }
+        assert_eq!(t.held_keys(), 1);
     }
 }

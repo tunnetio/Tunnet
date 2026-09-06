@@ -1,7 +1,4 @@
-//! `DataPlaneActor`: single owner of TUN/dataplane lifecycle.
-//!
-//! The actor is the only writer of [`PublishedDataPlane`]; packet hot paths
-//! load an immutable generation once and never touch an async mutex.
+//! Coarse dataplane lifecycle: publish, cancel, join, and restart on fatal local I/O failure.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -22,77 +19,11 @@ use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
 use crate::system_routes::desired_from_membership;
-
-// ---------------------------------------------------------------------------
-// Published hot-path view
-// ---------------------------------------------------------------------------
-
-/// Immutable generation published by `DataPlaneActor`.
-///
-/// Readers load once and retain `tun_writer` + `tx_registry`; they exit
-/// when `cancel` fires. A new TUN publishes a fresh generation; an old
-/// reader can never observe new state because it holds the old `Arc` +
-/// old token only.
-pub struct PublishedDataPlane {
-    /// Monotonic dataplane generation this publication belongs to. Reader
-    /// installation pins (generation, connection) together: a reader bound
-    /// to a stale generation is refused and rolled back.
-    pub generation: u64,
-    pub cancel: tokio_util::sync::CancellationToken,
-    /// Generation-owned TUN writer (the only TUN write path).
-    pub tun_writer: crate::tun_writer::TunWriterHandle,
-    /// Generation-owned endpoint TX workers (the only QUIC send path).
-    pub tx_registry: crate::endpoint_tx::EndpointTxRegistry,
-}
-
-pub type PublishedPlane = Arc<ArcSwapOption<PublishedDataPlane>>;
+pub type PublishedPlane = Arc<ArcSwapOption<crate::peer_transport::PeerTransports>>;
 
 pub fn new_published_plane() -> PublishedPlane {
     Arc::new(ArcSwapOption::empty())
 }
-
-/// Explicit dataplane lifecycle gate (item 4): TUNNEL_ALPN connections may
-/// become canonical only in `Up(generation)`. Arrivals while Down, Starting,
-/// or Stopping are closed immediately and never installed into the pool or
-/// the transport — no connection slips between `close_all()` and the next
-/// generation.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum GateState {
-    #[default]
-    Down,
-    Starting(u64),
-    Up(u64),
-    Stopping(u64),
-}
-
-/// Shared lifecycle gate: the actor owns transitions; the session manager
-/// refuses installs outside `Up`.
-#[derive(Clone, Default, Debug)]
-pub struct LifecycleGate {
-    state: Arc<std::sync::RwLock<GateState>>,
-}
-
-impl LifecycleGate {
-    pub fn set(&self, state: GateState) {
-        *self.state.write().expect("gate lock") = state;
-    }
-
-    pub fn get(&self) -> GateState {
-        *self.state.read().expect("gate lock")
-    }
-
-    /// Current generation iff the dataplane is fully up.
-    pub fn up_generation(&self) -> Option<u64> {
-        match self.get() {
-            GateState::Up(generation) => Some(generation),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Config / errors
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct DataPlaneActorConfig {
@@ -125,34 +56,11 @@ pub struct DataPlaneActorArgs {
     pub route_actor: ActorRef<RouteActor>,
     pub published: PublishedPlane,
     pub status: DataPlaneStatusSnapshot,
-    /// Ingress reader registry: aborted on BringDown alongside generation
-    /// cancellation (defense in depth; readers also observe the token).
-    pub ingress: crate::ingress::IngressRegistry,
-    /// Agent-lifetime shared packet pool (§18: one pool, one sampler; the
-    /// pool holds no generation state).
     pub packet_pool: Arc<PacketPool>,
-    /// Set when the ingress installer (pool hook) is registered. Preconnect
-    /// never runs before this: dials without an installer become canonical
-    /// with no reader.
-    pub ingress_gate: Arc<AtomicBool>,
-    /// Explicit lifecycle gate (item 4): installs allowed only in Up.
-    pub lifecycle_gate: LifecycleGate,
-    /// Session manager for bring-up reconcile (orphan canonical sessions
-    /// are closed, never inherited).
-    pub session_manager: Arc<crate::ingress::IngressManager>,
-    /// Start in up state (initial plane already published by bootstrap).
     pub initially_up: bool,
     pub initial_generation: u64,
-    /// Reconstruct the up state after a supervised restart: `on_start` issues
-    /// an internal BringUp rebuilt from durable state (snapshot cache), so a
-    /// restarted incarnation never inherits leaked state yet recovers service.
-    /// BringUp failure is logged, never a crash (no restart storm).
     pub auto_up: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Actor
-// ---------------------------------------------------------------------------
 
 pub struct DataPlaneActor {
     cfg: DataPlaneActorConfig,
@@ -163,17 +71,12 @@ pub struct DataPlaneActor {
     route_actor: ActorRef<RouteActor>,
     published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
-    ingress: crate::ingress::IngressRegistry,
     packet_pool: Arc<PacketPool>,
-    ingress_gate: Arc<AtomicBool>,
-    lifecycle_gate: LifecycleGate,
-    session_manager: Arc<crate::ingress::IngressManager>,
     up: bool,
     generation: u64,
     outbound: Option<tokio::task::JoinHandle<()>>,
     writer: Option<tokio::task::JoinHandle<crate::tun_writer::WriterExit>>,
-    tx_registry: Option<crate::endpoint_tx::EndpointTxRegistry>,
-    preconnect: Option<tokio::task::JoinHandle<()>>,
+    transports: Option<crate::peer_transport::PeerTransports>,
     sweeper: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
 }
@@ -195,21 +98,14 @@ impl Actor for DataPlaneActor {
             route_actor: args.route_actor,
             published: args.published,
             status: args.status,
-            ingress: args.ingress,
             packet_pool: args.packet_pool,
-            ingress_gate: args.ingress_gate,
-            lifecycle_gate: args.lifecycle_gate,
-            session_manager: args.session_manager,
             outbound: None,
             writer: None,
-            tx_registry: None,
-            preconnect: None,
+            transports: None,
             sweeper: None,
             generation_cancel: None,
         };
         if auto_up {
-            // Reconstruct service after (re)start from durable state.
-            // Prioritized by Kameo ahead of external messages.
             let _ = actor_ref.tell(BringUpSelf).send().await;
         }
         Ok(this)
@@ -220,18 +116,12 @@ impl Actor for DataPlaneActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        // Best-effort deterministic teardown; never hang shutdown. Runs after
-        // failure too, so a restarted incarnation never inherits leaked
-        // external state (all teardown steps are idempotent).
         let _ = self.teardown().await;
         Ok(())
     }
 }
 
 impl DataPlaneActor {
-    /// Bounded task stop with observed termination: join up to the timeout,
-    /// then abort stragglers AND await them. Never detaches a task that can
-    /// still touch generation state.
     async fn join_task<T: Send + 'static>(handle: Option<tokio::task::JoinHandle<T>>) {
         let Some(handle) = handle else { return };
         tokio::pin!(handle);
@@ -245,34 +135,16 @@ impl DataPlaneActor {
     }
 
     async fn teardown(&mut self) {
-        // Teardown order (item 4): gate -> Stopping FIRST so no connection
-        // can slip between close_all() and the next generation. Then
-        // withdraw publication, cancel, close sessions, join everything,
-        // and only then gate -> Down.
-        let stopping_gen = self.generation;
-        self.lifecycle_gate.set(GateState::Stopping(stopping_gen));
-        // Withdraw published generation first so new readers/installs stop.
         self.published.store(None);
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
-        // Close tunnel connections so old ingress readers exit, then
-        // observe their termination (bounded, abort + await stragglers).
-        self.node.tunnel_pool.close_all().await;
-        self.ingress.shutdown().await;
         Self::join_task(self.outbound.take()).await;
-        Self::join_task(self.preconnect.take()).await;
         Self::join_task(self.sweeper.take()).await;
-        // Observe endpoint worker termination: the registry shutdown is
-        // already cancel → bounded-join → abort → await (deterministic),
-        // so no outer timeout may wrap it — timing out would drop the
-        // shutdown future and its JoinHandles and detach exactly the
-        // workers it exists to prove terminated.
-        if let Some(registry) = self.tx_registry.take() {
-            registry.shutdown().await;
+        if let Some(transports) = self.transports.take() {
+            transports.shutdown().await;
         }
         Self::join_task(self.writer.take()).await;
-        // Best-effort route/DNS cleanup; never fail shutdown.
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.route_actor.ask(ClearRoutes),
@@ -290,12 +162,17 @@ impl DataPlaneActor {
         self.status.set_up(false);
         self.status.set_outbound_alive(false);
         self.status.set_writer_alive(false);
-        self.status.set_sessions(Vec::new());
-        self.lifecycle_gate.set(GateState::Down);
-        // NOTE: `restarting` is deliberately left alone here: teardown runs
-        // on every stop including crashes, and a crash must keep reporting
-        // `restarting` until the next successful bring-up clears it.
-        // `do_bring_down` clears it for intentional shutdowns.
+        self.publish_health();
+    }
+
+    fn publish_health(&self) {
+        self.metrics.dataplane_set(
+            self.status.is_up(),
+            self.status.generation(),
+            self.status.restart_count(),
+            self.status.outbound_alive(),
+            self.status.writer_alive(),
+        );
     }
 
     async fn do_bring_up(
@@ -320,51 +197,7 @@ impl DataPlaneActor {
 
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
-        // Bring-up order (item 4): gate leaves Down FIRST so no connection
-        // can slip in while services are constructed.
-        self.lifecycle_gate.set(GateState::Starting(generation));
         let cancel = tokio_util::sync::CancellationToken::new();
-        // Generation-owned I/O: one TUN writer task + one endpoint TX
-        // registry. Created BEFORE publishing so readers/installers never
-        // observe a generation without its mandatory services.
-        let tx_registry = crate::endpoint_tx::EndpointTxRegistry::new(
-            cancel.clone(),
-            self.node.tunnel_pool.clone(),
-            self.node.routes.peer_registry().clone(),
-            self.metrics.clone(),
-            self.packet_pool.clone(),
-            self.node.tunnel_pool.cloud_relay_meter(),
-        );
-        tx_registry.set_session_manager(self.session_manager.clone());
-        // Session-invalid escalation restarts the generation via
-        // supervision (same pattern as writer/outbound death).
-        {
-            let invalid_weak = self_ref.clone();
-            let invalid_gen = cancel.clone();
-            self.session_manager
-                .set_invalid_handler(Arc::new(move |reason: String| {
-                    if !invalid_gen.is_cancelled()
-                        && let Some(actor) = invalid_weak.upgrade()
-                    {
-                        let _ = actor.tell(SessionInvalid(reason)).try_send();
-                    }
-                }));
-        }
-        // TX-worker panic escalation: a dead worker with running=true is a
-        // one-way black hole — restart the generation, never just respawn.
-        {
-            let fatal_weak = self_ref.clone();
-            let fatal_gen = cancel.clone();
-            tx_registry.set_fatal_handler(Arc::new(move |endpoint, reason: String| {
-                if !fatal_gen.is_cancelled()
-                    && let Some(actor) = fatal_weak.upgrade()
-                {
-                    let _ = actor
-                        .tell(TxWorkerFailed(format!("{endpoint}: {reason}")))
-                        .try_send();
-                }
-            }));
-        }
         let writer_weak = self_ref.clone();
         let writer_gen = cancel.clone();
         let (tun_writer, writer_join) = crate::tun_writer::spawn_tun_writer(
@@ -379,17 +212,36 @@ impl DataPlaneActor {
                 }
             },
         );
-        self.published.store(Some(Arc::new(PublishedDataPlane {
-            generation,
-            cancel: cancel.clone(),
-            tun_writer: tun_writer.clone(),
-            tx_registry: tx_registry.clone(),
-        })));
+        let fatal_weak = self_ref.clone();
+        let transports = crate::peer_transport::PeerTransports::new(
+            self.node.endpoint.clone(),
+            crate::tun_io::InboundContext {
+                pool: self.node.pool.clone(),
+                routes: self.node.routes.clone(),
+                runtime: self.node.policy.clone(),
+                acl: self.node.acl.clone(),
+                spoofs: self
+                    .node
+                    .direct
+                    .iter()
+                    .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
+                    .collect(),
+                bufs: self.packet_pool.clone(),
+                metrics: self.metrics.clone(),
+                auth: self.node.direct_auth.clone(),
+            },
+            tun_writer.clone(),
+            cancel.clone(),
+            Arc::new(move |reason| {
+                if let Some(actor) = fatal_weak.upgrade() {
+                    let _ = actor.tell(TxWorkerFailed(reason)).try_send();
+                }
+            }),
+        );
+        self.published.store(Some(Arc::new(transports.clone())));
         self.generation_cancel = Some(cancel);
         self.writer = Some(writer_join);
-        self.tx_registry = Some(tx_registry.clone());
-
-        // OS DNS work stays off the actor executor thread.
+        self.transports = Some(transports.clone());
         let dns_active = match self.cfg.dns.clone() {
             Some(dns) => {
                 let ifname = self.cfg.ifname.clone();
@@ -413,8 +265,6 @@ impl DataPlaneActor {
             None => false,
         };
         self.peer_dns_active.store(dns_active, Ordering::SeqCst);
-
-        // Reconcile routes via RouteActor (one-way ask, bounded timeout).
         if !self.cfg.is_direct {
             let (remote_subnets, profile, has_exit) =
                 route_snapshot(&self.node, self.cfg.is_direct, self.cfg.network_id);
@@ -431,14 +281,11 @@ impl DataPlaneActor {
                 std::time::Duration::from_secs(15),
                 self.route_actor.ask(ApplyDesiredRoutes {
                     desired,
-                    // Local lifecycle intent: always applies, never versioned.
                     version: crate::actors::ControlVersion::Local,
                 }),
             )
             .await
             .map_err(|_| DataPlaneError::Routes("route apply timed out".into()));
-            // Kameo flattens `Result` replies: `ask` yields
-            // `Result<(), SendError<RouteError>>` here.
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -448,28 +295,22 @@ impl DataPlaneActor {
             }
         }
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
-
-        // The outbound loop's unexpected end is abnormal: report it so
-        // supervision restarts us. Shutdown ends it via abort (the
-        // generation token is already cancelled then, so no report fires).
         let exit_gen = self
             .generation_cancel
             .clone()
             .expect("generation token published above");
-        // Shared tunnel packet resources for this generation: pooled buffers and
-        // the runtime sweeper (tied to the generation token AND observed at
-        // teardown — no leaked tasks across bring-up cycles).
         let packet_pool = self.packet_pool.clone();
         self.sweeper = self.node.policy.spawn_sweeper(exit_gen.clone());
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
+            cancel: exit_gen.clone(),
             tun,
             routes: self.node.routes.clone(),
             runtime: self.node.policy.clone(),
             metrics: self.metrics.clone(),
             bufs: packet_pool,
             mtu: self.cfg.mtu,
-            tx_registry: tx_registry.clone(),
+            transports: transports.clone(),
             tun_writer: tun_writer.clone(),
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
@@ -480,55 +321,13 @@ impl DataPlaneActor {
             }),
         });
         self.outbound = Some(outbound);
-        // Bring-up reconcile (item 11, fail-safe behind the gate): close
-        // any pool canonical session without a live current reader instead
-        // of inheriting ambiguity. Only then open the gate.
-        self.session_manager.reconcile_generation(generation).await;
         self.up = true;
-        self.lifecycle_gate.set(GateState::Up(generation));
         self.status.set_up(true);
         self.status.set_restarting(false);
         self.status.set_outbound_alive(true);
         self.status.set_writer_alive(true);
         self.status.set_generation(generation);
-        // Eager preconnect (keep-alive): dial every known peer NOW so the
-        // first real packet doesn't pay connection setup. GATED on ingress
-        // readiness (set when the pool hook is registered, before BringUp):
-        // without an installer, dials would become canonical with no
-        // reader. Bound to the generation token: no stale dial survives
-        // BringDown.
-        if self.node.tunnel_pool.keep_alive() {
-            let pool = self.node.tunnel_pool.clone();
-            let routes = self.node.routes.clone();
-            let local = pool.endpoint().id();
-            let gate = self.ingress_gate.load(Ordering::SeqCst);
-            let gen_cancel = self
-                .generation_cancel
-                .clone()
-                .expect("generation token published above");
-            let peers: Vec<_> = routes
-                .peers()
-                .into_iter()
-                .filter(|p| p.endpoint != local)
-                .map(|p| p.endpoint)
-                .collect();
-            let preconnect = tokio::spawn(async move {
-                crate::endpoint_tx::preconnect_peers(
-                    peers,
-                    local,
-                    gate,
-                    &gen_cancel,
-                    move |peer| {
-                        let pool = pool.clone();
-                        async move {
-                            let _ = pool.get(peer).await;
-                        }
-                    },
-                )
-                .await;
-            });
-            self.preconnect = Some(preconnect);
-        }
+        self.publish_health();
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: true });
         tracing::info!("data plane up");
         Ok(())
@@ -538,13 +337,9 @@ impl DataPlaneActor {
         if !self.up {
             return Ok(());
         }
-        // Stop ingress readers first (observed shutdown, not fire-and-forget
-        // abort), then withdraw the generation (token cancellation) in
-        // teardown. Both are idempotent; readers also self-remove from the
-        // registry on exit.
-        self.ingress.shutdown().await;
         self.teardown().await;
         self.status.set_restarting(false);
+        self.publish_health();
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });
         tracing::info!("data plane down");
         Ok(())
@@ -574,10 +369,6 @@ fn route_snapshot(
     (vec![], tunnet_common::DeviceProfile::default(), false)
 }
 
-// ---------------------------------------------------------------------------
-// Messages
-// ---------------------------------------------------------------------------
-
 pub struct BringUp;
 pub struct BringDown;
 pub struct GetStatus;
@@ -597,16 +388,13 @@ impl Message<BringUp> for DataPlaneActor {
         let weak = ctx.actor_ref().downgrade();
         let res = self.do_bring_up(weak).await;
         if let Err(e) = &res {
-            // Failed bring-up is Down, not restarting: record the cause.
             self.status.set_restarting(false);
             self.status.set_last_error(format!("bring-up failed: {e}"));
+            self.publish_health();
         }
         res
     }
 }
-
-/// Internal reconstruction after (re)start. Failure is logged, never a crash:
-/// a broken TUN at boot must not spin the supervision restart budget.
 struct BringUpSelf;
 
 impl Message<BringUpSelf> for DataPlaneActor {
@@ -619,29 +407,20 @@ impl Message<BringUpSelf> for DataPlaneActor {
         }
     }
 }
-
-/// The owned outbound loop ended without generation cancellation. Abnormal:
-/// supervision must restart us (fresh generation is published on BringUp).
 struct OutboundExited;
 
 impl Message<OutboundExited> for DataPlaneActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
-        // Publish degraded state BEFORE supervision restarts us, so status
-        // readers see `restarting` (with the error and restart count)
-        // instead of a stale healthy `up`.
         self.status
             .note_restart("outbound TUN loop unexpectedly terminated".into());
         self.status.set_outbound_alive(false);
         self.status.set_restarting(true);
+        self.publish_health();
         panic!("outbound TUN loop unexpectedly terminated");
     }
 }
-
-/// The generation-owned TUN writer hit a fatal device error. Fatal means
-/// ambiguous partial-write state: restart into a fresh generation rather
-/// than guessing which packets reached the OS.
 struct TunWriterFailed(String);
 
 impl Message<TunWriterFailed> for DataPlaneActor {
@@ -652,15 +431,10 @@ impl Message<TunWriterFailed> for DataPlaneActor {
             .note_restart(format!("TUN writer fatal device error: {}", msg.0));
         self.status.set_writer_alive(false);
         self.status.set_restarting(true);
+        self.publish_health();
         panic!("TUN writer fatal device error: {}", msg.0);
     }
 }
-
-/// An endpoint TX worker died abnormally (panic). `running` was cleared by
-/// the supervisor wrapper, but the in-flight cursor's ownership is
-/// ambiguous after a panic — do NOT just respawn the worker. Escalate:
-/// restart the entire generation cleanly. Normal idle exit and generation
-/// cancellation never send this.
 struct TxWorkerFailed(String);
 
 impl Message<TxWorkerFailed> for DataPlaneActor {
@@ -668,25 +442,10 @@ impl Message<TxWorkerFailed> for DataPlaneActor {
 
     async fn handle(&mut self, msg: TxWorkerFailed, _ctx: &mut Context<Self, Self::Reply>) {
         self.status
-            .note_restart(format!("endpoint TX worker failed: {}", msg.0));
+            .note_restart(format!("peer transport failed: {}", msg.0));
         self.status.set_restarting(true);
-        panic!("endpoint TX worker failed: {}", msg.0);
-    }
-}
-
-/// A readerless canonical session could not be repaired: restart the
-/// generation so preconnect establishes fresh sessions. Never report a
-/// readerless canonical session as healthy.
-struct SessionInvalid(String);
-
-impl Message<SessionInvalid> for DataPlaneActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: SessionInvalid, _ctx: &mut Context<Self, Self::Reply>) {
-        self.status
-            .note_restart(format!("invalid canonical session: {}", msg.0));
-        self.status.set_restarting(true);
-        panic!("invalid canonical session: {}", msg.0);
+        self.publish_health();
+        panic!("peer transport failed: {}", msg.0);
     }
 }
 
@@ -698,9 +457,6 @@ impl Message<BringDown> for DataPlaneActor {
         _msg: BringDown,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Ingress readers stop via the generation token (they hold that exact
-        // generation's cancellation) plus pool close; the registry self-cleans
-        // finished readers.
         self.do_bring_down().await
     }
 }
@@ -728,9 +484,6 @@ impl Message<ShutdownPlane> for DataPlaneActor {
         ctx.stop();
     }
 }
-
-/// Test-only failure injection: panics inside the handler so supervision
-/// restarts the actor (proves panic isolation without killing the process).
 #[cfg(test)]
 pub struct FailNow;
 
@@ -742,22 +495,24 @@ impl Message<FailNow> for DataPlaneActor {
         panic!("injected test failure");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Kameo-free Local API control (agent side)
-// ---------------------------------------------------------------------------
-
-/// `DataPlaneControl` implemented with a Kameo actor. Lives in the agent so
-/// `tunnet-core` never depends on Kameo. Reads use the atomic snapshot.
 #[derive(Clone)]
 pub struct ActorDataPlaneControl {
+    published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
     actor: ActorRef<DataPlaneActor>,
 }
 
 impl ActorDataPlaneControl {
-    pub fn new(status: DataPlaneStatusSnapshot, actor: ActorRef<DataPlaneActor>) -> Self {
-        Self { status, actor }
+    pub fn new(
+        status: DataPlaneStatusSnapshot,
+        actor: ActorRef<DataPlaneActor>,
+        published: PublishedPlane,
+    ) -> Self {
+        Self {
+            status,
+            actor,
+            published,
+        }
     }
 }
 
@@ -775,16 +530,14 @@ impl DataPlaneControl for ActorDataPlaneControl {
             restart_count: self.status.restart_count(),
             generation: self.status.generation(),
             last_error: self.status.last_error(),
-            sessions: self.status.sessions(),
+            connected_peers: self
+                .published
+                .load_full()
+                .map_or(0, |peers| peers.connected_count()),
         }
     }
 
-    fn session_health(&self) -> Vec<tunnet_common::local_api::SessionHealth> {
-        self.status.sessions()
-    }
-
     async fn bring_up(&self) -> Result<(), String> {
-        // Kameo flattens `Result` replies into the `ask` error channel.
         tokio::time::timeout(std::time::Duration::from_secs(30), self.actor.ask(BringUp))
             .await
             .map_err(|_| "data plane bring-up timed out".to_string())?
@@ -810,37 +563,8 @@ mod tests {
     use crate::actors::test_support::{test_metrics, test_node};
     use kameo::actor::Spawn;
 
-    fn test_manager(
-        node: &CoreNode,
-        metrics: AgentMetrics,
-        published: PublishedPlane,
-        status: DataPlaneStatusSnapshot,
-        gate: LifecycleGate,
-        pool_arc: &Arc<tunnet_core::ConnPool>,
-    ) -> Arc<crate::ingress::IngressManager> {
-        let ctx = crate::ingress::IngressContext {
-            routes: node.routes.clone(),
-            acl: node.acl.clone(),
-            runtime: node.policy.clone(),
-            spoofs: std::collections::HashMap::new(),
-            bufs: tunnet_common::packet::PacketPool::new(8),
-            metrics,
-            auth: None,
-        };
-        Arc::new(crate::ingress::IngressManager::new(
-            pool_arc,
-            crate::ingress::IngressRegistry::new(),
-            ctx,
-            published,
-            status,
-            gate,
-            None,
-        ))
-    }
-
     fn test_args(node: CoreNode) -> DataPlaneActorArgs {
         let (events_tx, _) = tokio::sync::broadcast::channel(4);
-        // Route actor ref unused on the down-path; wire a real one lazily.
         let route = RouteActor::spawn_with_mailbox(
             RouteActorArgs,
             kameo::mailbox::bounded(crate::actors::ROUTE_MAILBOX),
@@ -848,16 +572,6 @@ mod tests {
         let metrics = test_metrics();
         let published = new_published_plane();
         let status = DataPlaneStatusSnapshot::new(false);
-        let gate = LifecycleGate::default();
-        let pool_arc = Arc::new(node.tunnel_pool.clone());
-        let session_manager = test_manager(
-            &node,
-            metrics.clone(),
-            published.clone(),
-            status.clone(),
-            gate.clone(),
-            &pool_arc,
-        );
         DataPlaneActorArgs {
             config: DataPlaneActorConfig {
                 ifname: "tunnet-test-down".into(),
@@ -877,14 +591,9 @@ mod tests {
             route_actor: route,
             published,
             status,
-            ingress: crate::ingress::IngressRegistry::new(),
             packet_pool: tunnet_common::packet::PacketPool::new(8),
-            ingress_gate: Arc::new(AtomicBool::new(true)),
-            lifecycle_gate: gate,
-            session_manager,
             initially_up: false,
             initial_generation: 0,
-            // Tests drive BringUp explicitly; no background reconstruction.
             auto_up: false,
         }
     }
@@ -897,7 +606,6 @@ mod tests {
             kameo::mailbox::bounded(crate::actors::DATAPLANE_MAILBOX),
         );
         actor.wait_for_startup().await;
-        // Kameo flattens `Result` replies: `ask` yields a single `Result`.
         actor.ask(BringDown).await.expect("down");
         actor.ask(BringDown).await.expect("down");
         let status: DataPlaneStatus = actor.ask(GetStatus).await.expect("status");
@@ -1012,16 +720,6 @@ mod tests {
         let metrics = test_metrics();
         let published = new_published_plane();
         let status = DataPlaneStatusSnapshot::new(false);
-        let gate = LifecycleGate::default();
-        let pool_arc = Arc::new(node.tunnel_pool.clone());
-        let session_manager = test_manager(
-            &node,
-            metrics.clone(),
-            published.clone(),
-            status.clone(),
-            gate.clone(),
-            &pool_arc,
-        );
         let dp_args = DataPlaneSupervisorArgs {
             route_args: RouteActorArgs,
             dataplane_config: DataPlaneActorConfig {
@@ -1041,22 +739,13 @@ mod tests {
             events: events_tx,
             published,
             status,
-            ingress: crate::ingress::IngressRegistry::new(),
             packet_pool: tunnet_common::packet::PacketPool::new(8),
-            ingress_gate: Arc::new(AtomicBool::new(true)),
-            lifecycle_gate: gate,
-            session_manager,
             initially_up: false,
             initial_generation: 0,
-            // Tests drive BringUp explicitly; no background reconstruction.
             auto_up: false,
         };
         let parent = Parent::spawn(());
         parent.wait_for_startup().await;
-        // NOTE: Transient, not Permanent. Permanent restarts on Normal exits
-        // too (kameo links.rs should_restart), so stop_gracefully() below
-        // would restart instead of stopping and wait_for_shutdown() would
-        // hang forever. Production uses Transient for the same reason.
         let sup = DataPlaneSupervisor::supervise(&parent, dp_args)
             .restart_policy(RestartPolicy::Transient)
             .spawn()
@@ -1065,9 +754,6 @@ mod tests {
         let children: crate::actors::supervisor::DataPlaneChildren =
             sup.ask(GetDataPlaneChildren).await.expect("children");
         let dp = children.dataplane_actor.expect("dataplane");
-        // Injected panic: supervisor must restart the child in place and the
-        // fresh incarnation must answer with valid (down) state. The test
-        // process itself must survive (panic isolation).
         let _ = dp.tell(FailNow).send().await;
         let restarted = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
@@ -1081,8 +767,6 @@ mod tests {
         })
         .await;
         restarted.expect("dataplane did not restart after injected panic");
-        // Bounded shutdown waits: a hang here must fail the test, never
-        // block CI forever.
         let _ = sup.stop_gracefully().await;
         tokio::time::timeout(std::time::Duration::from_secs(15), sup.wait_for_shutdown())
             .await

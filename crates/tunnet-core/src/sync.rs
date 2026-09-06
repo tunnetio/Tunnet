@@ -159,7 +159,7 @@ pub struct ManagedDriverCtx {
     pub tunnels: Option<crate::tunnel::TunnelManager>,
     #[cfg(feature = "send")]
     pub send: Option<crate::send::SendManager>,
-    pub tunnel_pool: Option<crate::iroh_pool::ConnPool>,
+    pub pool: Option<crate::iroh_pool::ConnPool>,
     pub effective_config: Option<crate::EffectiveConfigStore>,
 }
 
@@ -190,7 +190,7 @@ impl ManagedDriverCtx {
             tunnels: Some(node.tunnels.clone()),
             #[cfg(feature = "send")]
             send: Some(node.send.clone()),
-            tunnel_pool: Some(node.tunnel_pool.clone()),
+            pool: Some(node.pool.clone()),
             effective_config: Some(node.effective_config.clone()),
         }
     }
@@ -218,7 +218,7 @@ pub fn spawn_managed_driver(
             tunnels,
             #[cfg(feature = "send")]
             send,
-            tunnel_pool,
+            pool,
             effective_config,
         } = ctx;
         let crate::ws_client::PendingControl {
@@ -272,7 +272,7 @@ pub fn spawn_managed_driver(
                 Some(msg) = server_rx.recv() => {
                     match msg {
                         ServerMsg::Snapshot(snap) => {
-                            if let Some(pool) = tunnel_pool.as_ref() {
+                            if let Some(pool) = pool.as_ref() {
                                 pool.set_cloud_relay_urls(
                                     snap.connectivity_relays
                                         .iter()
@@ -703,7 +703,7 @@ pub fn spawn_managed_driver(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    let (active_conns, bytes_tx, bytes_rx) = tunnel_pool
+                    let (active_conns, bytes_tx, bytes_rx) = pool
                         .as_ref()
                         .map(|p| p.heartbeat_counters())
                         .unwrap_or((0, 0, 0));
@@ -712,7 +712,7 @@ pub fn spawn_managed_driver(
                         bytes_tx,
                         bytes_rx,
                     }).await;
-                    if let Some(pool) = tunnel_pool.as_ref() {
+                    if let Some(pool) = pool.as_ref() {
                         let bytes = pool.cloud_relay_meter().take();
                         if bytes > 0 {
                             let _ = client_tx.send(ClientMsg::CloudRelayUsage { bytes }).await;

@@ -25,8 +25,7 @@ param(
 #   {ts, product, scenario, direction, fraction, offered_mbps, actual_mbps,
 #    loss_pct, retransmits, latency:{n,p50,p95,p99,p999,max}, path:{...},
 #    meta:{...}, note, valid, load_met, delivery_ratio, undelivered_pct,
-#    *_bytes, *_packets, local_sw_drops, peer_sw_drops,
-#    local_session_before/after/changed, peer_session_before/after/changed}
+#    *_bytes, *_packets, local_sw_drops, peer_sw_drops}
 # Throughput matrix (TCP 1/4, up/down/bidir with explicit JSON parse),
 # loaded-latency sweeps per direction plus full-duplex bidir at fractions
 # of independently measured directional capacity (download load uses -R),
@@ -45,9 +44,6 @@ param(
 # delivery_ratio/undelivered_pct and byte/packet counts; downloads offer
 # against CAP_DOWN; loaded rows carry load_met (valid stays true on
 # catastrophic under-delivery).
-# Path/session state comes from the metrics endpoint (local + peer):
-# every row carries software-drop deltas AND session before/after/change,
-# so one-way session poisoning shows immediately without manual A/B runs.
 
 $ErrorActionPreference = "Continue"
 
@@ -79,13 +75,10 @@ $META_JSON = $META | ConvertTo-Json -Compress
 function Get-PathState {
     $state = [ordered]@{ product = $Product; mode = "unknown"; detail = "" }
     if ($Product -eq "tunnet") {
-        # Session/vitals come from the metrics endpoint (the legacy
-        # /api/status HTTP endpoint does not exist; the Local API is a
-        # local socket). Detail carries generation + session count.
-        $snap = Get-SessionSnapshot $MetricsUrl
+        $snap = Get-DataplaneSnapshot $MetricsUrl
         if ($snap.available) {
             $state.mode = "tunnet"
-            $state.detail = "gen=$($snap.generation) restarts=$($snap.restart_count) sessions=$($snap.sessions.Count)"
+            $state.detail = "gen=$($snap.generation) restarts=$($snap.restart_count)"
         } else {
             $state.detail = "tunnet metrics unreachable"
         }
@@ -236,37 +229,23 @@ if ([string]::IsNullOrWhiteSpace($PeerMetricsUrl) -and $Product -eq "tunnet") {
 # remote sender — one side alone cannot see both. Availability is explicit:
 # @{available=$false} when an endpoint is unreachable; zero is reported
 # only after a successful scrape, never as a substitute for "unknown".
-# Canonical session + dataplane vitals snapshot (item 14): generation,
-# restarts, liveness, and per-peer (canonical, reader, orientation,
-# alive). Unavailable reads as unavailable, never as healthy/zero.
-function Get-SessionSnapshot([string]$Url) {
-    $s = [ordered]@{ available = $false; sessions = @() }
-    if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) { return $s }
+function Get-DataplaneSnapshot([string]$Url) {
+    if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) {
+        return [ordered]@{ available = $false }
+    }
     try {
         $text = Invoke-RestMethod -Uri $Url -TimeoutSec 5
-        if ($text -isnot [string]) { return $s }
-        $s.available = $true
+        if ($text -isnot [string]) { return [ordered]@{ available = $false } }
+        $out = [ordered]@{ available = $true; generation = 0; restart_count = 0 }
         foreach ($line in ($text -split "`n")) {
-            if ($line -match "^tunnet_dataplane_(generation|restart_count|up|outbound_alive|writer_alive)\s+([0-9.eE+-]+)") {
-                $s[$Matches[1]] = [double]$Matches[2]
-            }
-            elseif ($line -match '^tunnet_session_info\{([^}]*)\}\s+([0-9.eE+-]+)') {
-                $labels = @{}
-                foreach ($kv in ($Matches[1] -split ",")) {
-                    $k, $v = $kv -split "=", 2
-                    $labels[$k.Trim()] = $v.Trim().Trim('"')
-                }
-                $s.sessions += [ordered]@{
-                    peer = $labels["peer"]; generation = $labels["generation"]
-                    canonical = $labels["canonical"]; reader = $labels["reader"]
-                    orientation = $labels["orientation"]; alive = ([double]$Matches[2] -gt 0)
-                }
-            }
+            if ($line -match "^tunnet_dataplane_generation\s+([0-9.eE+-]+)") { $out.generation = [int][double]$Matches[1] }
+            elseif ($line -match "^tunnet_dataplane_restart_count\s+([0-9.eE+-]+)") { $out.restart_count = [int][double]$Matches[1] }
         }
-        return $s
-    } catch { return [ordered]@{ available = $false; sessions = @() } }
+        return $out
+    } catch { return [ordered]@{ available = $false } }
 }
 
+# Unavailable reads as unavailable, never as healthy/zero.
 function Get-SwSnapshot([string]$Url) {
     if ($Product -ne "tunnet" -or [string]::IsNullOrWhiteSpace($Url)) {
         return [ordered]@{ available = $false }
@@ -274,13 +253,11 @@ function Get-SwSnapshot([string]$Url) {
     try {
         $text = Invoke-RestMethod -Uri $Url -TimeoutSec 5
         if ($text -isnot [string]) { return [ordered]@{ available = $false } }
-        $out = [ordered]@{ available = $true; sched = 0.0; dropped = 0.0; tun_write_drop = 0.0 }
+        $out = [ordered]@{ available = $true; dropped = 0.0; tun_write_drop = 0.0 }
         foreach ($line in ($text -split "`n")) {
-            if ($line -match "^tunnet_sched_drops_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.sched += [double]$Matches[1] }
-            elseif ($line -match "^tunnet_dropped_packets_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.dropped += [double]$Matches[1] }
+            if ($line -match "^tunnet_dropped_packets_total\{[^}]*\}\s+([0-9.eE+-]+)") { $out.dropped += [double]$Matches[1] }
             elseif ($line -match "^tunnet_tun_write_queue_drop_total\s+([0-9.eE+-]+)") { $out.tun_write_drop += [double]$Matches[1] }
         }
-        $out.session = (Get-SessionSnapshot $Url)
         return $out
     } catch { return [ordered]@{ available = $false } }
 }
@@ -298,39 +275,16 @@ function Diff-Sw($Before, $After) {
     }
     return [ordered]@{
         available = $true
-        sched = [math]::Round($After.sched - $Before.sched, 0)
         dropped = [math]::Round($After.dropped - $Before.dropped, 0)
         tun_write_drop = [math]::Round($After.tun_write_drop - $Before.tun_write_drop, 0)
     }
 }
 
-function Sessions-Equal($A, $B) {
-    if (($null -eq $A) -ne ($null -eq $B)) { return $false }
-    if ($null -eq $A) { return $true }
-    foreach ($k in @("generation", "restart_count", "up", "outbound_alive", "writer_alive")) {
-        if ($A[$k] -ne $B[$k]) { return $false }
-    }
-    $sa = @($A.sessions | ForEach-Object { "$($_.peer)|$($_.generation)|$($_.canonical)|$($_.reader)|$($_.orientation)|$($_.alive)" } | Sort-Object)
-    $sb = @($B.sessions | ForEach-Object { "$($_.peer)|$($_.generation)|$($_.canonical)|$($_.reader)|$($_.orientation)|$($_.alive)" } | Sort-Object)
-    if ($sa.Count -ne $sb.Count) { return $false }
-    for ($i = 0; $i -lt $sa.Count; $i++) { if ($sa[$i] -ne $sb[$i]) { return $false } }
-    return $true
-}
-
-# Capture the "after" side and return deltas + session before/after/change
-# for the row (session poisoning detection, both sides).
 function SwDelta($Before) {
     $after = Get-ScenarioSw
     $out = [ordered]@{
         local_sw_drops = (Diff-Sw $Before.local $after.local)
         peer_sw_drops = (Diff-Sw $Before.peer $after.peer)
-    }
-    foreach ($side in @("local", "peer")) {
-        $s0 = $Before[$side].session
-        $s1 = $after[$side].session
-        $out["${side}_session_before"] = $s0
-        $out["${side}_session_after"] = $s1
-        $out["${side}_session_changed"] = -not (Sessions-Equal $s0 $s1)
     }
     return $out
 }
@@ -589,7 +543,6 @@ foreach ($d in $dirs) {
         $sw = SwDelta $sw0
         $note = ""
         if ($pathBefore.mode -ne $pathAfter.mode) { $note = "PATH CHANGED mid-run; result flagged" }
-        if ($sw.local_session_changed -or $sw.peer_session_changed) { $note += " SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
         # actual==0 MUST count: a successfully executed but fully
         # undelivered load is catastrophic under-delivery (valid stays
         # true, load_met goes false), not a parser failure.
@@ -610,12 +563,7 @@ foreach ($d in $dirs) {
             load_met = ($valid -and (-not $under))
             local_sw_drops = $sw.local_sw_drops
             peer_sw_drops = $sw.peer_sw_drops
-            local_session_before = $sw.local_session_before
-            local_session_after = $sw.local_session_after
-            local_session_changed = $sw.local_session_changed
-            peer_session_before = $sw.peer_session_before
-            peer_session_after = $sw.peer_session_after
-            peer_session_changed = $sw.peer_session_changed }
+ }
     }
 }
 
@@ -694,7 +642,6 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
     $sw = SwDelta $sw0
     $note = ""
     if ($pathBefore.mode -ne $pathAfter.mode) { $note = "PATH CHANGED mid-run; result flagged" }
-    if ($sw.local_session_changed -or $sw.peer_session_changed) { $note += " SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
     $underUp = ($null -eq $errUp) -and ($actualUp -lt $rateUp * 0.7) -and ($f -le 1.0)
     $underDown = ($null -eq $errDown) -and ($actualDown -lt $rateDown * 0.7) -and ($f -le 1.0)
     if ($underUp) { $note += " under-delivered up load" }
@@ -718,12 +665,7 @@ foreach ($f in @(0.25, 0.50, 0.75, 0.90, 1.00)) {
         load_met = ($valid -and (-not $underUp) -and (-not $underDown))
         local_sw_drops = $sw.local_sw_drops
         peer_sw_drops = $sw.peer_sw_drops
-        local_session_before = $sw.local_session_before
-        local_session_after = $sw.local_session_after
-        local_session_changed = $sw.local_session_changed
-        peer_session_before = $sw.peer_session_before
-        peer_session_after = $sw.peer_session_after
-        peer_session_changed = $sw.peer_session_changed }
+ }
 }
 
 # --- UDP sweep: rates x sizes x directions, sender vs receiver split ---
@@ -773,7 +715,6 @@ foreach ($ud in $udpDirs) {
                 $jitter = $ps.jitter
                 $note = ""
                 $sw = SwDelta $sw0
-                if ($sw.local_session_changed -or $sw.peer_session_changed) { $note = "SESSION CHANGED mid-run (generation/stable/reader moved); result flagged" }
                 Write-Host ("  $($ud.name) offered={0}Mbps sent={1}Mbps delivered={2}Mbps undelivered={3}% pps_sent={4} pps_recv={5} loss={6}% jitter={7}ms len={8}B" -f $rate, $sentMbps, $del, $ps.undelivered_pct, $ppsSent, $ppsRecv, $loss, $jitter, $len)
                 Write-Row @{ scenario = "udp"; direction = $ud.name; offered_mbps = $rate; packet_len = $len
                     sent_mbps = $sentMbps; actual_mbps = $del; pps_sent = $ppsSent; pps_received = $ppsRecv
@@ -784,12 +725,7 @@ foreach ($ud in $udpDirs) {
                     path = (Get-PathState); note = $note; valid = $true
                     local_sw_drops = $sw.local_sw_drops
                     peer_sw_drops = $sw.peer_sw_drops
-                    local_session_before = $sw.local_session_before
-                    local_session_after = $sw.local_session_after
-                    local_session_changed = $sw.local_session_changed
-                    peer_session_before = $sw.peer_session_before
-                    peer_session_after = $sw.peer_session_after
-                    peer_session_changed = $sw.peer_session_changed }
+ }
             } else {
                 Write-Host "  $($ud.name) offered=${rate}Mbps len=${len}B : FAILED: $($r.error)" -ForegroundColor Red
                 $sw = SwDelta $sw0
@@ -799,12 +735,7 @@ foreach ($ud in $udpDirs) {
                     note = "UDP FAILED: $($r.error)"; valid = $false
                     local_sw_drops = $sw.local_sw_drops
                     peer_sw_drops = $sw.peer_sw_drops
-                    local_session_before = $sw.local_session_before
-                    local_session_after = $sw.local_session_after
-                    local_session_changed = $sw.local_session_changed
-                    peer_session_before = $sw.peer_session_before
-                    peer_session_after = $sw.peer_session_after
-                    peer_session_changed = $sw.peer_session_changed }
+ }
             }
         }
     }

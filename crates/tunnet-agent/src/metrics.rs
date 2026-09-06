@@ -1,21 +1,6 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
-
-use metrics::{Counter, Gauge, counter, describe_counter, describe_gauge, gauge};
+//! Metrics recorded at packet admission, transport submission, and OS delivery.
+use metrics::{Counter, Gauge, counter, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-
-/// Cached metric handles: registered once, incremented without per-packet
-/// registry lookup. Hot packet/byte counters accumulate in shared atomics
-/// (correct across peers — no per-peer gauge overwrite) and flush once a
-/// second. Sojourn latency uses a bounded bucket histogram for p50/p95/p99
-/// estimates without per-packet registry work. Drop reasons on hot paths
-/// use pre-registered handles selected by a plain match.
-///
-/// Delivery is counted at real boundaries (§19): TUN receive, overlay TX
-/// (logical + datagrams), overlay RX (datagrams + complete logicals), TUN
-/// writer queue accept, and actual OS writes. Scheduler/AQM drops are
-/// separate from writer-queue drops.
 #[derive(Clone)]
 pub struct AgentMetrics {
     handle: PrometheusHandle,
@@ -24,122 +9,24 @@ pub struct AgentMetrics {
     bytes_out: Counter,
     bytes_in: Counter,
     active_conns: Gauge,
+    interrupted: Counter,
     queue_packets: Gauge,
     queue_bytes: Gauge,
-    queue_flows: Gauge,
-    queue_inflight_packets: Gauge,
-    queue_inflight_bytes: Gauge,
     overlay_tx_logical: Counter,
     overlay_tx_datagrams: Counter,
     overlay_rx_logical: Counter,
     tun_rx_packets: Counter,
+    tun_rx_bytes: Counter,
+    tun_tx_bytes: Counter,
+    overlay_tx_bytes: Counter,
+    overlay_rx_bytes: Counter,
     tun_write_queued: Counter,
     tun_write_packets: Counter,
     tun_write_queue_drop: Counter,
     pool_hits: Counter,
     pool_miss: Counter,
-    drop_sched_bytes: Counter,
-    drop_sched_packets: Counter,
-    drop_sched_codel: Counter,
-    drop_sched_emergency: Counter,
-    drop_sched_revoke: Counter,
-    drop_sched_genend: Counter,
-    drop_sched_incompatible: Counter,
-    tx_incompatible: Counter,
-    reader_panics: Counter,
-    drop_policy: Counter,
-    drop_too_large: Counter,
-    drop_no_conn: Counter,
-    drop_other: Counter,
-    sojourn_p50: Gauge,
-    sojourn_p95: Gauge,
-    sojourn_p99: Gauge,
-    sojourn_avg: Gauge,
-    hot: Arc<HotCounters>,
-    sojourn: Arc<SojournHist>,
 }
-
-#[derive(Default)]
-struct HotCounters {
-    packets_out: AtomicU64,
-    bytes_out: AtomicU64,
-    packets_in: AtomicU64,
-    bytes_in: AtomicU64,
-    queue_packets: AtomicI64,
-    queue_bytes: AtomicI64,
-    queue_flows: AtomicI64,
-    queue_inflight_packets: AtomicI64,
-    queue_inflight_bytes: AtomicI64,
-}
-
-/// Sojourn buckets (ms): [1, 5, 25, 100, 250, 1000, +inf). p50/p95/p99 are
-/// estimated from cumulative counts — cheap and bounded.
-const SOJOURN_BOUNDS_MS: [u64; 6] = [1, 5, 25, 100, 250, 1000];
-
-struct SojournHist {
-    buckets: [AtomicU64; 7],
-    sum_us: AtomicU64,
-    count: AtomicU64,
-}
-
-impl SojournHist {
-    fn observe(&self, d: Duration) {
-        let ms = d.as_millis() as u64;
-        let mut idx = 6;
-        for (i, b) in SOJOURN_BOUNDS_MS.iter().enumerate() {
-            if ms <= *b {
-                idx = i;
-                break;
-            }
-        }
-        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum_us
-            .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Estimate the q-quantile (0 < q <= 1) as a bucket upper bound in ms.
-    fn quantile_ms(&self, q: f64) -> f64 {
-        let total: u64 = self.buckets.iter().map(|b| b.load(Ordering::Relaxed)).sum();
-        if total == 0 {
-            return 0.0;
-        }
-        let mut cum = 0u64;
-        for (i, b) in self.buckets.iter().enumerate() {
-            cum += b.load(Ordering::Relaxed);
-            if cum as f64 >= q * total as f64 {
-                return if i < SOJOURN_BOUNDS_MS.len() {
-                    SOJOURN_BOUNDS_MS[i] as f64
-                } else {
-                    2000.0
-                };
-            }
-        }
-        2000.0
-    }
-}
-
-impl Default for SojournHist {
-    fn default() -> Self {
-        Self {
-            buckets: Default::default(),
-            sum_us: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-        }
-    }
-}
-
 impl AgentMetrics {
-    /// Test handle without installing a global recorder (parallel tests).
-    #[cfg(test)]
-    pub fn for_tests() -> Self {
-        let recorder = PrometheusBuilder::new()
-            .with_recommended_naming(true)
-            .build_recorder();
-        Self::from_handle(recorder.handle())
-    }
-
-    #[allow(clippy::too_many_lines)]
     fn from_handle(handle: PrometheusHandle) -> Self {
         Self {
             handle,
@@ -147,389 +34,128 @@ impl AgentMetrics {
             packets_in: counter!("tunnet_packets_total", "direction" => "in"),
             bytes_out: counter!("tunnet_bytes_total", "direction" => "out"),
             bytes_in: counter!("tunnet_bytes_total", "direction" => "in"),
+            interrupted: counter!("tunnet_dropped_packets_total", "reason" => "connection_interrupted"),
             active_conns: gauge!("tunnet_active_connections"),
-            queue_packets: gauge!("tunnet_sched_queue_packets"),
-            queue_bytes: gauge!("tunnet_sched_queue_bytes"),
-            queue_flows: gauge!("tunnet_sched_active_flows"),
-            queue_inflight_packets: gauge!("tunnet_sched_inflight_packets"),
-            queue_inflight_bytes: gauge!("tunnet_sched_inflight_bytes"),
+            queue_packets: gauge!("tunnet_queue_packets"),
+            queue_bytes: gauge!("tunnet_queue_bytes"),
             overlay_tx_logical: counter!("tunnet_overlay_tx_logical_total"),
             overlay_tx_datagrams: counter!("tunnet_overlay_tx_datagrams_total"),
             overlay_rx_logical: counter!("tunnet_overlay_rx_logical_total"),
+            tun_rx_bytes: counter!("tunnet_tun_rx_bytes_total"),
+            tun_tx_bytes: counter!("tunnet_tun_tx_bytes_total"),
+            overlay_tx_bytes: counter!("tunnet_overlay_tx_bytes_total"),
+            overlay_rx_bytes: counter!("tunnet_overlay_rx_bytes_total"),
             tun_rx_packets: counter!("tunnet_tun_rx_packets_total"),
             tun_write_queued: counter!("tunnet_tun_write_queued_total"),
             tun_write_packets: counter!("tunnet_tun_write_packets_total"),
             tun_write_queue_drop: counter!("tunnet_tun_write_queue_drop_total"),
             pool_hits: counter!("tunnet_pool_hits_total"),
             pool_miss: counter!("tunnet_pool_miss_total"),
-            drop_sched_bytes: counter!("tunnet_sched_drops_total", "reason" => "sched_endpoint_bytes"),
-            drop_sched_packets: counter!("tunnet_sched_drops_total", "reason" => "sched_endpoint_packets"),
-            drop_sched_codel: counter!("tunnet_sched_drops_total", "reason" => "sched_codel"),
-            drop_sched_emergency: counter!("tunnet_sched_drops_total", "reason" => "sched_emergency"),
-            drop_sched_revoke: counter!("tunnet_sched_drops_total", "reason" => "sched_membership_revoked"),
-            drop_sched_genend: counter!("tunnet_sched_drops_total", "reason" => "sched_generation_end"),
-            drop_sched_incompatible: counter!("tunnet_sched_drops_total", "reason" => "sched_incompatible"),
-            tx_incompatible: counter!("tunnet_tx_incompatible_total"),
-            reader_panics: counter!("tunnet_reader_panics_total"),
-            drop_policy: counter!("tunnet_dropped_packets_total", "reason" => "policy_deny"),
-            drop_too_large: counter!("tunnet_dropped_packets_total", "reason" => "datagram_too_large"),
-            drop_no_conn: counter!("tunnet_dropped_packets_total", "reason" => "no_connection"),
-            drop_other: counter!("tunnet_dropped_packets_total", "reason" => "other"),
-            sojourn_p50: gauge!("tunnet_sojourn_p50_ms"),
-            sojourn_p95: gauge!("tunnet_sojourn_p95_ms"),
-            sojourn_p99: gauge!("tunnet_sojourn_p99_ms"),
-            sojourn_avg: gauge!("tunnet_sojourn_avg_ms"),
-            hot: Arc::new(HotCounters::default()),
-            sojourn: Arc::new(SojournHist::default()),
         }
     }
-
-    /// Dataplane vitals for session-poisoning detection (item 14): plain
-    /// gauges scraped beside the drop counters, local and peer side.
-    pub fn dataplane_vitals(
-        &self,
-        generation: u64,
-        restart_count: u64,
-        up: bool,
-        outbound_alive: bool,
-        writer_alive: bool,
-    ) {
-        gauge!("tunnet_dataplane_generation").set(generation as f64);
-        gauge!("tunnet_dataplane_restart_count").set(restart_count as f64);
-        gauge!("tunnet_dataplane_up").set(u8::from(up) as f64);
-        gauge!("tunnet_dataplane_outbound_alive").set(u8::from(outbound_alive) as f64);
-        gauge!("tunnet_dataplane_writer_alive").set(u8::from(writer_alive) as f64);
-    }
-
-    /// Canonical session state series (item 14): value 1 marks the current
-    /// series for a peer (0 = stale/superseded — set explicitly when a
-    /// combo is replaced so old series never read as live). The benchmark
-    /// diffs label sets + values across scenarios to flag session changes.
-    pub fn session_set(
-        &self,
-        peer_hex: &str,
-        generation: u64,
-        canonical: &str,
-        reader: &str,
-        orientation: &str,
-        alive: bool,
-    ) {
-        gauge!("tunnet_session_info",
-            "peer" => peer_hex.to_string(),
-            "generation" => generation.to_string(),
-            "canonical" => canonical.to_string(),
-            "reader" => reader.to_string(),
-            "orientation" => orientation.to_string(),
-        )
-        .set(u8::from(alive) as f64);
-    }
-
-    pub fn new() -> anyhow::Result<Self> {
-        let handle = PrometheusBuilder::new()
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        let recorder = PrometheusBuilder::new()
             .with_recommended_naming(true)
-            .install_recorder()?;
-
-        describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
-        describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
-        describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
-        describe_counter!("tunnet_sched_drops_total", "Scheduler drops by reason");
-        describe_counter!(
-            "tunnet_tx_incompatible_total",
-            "Endpoints with permanent DATAGRAM incompatibility"
-        );
-        describe_counter!("tunnet_reader_panics_total", "Ingress reader panics");
-        describe_gauge!(
-            "tunnet_dataplane_generation",
-            "Current dataplane generation"
-        );
-        describe_gauge!("tunnet_dataplane_restart_count", "Dataplane restarts");
-        describe_gauge!("tunnet_dataplane_up", "Dataplane up (1/0)");
-        describe_gauge!("tunnet_dataplane_outbound_alive", "TUN reader alive (1/0)");
-        describe_gauge!("tunnet_dataplane_writer_alive", "TUN writer alive (1/0)");
-        describe_gauge!(
-            "tunnet_session_info",
-            "Canonical tunnel session state by peer (1 = current)"
-        );
-        describe_counter!(
-            "tunnet_overlay_tx_logical_total",
-            "Logical packets transmitted to the overlay"
-        );
-        describe_counter!(
-            "tunnet_overlay_tx_datagrams_total",
-            "QUIC DATAGRAMs transmitted"
-        );
-        describe_counter!(
-            "tunnet_overlay_rx_logical_total",
-            "Complete logical packets received from the overlay"
-        );
-        describe_counter!(
-            "tunnet_tun_rx_packets_total",
-            "Packets read from the OS TUN"
-        );
-        describe_counter!(
-            "tunnet_tun_write_queued_total",
-            "Complete packets accepted into the TUN writer queue"
-        );
-        describe_counter!(
-            "tunnet_tun_write_packets_total",
-            "Packets actually written to the OS TUN"
-        );
-        describe_counter!(
-            "tunnet_tun_write_queue_drop_total",
-            "Complete packets dropped at the TUN writer queue"
-        );
-        describe_counter!("tunnet_reassembly_total", "Reassembly outcomes by result");
-        describe_counter!("tunnet_tun_syscalls_total", "TUN syscalls by operation");
-        describe_counter!("tunnet_datagrams_total", "QUIC DATAGRAMs by direction");
-        describe_counter!("tunnet_pool_hits_total", "Packet pool hits");
-        describe_counter!("tunnet_pool_miss_total", "Packet pool misses");
-        describe_gauge!("tunnet_active_connections", "Live peer connections");
-        describe_gauge!(
-            "tunnet_sched_queue_packets",
-            "Queued logical packets across all peers"
-        );
-        describe_gauge!("tunnet_sched_queue_bytes", "Queued bytes across all peers");
-        describe_gauge!("tunnet_sched_active_flows", "Active flows across all peers");
-        describe_gauge!(
-            "tunnet_sched_inflight_packets",
-            "Worker-owned in-flight packets"
-        );
-        describe_gauge!(
-            "tunnet_sched_inflight_bytes",
-            "Worker-owned in-flight bytes"
-        );
-        describe_gauge!("tunnet_virtual_mtu_bytes", "Configured logical MTU");
-        describe_gauge!("tunnet_sojourn_p50_ms", "Queue sojourn p50 estimate");
-        describe_gauge!("tunnet_sojourn_p95_ms", "Queue sojourn p95 estimate");
-        describe_gauge!("tunnet_sojourn_p99_ms", "Queue sojourn p99 estimate");
-        describe_gauge!("tunnet_sojourn_avg_ms", "Queue sojourn mean");
-
-        let m = Self::from_handle(handle.clone());
-        // Periodic flush of hot counters + prometheus upkeep.
-        let flush = m.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                flush.flush_hot();
-                handle.run_upkeep();
-            }
-        });
-
-        Ok(m)
+            .build_recorder();
+        metrics::with_local_recorder(&recorder, || Self::from_handle(recorder.handle()))
     }
-
-    fn flush_hot(&self) {
-        let p_out = self.hot.packets_out.swap(0, Ordering::Relaxed);
-        let b_out = self.hot.bytes_out.swap(0, Ordering::Relaxed);
-        let p_in = self.hot.packets_in.swap(0, Ordering::Relaxed);
-        let b_in = self.hot.bytes_in.swap(0, Ordering::Relaxed);
-        if p_out > 0 {
-            self.packets_out.increment(p_out);
-        }
-        if b_out > 0 {
-            self.bytes_out.increment(b_out);
-        }
-        if p_in > 0 {
-            self.packets_in.increment(p_in);
-        }
-        if b_in > 0 {
-            self.bytes_in.increment(b_in);
-        }
-        self.queue_packets
-            .set(self.hot.queue_packets.load(Ordering::Relaxed) as f64);
-        self.queue_bytes
-            .set(self.hot.queue_bytes.load(Ordering::Relaxed) as f64);
-        self.queue_flows
-            .set(self.hot.queue_flows.load(Ordering::Relaxed) as f64);
-        self.queue_inflight_packets
-            .set(self.hot.queue_inflight_packets.load(Ordering::Relaxed) as f64);
-        self.queue_inflight_bytes
-            .set(self.hot.queue_inflight_bytes.load(Ordering::Relaxed) as f64);
-        self.sojourn_p50.set(self.sojourn.quantile_ms(0.50));
-        self.sojourn_p95.set(self.sojourn.quantile_ms(0.95));
-        self.sojourn_p99.set(self.sojourn.quantile_ms(0.99));
-        let n = self.sojourn.count.load(Ordering::Relaxed);
-        if n > 0 {
-            self.sojourn_avg
-                .set(self.sojourn.sum_us.load(Ordering::Relaxed) as f64 / 1000.0 / n as f64);
-        }
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self::from_handle(
+            PrometheusBuilder::new()
+                .with_recommended_naming(true)
+                .install_recorder()?,
+        ))
     }
-
+    pub fn interrupted_counter(&self) -> Counter {
+        self.interrupted.clone()
+    }
     pub fn packets_inc(&self, direction: &'static str) {
-        match direction {
-            "out" => self.hot.packets_out.fetch_add(1, Ordering::Relaxed),
-            "in" => self.hot.packets_in.fetch_add(1, Ordering::Relaxed),
-            _ => {
-                counter!("tunnet_packets_total", "direction" => direction).increment(1);
-                0
-            }
-        };
-    }
-
-    pub fn packets_add(&self, direction: &'static str, n: u64) {
-        if n == 0 {
-            return;
+        if direction == "out" {
+            self.packets_out.increment(1);
+        } else {
+            self.packets_in.increment(1);
         }
-        match direction {
-            "out" => self.hot.packets_out.fetch_add(n, Ordering::Relaxed),
-            "in" => self.hot.packets_in.fetch_add(n, Ordering::Relaxed),
-            _ => {
-                counter!("tunnet_packets_total", "direction" => direction).increment(n);
-                0
-            }
-        };
     }
-
     pub fn bytes_add(&self, direction: &'static str, n: u64) {
-        match direction {
-            "out" => self.hot.bytes_out.fetch_add(n, Ordering::Relaxed),
-            "in" => self.hot.bytes_in.fetch_add(n, Ordering::Relaxed),
-            _ => {
-                counter!("tunnet_bytes_total", "direction" => direction).increment(n);
-                0
-            }
-        };
+        if direction == "out" {
+            self.bytes_out.increment(n);
+        } else {
+            self.bytes_in.increment(n);
+        }
     }
-
-    /// Drop counter with pre-registered hot handles (no per-packet lookup).
-    /// ONE call per drop event: the scheduler diff reporter is the only
-    /// scheduler-side caller, so nothing double-counts.
     pub fn dropped_inc(&self, reason: &'static str) {
         self.dropped_add(reason, 1);
     }
-
     pub fn dropped_add(&self, reason: &'static str, n: u64) {
-        if n == 0 {
-            return;
-        }
-        match reason {
-            "sched_emergency" => self.drop_sched_emergency.increment(n),
-            "sched_endpoint_bytes" => self.drop_sched_bytes.increment(n),
-            "sched_endpoint_packets" => self.drop_sched_packets.increment(n),
-            "sched_codel" => self.drop_sched_codel.increment(n),
-            "sched_membership_revoked" => self.drop_sched_revoke.increment(n),
-            "sched_generation_end" => self.drop_sched_genend.increment(n),
-            "sched_incompatible" => self.drop_sched_incompatible.increment(n),
-            "policy_deny" | "policy_deny_in" => self.drop_policy.increment(n),
-            "datagram_too_large" => self.drop_too_large.increment(n),
-            "no_connection" => self.drop_no_conn.increment(n),
-            _ => self.drop_other.increment(n),
+        if n > 0 {
+            counter!("tunnet_dropped_packets_total", "reason" => reason).increment(n);
         }
     }
-
-    /// Permanent DATAGRAM incompatibility surfaced for an endpoint: no
-    /// redial loop, packet resolved explicitly, waits for a new connection.
-    pub fn endpoint_incompatible_inc(&self) {
-        self.tx_incompatible.increment(1);
+    pub fn queue_add(&self, packets: i64, bytes: i64) {
+        self.queue_packets.increment(packets as f64);
+        self.queue_bytes.increment(bytes as f64);
     }
-
-    /// Ingress reader panic (session failure + internal-error telemetry).
-    pub fn reader_panic_inc(&self) {
-        self.reader_panics.increment(1);
-    }
-
-    /// Aggregate queue levels across all endpoints (signed deltas, never
-    /// overwrites another endpoint's values).
-    pub fn queue_add(&self, packets: i64, bytes: i64, flows: i64) {
-        if packets != 0 {
-            self.hot.queue_packets.fetch_add(packets, Ordering::Relaxed);
-        }
-        if bytes != 0 {
-            self.hot.queue_bytes.fetch_add(bytes, Ordering::Relaxed);
-        }
-        if flows != 0 {
-            self.hot.queue_flows.fetch_add(flows, Ordering::Relaxed);
-        }
-    }
-
-    /// Worker-owned in-flight levels (scheduler -> worker handoff accounting).
-    pub fn queue_inflight_add(&self, packets: i64, bytes: i64) {
-        if packets != 0 {
-            self.hot
-                .queue_inflight_packets
-                .fetch_add(packets, Ordering::Relaxed);
-        }
-        if bytes != 0 {
-            self.hot
-                .queue_inflight_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-
-    /// Delivery-boundary counters (§19).
-    pub fn tun_rx_packets_inc(&self) {
+    pub fn tun_rx_packets_inc(&self, bytes: usize) {
+        self.tun_rx_bytes.increment(bytes as u64);
         self.tun_rx_packets.increment(1);
     }
-
     pub fn overlay_tx_logical_add(&self, n: u64) {
-        if n > 0 {
-            self.overlay_tx_logical.increment(n);
-        }
+        self.overlay_tx_logical.increment(n);
     }
-
-    pub fn overlay_tx_datagrams_add(&self, n: u64) {
-        if n > 0 {
-            self.overlay_tx_datagrams.increment(n);
-        }
+    pub fn overlay_tx_datagrams_add(&self, n: u64, bytes: usize) {
+        self.overlay_tx_bytes.increment(bytes as u64);
+        self.overlay_tx_datagrams.increment(n);
     }
-
     pub fn overlay_rx_logical_inc(&self) {
         self.overlay_rx_logical.increment(1);
     }
-
     pub fn tun_write_queued(&self) {
         self.tun_write_queued.increment(1);
     }
-
-    pub fn tun_write_packets_add(&self, n: u64) {
-        if n > 0 {
-            self.tun_write_packets.increment(n);
-        }
+    pub fn tun_write_packets_add(&self, n: u64, bytes: usize) {
+        self.tun_tx_bytes.increment(bytes as u64);
+        self.tun_write_packets.increment(n);
     }
-
     pub fn tun_write_queue_drop(&self) {
         self.tun_write_queue_drop.increment(1);
     }
-
-    pub fn observe_sojourn(&self, d: Duration) {
-        self.sojourn.observe(d);
-    }
-
-    pub fn reassembly_inc(&self, result: &'static str) {
-        counter!("tunnet_reassembly_total", "result" => result).increment(1);
-    }
-
     pub fn tun_syscall_inc(&self, op: &'static str) {
         counter!("tunnet_tun_syscalls_total", "op" => op).increment(1);
     }
-
-    pub fn datagram_inc(&self, direction: &'static str) {
+    pub fn datagram_inc(&self, direction: &'static str, bytes: usize) {
+        self.overlay_rx_bytes.increment(bytes as u64);
         counter!("tunnet_datagrams_total", "direction" => direction).increment(1);
     }
-
     pub fn pool_hit_miss(&self, hits: u64, misses: u64) {
-        if hits > 0 {
-            self.pool_hits.increment(hits);
-        }
-        if misses > 0 {
-            self.pool_miss.increment(misses);
-        }
+        self.pool_hits.increment(hits);
+        self.pool_miss.increment(misses);
     }
-
     pub fn mtu_set(&self, mtu: u64) {
         gauge!("tunnet_virtual_mtu_bytes").set(mtu as f64);
     }
-
+    pub fn dataplane_set(
+        &self,
+        up: bool,
+        generation: u64,
+        restart_count: u64,
+        outbound_alive: bool,
+        writer_alive: bool,
+    ) {
+        gauge!("tunnet_dataplane_up").set(if up { 1.0 } else { 0.0 });
+        gauge!("tunnet_dataplane_generation").set(generation as f64);
+        gauge!("tunnet_dataplane_restart_count").set(restart_count as f64);
+        gauge!("tunnet_dataplane_outbound_alive").set(if outbound_alive { 1.0 } else { 0.0 });
+        gauge!("tunnet_dataplane_writer_alive").set(if writer_alive { 1.0 } else { 0.0 });
+    }
     pub fn active_conns_inc(&self) {
         self.active_conns.increment(1.0);
     }
-
     pub fn active_conns_dec(&self) {
         self.active_conns.decrement(1.0);
     }
-
     pub fn render(&self) -> String {
+        self.handle.run_upkeep();
         self.handle.render()
     }
 }

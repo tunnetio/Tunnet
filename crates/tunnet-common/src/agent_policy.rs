@@ -230,10 +230,8 @@ pub struct EffectiveAgentConfig {
 
 const DEFAULT_MDNS: bool = true;
 const DEFAULT_LAN_DISCOVERY: bool = true;
-/// Default logical/virtual MTU for the dataplane: 1280, the stable
-/// production default. Ordinary inner packets travel as single frames on
-/// normal paths; larger MTUs stay configurable and segment when needed.
-const DEFAULT_TUNNEL_MTU: u16 = 1280;
+/// Single-DATAGRAM IPv4 MTU, also used by local TUN creation.
+const DEFAULT_TUNNEL_MTU: u16 = crate::packet::DEFAULT_VIRTUAL_MTU as u16;
 const DEFAULT_AUTO_UPDATE_ENABLED: bool = false;
 const DEFAULT_AUTO_UPDATE_INTERVAL: u64 = 6;
 const DEFAULT_POSTURE_INTERVAL: u64 = 300;
@@ -349,7 +347,12 @@ pub fn merge_agent_config(
             remote.lan_discovery,
             DEFAULT_LAN_DISCOVERY,
         ),
-        tunnel_mtu: resolve_dual(local_dual.tunnel_mtu, remote.tunnel_mtu, DEFAULT_TUNNEL_MTU),
+        tunnel_mtu: {
+            let mut setting =
+                resolve_dual(local_dual.tunnel_mtu, remote.tunnel_mtu, DEFAULT_TUNNEL_MTU);
+            setting.value = setting.value.clamp(576, DEFAULT_TUNNEL_MTU);
+            setting
+        },
         auto_update_enabled: resolve_dual(
             local_dual.auto_update_enabled,
             auto_enabled_remote,

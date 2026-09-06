@@ -22,14 +22,12 @@ mod meta;
 mod owned;
 mod parse;
 
-pub use build::{set_tcp_ipv4_checksum, synthesize_reject, tcp_ipv4_checksum_of};
+pub use build::{synthesize_reject, tcp_ipv4_checksum_of};
 pub use frag::{
     CachedTransport, FRAGMENT_TTL, FragKey, FragmentTable, MAX_FRAGMENT_ENTRIES, ResolvedL4,
 };
 pub use frame::{
-    DecodeError, Frame, KIND_SEGMENT, KIND_SINGLE, MAX_SEGMENTS, MIN_SEGMENT_PAYLOAD,
-    SEGMENT_OVERHEAD, SINGLE_OVERHEAD, SegmentHeader, decode_frame, encode_segment_prefix,
-    encode_single_prefix, segment_count,
+    DecodeError, Frame, KIND_SINGLE, SINGLE_OVERHEAD, decode_frame, encode_single_prefix,
 };
 pub use meta::{FlowKey, PacketMeta, SshNatClass};
 pub use owned::{

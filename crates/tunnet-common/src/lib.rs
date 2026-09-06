@@ -39,7 +39,7 @@ pub fn git_hash() -> &'static str {
 /// `/2` framing) from accidentally speaking an incompatible format. It does
 /// not imply any older implementation remains — there is none, and there is
 /// no compatibility decoder.
-pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/3";
+pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/4";
 
 /// ALPN for agent ↔ public edge reverse tunnels.
 pub const EDGE_ALPN: &[u8] = b"tunnet/edge/1";

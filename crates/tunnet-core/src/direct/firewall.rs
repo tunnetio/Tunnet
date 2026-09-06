@@ -557,7 +557,8 @@ mod tests {
         let dst = Ipv4Addr::new(100, 64, 0, 1);
         let p = tcp_syn(src, dst, 9999, 22);
         let v = tunnet_common::packet::parse(&p).unwrap();
-        let reply = synthesize_reject(&v).unwrap();
+        let reply =
+            synthesize_reject(&tunnet_common::packet::PacketMeta::from_packet(&v), v.raw).unwrap();
         assert!(reply.len() >= 40);
         assert_eq!(reply[9], 6);
         let parsed = tunnet_common::packet::parse(&reply).unwrap();
