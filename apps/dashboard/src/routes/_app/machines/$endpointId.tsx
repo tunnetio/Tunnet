@@ -58,10 +58,7 @@ import {
 import { PageHeader } from "@/components/app/page-header";
 import { StatusBadge } from "@/components/app/status-badge";
 import { useCan } from "@/hooks/use-permission";
-import {
-  seedPresenceCache,
-  usePresenceStream,
-} from "@/hooks/use-presence-stream";
+import { seedPresenceCache } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
 import { deviceKindLabel, deviceTypeLabel } from "@/lib/device-type";
 import { deriveInactivityLimitCompact } from "@/lib/machine-expiry";
@@ -374,7 +371,6 @@ function MachineDetailPage() {
   const [nameDraft, setNameDraft] = useState("");
   const [tab, setTab] = useState("overview");
   const queryClient = useQueryClient();
-  usePresenceStream(orgId);
 
   const machineTunnels = useMemo(
     () => (tunnels ?? []).filter((t) => t.endpointId === endpointId),

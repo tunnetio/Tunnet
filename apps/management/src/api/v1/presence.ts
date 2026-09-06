@@ -1,4 +1,4 @@
-import { createListenClient, schema } from "@tunnet/db";
+import { schema } from "@tunnet/db";
 import { formatIp } from "@tunnet/ip";
 import { and, desc, eq } from "drizzle-orm";
 import { Elysia } from "elysia";
@@ -7,6 +7,7 @@ import {
   ENTITY_NOTIFY_CHANNEL,
   PRESENCE_NOTIFY_CHANNEL,
 } from "../../lib/notify";
+import { getPresenceNotifyHub } from "../../lib/presence-notify-hub";
 import {
   serializePresenceEvent,
   serializePresencePatch,
@@ -22,24 +23,41 @@ export const presenceRoutes = new Elysia()
       getAuth({ authContext });
       const orgId = params.orgId;
       const encoder = new TextEncoder();
-      let listenClient: ReturnType<typeof createListenClient> | null = null;
       let heartbeat: ReturnType<typeof setInterval> | null = null;
+      let unsubscribe: (() => void) | null = null;
+      let closed = false;
+
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (heartbeat) {
+          clearInterval(heartbeat);
+          heartbeat = null;
+        }
+        unsubscribe?.();
+        unsubscribe = null;
+      };
 
       const stream = new ReadableStream({
         start: (controller) => {
-          void (async () => {
-            const send = (data: unknown) => {
+          const send = (data: unknown) => {
+            if (closed) return;
+            try {
               controller.enqueue(
                 encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
               );
-            };
+            } catch {
+              cleanup();
+            }
+          };
 
-            send({ type: "ready", organizationId: orgId });
+          send({ type: "ready", organizationId: orgId });
 
-            listenClient = createListenClient();
-            await listenClient.listen(
-              PRESENCE_NOTIFY_CHANNEL,
-              async (payload: string) => {
+          unsubscribe = getPresenceNotifyHub().subscribe((channel, payload) => {
+            if (closed) return;
+
+            if (channel === PRESENCE_NOTIFY_CHANNEL) {
+              void (async () => {
                 try {
                   const parsed = JSON.parse(payload) as {
                     organizationId?: string;
@@ -60,7 +78,7 @@ export const presenceRoutes = new Elysia()
                       },
                     },
                   });
-                  if (!row) return;
+                  if (!row || closed) return;
 
                   const networkId = row.memberships[0]?.networkId;
                   if (!networkId) return;
@@ -75,66 +93,67 @@ export const presenceRoutes = new Elysia()
                 } catch {
                   // ignore malformed payloads
                 }
-              },
-            );
+              })();
+              return;
+            }
 
-            await listenClient.listen(
-              ENTITY_NOTIFY_CHANNEL,
-              (payload: string) => {
-                try {
-                  const parsed = JSON.parse(payload) as {
-                    organizationId?: string;
-                    kind?: string;
-                    entityId?: string;
-                    networkId?: string | null;
-                  };
-                  if (
-                    parsed.organizationId !== orgId ||
-                    !parsed.kind ||
-                    !parsed.entityId
-                  ) {
-                    return;
-                  }
-                  send({
-                    type: "entity",
-                    kind: parsed.kind,
-                    entityId: parsed.entityId,
-                    networkId: parsed.networkId ?? null,
-                  });
-                } catch {
-                  // ignore malformed payloads
-                }
-              },
-            );
-
-            heartbeat = setInterval(() => {
+            if (channel === ENTITY_NOTIFY_CHANNEL) {
               try {
-                controller.enqueue(encoder.encode(": keepalive\n\n"));
+                const parsed = JSON.parse(payload) as {
+                  organizationId?: string;
+                  kind?: string;
+                  entityId?: string;
+                  networkId?: string | null;
+                };
+                if (
+                  parsed.organizationId !== orgId ||
+                  !parsed.kind ||
+                  !parsed.entityId
+                ) {
+                  return;
+                }
+                send({
+                  type: "entity",
+                  kind: parsed.kind,
+                  entityId: parsed.entityId,
+                  networkId: parsed.networkId ?? null,
+                });
               } catch {
-                if (heartbeat) clearInterval(heartbeat);
+                // ignore malformed payloads
               }
-            }, 25_000);
+            }
+          });
 
-            request.signal.addEventListener("abort", () => {
-              if (heartbeat) clearInterval(heartbeat);
-              if (listenClient) {
-                void listenClient.end();
-                listenClient = null;
+          heartbeat = setInterval(() => {
+            if (closed) {
+              if (heartbeat) {
+                clearInterval(heartbeat);
+                heartbeat = null;
               }
+              return;
+            }
+            try {
+              controller.enqueue(encoder.encode(": keepalive\n\n"));
+            } catch {
+              cleanup();
+            }
+          }, 25_000);
+
+          request.signal.addEventListener(
+            "abort",
+            () => {
+              cleanup();
               try {
                 controller.close();
               } catch {
                 // already closed
               }
-            });
-          })();
+            },
+            { once: true },
+          );
         },
         cancel: () => {
-          if (heartbeat) clearInterval(heartbeat);
-          if (listenClient) {
-            void listenClient.end();
-            listenClient = null;
-          }
+          cleanup();
         },
       });
 

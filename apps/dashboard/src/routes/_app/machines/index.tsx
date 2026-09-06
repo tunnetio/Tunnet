@@ -45,10 +45,7 @@ import { PageHeader } from "@/components/app/page-header";
 import { PageToolbar } from "@/components/app/page-toolbar";
 import { StatusBadge } from "@/components/app/status-badge";
 import { useCan } from "@/hooks/use-permission";
-import {
-  seedPresenceCache,
-  usePresenceStream,
-} from "@/hooks/use-presence-stream";
+import { seedPresenceCache } from "@/hooks/use-presence-stream";
 import { useActiveOrganization } from "@/lib/auth-client";
 import { deviceKindLabel, deviceTypeLabel } from "@/lib/device-type";
 import {
@@ -89,7 +86,6 @@ function MachinesPage() {
   );
 
   const deviceMutations = useDeviceMutations(orgId);
-  usePresenceStream(orgId);
 
   useEffect(() => {
     if (orgId && machines) {

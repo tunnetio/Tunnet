@@ -13,7 +13,7 @@
     "@better-auth/sso": "^1.7.2",
     "@better-auth/stripe": "^1.7.2",
     "@elysiajs/cors": "^1.4.2",
-    "@peculiar/x509": "^2.0.0",
+    "@peculiar/x509": "^2.1.0",
     "@tunnet/api": "workspace:*",
     "@tunnet/db": "workspace:*",
     "@tunnet/env": "workspace:*",
