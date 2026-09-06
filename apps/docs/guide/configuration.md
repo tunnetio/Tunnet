@@ -17,8 +17,7 @@ Override with `--state-dir` or `TUNNET_STATE_DIR`.
   state.json               # public enrollment / network metadata
   state.enc                # encrypted secrets
   state.enc.meta           # seal tier + key wrapping metadata
-  ip_overrides.json        # peer IP overrides (Direct multi-network)
-  docs/<network-uuid>/     # per-network iroh-docs store
+    docs/<network-uuid>/     # per-network iroh-docs store
   direct_invites/
   direct_pending/
   firewall_pending/
@@ -45,7 +44,7 @@ rules = [
 ]
 
 [direct.homelab.dns]
-magic-ip = "100.100.100.53"
+magic-ip = "the gateway peer address
 tld = "tunnet"
 upstream = ["1.1.1.1", "8.8.8.8"]
 
@@ -130,7 +129,7 @@ You can also manage rules with `tunnet firewall`. Edits to TOML take effect afte
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `magic-ip` | `100.100.100.53` | PeerDNS listener address on the TUN |
+| `magic-ip` | `the gateway peer address | PeerDNS listener address on the TUN |
 | `tld` | `tunnet` | DNS suffix for peer hostnames |
 | `upstream` | `1.1.1.1`, `8.8.8.8` | Forwarders for non-mesh queries |
 

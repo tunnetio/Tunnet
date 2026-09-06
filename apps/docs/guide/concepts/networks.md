@@ -14,8 +14,7 @@ An agent enrolls into **one** Managed network. Switching requires `tunnet reset 
 
 In Direct mode there is no organization. Each network is identified by its name and PSK. A single agent can join **multiple Direct networks** at once (`tunnet create` / `tunnet join` without resetting). Managed and Direct modes cannot be mixed on the same machine.
 
-Join order is stored in local state: when derived mesh IPs collide across networks, the first-joined network wins for outbound routing. Resolve collisions with `tunnet override-ip`. Per-network firewall and DNS settings live under `[direct.<name>]` in [`tunnet.toml`](/guide/configuration).
-
+Overlapping Direct peer ranges are rejected.   Resolve collisions with `
 ## Peers
 
 Every machine in a network is a peer. Each peer has an endpoint ID (a 64-character hex string derived from its Ed25519 public key), an assigned mesh IPv4 address, a hostname, and optionally tags.

@@ -3,7 +3,6 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use ipnet::Ipv4Net;
 use iroh::EndpointId;
 use parking_lot::Mutex;
@@ -43,8 +42,7 @@ struct NetworkSlice {
     dns: DnsConfig,
     network_name: String,
     self_endpoint_id: String,
-    /// Join index: lower = first-joined = outbound winner on IP clash.
-    join_index: u64,
+    peer_cidr: Option<Ipv4Net>,
 }
 
 pub struct Tables {
@@ -63,12 +61,8 @@ pub struct Tables {
     pub hostname_wildcards: Vec<Arc<HostnameRouteInfo>>,
     /// Hostname routes this node itself advertises (local resolve + proxy).
     pub advertised_hostnames: Vec<Arc<HostnameRouteInfo>>,
-    /// Synthetic IP → hostname (PeerDNS hostname-route answers).
-    pub synthetic_hosts: std::collections::HashMap<Ipv4Addr, String>,
     pub dns_suffix: String,
     pub network_name: String,
-    /// PeerDNS magic listener IP (local, not mesh-forwarded).
-    pub magic_ip: Ipv4Addr,
     /// Selected exit node peer (when device_profile chooses one).
     pub exit_node: Option<Arc<PeerInfo>>,
     /// When true, RFC1918 destinations are not sent via the exit node.
@@ -79,11 +73,7 @@ pub struct Tables {
 #[derive(Clone)]
 pub struct RoutingTable {
     inner: Arc<ArcSwap<Tables>>,
-    /// Synthetic IPs created at DNS resolve time (esp. wildcard hostname routes).
-    dynamic_synth: Arc<DashMap<Ipv4Addr, Arc<PeerInfo>>>,
     slices: Arc<Mutex<BTreeMap<Uuid, NetworkSlice>>>,
-    /// Manual IP overrides: (network_id, peer_key) → ip. peer_key is hostname or endpoint hex.
-    overrides: Arc<DashMap<(Uuid, String), Ipv4Addr>>,
 }
 
 impl Default for RoutingTable {
@@ -105,17 +95,13 @@ impl RoutingTable {
                 hostname_exact: Default::default(),
                 hostname_wildcards: Default::default(),
                 advertised_hostnames: Default::default(),
-                synthetic_hosts: Default::default(),
                 dns_suffix: "tunnet".into(),
                 network_name: String::new(),
-                magic_ip: Ipv4Addr::new(100, 100, 100, 53),
                 exit_node: None,
                 allow_local_lan: true,
                 version: 0,
             })),
-            dynamic_synth: Arc::new(DashMap::new()),
             slices: Arc::new(Mutex::new(BTreeMap::new())),
-            overrides: Arc::new(DashMap::new()),
         }
     }
 
@@ -128,28 +114,20 @@ impl RoutingTable {
             .cloned()
     }
 
-    /// Set a manual outbound IP override for a peer in a network.
-    pub fn set_ip_override(&self, network_id: Uuid, peer_key: &str, ip: Ipv4Addr) {
-        self.overrides
-            .insert((network_id, peer_key.to_ascii_lowercase()), ip);
-        self.rebuild(None);
-    }
-
-    pub fn clear_ip_override(&self, network_id: Uuid, peer_key: &str) {
-        self.overrides
-            .remove(&(network_id, peer_key.to_ascii_lowercase()));
-        self.rebuild(None);
+    pub fn lookup_endpoint_in(&self, network_id: Uuid, hex: &str) -> Option<Arc<PeerInfo>> {
+        let tables = self.inner.load();
+        tables
+            .by_network_ip
+            .iter()
+            .find(|((nid, _), p)| *nid == network_id && p.endpoint_hex == hex)
+            .map(|(_, p)| p.clone())
     }
 
     /// Direct peer IP, subnet LPM, then selected exit node for internet.
-    /// On birthday collisions across networks, first-joined network wins.
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
         let tables = self.inner.load();
         if let Some(peer) = tables.by_ip.get(ip).cloned() {
             return Some(peer);
-        }
-        if let Some(peer) = self.dynamic_synth.get(ip) {
-            return Some(peer.clone());
         }
         if let Some((prefix, peer)) = tables.subnets.get_lpm(&Ipv4Net::from(*ip)) {
             // Full-tunnel exit CIDR must not steal LAN when allow_local_lan is on.
@@ -247,14 +225,6 @@ impl RoutingTable {
         self.inner.load().dns_suffix.clone()
     }
 
-    pub fn magic_ip(&self) -> Ipv4Addr {
-        self.inner.load().magic_ip
-    }
-
-    pub fn is_magic_dns_destination(&self, ip: &Ipv4Addr) -> bool {
-        *ip == self.inner.load().magic_ip
-    }
-
     pub fn network_name(&self) -> String {
         self.inner.load().network_name.clone()
     }
@@ -262,11 +232,7 @@ impl RoutingTable {
     /// Approximate PeerDNS / route cache size for `tunnet dns status`.
     pub fn cached_entry_count(&self) -> usize {
         let tables = self.inner.load();
-        tables.by_hostname.len()
-            + tables.hostname_exact.len()
-            + tables.hostname_wildcards.len()
-            + tables.synthetic_hosts.len()
-            + self.dynamic_synth.len()
+        tables.by_hostname.len() + tables.hostname_exact.len() + tables.hostname_wildcards.len()
     }
 
     /// Resolve a PeerDNS name to an advertised SSH host pubkey (TXT).
@@ -316,9 +282,9 @@ impl RoutingTable {
             })
     }
 
-    /// Resolve a PeerDNS name to an IPv4 address (peer mesh IP or synthetic).
-    /// Pure: does not mutate `dynamic_synth`. For wildcard hostname routes the
-    /// caller should [`Self::remember_dns_synth`] so dataplane lookup works.
+    /// Resolve a PeerDNS name to an IPv4 address.
+    /// Hostname routes resolve to the gateway peer IP; the gateway
+    /// proxies to the real target via explicit hostname/stream routing.
     pub fn resolve_dns_a(&self, name: &str) -> Option<Ipv4Addr> {
         let tables = self.inner.load();
         let suffix = format!(".{}", tables.dns_suffix);
@@ -360,42 +326,12 @@ impl RoutingTable {
         }
 
         for host in [bare, peer_name] {
-            if self.lookup_hostname_route(host).is_some() {
-                return Some(synthetic_ip_for(host));
+            if let Some(info) = self.lookup_hostname_route(host) {
+                return Some(info.peer.ip);
             }
         }
 
         None
-    }
-
-    /// Cache a synthetic IP → peer mapping for a hostname (wildcard routes).
-    /// Survives [`Self::rebuild`] because `dynamic_synth` lives outside the tables Arc.
-    pub fn remember_dns_synth(&self, name: &str, ip: Ipv4Addr) {
-        let tables = self.inner.load();
-        let suffix = format!(".{}", tables.dns_suffix);
-        let lower = name.trim_end_matches('.').to_ascii_lowercase();
-        let bare = lower
-            .strip_suffix(&suffix)
-            .unwrap_or(lower.as_str())
-            .trim_end_matches('.');
-        let network_suffix = if tables.network_name.is_empty() {
-            None
-        } else {
-            Some(format!(".{}", tables.network_name))
-        };
-        let peer_name = network_suffix
-            .as_ref()
-            .and_then(|s| bare.strip_suffix(s.as_str()))
-            .unwrap_or(bare);
-
-        for host in [bare, peer_name] {
-            if let Some(info) = self.lookup_hostname_route(host)
-                && synthetic_ip_for(host) == ip
-            {
-                self.dynamic_synth.insert(ip, info.peer.clone());
-                return;
-            }
-        }
     }
 
     /// Reverse lookup: mesh IP → `hostname[.network].suffix`.
@@ -444,27 +380,68 @@ impl RoutingTable {
                     dns: dns.clone(),
                     network_name: network_name.to_ascii_lowercase(),
                     self_endpoint_id: self_endpoint_id.to_string(),
-                    join_index: 0,
+                    peer_cidr: None,
                 },
             );
         }
         self.rebuild(Some(version));
     }
 
-    /// Replace peers for one Direct network; other networks kept. First-joined wins outbound.
+    /// Replace peers for one Direct network; other networks kept.
+    /// Overlapping peer CIDRs are rejected by invariant; duplicate IPs fail closed.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_network(
         &self,
         network_id: Uuid,
-        join_index: u64,
         peers: &[PeerEntry],
         dns: &DnsConfig,
         network_name: &str,
         self_endpoint_id: &str,
         version: u64,
     ) {
+        self.replace_network_with_plan(
+            network_id,
+            peers,
+            dns,
+            network_name,
+            self_endpoint_id,
+            version,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_network_with_plan(
+        &self,
+        network_id: Uuid,
+        peers: &[PeerEntry],
+        dns: &DnsConfig,
+        network_name: &str,
+        self_endpoint_id: &str,
+        version: u64,
+        peer_cidr: Option<Ipv4Net>,
+    ) {
         {
             let mut slices = self.slices.lock();
+            if let Some(plan) = peer_cidr {
+                for (other_id, other) in slices.iter() {
+                    if *other_id == network_id {
+                        continue;
+                    }
+                    if let Some(other_plan) = other.peer_cidr
+                        && cidr_overlaps(&plan, &other_plan)
+                    {
+                        tracing::error!(
+                            %network_id,
+                            %other_id,
+                            %plan,
+                            %other_plan,
+                            "overlapping Direct peer CIDRs rejected"
+                        );
+                        return;
+                    }
+                }
+            }
             slices.insert(
                 network_id,
                 NetworkSlice {
@@ -476,7 +453,7 @@ impl RoutingTable {
                     dns: dns.clone(),
                     network_name: network_name.to_ascii_lowercase(),
                     self_endpoint_id: self_endpoint_id.to_string(),
-                    join_index,
+                    peer_cidr,
                 },
             );
         }
@@ -540,7 +517,7 @@ impl RoutingTable {
         let slices: Vec<(Uuid, NetworkSlice)> = {
             let g = self.slices.lock();
             let mut v: Vec<_> = g.iter().map(|(k, s)| (*k, s.clone())).collect();
-            v.sort_by_key(|(_, s)| s.join_index);
+            v.sort_by_key(|(id, _)| *id);
             v
         };
 
@@ -559,12 +536,9 @@ impl RoutingTable {
             std::collections::HashMap::new();
         let mut hostname_wildcards = Vec::new();
         let mut advertised_hostnames = Vec::new();
-        let mut synthetic_hosts: std::collections::HashMap<Ipv4Addr, String> =
-            std::collections::HashMap::new();
         let mut exit_node = None;
         let mut allow_local_lan = true;
         let mut dns_suffix = "tunnet".to_string();
-        let mut magic_ip = Ipv4Addr::new(100, 100, 100, 53);
         let mut primary_network_name = String::new();
 
         for (network_id, slice) in &slices {
@@ -572,7 +546,6 @@ impl RoutingTable {
                 primary_network_name = slice.network_name.clone();
             }
             dns_suffix = slice.dns.suffix.clone();
-            magic_ip = slice.dns.magic_ip;
 
             let mut local_by_endpoint: std::collections::HashMap<String, Arc<PeerInfo>> =
                 std::collections::HashMap::new();
@@ -581,20 +554,7 @@ impl RoutingTable {
                     tracing::warn!(id = %p.endpoint_id, "skip peer with bad endpoint id");
                     continue;
                 };
-                let mut ip = p.ip;
-                // Apply override by hostname or endpoint hex.
-                for key in [
-                    p.hostname.to_ascii_lowercase(),
-                    p.endpoint_id.to_ascii_lowercase(),
-                ] {
-                    if key.is_empty() {
-                        continue;
-                    }
-                    if let Some(ov) = self.overrides.get(&(*network_id, key)) {
-                        ip = *ov;
-                        break;
-                    }
-                }
+                let ip = p.ip;
                 let info = Arc::new(PeerInfo {
                     endpoint: ep,
                     endpoint_hex: p.endpoint_id.clone(),
@@ -606,17 +566,13 @@ impl RoutingTable {
                     ssh_host_key: p.ssh_host_key.clone(),
                 });
                 by_network_ip.insert((*network_id, ip), info.clone());
-                // First-joined wins on outbound by_ip.
                 if let Some(existing) = by_ip.get(&ip) {
                     if existing.endpoint_hex != info.endpoint_hex {
-                        tracing::warn!(
+                        tracing::error!(
                             %ip,
-                            winner_network = %existing.network_name,
-                            winner_peer = %existing.hostname,
-                            loser_network = %info.network_name,
-                            loser_peer = %info.hostname,
-                            "IP collision across Direct networks; first-joined wins outbound \
-                             (use `tunnet direct override-ip` to resolve)"
+                            existing_network = %existing.network_name,
+                            network = %info.network_name,
+                            "duplicate IP across Direct networks; overlapping plans must be rejected"
                         );
                     }
                 } else {
@@ -652,7 +608,6 @@ impl RoutingTable {
                     &slice.network_name,
                 );
                 let Some(peer) = peer else { continue };
-                // First-joined wins on overlapping exact prefixes.
                 if !subnets.contains_key(&route.cidr) {
                     subnets.insert(route.cidr, peer);
                 }
@@ -710,9 +665,6 @@ impl RoutingTable {
                     continue;
                 }
                 if !route.is_wildcard {
-                    let synth = synthetic_ip_for(&hostname);
-                    by_ip.entry(synth).or_insert_with(|| peer.clone());
-                    synthetic_hosts.insert(synth, hostname.clone());
                     hostname_exact.insert(hostname, info);
                 } else {
                     hostname_wildcards.push(info);
@@ -722,8 +674,6 @@ impl RoutingTable {
 
         hostname_wildcards.sort_by_key(|route| std::cmp::Reverse(route.hostname.len()));
 
-        // Keep dynamic_synth across rebuild - it lives outside the tables Arc so
-        // wildcard DNS answers survive membership/policy refreshes.
         self.inner.store(Arc::new(Tables {
             by_ip,
             by_network_ip,
@@ -734,10 +684,8 @@ impl RoutingTable {
             hostname_exact,
             hostname_wildcards,
             advertised_hostnames,
-            synthetic_hosts,
             dns_suffix,
             network_name: primary_network_name,
-            magic_ip,
             exit_node,
             allow_local_lan,
             version,
@@ -753,17 +701,11 @@ fn is_rfc1918(ip: &Ipv4Addr) -> bool {
     matches!(ip.octets(), [10, ..] | [172, 16..=31, ..] | [192, 168, ..])
 }
 
-/// Stable synthetic IP in 100.100.0.0/16 derived from hostname.
-fn synthetic_ip_for(host: &str) -> Ipv4Addr {
-    let mut hash: u32 = 2166136261;
-    for b in host.as_bytes() {
-        hash ^= u32::from(*b);
-        hash = hash.wrapping_mul(16777619);
-    }
-    let offset = (hash % 65_534) + 1;
-    let hi = ((offset >> 8) & 0xff) as u8;
-    let low = (offset & 0xff) as u8;
-    Ipv4Addr::new(100, 100, hi, low)
+fn cidr_overlaps(a: &Ipv4Net, b: &Ipv4Net) -> bool {
+    a.contains(&b.network())
+        || a.contains(&b.broadcast())
+        || b.contains(&a.network())
+        || b.contains(&a.broadcast())
 }
 
 fn peer_for_via(
@@ -1010,11 +952,10 @@ mod tests {
             table.resolve_dns_a("db-server.office.tunnet"),
             Some("10.7.0.5".parse().unwrap())
         );
-        let synth = table.resolve_dns_a("wiki.internal.tunnet").unwrap();
-        table.remember_dns_synth("wiki.internal.tunnet", synth);
-        assert_eq!(synth.octets()[0], 100);
-        assert_eq!(synth.octets()[1], 100);
-        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+        let gw_ip = table.resolve_dns_a("wiki.internal.tunnet").unwrap();
+        assert_eq!(gw_ip, Ipv4Addr::new(10, 7, 0, 5));
+        assert_eq!(table.lookup_ip(&gw_ip).unwrap().endpoint_hex, gw);
+        assert!(table.lookup_hostname_route("wiki.internal").is_some());
     }
 
     #[test]
@@ -1064,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_synth_survives_rebuild() {
+    fn hostname_route_resolves_to_gateway_without_fake_ip() {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
         let gw = "b".repeat(64);
@@ -1087,11 +1028,10 @@ mod tests {
             &self_id,
             1,
         );
-        let synth = table.resolve_dns_a("api.internal.tunnet").unwrap();
-        table.remember_dns_synth("api.internal.tunnet", synth);
-        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+        let gw_ip = table.resolve_dns_a("api.internal.tunnet").unwrap();
+        assert_eq!(gw_ip, Ipv4Addr::new(10, 7, 0, 5));
+        assert_eq!(table.lookup_ip(&gw_ip).unwrap().endpoint_hex, gw);
 
-        // Rebuild via peer delta must keep dynamic_synth.
         table.apply_peer_delta(
             nid,
             &[peer(&"d".repeat(64), "10.7.0.7", "dave")],
@@ -1100,7 +1040,41 @@ mod tests {
             &self_id,
             "office",
         );
-        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+        assert_eq!(
+            table.resolve_dns_a("api.internal.tunnet").unwrap(),
+            Ipv4Addr::new(10, 7, 0, 5)
+        );
+    }
+
+    #[test]
+    fn overlapping_plans_rejected_without_precedence() {
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let a = "b".repeat(64);
+        let b = "c".repeat(64);
+        let net_a = Uuid::new_v4();
+        let net_b = Uuid::new_v4();
+        let plan: Ipv4Net = "10.90.0.0/24".parse().unwrap();
+        table.replace_network_with_plan(
+            net_a,
+            &[peer(&a, "10.90.0.1", "a")],
+            &dns(),
+            "a",
+            &self_id,
+            1,
+            Some(plan),
+        );
+        table.replace_network_with_plan(
+            net_b,
+            &[peer(&b, "10.90.0.2", "b")],
+            &dns(),
+            "b",
+            &self_id,
+            1,
+            Some(plan),
+        );
+        assert!(table.lookup_endpoint(&b).is_none());
+        assert!(table.lookup_endpoint(&a).is_some());
     }
 
     #[test]

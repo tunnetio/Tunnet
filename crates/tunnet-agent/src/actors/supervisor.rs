@@ -636,8 +636,7 @@ mod tests {
                 route_args: RouteActorArgs,
                 dataplane_config: DataPlaneActorConfig {
                     ifname: "tunnet-test-down".into(),
-                    assigned_ipv4: "10.9.0.1".parse().unwrap(),
-                    prefix: 24,
+                    local_addrs: vec!["10.9.0.1".parse().unwrap()],
                     mtu: 1280,
                     dns_cfg: tunnet_common::DnsConfig::default(),
                     dns: None,

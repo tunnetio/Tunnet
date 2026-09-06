@@ -29,6 +29,14 @@ impl AgentMetrics {
         describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
         describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
         describe_gauge!("tunnet_active_connections", "Live peer connections");
+        describe_gauge!(
+            "tunnet_direct_network_conflicts",
+            "Active Direct address-plan conflicts by category"
+        );
+        describe_gauge!(
+            "tunnet_direct_network_healthy",
+            "Direct network health (1 healthy, 0 degraded)"
+        );
 
         let upkeep = handle.clone();
         tokio::spawn(async move {
@@ -60,6 +68,14 @@ impl AgentMetrics {
 
     pub fn active_conns_dec(&self) {
         gauge!("tunnet_active_connections").decrement(1.0);
+    }
+
+    pub fn direct_conflict(&self, category: &'static str, count: f64) {
+        gauge!("tunnet_direct_network_conflicts", "category" => category).set(count);
+    }
+
+    pub fn direct_health(&self, healthy: bool) {
+        gauge!("tunnet_direct_network_healthy").set(if healthy { 1.0 } else { 0.0 });
     }
 
     pub fn render(&self) -> String {

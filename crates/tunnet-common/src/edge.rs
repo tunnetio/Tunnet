@@ -150,7 +150,7 @@ mod tests {
     fn forward_with_ip_roundtrip() {
         let msg = EdgeCtrl::Forward {
             target_port: 22,
-            target_ip: Some("100.64.0.2".into()),
+            target_ip: Some("10.21.0.2".into()),
         };
         match roundtrip(&msg) {
             EdgeCtrl::Forward {
@@ -158,7 +158,7 @@ mod tests {
                 target_ip,
             } => {
                 assert_eq!(target_port, 22);
-                assert_eq!(target_ip.as_deref(), Some("100.64.0.2"));
+                assert_eq!(target_ip.as_deref(), Some("10.21.0.2"));
             }
             other => panic!("expected Forward, got {other:?}"),
         }

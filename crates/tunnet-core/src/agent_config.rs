@@ -2,7 +2,6 @@
 //! node, Direct networks, firewall, DNS, connect allowlist, logging, mDNS, and updates.
 
 use std::collections::{BTreeMap, HashSet};
-use std::net::Ipv4Addr;
 use std::path::Path;
 
 use anyhow::Context;
@@ -112,8 +111,6 @@ pub enum TomlPort {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectDnsSection {
-    #[serde(default = "default_magic_ip", rename = "magic-ip")]
-    pub magic_ip: Ipv4Addr,
     #[serde(default = "default_tld")]
     pub tld: String,
     #[serde(default = "default_upstream")]
@@ -125,7 +122,6 @@ pub struct DirectDnsSection {
 impl Default for DirectDnsSection {
     fn default() -> Self {
         Self {
-            magic_ip: default_magic_ip(),
             tld: default_tld(),
             upstream: default_upstream(),
             dnssec: false,
@@ -245,9 +241,6 @@ fn default_true() -> bool {
 }
 fn default_health_window_secs() -> u64 {
     30
-}
-fn default_magic_ip() -> Ipv4Addr {
-    Ipv4Addr::new(100, 100, 100, 53)
 }
 fn default_tld() -> String {
     "tunnet".into()
@@ -493,8 +486,6 @@ impl DirectDnsSection {
                 self.upstream.clone()
             },
             dnssec: self.dnssec,
-            synthetic_base: DnsConfig::default().synthetic_base,
-            magic_ip: self.magic_ip,
         }
     }
 }

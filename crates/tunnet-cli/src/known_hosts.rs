@@ -81,14 +81,12 @@ mod tests {
     #[test]
     fn formats_known_hosts_line() {
         let line = known_hosts_line(
-            &["db", "db.tunnet", "100.64.0.2"],
+            &["db", "db.tunnet", "10.21.0.2"],
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample comment",
         )
         .unwrap();
         assert!(
-            line.starts_with(
-                "db,db.tunnet,100.64.0.2 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample"
-            )
+            line.starts_with("db,db.tunnet,10.21.0.2 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample")
         );
     }
 }

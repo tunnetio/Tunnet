@@ -4,7 +4,7 @@ Hostname routes map DNS names to services accessible through a gateway machine. 
 
 ## How they work
 
-When you create a hostname route for `internal-app`, PeerDNS resolves `internal-app.tunnet` to a synthetic IP in the CGNAT range (100.100.x.x). Traffic to that IP is routed through the designated gateway machine, which forwards it to the actual service.
+When you create a hostname route for `internal-app`, PeerDNS resolves `internal-app.tunnet` to a synthetic IP in the private peer range (the gateway peer address). Traffic to that IP is routed through the designated gateway machine, which forwards it to the actual service.
 
 ## Wildcard routes
 

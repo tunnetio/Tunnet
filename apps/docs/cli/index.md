@@ -41,8 +41,7 @@ The `tunnet` CLI is the primary interface for interacting with Tunnet from the c
 | `tunnet join` | Join a Direct network with an invite |
 | `tunnet invite` | Create an invite code |
 | `tunnet leave` | Leave one Direct network |
-| `tunnet override-ip` | Override a peer IP (multi-network collisions) |
-| `tunnet connect` | Ephemeral 2-peer connection (contact id) |
+| `| `tunnet connect` | Ephemeral 2-peer connection (contact id) |
 | `tunnet requests` | List pending join requests |
 | `tunnet accept` | Accept a join request |
 | `tunnet deny` | Deny a join request |

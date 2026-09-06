@@ -257,6 +257,7 @@ fn elevate_and_run(op: ElevatedOp) -> Result<OkResponse, String> {
     }
 }
 
+#[cfg(windows)]
 fn read_result(path: &Path) -> Result<ElevatedResult, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("elevated worker did not write a result ({e})"))?;

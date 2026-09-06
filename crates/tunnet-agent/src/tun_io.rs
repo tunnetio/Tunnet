@@ -18,15 +18,19 @@ use crate::metrics::AgentMetrics;
 use crate::qos::{self, OutboundScheduler};
 use crate::ssh_nat;
 
-pub fn build_tun(
+pub fn build_tun_multi(
     ifname: &str,
-    ipv4: std::net::Ipv4Addr,
+    addrs: &[std::net::Ipv4Addr],
     prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {
+    let first = addrs
+        .first()
+        .copied()
+        .context("at least one local address required")?;
     let builder = DeviceBuilder::new()
         .name(ifname)
-        .ipv4(ipv4, prefix, None)
+        .ipv4(first, prefix, None)
         .mtu(mtu);
     #[cfg(windows)]
     let builder = {
@@ -36,7 +40,12 @@ pub fn build_tun(
             .wintun_log(true)
     };
     let dev = builder.build_async().context("build_async TUN device")?;
-    tracing::info!(%ipv4, prefix, mtu, "TUN device up");
+    for extra in addrs.iter().skip(1) {
+        if let Err(e) = dev.add_address_v4(*extra, 32) {
+            tracing::warn!(%extra, error = %e, "extra TUN /32 failed");
+        }
+    }
+    tracing::info!(addrs = ?addrs, prefix, mtu, "TUN device up");
     Ok(dev)
 }
 
@@ -100,11 +109,6 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
             continue;
         };
         let dst = pkt.ip.v4_dst().unwrap();
-
-        if routes.is_magic_dns_destination(&dst) {
-            metrics.dropped_inc("magic_dns_local");
-            continue;
-        }
 
         if routes.is_advertised_destination(&dst) {
             metrics.dropped_inc("local_subnet");

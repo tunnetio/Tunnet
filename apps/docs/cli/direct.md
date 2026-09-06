@@ -43,13 +43,6 @@ tunnet leave <name>
 
 Restart or reload the service after leaving so the agent drops that network's docs and routes.
 
-## tunnet override-ip
-
-Override a peer's mesh IP when birthday collisions occur across Direct networks. First-joined network wins outbound by default; use this to force a specific IP for a peer.
-
-```bash
-tunnet override-ip --peer <hostname-or-endpoint> --ip <ipv4> [--network <name>]
-```
 
 ## tunnet connect
 

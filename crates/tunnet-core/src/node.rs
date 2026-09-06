@@ -29,8 +29,8 @@ use crate::direct::PresenceTable;
 #[cfg(feature = "direct")]
 use crate::direct::{
     AUTH_ALPN, AuthCache, DirectAuthHook, DocsBootstrap, DocsMembership, MembershipEntry,
-    NetworkGrant, derive_ipv4, firewall_to_policy, signing_key_from_hex, spawn_discovery,
-    spawn_seed_auth,
+    NetworkGrant, firewall_to_policy, signing_key_from_hex, spawn_discovery, spawn_seed_auth,
+    validate_member_against_genesis, verify_genesis, verifying_key_from_hex,
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::direct::{ConnectivityOptions, apply_connectivity, endpoint_builder};
@@ -503,11 +503,41 @@ impl CoreNode {
         let alpns = build_alpns(&cfg, true, true);
         let my_id_hex = identity.endpoint_id_hex();
         let primary = &networks[0];
-        let self_ipv4 = if primary.assigned_ipv4.is_unspecified() {
-            derive_ipv4(&my_id_hex, primary.collision_index)
-        } else {
-            primary.assigned_ipv4
-        };
+        for d in &networks {
+            let vk =
+                verifying_key_from_hex(d.coordinator_verifying_key.as_deref().unwrap_or_default())
+                    .with_context(|| format!("coordinator key for '{}'", d.network_name))?;
+            verify_genesis(&vk, &d.genesis)?;
+            validate_member_against_genesis(&d.genesis, &d.self_record)?;
+            if d.self_record.endpoint_id != my_id_hex {
+                anyhow::bail!(
+                    "self record mismatch for '{}'; re-join with a fresh invite",
+                    d.network_name
+                );
+            }
+        }
+        for (a, b) in networks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| networks.iter().skip(i + 1).map(move |b| (a, b)))
+        {
+            let pa = a.genesis.address_plan.peer_cidr;
+            let pb = b.genesis.address_plan.peer_cidr;
+            if pa.contains(&pb.network())
+                || pa.contains(&pb.broadcast())
+                || pb.contains(&pa.network())
+                || pb.contains(&pa.broadcast())
+            {
+                anyhow::bail!(
+                    "overlapping Direct networks '{}' ({}) and '{}' ({}); leave one",
+                    a.network_name,
+                    pa,
+                    b.network_name,
+                    pb
+                );
+            }
+        }
+        let self_ipv4 = primary.self_record.ipv4;
 
         let routes = RoutingTable::new();
         let version = Arc::new(ArcSwap::from_pointee(1u64));
@@ -598,11 +628,10 @@ impl CoreNode {
         let mut any_secret_update = false;
         let mut skipped = Vec::new();
 
-        for (join_index, mut direct) in networks.into_iter().enumerate() {
+        for mut direct in networks.into_iter() {
             let network_name = direct.network_name.clone();
             match bootstrap_one_direct_network(
                 BootstrapOneArgs {
-                    join_index,
                     identity: &identity,
                     my_id_hex: &my_id_hex,
                     paths: &paths,
@@ -795,7 +824,6 @@ fn warn_legacy_docs_dirs(paths: &StatePaths, networks: &[DirectState]) {
 
 #[cfg(feature = "direct")]
 struct BootstrapOneArgs<'a> {
-    join_index: usize,
     identity: &'a AgentIdentity,
     my_id_hex: &'a str,
     paths: &'a StatePaths,
@@ -822,11 +850,8 @@ async fn bootstrap_one_direct_network(
     args: BootstrapOneArgs<'_>,
     direct: &mut DirectState,
 ) -> anyhow::Result<BootstrappedNetwork> {
-    let net_ipv4 = if direct.assigned_ipv4.is_unspecified() {
-        derive_ipv4(args.my_id_hex, direct.collision_index)
-    } else {
-        direct.assigned_ipv4
-    };
+    let net_ipv4 = direct.self_record.ipv4;
+    validate_member_against_genesis(&direct.genesis, &direct.self_record)?;
 
     let fw_cfg = crate::agent_config::load_firewall_for(args.paths, &direct.network_name);
     let policy = firewall_to_policy(&fw_cfg, args.my_id_hex, net_ipv4);
@@ -838,12 +863,11 @@ async fn bootstrap_one_direct_network(
         endpoint_id: args.my_id_hex.to_string(),
         hostname: direct.hostname.clone(),
         ipv4: net_ipv4,
-        collision_index: direct.collision_index,
-        tags: vec![],
-        joined_at: jiff::Timestamp::now(),
+        tags: direct.self_record.tags.clone(),
+        joined_at: direct.self_record.joined_at,
         coordinator: direct.coordinator,
         status: "active".into(),
-        ssh_host_key: None,
+        ssh_host_key: direct.self_record.ssh_host_key.clone(),
     };
 
     let endpoint_signing_key = SigningKey::from_bytes(&args.identity.secret_bytes);
@@ -915,7 +939,6 @@ async fn bootstrap_one_direct_network(
         policy,
         firewall: Some(firewall.clone()),
         dns: crate::load_dns(args.paths),
-        join_index: args.join_index as u64,
         seed_peers: seed_peers.clone(),
     })
     .await
@@ -936,7 +959,6 @@ async fn bootstrap_one_direct_network(
             direct.namespace_id = Some(ns);
         }
     }
-    direct.assigned_ipv4 = net_ipv4;
 
     docs.refresh_seed_peers();
     let discovery_seeds = seed_peers.lock().clone();

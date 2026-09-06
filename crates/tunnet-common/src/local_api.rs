@@ -378,6 +378,8 @@ pub struct NetworkCreateRequest {
     pub network_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
     #[serde(default)]
     pub no_encrypt_state: bool,
 }
@@ -742,15 +744,6 @@ pub struct DirectKeepAliveRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub struct DirectOverrideIpRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<String>,
-    pub peer: String,
-    pub ip: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub struct DirectConnectRequest {
     pub contact_id: String,
 }
@@ -896,8 +889,6 @@ pub struct DirectConnectPendingInfo {
 pub struct DirectPendingInfo {
     pub endpoint_id: String,
     pub hostname: String,
-    pub ipv4: String,
-    pub collision_index: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -980,8 +971,7 @@ pub struct DnsStatusInfo {
     pub dnssec: bool,
     pub peer_dns_active: bool,
     pub cached_entries: usize,
-    pub synthetic_base: String,
-    pub magic_ip: String,
+    pub resolver_endpoint: String,
     pub bind: String,
 }
 
@@ -1193,7 +1183,7 @@ mod tests {
         let probe = PingEvent::Probe(PingProbe {
             seq: 1,
             peer: "db".into(),
-            peer_ip: "100.64.0.2".into(),
+            peer_ip: "10.21.0.2".into(),
             latency_ms: 12.5,
             path: "direct".into(),
         });
