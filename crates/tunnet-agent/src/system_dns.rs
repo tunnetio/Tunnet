@@ -307,6 +307,30 @@ pub fn desired_config(
 /// Never guesses ownership: external conflicts are surfaced and left
 /// untouched rather than blindly restoring old DNS state. Corrupt journals
 /// fail closed.
+/// True when recovery failed only because the resource no longer exists.
+///
+/// A TUN that disappears before its lease is dropped leaves a journal record
+/// pointing at a dead interface index, and every later start then fails to
+/// recover it. Failing closed is right when state might be clobbered, but here
+/// the resource is already gone: there is nothing to restore and nothing to
+/// protect. Treating it as fatal disables DNS integration permanently, on every
+/// subsequent start, for an interface that no longer exists.
+///
+/// Observed after a service restart: the lease drop logged `NoSuchLink: Link 8
+/// not known`, the record was kept for recovery, and the next start then failed
+/// with the same error, leaving `PeerDNS inactive` indefinitely even though the
+/// new TUN came up fine as a different index.
+///
+/// `osdns` has no typed "resource gone" error at this version, so this matches
+/// the stable D-Bus error name. The better fix is upstream: `recover_stale`
+/// should report a vanished resource as `JournalCleared` rather than erroring.
+fn is_vanished_resource(e: &osdns::Error) -> bool {
+    matches!(
+        e,
+        osdns::Error::Platform { message, .. } if message.contains("NoSuchLink")
+    )
+}
+
 fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
     match manager.recover_stale() {
         Ok(outcomes) => {
@@ -333,6 +357,14 @@ fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
             }
             Ok(())
         }
+        Err(e) if is_vanished_resource(&e) => {
+            tracing::warn!(
+                error = %e,
+                "stale DNS journal names an interface that no longer exists; \
+                 discarding it and continuing, since there is nothing left to restore"
+            );
+            Ok(())
+        }
         Err(e) => {
             tracing::error!(error = %e, "DNS journal recovery failed; failing closed");
             Err(e)
@@ -349,6 +381,43 @@ fn log_apply_failure(e: &osdns::Error) {
             tracing::error!(error = %e, "PeerDNS OS configuration unsupported on this backend")
         }
         _ => tracing::error!(error = %e, "PeerDNS OS configuration failed"),
+    }
+}
+
+#[cfg(test)]
+mod vanished_resource_tests {
+    use super::*;
+    use osdns::BackendKind;
+
+    /// The exact error seen after a restart where the TUN went away before the
+    /// lease was dropped. Must not disable DNS integration.
+    #[test]
+    fn nosuchlink_is_treated_as_vanished() {
+        let e = osdns::Error::Platform {
+            backend: BackendKind::SystemdResolved,
+            message: "org.freedesktop.resolve1.NoSuchLink: Link 8 not known".into(),
+        };
+        assert!(is_vanished_resource(&e));
+    }
+
+    /// Anything else must still fail closed, so real conflicts are not masked.
+    #[test]
+    fn other_platform_errors_still_fail_closed() {
+        let e = osdns::Error::Platform {
+            backend: BackendKind::SystemdResolved,
+            message: "org.freedesktop.resolve1.AccessDenied: permission denied".into(),
+        };
+        assert!(!is_vanished_resource(&e));
+    }
+
+    #[test]
+    fn non_platform_errors_still_fail_closed() {
+        assert!(!is_vanished_resource(&osdns::Error::InvalidConfig(
+            "bad".into()
+        )));
+        assert!(!is_vanished_resource(&osdns::Error::RequiresPrivilege(
+            "nope".into()
+        )));
     }
 }
 
