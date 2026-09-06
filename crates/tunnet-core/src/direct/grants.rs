@@ -36,7 +36,6 @@ pub struct SignedMemberRecord {
     pub endpoint_id: String,
     pub hostname: String,
     pub ipv4: Ipv4Addr,
-    pub collision_index: u8,
     pub tags: Vec<String>,
     pub status: String,
     pub ssh_host_key: Option<String>,
@@ -47,12 +46,17 @@ pub struct SignedMemberRecord {
     pub coordinator: bool,
 }
 
+pub const MEMBER_SCHEMA_VERSION: u16 = 2;
+pub const GENESIS_SCHEMA_VERSION: u16 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Genesis {
+    pub schema_version: u16,
     pub network_id: Uuid,
     pub network_name: String,
     pub coordinator_endpoint_id: String,
     pub coordinator_verifying_key: String,
+    pub address_plan: crate::direct::addrplan::AddressPlan,
     pub created_at: Timestamp,
     pub sig: String,
 }
@@ -171,7 +175,6 @@ struct MemberRecordSignPayload<'a> {
     endpoint_id: &'a str,
     hostname: &'a str,
     ipv4: Ipv4Addr,
-    collision_index: u8,
     tags: &'a [String],
     status: &'a str,
     ssh_host_key: &'a Option<String>,
@@ -188,7 +191,6 @@ fn member_record_sign_payload(record: &SignedMemberRecord) -> anyhow::Result<Vec
         endpoint_id: &record.endpoint_id,
         hostname: &record.hostname,
         ipv4: record.ipv4,
-        collision_index: record.collision_index,
         tags: &record.tags,
         status: &record.status,
         ssh_host_key: &record.ssh_host_key,
@@ -214,8 +216,11 @@ pub fn verify_member_record(
     record: &SignedMemberRecord,
     min_epoch: u64,
 ) -> anyhow::Result<()> {
-    if record.schema_version != 1 {
-        bail!("unsupported member record schema {}", record.schema_version);
+    if record.schema_version != MEMBER_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported member record schema {}; recreate the network with `tunnet create`",
+            record.schema_version
+        );
     }
     verify_grant(coord_vk, &record.grant, min_epoch)?;
     let payload = member_record_sign_payload(record)?;
@@ -224,19 +229,23 @@ pub fn verify_member_record(
 
 #[derive(Serialize)]
 struct GenesisSignPayload<'a> {
+    schema_version: u16,
     network_id: Uuid,
     network_name: &'a str,
     coordinator_endpoint_id: &'a str,
     coordinator_verifying_key: &'a str,
+    peer_cidr: String,
     created_at: Timestamp,
 }
 
 fn genesis_sign_payload(genesis: &Genesis) -> anyhow::Result<Vec<u8>> {
     Ok(serde_json::to_vec(&GenesisSignPayload {
+        schema_version: genesis.schema_version,
         network_id: genesis.network_id,
         network_name: &genesis.network_name,
         coordinator_endpoint_id: &genesis.coordinator_endpoint_id,
         coordinator_verifying_key: &genesis.coordinator_verifying_key,
+        peer_cidr: genesis.address_plan.peer_cidr.to_string(),
         created_at: genesis.created_at,
     })?)
 }
@@ -248,8 +257,44 @@ pub fn sign_genesis(sk: &SigningKey, mut genesis: Genesis) -> anyhow::Result<Gen
 }
 
 pub fn verify_genesis(vk: &VerifyingKey, genesis: &Genesis) -> anyhow::Result<()> {
+    if genesis.schema_version != GENESIS_SCHEMA_VERSION {
+        anyhow::bail!(
+            "unsupported genesis schema {}; recreate the network with `tunnet create`",
+            genesis.schema_version
+        );
+    }
     let payload = genesis_sign_payload(genesis)?;
     verify_sig(vk, &payload, &genesis.sig)
+}
+
+pub fn validate_member_against_genesis(
+    genesis: &Genesis,
+    record: &SignedMemberRecord,
+) -> anyhow::Result<()> {
+    if record.network_id != genesis.network_id {
+        anyhow::bail!("member network mismatch");
+    }
+    if record.grant.network_id != genesis.network_id {
+        anyhow::bail!("grant network mismatch");
+    }
+    crate::direct::addrplan::validate_member_ip(&genesis.address_plan, &record.ipv4)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
+pub fn validate_membership_set(
+    genesis: &Genesis,
+    records: &[SignedMemberRecord],
+) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    for r in records {
+        validate_member_against_genesis(genesis, r)?;
+        if !seen.insert(r.ipv4) {
+            anyhow::bail!("duplicate member address {}", r.ipv4);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -425,12 +470,11 @@ mod tests {
         )
         .unwrap();
         let record = SignedMemberRecord {
-            schema_version: 1,
+            schema_version: MEMBER_SCHEMA_VERSION,
             network_id,
             endpoint_id: hex::encode(endpoint_vk.to_bytes()),
             hostname: "alice".into(),
-            ipv4: "100.64.0.2".parse().unwrap(),
-            collision_index: 0,
+            ipv4: "10.21.0.7".parse().unwrap(),
             tags: vec!["tag".into()],
             status: "active".into(),
             ssh_host_key: None,
@@ -459,12 +503,11 @@ mod tests {
         )
         .unwrap();
         let mut record = SignedMemberRecord {
-            schema_version: 1,
+            schema_version: MEMBER_SCHEMA_VERSION,
             network_id,
             endpoint_id: hex::encode(endpoint_vk.to_bytes()),
             hostname: "bob".into(),
-            ipv4: "100.64.0.3".parse().unwrap(),
-            collision_index: 0,
+            ipv4: "10.21.0.8".parse().unwrap(),
             tags: vec![],
             status: "active".into(),
             ssh_host_key: None,
@@ -481,18 +524,122 @@ mod tests {
     }
 
     #[test]
+    fn member_record_rejects_legacy_schema() {
+        let (coord_sk, coord_vk) = generate_coordinator_keypair();
+        let network_id = Uuid::new_v4();
+        let grant = sign_grant(
+            &coord_sk,
+            sample_grant(network_id, &"aa".repeat(32), MemberRole::Member),
+        )
+        .unwrap();
+        let record = SignedMemberRecord {
+            schema_version: 1,
+            network_id,
+            endpoint_id: "aa".repeat(32),
+            hostname: "legacy".into(),
+            ipv4: "10.21.0.9".parse().unwrap(),
+            tags: vec![],
+            status: "active".into(),
+            ssh_host_key: None,
+            sequence: 1,
+            joined_at: Timestamp::now(),
+            grant,
+            endpoint_sig: String::new(),
+            coordinator: false,
+        };
+        let signed = sign_member_record(&coord_sk, record).unwrap();
+        assert!(verify_member_record(&coord_vk, &signed, 1).is_err());
+    }
+
+    #[test]
     fn genesis_roundtrip() {
         let (sk, vk) = generate_coordinator_keypair();
         let genesis = Genesis {
+            schema_version: GENESIS_SCHEMA_VERSION,
             network_id: Uuid::new_v4(),
             network_name: "home".into(),
             coordinator_endpoint_id: "dd".repeat(32),
             coordinator_verifying_key: hex::encode(vk.to_bytes()),
+            address_plan: crate::direct::addrplan::AddressPlan {
+                peer_cidr: "10.31.0.0/24".parse().unwrap(),
+            },
             created_at: Timestamp::now(),
             sig: String::new(),
         };
         let signed = sign_genesis(&sk, genesis).unwrap();
         verify_genesis(&vk, &signed).unwrap();
+    }
+
+    #[test]
+    fn genesis_signature_covers_peer_cidr() {
+        let (sk, vk) = generate_coordinator_keypair();
+        let genesis = Genesis {
+            schema_version: GENESIS_SCHEMA_VERSION,
+            network_id: Uuid::new_v4(),
+            network_name: "home".into(),
+            coordinator_endpoint_id: "dd".repeat(32),
+            coordinator_verifying_key: hex::encode(vk.to_bytes()),
+            address_plan: crate::direct::addrplan::AddressPlan {
+                peer_cidr: "10.31.0.0/24".parse().unwrap(),
+            },
+            created_at: Timestamp::now(),
+            sig: String::new(),
+        };
+        let mut signed = sign_genesis(&sk, genesis).unwrap();
+        verify_genesis(&vk, &signed).unwrap();
+        signed.address_plan.peer_cidr = "10.32.0.0/24".parse().unwrap();
+        assert!(verify_genesis(&vk, &signed).is_err());
+    }
+
+    #[test]
+    fn genesis_rejects_legacy_schema() {
+        let (sk, vk) = generate_coordinator_keypair();
+        let genesis = Genesis {
+            schema_version: 1,
+            network_id: Uuid::new_v4(),
+            network_name: "home".into(),
+            coordinator_endpoint_id: "dd".repeat(32),
+            coordinator_verifying_key: hex::encode(vk.to_bytes()),
+            address_plan: crate::direct::addrplan::AddressPlan {
+                peer_cidr: "10.31.0.0/24".parse().unwrap(),
+            },
+            created_at: Timestamp::now(),
+            sig: String::new(),
+        };
+        let signed = sign_genesis(&sk, genesis).unwrap();
+        assert!(verify_genesis(&vk, &signed).is_err());
+    }
+
+    #[test]
+    fn member_outside_plan_rejected() {
+        let genesis = Genesis {
+            schema_version: GENESIS_SCHEMA_VERSION,
+            network_id: Uuid::new_v4(),
+            network_name: "home".into(),
+            coordinator_endpoint_id: "dd".repeat(32),
+            coordinator_verifying_key: String::new(),
+            address_plan: crate::direct::addrplan::AddressPlan {
+                peer_cidr: "10.40.0.0/24".parse().unwrap(),
+            },
+            created_at: Timestamp::now(),
+            sig: String::new(),
+        };
+        let record = SignedMemberRecord {
+            schema_version: MEMBER_SCHEMA_VERSION,
+            network_id: genesis.network_id,
+            endpoint_id: "aa".repeat(32),
+            hostname: "x".into(),
+            ipv4: "192.168.1.5".parse().unwrap(),
+            tags: vec![],
+            status: "active".into(),
+            ssh_host_key: None,
+            sequence: 1,
+            joined_at: Timestamp::now(),
+            grant: sample_grant(genesis.network_id, &"aa".repeat(32), MemberRole::Member),
+            endpoint_sig: String::new(),
+            coordinator: false,
+        };
+        assert!(validate_member_against_genesis(&genesis, &record).is_err());
     }
 
     #[test]

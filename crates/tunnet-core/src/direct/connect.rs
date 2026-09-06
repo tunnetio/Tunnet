@@ -8,7 +8,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::direct::contact::{contact_id_from_endpoint, parse_contact_id};
-use crate::direct::{AUTH_ALPN, AuthClientMode, derive_ipv4, run_auth_client};
+use crate::direct::{AUTH_ALPN, AuthClientMode, run_auth_client};
 use crate::identity::AgentIdentity;
 use tunnet_common::local_api::DirectConnectPendingInfo;
 
@@ -62,13 +62,6 @@ fn install_peer_route(
     let direct = state.node.persisted.require_direct_network(None)?;
     let network_id = direct.network_id;
     let network_name = direct.network_name.clone();
-    let join_index = state
-        .node
-        .persisted
-        .direct_networks()
-        .iter()
-        .position(|d| d.network_id == network_id)
-        .unwrap_or(0) as u64;
 
     let hex = format!("{endpoint}");
     let _info = std::sync::Arc::new(PeerInfo {
@@ -106,19 +99,22 @@ fn install_peer_route(
     let version = state.node.routes.version() + 1;
     let self_id = state.node.endpoint_id_hex();
     let dns = crate::agent_config::load_dns(&state.node.paths);
-    state.node.routes.replace_network(
-        network_id,
-        join_index,
-        &peers,
-        &dns,
-        &network_name,
-        &self_id,
-        version,
-    );
+    state
+        .node
+        .routes
+        .replace_network(network_id, &peers, &dns, &network_name, &self_id, version);
     if let Some(auth) = &state.node.direct_auth {
         auth.insert(hex, network_id);
     }
     Ok(())
+}
+
+fn peer_hostname(peer: &crate::routing::PeerInfo) -> &str {
+    if peer.hostname.is_empty() {
+        "peer"
+    } else {
+        peer.hostname.as_str()
+    }
 }
 
 /// Initiate a connect dial to a remote contact id.
@@ -172,16 +168,19 @@ pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow:
     let resp: serde_json::Value = serde_json::from_slice(&body)?;
     match resp.get("status").and_then(|v| v.as_str()) {
         Some("accepted") => {
-            let peer_ip: std::net::Ipv4Addr = resp
-                .get("ipv4")
-                .and_then(|v| v.as_str())
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| derive_ipv4(&format!("{peer}"), 0));
+            let peer_hex = format!("{peer}");
+            let verified = state
+                .node
+                .routes
+                .lookup_endpoint(&peer_hex)
+                .context("peer not in verified membership; join the network first")?;
+            let peer_ip = verified.ip;
             let peer_host = resp
                 .get("hostname")
                 .and_then(|v| v.as_str())
-                .unwrap_or("peer");
-            install_peer_route(state, peer, peer_host, peer_ip)?;
+                .unwrap_or(peer_hostname(&verified));
+            let peer_host = peer_host.to_string();
+            install_peer_route(state, peer, &peer_host, peer_ip)?;
             Ok(format!("Connected to {contact_id} ({peer_ip})"))
         }
         Some("pending") => Ok(format!(
@@ -229,7 +228,12 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
         .endpoint_id
         .parse()
         .context("parse pending endpoint")?;
-    let peer_ip = derive_ipv4(&pending.endpoint_id, 0);
+    let verified = state
+        .node
+        .routes
+        .lookup_endpoint(&pending.endpoint_id)
+        .context("peer not in verified membership; join the network first")?;
+    let peer_ip = verified.ip;
     install_peer_route(state, peer, &pending.hostname, peer_ip)?;
 
     // Best-effort: dial back to notify acceptance.

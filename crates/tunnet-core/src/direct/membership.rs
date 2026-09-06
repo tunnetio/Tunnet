@@ -3,7 +3,7 @@
 //! One document per Direct network. Keys:
 //! - `meta/genesis` - network genesis (signed)
 //! - `meta/epoch` - current network epoch (signed)
-//! - `meta/name`, `meta/subnet` - optional display metadata
+//! - `meta/name` - optional display metadata
 //! - `peers/<endpoint_id>/record` - signed [`SignedMemberRecord`] JSON
 //! - `revocations/<endpoint_id>` - signed [`Revocation`] JSON
 //! - `policy/v1/bundle` - coordinator firewall policy bundle
@@ -38,23 +38,19 @@ use uuid::Uuid;
 use crate::acl::AclEngine;
 use crate::direct::auth::AuthCache;
 use crate::direct::grants::{
-    EpochRecord, Genesis, MemberRole, NetworkGrant, Revocation, SignedMemberRecord, grant_expiry,
-    sign_epoch, sign_genesis, sign_grant, sign_member_record, sign_revocation, verify_epoch,
-    verify_genesis, verify_member_record, verify_revocation, verifying_key_from_hex,
+    EpochRecord, Genesis, MEMBER_SCHEMA_VERSION, MemberRole, NetworkGrant, Revocation,
+    SignedMemberRecord, grant_expiry, sign_epoch, sign_grant, sign_member_record, sign_revocation,
+    validate_member_against_genesis, verify_epoch, verify_genesis, verify_member_record,
+    verify_revocation, verifying_key_from_hex,
 };
 use crate::routing::RoutingTable;
 use crate::state::{DirectState, StatePaths};
-
-const SUBNET: &str = "100.64.0.0/10";
-const RECORD_SCHEMA: u16 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipEntry {
     pub endpoint_id: String,
     pub hostname: String,
     pub ipv4: Ipv4Addr,
-    #[serde(default)]
-    pub collision_index: u8,
     #[serde(default)]
     pub tags: Vec<String>,
     pub joined_at: Timestamp,
@@ -104,8 +100,8 @@ struct DocsInner {
     author: AuthorId,
     members: Mutex<HashMap<String, MembershipEntry>>,
     network_id: Uuid,
-    join_index: u64,
     network_name: String,
+    genesis: parking_lot::RwLock<Option<Genesis>>,
     join_secret: String,
     coordinator_signing_key: Option<SigningKey>,
     coordinator_verifying_key: String,
@@ -146,7 +142,6 @@ pub struct DocsBootstrap<'a> {
     pub policy: tunnet_common::policy::PolicyBundle,
     pub firewall: Option<crate::direct::FirewallEngine>,
     pub dns: DnsConfig,
-    pub join_index: u64,
     pub seed_peers: Arc<Mutex<Vec<String>>>,
 }
 
@@ -227,7 +222,6 @@ impl DocsMembership {
             policy,
             firewall,
             dns,
-            join_index,
             seed_peers,
         } = cfg;
         paths.ensure_network_dirs(direct.network_id)?;
@@ -279,8 +273,8 @@ impl DocsMembership {
                 author,
                 members: Mutex::new(HashMap::new()),
                 network_id: direct.network_id,
-                join_index,
                 network_name: direct.network_name.clone(),
+                genesis: parking_lot::RwLock::new(Some(direct.genesis.clone())),
                 join_secret: direct.join_secret.clone(),
                 coordinator_signing_key,
                 coordinator_verifying_key,
@@ -301,9 +295,7 @@ impl DocsMembership {
         };
 
         if direct.coordinator && direct.doc_ticket.is_none() && direct.namespace_id.is_none() {
-            membership
-                .seed_coordinator_genesis(direct, self_endpoint_id)
-                .await?;
+            membership.publish_genesis(&direct.genesis).await?;
             membership
                 .write_self_record(&self_entry)
                 .await
@@ -370,35 +362,26 @@ impl DocsMembership {
         Ok((membership, created_ticket, namespace_str))
     }
 
-    async fn seed_coordinator_genesis(
-        &self,
-        direct: &DirectState,
-        coordinator_id: &str,
-    ) -> anyhow::Result<()> {
-        let Some(sk) = &self.inner.coordinator_signing_key else {
-            anyhow::bail!("coordinator signing key required to seed genesis");
-        };
-        let vk_hex = hex::encode(sk.verifying_key().to_bytes());
-        let genesis = sign_genesis(
-            sk,
-            Genesis {
-                network_id: direct.network_id,
-                network_name: direct.network_name.clone(),
-                coordinator_endpoint_id: coordinator_id.to_string(),
-                coordinator_verifying_key: vk_hex,
-                created_at: direct.created_at,
-                sig: String::new(),
-            },
-        )?;
-        set_json(&self.inner.doc, self.inner.author, genesis_key(), &genesis).await?;
+    pub async fn publish_genesis(&self, genesis: &Genesis) -> anyhow::Result<()> {
+        let coord_vk = verifying_key_from_hex(&self.inner.coordinator_verifying_key)
+            .context("coordinator verifying key")?;
+        verify_genesis(&coord_vk, genesis)?;
+        if genesis.network_id != self.inner.network_id {
+            anyhow::bail!("genesis network_id mismatch");
+        }
+        set_json(&self.inner.doc, self.inner.author, genesis_key(), genesis).await?;
 
-        let epoch = sign_epoch(
-            sk,
-            EpochRecord {
-                network_epoch: 0,
-                sig: String::new(),
-            },
-        )?;
+        let epoch = if let Some(sk) = &self.inner.coordinator_signing_key {
+            sign_epoch(
+                sk,
+                EpochRecord {
+                    network_epoch: 0,
+                    sig: String::new(),
+                },
+            )?
+        } else {
+            anyhow::bail!("coordinator signing key required to publish genesis");
+        };
         set_json(&self.inner.doc, self.inner.author, epoch_key(), &epoch).await?;
         self.inner.network_epoch.store(0, Ordering::Relaxed);
 
@@ -406,17 +389,15 @@ impl DocsMembership {
             &self.inner.doc,
             self.inner.author,
             meta_key("name"),
-            &direct.network_name,
+            &self.inner.network_name,
         )
         .await?;
-        set_str(
-            &self.inner.doc,
-            self.inner.author,
-            meta_key("subnet"),
-            SUBNET,
-        )
-        .await?;
+        *self.inner.genesis.write() = Some(genesis.clone());
         Ok(())
+    }
+
+    pub fn genesis(&self) -> Option<Genesis> {
+        self.inner.genesis.read().clone()
     }
 
     async fn write_self_record(&self, entry: &MembershipEntry) -> anyhow::Result<()> {
@@ -467,12 +448,11 @@ impl DocsMembership {
             anyhow::bail!("coordinator signing key not configured");
         };
         let record = SignedMemberRecord {
-            schema_version: RECORD_SCHEMA,
+            schema_version: MEMBER_SCHEMA_VERSION,
             network_id: self.inner.network_id,
             endpoint_id: entry.endpoint_id.clone(),
             hostname: entry.hostname.clone(),
             ipv4: entry.ipv4,
-            collision_index: entry.collision_index,
             tags: entry.tags.clone(),
             status: entry.status.clone(),
             ssh_host_key: entry.ssh_host_key.clone(),
@@ -504,7 +484,7 @@ impl DocsMembership {
         &self,
         entry: &MembershipEntry,
         auth: &AuthCache,
-    ) -> anyhow::Result<(NetworkGrant, String)> {
+    ) -> anyhow::Result<(NetworkGrant, String, SignedMemberRecord)> {
         let grant = self.issue_grant(
             &entry.endpoint_id,
             if entry.coordinator {
@@ -527,7 +507,7 @@ impl DocsMembership {
             .lock()
             .insert(entry.endpoint_id.clone(), entry.clone());
         auth.insert(entry.endpoint_id.clone(), self.inner.network_id);
-        Ok((grant, self.inner.content_key.clone()))
+        Ok((grant, self.inner.content_key.clone(), record))
     }
 
     /// Publish this node's SSH host pubkey by updating the self member record.
@@ -596,13 +576,26 @@ impl DocsMembership {
         let coord_vk = verifying_key_from_hex(&self.inner.coordinator_verifying_key)
             .context("coordinator verifying key")?;
 
-        if let Some(bytes) = self.get_key_bytes(&genesis_key()).await? {
-            let genesis: Genesis = serde_json::from_slice(&bytes)?;
+        let genesis = if let Some(bytes) = self.get_key_bytes(&genesis_key()).await? {
+            let genesis: Genesis = serde_json::from_slice(&bytes).map_err(|_| {
+                anyhow::anyhow!("unsupported legacy Direct network: recreate with `tunnet create`")
+            })?;
             verify_genesis(&coord_vk, &genesis)?;
             if genesis.network_id != self.inner.network_id {
                 anyhow::bail!("genesis network_id mismatch");
             }
-        }
+            if let Some(local) = self.inner.genesis.read().clone()
+                && local.address_plan != genesis.address_plan
+            {
+                anyhow::bail!("genesis address plan mismatch");
+            }
+            *self.inner.genesis.write() = Some(genesis.clone());
+            genesis
+        } else if let Some(local) = self.inner.genesis.read().clone() {
+            local
+        } else {
+            anyhow::bail!("missing genesis; recreate with `tunnet create`");
+        };
 
         let mut min_epoch = 0u64;
         if let Some(bytes) = self.get_key_bytes(&epoch_key()).await? {
@@ -691,6 +684,10 @@ impl DocsMembership {
                 tracing::warn!(peer = %endpoint_id, "member record verification failed");
                 continue;
             }
+            if validate_member_against_genesis(&genesis, &record).is_err() {
+                tracing::warn!(peer = %endpoint_id, "member record outside address plan");
+                continue;
+            }
             if record.status == "kicked" || revoked.contains(&record.endpoint_id) {
                 continue;
             }
@@ -700,7 +697,6 @@ impl DocsMembership {
                     endpoint_id: record.endpoint_id,
                     hostname: record.hostname,
                     ipv4: record.ipv4,
-                    collision_index: record.collision_index,
                     tags: record.tags,
                     joined_at: record.joined_at,
                     coordinator: record.coordinator,
@@ -708,6 +704,11 @@ impl DocsMembership {
                     ssh_host_key: record.ssh_host_key,
                 },
             );
+        }
+        {
+            use std::collections::HashSet;
+            let mut seen = HashSet::new();
+            map.retain(|_, m| seen.insert(m.ipv4));
         }
         *self.inner.members.lock() = map;
         Ok(())
@@ -733,14 +734,20 @@ impl DocsMembership {
             .collect();
         let version = members.len() as u64;
         let dns = (**self.inner.dns.load()).clone();
-        routes.replace_network(
+        let peer_cidr = self
+            .inner
+            .genesis
+            .read()
+            .clone()
+            .map(|g| g.address_plan.peer_cidr);
+        routes.replace_network_with_plan(
             self.inner.network_id,
-            self.inner.join_index,
             &peers,
             &dns,
             &self.inner.network_name,
             &self.inner.self_endpoint_id,
             version,
+            peer_cidr,
         );
         acl.replace_bundle(policy.clone());
         if let Ok(json) = serde_json::to_vec_pretty(&members) {

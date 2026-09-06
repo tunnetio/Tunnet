@@ -122,6 +122,5 @@ async fn async_main() -> anyhow::Result<()> {
         cli::Command::KeepAlive(a) => cmds_direct::run_keep_alive(a, state_dir).await,
         cli::Command::UpgradeToManaged(a) => cmds_direct::run_upgrade(a, state_dir).await,
         cli::Command::Leave(a) => cmds_direct::run_leave(a, state_dir).await,
-        cli::Command::OverrideIp(a) => cmds_direct::run_override_ip(a, state_dir).await,
     }
 }

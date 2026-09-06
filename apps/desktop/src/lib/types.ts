@@ -169,6 +169,7 @@ export interface NetworkCreateRequest {
   open?: boolean;
   network_name?: string;
   secret?: string;
+  cidr?: string;
   no_encrypt_state?: boolean;
 }
 
@@ -330,12 +331,6 @@ export interface DirectKeepAliveRequest {
   enable?: boolean;
 }
 
-export interface DirectOverrideIpRequest {
-  network?: string;
-  peer: string;
-  ip: string;
-}
-
 export interface DirectConnectRequest {
   contact_id: string;
 }
@@ -427,8 +422,6 @@ export interface DirectConnectPendingInfo {
 export interface DirectPendingInfo {
   endpoint_id: string;
   hostname: string;
-  ipv4: string;
-  collision_index: number;
 }
 
 export interface DirectFirewallRuleInfo {
@@ -486,8 +479,7 @@ export interface DnsStatusInfo {
   dnssec: boolean;
   peer_dns_active: boolean;
   cached_entries: number;
-  synthetic_base: string;
-  magic_ip: string;
+  resolver_endpoint: string;
   bind: string;
 }
 

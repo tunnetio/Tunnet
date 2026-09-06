@@ -23,15 +23,14 @@ use tunnet_common::local_api::{
     DirectConnectRequest, DirectContactResponse, DirectFirewallAddRequest,
     DirectFirewallPendingResponse, DirectFirewallRemoveRequest, DirectFirewallResponse,
     DirectInviteRequest, DirectInviteResponse, DirectKeepAliveRequest, DirectNetworkRequest,
-    DirectOverrideIpRequest, DirectPendingResponse, DirectPolicyResponse, DirectPolicySetRequest,
-    JsonPayload, LocalEnrollRequest, MetaInfo, NetworkCreateRequest, NetworkJoinRequest,
-    NetworkLeaveRequest, NetworkUpgradeRequest, NetworksResponse, NodeSummary, OkResponse,
-    PeersResponse, PolicyOpRequest, PostureCheckRequest, ResetRequest, RouteAddRequest,
-    RouteAddedResponse, SendAcceptRequest, SendFileRequest, SendRejectRequest,
-    SendSetConfigRequest, ServeStartRequest, ServesResponse, SshAuthPollRequest,
-    SshAuthPollResponse, SshCastResponse, SshRecordingsParams, SshRecordingsResponse,
-    SshSessionsParams, SshSessionsResponse, TransfersResponse, TunnelOffRequest,
-    TunnelStartRequest, TunnelsResponse, UpdateRequest, ValidateConfigRequest,
+    DirectPendingResponse, DirectPolicyResponse, DirectPolicySetRequest, JsonPayload,
+    LocalEnrollRequest, MetaInfo, NetworkCreateRequest, NetworkJoinRequest, NetworkLeaveRequest,
+    NetworkUpgradeRequest, NetworksResponse, NodeSummary, OkResponse, PeersResponse,
+    PolicyOpRequest, PostureCheckRequest, ResetRequest, RouteAddRequest, RouteAddedResponse,
+    SendAcceptRequest, SendFileRequest, SendRejectRequest, SendSetConfigRequest, ServeStartRequest,
+    ServesResponse, SshAuthPollRequest, SshAuthPollResponse, SshCastResponse, SshRecordingsParams,
+    SshRecordingsResponse, SshSessionsParams, SshSessionsResponse, TransfersResponse,
+    TunnelOffRequest, TunnelStartRequest, TunnelsResponse, UpdateRequest, ValidateConfigRequest,
 };
 
 use super::auth::PeerIdentity;
@@ -122,7 +121,6 @@ pub fn app(state: ApiState) -> Router {
                 .delete(direct_policy_clear),
         )
         .route("/v1/direct/keep-alive", post(direct_keep_alive))
-        .route("/v1/direct/ip-overrides", post(direct_override_ip))
         .route("/v1/direct/connect", post(direct_connect))
         .route("/v1/direct/connect/allow", post(direct_connect_allow))
         .route("/v1/direct/connect/pending", get(direct_connect_pending))
@@ -1122,18 +1120,6 @@ async fn direct_keep_alive(
     peer.require_cap(DATA_PLANE_WRITE)?;
     let message =
         handlers::direct_keep_alive(&state, &body.hostname, body.enable).map_err(map_anyhow)?;
-    Ok(Json(result_ok(message)))
-}
-
-async fn direct_override_ip(
-    Extension(peer): Extension<PeerIdentity>,
-    State(state): State<ApiState>,
-    Json(body): Json<DirectOverrideIpRequest>,
-) -> ApiResult<Json<OkResponse>> {
-    peer.require_cap(DATA_PLANE_WRITE)?;
-    let message =
-        handlers::direct_override_ip(&state, body.network.as_deref(), &body.peer, &body.ip)
-            .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 

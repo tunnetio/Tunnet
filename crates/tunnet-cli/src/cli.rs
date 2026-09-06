@@ -67,7 +67,6 @@ pub enum Command {
     KeepAlive(crate::cmds_direct::KeepAliveArgs),
     UpgradeToManaged(crate::cmds_direct::UpgradeArgs),
     Leave(crate::cmds_direct::LeaveArgs),
-    OverrideIp(crate::cmds_direct::OverrideIpArgs),
 }
 
 #[derive(Subcommand, Debug)]

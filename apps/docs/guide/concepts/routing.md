@@ -14,7 +14,7 @@ This advertises the local LAN subnet through the current machine. Other peers ca
 
 ## Hostname routes
 
-Hostname routes map a DNS name to a mesh IP through a gateway. When a peer queries `internal-app.tunnet`, PeerDNS resolves it to a synthetic IP in the CGNAT range (100.100.x.x), and the routing table forwards traffic for that IP to the gateway machine.
+Hostname routes map a DNS name to a mesh IP through a gateway. When a peer queries `internal-app.tunnet`, PeerDNS resolves it to a synthetic IP in the private peer range (the gateway peer address), and the routing table forwards traffic for that IP to the gateway machine.
 
 Hostname routes support wildcards (`*.internal.tunnet`) for scenarios where you want to route all subdomains of a domain through a single gateway.
 

@@ -141,8 +141,8 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
     }
 
     Ok(format!(
-        "reloaded firewall, dns (suffix={}, magic={}), keep-alive from tunnet.toml; logging.level={}",
-        dns.suffix, dns.magic_ip, cfg.logging.level
+        "reloaded firewall, dns (suffix={}), keep-alive from tunnet.toml; logging.level={}",
+        dns.suffix, cfg.logging.level
     ))
 }
 
@@ -519,7 +519,7 @@ pub(crate) fn build_network_summary(
         network_id: network_id.to_string(),
         network_name: direct.network_name.clone(),
         mode: "direct".into(),
-        ip: direct.assigned_ipv4.to_string(),
+        ip: direct.self_record.ipv4.to_string(),
         role: role.into(),
         peers_total,
         peers_online,
@@ -666,7 +666,7 @@ pub(crate) fn idle_meta(daemon_version: &str, peer: &PeerIdentity) -> MetaInfo {
 
 pub(crate) fn build_dns_status(state: &LocalApiState) -> DnsStatusInfo {
     let tables_cached = state.node.routes.cached_entry_count();
-    let magic = state.magic_ip.clone();
+    let endpoint = state.resolver_endpoint.clone();
     DnsStatusInfo {
         suffix: state.node.routes.dns_suffix(),
         upstream: state.dns_upstream.clone(),
@@ -675,9 +675,8 @@ pub(crate) fn build_dns_status(state: &LocalApiState) -> DnsStatusInfo {
             .peer_dns_active
             .load(std::sync::atomic::Ordering::SeqCst),
         cached_entries: tables_cached,
-        synthetic_base: state.synthetic_base.clone(),
-        magic_ip: magic.clone(),
-        bind: format!("{magic}:53"),
+        resolver_endpoint: endpoint.clone(),
+        bind: endpoint,
     }
 }
 
@@ -1142,8 +1141,6 @@ pub(crate) fn direct_requests_for_network(
         .map(|p| DirectPendingInfo {
             endpoint_id: p.endpoint_id,
             hostname: p.hostname,
-            ipv4: p.ipv4.to_string(),
-            collision_index: p.collision_index,
         })
         .collect())
 }
@@ -1216,8 +1213,6 @@ pub(crate) fn direct_requests(
         .map(|p| DirectPendingInfo {
             endpoint_id: p.endpoint_id,
             hostname: p.hostname,
-            ipv4: p.ipv4.to_string(),
-            collision_index: p.collision_index,
         })
         .collect())
 }
@@ -1559,34 +1554,4 @@ pub(crate) fn direct_keep_alive(
         }
         Ok(format!("Keep-alive disabled for {hostname}"))
     }
-}
-
-pub(crate) fn direct_override_ip(
-    state: &LocalApiState,
-    network: Option<&str>,
-    peer: &str,
-    ip: &str,
-) -> anyhow::Result<String> {
-    let direct = state.node.persisted.require_direct_network(network)?;
-    let ip: std::net::Ipv4Addr = ip.parse().context("invalid IPv4 address")?;
-    state
-        .node
-        .routes
-        .set_ip_override(direct.network_id, peer, ip);
-    let path = state.node.paths.ip_overrides_file();
-    let mut map: std::collections::BTreeMap<String, String> = if path.exists() {
-        serde_json::from_slice(&std::fs::read(&path)?).unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    let key = format!("{}:{}", direct.network_id, peer.to_ascii_lowercase());
-    map.insert(key, ip.to_string());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_vec_pretty(&map)?)?;
-    Ok(format!(
-        "Override: peer '{peer}' on network '{}' → {ip}",
-        direct.network_name
-    ))
 }
