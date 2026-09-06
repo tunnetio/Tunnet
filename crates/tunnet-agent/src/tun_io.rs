@@ -26,25 +26,35 @@ use crate::tun_fast;
 use crate::tun_writer::TunWriterHandle;
 pub const INBOUND_DRAIN_BUDGET: usize = 32;
 
+/// IPv6 `NlMtu` below 1280 is rejected by Windows (`ERROR_INVALID_PARAMETER`).
+#[cfg(windows)]
+const WINDOWS_IPV6_MIN_MTU: u16 = 1280;
+
 pub fn build_tun(
     ifname: &str,
     ipv4: std::net::Ipv4Addr,
     prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {
-    let mtu = mtu.clamp(576, tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16);
-    let builder = DeviceBuilder::new()
-        .name(ifname)
-        .ipv4(ipv4, prefix, None)
-        .mtu(mtu);
+    let mtu = mtu.clamp(
+        tunnet_common::packet::MIN_VIRTUAL_MTU as u16,
+        tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16,
+    );
+    let builder = DeviceBuilder::new().name(ifname).ipv4(ipv4, prefix, None);
+    #[cfg(not(windows))]
+    let builder = builder.mtu(mtu);
     #[cfg(target_os = "linux")]
     let builder = builder.offload(true);
     #[cfg(windows)]
     let builder = {
         let path = crate::wintun::materialize()?;
+        // DeviceBuilder::mtu() copies the same value to IPv6. Windows
+        // rejects IPv6 NlMtu < 1280 with ERROR_INVALID_PARAMETER (87).
         builder
             .wintun_file(path.display().to_string())
             .wintun_log(true)
+            .mtu_v4(mtu)
+            .mtu_v6(mtu.max(WINDOWS_IPV6_MIN_MTU))
     };
     let dev = builder.build_async().context("build_async TUN device")?;
     tracing::info!(%ipv4, prefix, mtu, "TUN device up (fast path)");
@@ -684,6 +694,23 @@ mod tests {
         );
         let ep: iroh::EndpointId = ep_hex.parse().unwrap();
         (table, ep, ep_hex)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ipv6_mtu_never_below_ietf_minimum() {
+        assert_eq!(
+            tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16,
+            1100,
+            "the overlay MTU is what DeviceBuilder::mtu() used to copy onto IPv6"
+        );
+        assert!(
+            (tunnet_common::packet::DEFAULT_VIRTUAL_MTU as u16) < WINDOWS_IPV6_MIN_MTU,
+            "Windows IPv6 must not inherit the overlay MTU"
+        );
+        assert_eq!(1100u16.max(WINDOWS_IPV6_MIN_MTU), 1280);
+        assert_eq!(1280u16.max(WINDOWS_IPV6_MIN_MTU), 1280);
+        assert_eq!(1420u16.max(WINDOWS_IPV6_MIN_MTU), 1420);
     }
 
     #[test]
