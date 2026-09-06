@@ -472,14 +472,42 @@ fn print_status(
         out.dim(&format!("· {primary_name}"))
     ));
     out.writeln(format!("  mode       {mode}"));
-    out.writeln(format!(
-        "  data plane {}",
-        if node.data_plane_up {
-            out.green("up")
-        } else {
-            out.dim("down")
-        }
-    ));
+    // Dataplane health: never a bare "up" when the packet worker is dead.
+    // Prefer the detailed state; fall back to the legacy boolean for old
+    // daemons that do not report it yet.
+    let dp_line = match node.data_plane.as_ref() {
+        Some(dp) => match dp.state.as_str() {
+            "up" => format!("  data plane {}", out.green("up")),
+            "degraded" => format!(
+                "  data plane {} (outbound worker dead, restarts: {}){}",
+                out.yellow("degraded"),
+                dp.restart_count,
+                dp.last_error
+                    .as_ref()
+                    .map(|e| format!(" · {}", out.dim(e)))
+                    .unwrap_or_default()
+            ),
+            "restarting" => format!(
+                "  data plane {} (restarts: {}){}",
+                out.yellow("restarting"),
+                dp.restart_count,
+                dp.last_error
+                    .as_ref()
+                    .map(|e| format!(" · {}", out.dim(e)))
+                    .unwrap_or_default()
+            ),
+            other => format!("  data plane {}", out.dim(other)),
+        },
+        None => format!(
+            "  data plane {}",
+            if node.data_plane_up {
+                out.green("up")
+            } else {
+                out.dim("down")
+            }
+        ),
+    };
+    out.writeln(dp_line);
     out.writeln(format!(
         "  endpoint   {}",
         out.dim(&output::short_endpoint(&node.endpoint_id))
@@ -501,6 +529,25 @@ fn print_status(
         "  uptime     {}  ·  daemon v{}  ·  snap {}",
         uptime, node.daemon_version, node.snapshot_version
     ));
+    // Build identity: a bare version (v0.9.1) cannot distinguish
+    // protocol-breaking pre-1.0 commits. Show both sides' git hashes and
+    // warn loudly on mismatch (the classic stale-daemon trap: fresh CLI
+    // talking to an old service binary).
+    let cli_git = tunnet_common::git_hash();
+    let mut build_line = format!("  build      cli {cli_git}");
+    if let Some(dg) = node.daemon_git.as_deref() {
+        build_line.push_str(&format!("  ·  daemon {dg}"));
+        if dg != "unknown" && cli_git != "unknown" && dg != cli_git {
+            build_line.push_str(&format!(
+                "  ·  {}",
+                out.red("MISMATCH: daemon and CLI built from different commits — restart/redeploy the daemon")
+            ));
+        }
+    }
+    if let Some(alpn) = node.tunnel_alpn.as_deref() {
+        build_line.push_str(&format!("  ·  {alpn}"));
+    }
+    out.writeln(build_line);
 
     if let Some(od) = &node.on_demand {
         out.writeln(format!(

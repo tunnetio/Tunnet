@@ -159,7 +159,12 @@ pub async fn run(
         (
             node.self_ipv4,
             10u8,
-            1280u16,
+            config_store
+                .load()
+                .effective
+                .tunnel_mtu
+                .value
+                .clamp(576, 9000),
             tunnet_core::load_dns(&node.paths),
         )
     } else {
@@ -170,7 +175,12 @@ pub async fn run(
                     .find(|m| m.network_id == network_id)
             })
             .context("cached snapshot missing enrolled network")?;
-        let effective_mtu = config_store.load().effective.tunnel_mtu.value.max(576);
+        let effective_mtu = config_store
+            .load()
+            .effective
+            .tunnel_mtu
+            .value
+            .clamp(576, 9000);
         (
             membership_snap.assigned_ipv4,
             membership_snap.prefix,
@@ -387,26 +397,24 @@ pub async fn run(
     let stream_handler = tunnet_core::stream_handler(node.routes.clone());
     let dgram_pool = node.tunnel_pool.clone();
 
-    let firewalls: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.firewall.clone()))
-        .collect();
     let spoofs: HashMap<_, _> = node
         .direct
         .iter()
         .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
         .collect();
+    // Shared tunnel packet resources: pooled buffers (MTU classes) for TUN
+    // receives and segment staging.
+    let packet_pool = tunnet_common::packet::PacketPool::new(128);
 
     crate::dgram_pump::install_dialer_datagram_pump(
         &dgram_pool,
         published.clone(),
         node.routes.clone(),
         node.acl.clone(),
-        firewalls.clone(),
+        node.policy.clone(),
         spoofs.clone(),
         metrics.clone(),
-        node.direct_auth.clone(),
+        packet_pool.clone(),
         ingress.clone(),
     );
 
@@ -515,6 +523,7 @@ pub async fn run(
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
         acl: node.acl.clone(),
+        runtime: node.policy.clone(),
         metrics: metrics.clone(),
         tun: published.clone(),
         stream_handler,
@@ -528,9 +537,9 @@ pub async fn run(
         auth_server_ctx,
         state_dir: node.paths.dir.clone(),
         docs: docs_map,
-        firewalls,
         spoofs,
         dgram_pool: dgram_pool.clone(),
+        bufs: packet_pool.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
         ingress: ingress.clone(),

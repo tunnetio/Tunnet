@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use ipnet::Ipv4Net;
 use iroh::EndpointId;
@@ -13,6 +13,9 @@ use tunnet_common::{
 };
 use uuid::Uuid;
 
+use crate::peers::{PeerIdentity, PeerMembershipState, PeerRegistry};
+use crate::policy_runtime::{FwSlot, PolicyRuntime};
+
 pub struct PeerInfo {
     pub endpoint: EndpointId,
     pub endpoint_hex: String,
@@ -22,6 +25,56 @@ pub struct PeerInfo {
     pub network_id: Uuid,
     pub network_name: String,
     pub ssh_host_key: Option<String>,
+    /// Stable fast state shared with the established packet path (§0.5).
+    /// Reused across routing snapshot rebuilds; cloned (not looked up) per
+    /// packet via the route decision.
+    pub fast: Arc<PeerMembershipState>,
+}
+
+// Manual Debug: EndpointId may not implement it in all feature sets; keep a
+// compact representation for logs/tests.
+impl std::fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerInfo")
+            .field("endpoint_hex", &self.endpoint_hex)
+            .field("hostname", &self.hostname)
+            .field("ip", &self.ip)
+            .field("network_id", &self.network_id)
+            .finish()
+    }
+}
+
+/// Stable per-peer fast-path handle returned directly by routing.
+///
+/// Carries the binary endpoint ID plus the resolved peer, so established
+/// packet forwarding needs no DashMap lookup, no endpoint-hex conversion,
+/// and no second route-table load.
+#[derive(Debug, Clone)]
+pub struct FastPeerHandle {
+    pub endpoint: EndpointId,
+    pub peer: Arc<PeerInfo>,
+}
+
+impl FastPeerHandle {
+    pub fn endpoint_hex(&self) -> &str {
+        &self.peer.endpoint_hex
+    }
+}
+
+/// Single routing verdict from one immutable snapshot load.
+#[derive(Debug, Clone)]
+pub enum RouteDecision {
+    LocalMagic,
+    LocalAdvertised,
+    Peer(FastPeerHandle),
+    NoRoute,
+}
+
+impl RouteDecision {
+    pub fn peer(peer: Arc<PeerInfo>) -> Self {
+        let endpoint = peer.endpoint;
+        Self::Peer(FastPeerHandle { endpoint, peer })
+    }
 }
 
 /// Resolved hostname route (exact or wildcard).
@@ -55,8 +108,9 @@ pub struct Tables {
     pub by_hostname: std::collections::HashMap<String, Arc<PeerInfo>>,
     /// Longest-prefix-match subnet routes (via PrefixMap).
     pub subnets: PrefixMap<Ipv4Net, Arc<PeerInfo>>,
-    /// CIDRs this node itself advertises (local LAN forwarding).
-    pub advertised: Vec<Ipv4Net>,
+    /// CIDRs this node itself advertises, as a prefix structure (§12: no
+    /// linear scan on the hot path).
+    pub advertised: PrefixMap<Ipv4Net, ()>,
     /// Exact hostname → gateway.
     pub hostname_exact: std::collections::HashMap<String, Arc<HostnameRouteInfo>>,
     /// Wildcard suffixes, longest first.
@@ -73,6 +127,8 @@ pub struct Tables {
     pub exit_node: Option<Arc<PeerInfo>>,
     /// When true, RFC1918 destinations are not sent via the exit node.
     pub allow_local_lan: bool,
+    /// This node advertises a default route (computed at rebuild).
+    pub is_exit: bool,
     pub version: u64,
 }
 
@@ -84,6 +140,13 @@ pub struct RoutingTable {
     slices: Arc<Mutex<BTreeMap<Uuid, NetworkSlice>>>,
     /// Manual IP overrides: (network_id, peer_key) → ip. peer_key is hostname or endpoint hex.
     overrides: Arc<DashMap<(Uuid, String), Ipv4Addr>>,
+    /// Stable per-peer fast states, shared with ConnPool slow paths (§0.5).
+    /// Rebuilds reuse these objects; the packet path never touches this map
+    /// (states ride inside PeerInfo/route decisions instead).
+    fast_registry: Arc<PeerRegistry>,
+    /// Shared policy runtime for firewall slot assignment at (re)resolution
+    /// (§2.1-3). Set once at dataplane install; slow path only.
+    policy_runtime: Arc<ArcSwapOption<PolicyRuntime>>,
 }
 
 impl Default for RoutingTable {
@@ -101,7 +164,7 @@ impl RoutingTable {
                 by_endpoint: Default::default(),
                 by_hostname: Default::default(),
                 subnets: PrefixMap::new(),
-                advertised: Default::default(),
+                advertised: PrefixMap::new(),
                 hostname_exact: Default::default(),
                 hostname_wildcards: Default::default(),
                 advertised_hostnames: Default::default(),
@@ -111,12 +174,64 @@ impl RoutingTable {
                 magic_ip: Ipv4Addr::new(100, 100, 100, 53),
                 exit_node: None,
                 allow_local_lan: true,
+                is_exit: false,
                 version: 0,
             })),
             dynamic_synth: Arc::new(DashMap::new()),
             slices: Arc::new(Mutex::new(BTreeMap::new())),
             overrides: Arc::new(DashMap::new()),
+            fast_registry: Arc::new(PeerRegistry::new()),
+            policy_runtime: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    /// Install the shared policy runtime (dataplane bring-up, slow path).
+    /// Every (re)resolution from then on assigns the peer's stable network
+    /// firewall slot (§2.1-3).
+    pub fn set_policy_runtime(&self, runtime: PolicyRuntime) {
+        self.policy_runtime.store(Some(Arc::new(runtime)));
+    }
+
+    /// Stable firewall slot for a network, if the runtime is installed.
+    pub fn policy_slot_for(&self, network: Uuid) -> Option<Arc<FwSlot>> {
+        self.policy_runtime
+            .load_full()
+            .map(|rt| rt.slot_for_network(network))
+    }
+
+    /// Stable fast-state registry shared with connection slow paths.
+    pub fn peer_registry(&self) -> &Arc<PeerRegistry> {
+        &self.fast_registry
+    }
+
+    /// Ensure (slow path: rebuild only) the stable fast state for a peer.
+    /// (Re)assigns the network's stable firewall slot, so peers joining
+    /// after install and peers changing networks observe publication with
+    /// no relink (§2.1-3).
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_fast(
+        &self,
+        endpoint: EndpointId,
+        endpoint_hex: &str,
+        hostname: &str,
+        ip: Ipv4Addr,
+        tags: &[String],
+        network_id: Uuid,
+        network_name: &str,
+    ) -> Arc<PeerMembershipState> {
+        let state = self.fast_registry.ensure(Arc::new(PeerIdentity {
+            endpoint,
+            endpoint_hex: endpoint_hex.to_string(),
+            hostname: hostname.to_string(),
+            ip,
+            tags: tags.to_vec(),
+            network_id,
+            network_name: network_name.to_string(),
+        }));
+        if let Some(slot) = self.policy_slot_for(network_id) {
+            state.policy.store(slot);
+        }
+        state
     }
 
     /// Look up peer by (network, ip) for inbound / firewall context.
@@ -141,30 +256,47 @@ impl RoutingTable {
         self.rebuild(None);
     }
 
-    /// Direct peer IP, subnet LPM, then selected exit node for internet.
-    /// On birthday collisions across networks, first-joined network wins.
-    pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
+    /// Single immutable-snapshot route decision for the hot path.
+    ///
+    /// Loads route state exactly once and returns a [`RouteDecision`] carrying
+    /// a stable peer handle. Replaces the old multi-call sequence of
+    /// `is_magic_dns_destination` + `is_advertised_destination` + `lookup_ip`.
+    pub fn route_once(&self, dst: &Ipv4Addr) -> RouteDecision {
         let tables = self.inner.load();
-        if let Some(peer) = tables.by_ip.get(ip).cloned() {
-            return Some(peer);
+        if *dst == tables.magic_ip {
+            return RouteDecision::LocalMagic;
         }
-        if let Some(peer) = self.dynamic_synth.get(ip) {
-            return Some(peer.clone());
+        if tables.advertised.get_lpm(&Ipv4Net::from(*dst)).is_some() {
+            return RouteDecision::LocalAdvertised;
         }
-        if let Some((prefix, peer)) = tables.subnets.get_lpm(&Ipv4Net::from(*ip)) {
-            // Full-tunnel exit CIDR must not steal LAN when allow_local_lan is on.
-            if !(tables.allow_local_lan && is_rfc1918(ip) && prefix.prefix_len() == 0) {
-                return Some(peer.clone());
-            }
+        if let Some(peer) = tables.by_ip.get(dst).cloned() {
+            return RouteDecision::peer(peer);
         }
-        // Exit node catches remaining (non-mesh, non-LAN when allowed) destinations.
-        if !is_mesh_or_link_local(ip)
-            && !(tables.allow_local_lan && is_rfc1918(ip))
+        if let Some(peer) = self.dynamic_synth.get(dst) {
+            return RouteDecision::peer(peer.clone());
+        }
+        if let Some((prefix, peer)) = tables.subnets.get_lpm(&Ipv4Net::from(*dst))
+            && !(tables.allow_local_lan && is_rfc1918(dst) && prefix.prefix_len() == 0)
+        {
+            return RouteDecision::peer(peer.clone());
+        }
+        if !is_mesh_or_link_local(dst)
+            && !(tables.allow_local_lan && is_rfc1918(dst))
             && let Some(exit) = &tables.exit_node
         {
-            return Some(exit.clone());
+            return RouteDecision::peer(exit.clone());
         }
-        None
+        RouteDecision::NoRoute
+    }
+
+    /// Direct peer IP, subnet LPM, then selected exit node for internet.
+    /// On birthday collisions across networks, first-joined network wins.
+    /// Delegates to [`Self::route_once`]; retained for non-hot-path callers.
+    pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
+        match self.route_once(ip) {
+            RouteDecision::Peer(h) => Some(h.peer),
+            _ => None,
+        }
     }
 
     pub fn exit_node(&self) -> Option<Arc<PeerInfo>> {
@@ -172,16 +304,26 @@ impl RoutingTable {
     }
 
     pub fn is_exit_node(&self) -> bool {
-        // Advertised default route means we are an exit.
-        self.inner
-            .load()
-            .advertised
-            .iter()
-            .any(|n| n.prefix_len() == 0)
+        // Computed at rebuild: we advertise a default route.
+        self.inner.load().is_exit
     }
 
     pub fn lookup_endpoint(&self, hex: &str) -> Option<Arc<PeerInfo>> {
         self.inner.load().by_endpoint.get(hex).cloned()
+    }
+
+    /// Exact (endpoint, network) membership lookup (§2.2-1): the only
+    /// correct way to resolve an inbound frame, which binds its network.
+    /// Never infer network identity from whichever membership was inserted
+    /// last — `by_endpoint` (first-joined) is for legacy single-membership
+    /// consumers only. Slow path (rebuild races); linear scan is fine.
+    pub fn lookup_membership(&self, hex: &str, network: Uuid) -> Option<Arc<PeerInfo>> {
+        self.inner
+            .load()
+            .by_network_ip
+            .values()
+            .find(|p| p.endpoint_hex == hex && p.network_id == network)
+            .cloned()
     }
 
     /// Peer hostname (mesh member), then hostname-route exact/wildcard.
@@ -214,8 +356,8 @@ impl RoutingTable {
         self.inner
             .load()
             .advertised
-            .iter()
-            .any(|net| net.contains(ip))
+            .get_lpm(&Ipv4Net::from(*ip))
+            .is_some()
     }
 
     /// True when this node is the gateway for a hostname route matching `host`.
@@ -232,7 +374,12 @@ impl RoutingTable {
     }
 
     pub fn advertised_subnets(&self) -> Vec<Ipv4Net> {
-        self.inner.load().advertised.clone()
+        self.inner
+            .load()
+            .advertised
+            .iter()
+            .map(|(p, _)| p)
+            .collect()
     }
 
     pub fn peers(&self) -> Vec<Arc<PeerInfo>> {
@@ -369,7 +516,8 @@ impl RoutingTable {
     }
 
     /// Cache a synthetic IP → peer mapping for a hostname (wildcard routes).
-    /// Survives [`Self::rebuild`] because `dynamic_synth` lives outside the tables Arc.
+    /// Cleared on every membership rebuild (§2.2-5): the cache never owns
+    /// membership lifetime. DNS regenerates entries on demand.
     pub fn remember_dns_synth(&self, name: &str, ip: Ipv4Addr) {
         let tables = self.inner.load();
         let suffix = format!(".{}", tables.dns_suffix);
@@ -554,7 +702,7 @@ impl RoutingTable {
         let mut by_hostname: std::collections::HashMap<String, Arc<PeerInfo>> =
             std::collections::HashMap::new();
         let mut subnets: PrefixMap<Ipv4Net, Arc<PeerInfo>> = PrefixMap::new();
-        let mut advertised = Vec::new();
+        let mut advertised: PrefixMap<Ipv4Net, ()> = PrefixMap::new();
         let mut hostname_exact: std::collections::HashMap<String, Arc<HostnameRouteInfo>> =
             std::collections::HashMap::new();
         let mut hostname_wildcards = Vec::new();
@@ -595,6 +743,15 @@ impl RoutingTable {
                         break;
                     }
                 }
+                let fast = self.ensure_fast(
+                    ep,
+                    &p.endpoint_id,
+                    &p.hostname,
+                    ip,
+                    &p.tags,
+                    *network_id,
+                    &slice.network_name,
+                );
                 let info = Arc::new(PeerInfo {
                     endpoint: ep,
                     endpoint_hex: p.endpoint_id.clone(),
@@ -604,6 +761,7 @@ impl RoutingTable {
                     network_id: *network_id,
                     network_name: slice.network_name.clone(),
                     ssh_host_key: p.ssh_host_key.clone(),
+                    fast,
                 });
                 by_network_ip.insert((*network_id, ip), info.clone());
                 // First-joined wins on outbound by_ip.
@@ -641,10 +799,10 @@ impl RoutingTable {
 
             for route in &slice.subnet_routes {
                 if route.via_endpoint_id == slice.self_endpoint_id {
-                    advertised.push(route.cidr);
+                    advertised.insert(route.cidr, ());
                     continue;
                 }
-                let peer = peer_for_via(
+                let peer = self.peer_for_via(
                     &local_by_endpoint,
                     &route.via_endpoint_id,
                     route.via_ip,
@@ -661,7 +819,7 @@ impl RoutingTable {
             for exit in &slice.exit_nodes {
                 if exit.endpoint_id == slice.self_endpoint_id {
                     for cidr in &exit.allowed_cidrs {
-                        advertised.push(*cidr);
+                        advertised.insert(*cidr, ());
                     }
                 }
             }
@@ -669,7 +827,7 @@ impl RoutingTable {
             if let Some(exit_id) = &slice.profile.exit_node_endpoint_id
                 && let Some(exit) = slice.exit_nodes.iter().find(|e| &e.endpoint_id == exit_id)
             {
-                let peer = peer_for_via(
+                let peer = self.peer_for_via(
                     &local_by_endpoint,
                     &exit.endpoint_id,
                     exit.via_ip,
@@ -691,7 +849,7 @@ impl RoutingTable {
 
             for route in &slice.hostname_routes {
                 let hostname = route.hostname.to_ascii_lowercase();
-                let peer = peer_for_via(
+                let peer = self.peer_for_via(
                     &local_by_endpoint,
                     &route.via_endpoint_id,
                     route.via_ip,
@@ -722,8 +880,31 @@ impl RoutingTable {
 
         hostname_wildcards.sort_by_key(|route| std::cmp::Reverse(route.hostname.len()));
 
-        // Keep dynamic_synth across rebuild - it lives outside the tables Arc so
-        // wildcard DNS answers survive membership/policy refreshes.
+        // Synthetic DNS cache must never own peer membership lifetime
+        // (§2.2-5): a removed peer's synthetic IP must stop routing and its
+        // membership must deactivate. Clear the cache on every membership
+        // rebuild — DNS regenerates entries on demand.
+        self.dynamic_synth.clear();
+
+        // Prune departed MEMBERSHIPS from fast states (slow path only): keep
+        // every (endpoint, network) reachable via direct, subnet, or exit
+        // routes. Same endpoint in two networks yields two live entries;
+        // removal of one never touches the other.
+        let mut live = std::collections::HashSet::new();
+        // by_network_ip is the superset (same IP may lose by_ip on clash
+        // but stays reachable for inbound/policy context).
+        for peer in by_network_ip.values() {
+            live.insert((peer.endpoint, peer.network_id));
+        }
+        for (_, peer) in subnets.iter() {
+            live.insert((peer.endpoint, peer.network_id));
+        }
+        if let Some(exit) = &exit_node {
+            live.insert((exit.endpoint, exit.network_id));
+        }
+        self.fast_registry.retain(&live);
+
+        let is_exit = advertised.iter().any(|(p, _)| p.prefix_len() == 0);
         self.inner.store(Arc::new(Tables {
             by_ip,
             by_network_ip,
@@ -740,8 +921,46 @@ impl RoutingTable {
             magic_ip,
             exit_node,
             allow_local_lan,
+            is_exit,
             version,
         }));
+    }
+
+    fn peer_for_via(
+        &self,
+        by_endpoint: &std::collections::HashMap<String, Arc<PeerInfo>>,
+        via_endpoint_id: &str,
+        via_ip: Ipv4Addr,
+        network_id: Uuid,
+        network_name: &str,
+    ) -> Option<Arc<PeerInfo>> {
+        if let Some(existing) = by_endpoint.get(via_endpoint_id) {
+            return Some(existing.clone());
+        }
+        let Ok(ep) = via_endpoint_id.parse::<EndpointId>() else {
+            tracing::warn!(id = %via_endpoint_id, "skip route with bad via endpoint id");
+            return None;
+        };
+        let fast = self.ensure_fast(
+            ep,
+            via_endpoint_id,
+            "",
+            via_ip,
+            &[],
+            network_id,
+            network_name,
+        );
+        Some(Arc::new(PeerInfo {
+            endpoint: ep,
+            endpoint_hex: via_endpoint_id.to_string(),
+            hostname: String::new(),
+            ip: via_ip,
+            tags: Vec::new(),
+            network_id,
+            network_name: network_name.to_string(),
+            ssh_host_key: None,
+            fast,
+        }))
     }
 }
 
@@ -764,32 +983,6 @@ fn synthetic_ip_for(host: &str) -> Ipv4Addr {
     let hi = ((offset >> 8) & 0xff) as u8;
     let low = (offset & 0xff) as u8;
     Ipv4Addr::new(100, 100, hi, low)
-}
-
-fn peer_for_via(
-    by_endpoint: &std::collections::HashMap<String, Arc<PeerInfo>>,
-    via_endpoint_id: &str,
-    via_ip: Ipv4Addr,
-    network_id: Uuid,
-    network_name: &str,
-) -> Option<Arc<PeerInfo>> {
-    if let Some(existing) = by_endpoint.get(via_endpoint_id) {
-        return Some(existing.clone());
-    }
-    let Ok(ep) = via_endpoint_id.parse::<EndpointId>() else {
-        tracing::warn!(id = %via_endpoint_id, "skip route with bad via endpoint id");
-        return None;
-    };
-    Some(Arc::new(PeerInfo {
-        endpoint: ep,
-        endpoint_hex: via_endpoint_id.to_string(),
-        hostname: String::new(),
-        ip: via_ip,
-        tags: Vec::new(),
-        network_id,
-        network_name: network_name.to_string(),
-        ssh_host_key: None,
-    }))
 }
 
 fn hostname_matches_wildcard(host: &str, suffix: &str) -> bool {
@@ -951,6 +1144,133 @@ mod tests {
     }
 
     #[test]
+    fn removed_peer_is_unroutable_and_deactivated() {
+        // §2.1-9: peer connected → membership removed → routing generation
+        // changes → outbound packets rejected (NoRoute), registry resolve
+        // fails (inbound readers must exit), old fast state deactivated.
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let peer_id = "b".repeat(64);
+        let net = Uuid::nil();
+        table.replace(
+            &[peer(&peer_id, "10.7.0.5", "gw")],
+            &[],
+            &[],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            net,
+            &self_id,
+            1,
+        );
+        let ip: Ipv4Addr = "10.7.0.5".parse().unwrap();
+        let info = table.lookup_ip(&ip).expect("peer connected");
+        assert_eq!(info.endpoint_hex, peer_id);
+        let fast = info.fast.clone();
+        let epoch0 = fast.epoch.load(std::sync::atomic::Ordering::Relaxed);
+        let v0 = table.version();
+        // Membership removal (delta path, as live sync would send it).
+        table.apply_peer_delta(
+            net,
+            &[],
+            std::slice::from_ref(&peer_id),
+            2,
+            &self_id,
+            "office",
+        );
+        assert!(table.version() > v0, "routing generation must change");
+        assert!(
+            matches!(table.route_once(&ip), RouteDecision::NoRoute),
+            "next outbound packet is rejected"
+        );
+        let ep: EndpointId = peer_id.parse().unwrap();
+        assert!(
+            table.peer_registry().get(ep).is_none(),
+            "inbound resolve finds nothing → reader exits"
+        );
+        assert_eq!(
+            fast.epoch.load(std::sync::atomic::Ordering::Relaxed),
+            epoch0 + 1,
+            "old fast state hard-revoked"
+        );
+    }
+
+    #[test]
+    fn same_endpoint_two_networks_route_to_distinct_memberships() {
+        // §2.2-1 (tests 3, 4): one endpoint in networks A and B with
+        // different mesh IPs. Outbound routes resolve each network's OWN
+        // membership state — never a shared endpoint-global context.
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let ep_hex = "b".repeat(64);
+        let net_a = Uuid::from_u128(0x0a);
+        let net_b = Uuid::from_u128(0x0b);
+        table.replace_network(
+            net_a,
+            0,
+            &[peer(&ep_hex, "10.7.0.5", "gw")],
+            &dns(),
+            "neta",
+            &self_id,
+            1,
+        );
+        table.replace_network(
+            net_b,
+            1,
+            &[peer(&ep_hex, "10.7.1.5", "gw")],
+            &dns(),
+            "netb",
+            &self_id,
+            2,
+        );
+        let a = table
+            .lookup_ip(&"10.7.0.5".parse().unwrap())
+            .expect("route A");
+        let b = table
+            .lookup_ip(&"10.7.1.5".parse().unwrap())
+            .expect("route B");
+        assert_eq!(a.network_id, net_a);
+        assert_eq!(b.network_id, net_b);
+        assert!(!Arc::ptr_eq(&a.fast, &b.fast), "distinct membership states");
+        assert_eq!(
+            a.fast.identity.read().ip,
+            std::net::Ipv4Addr::new(10, 7, 0, 5)
+        );
+        assert_eq!(
+            b.fast.identity.read().ip,
+            std::net::Ipv4Addr::new(10, 7, 1, 5)
+        );
+        // Exact registry + route resolution per (endpoint, network).
+        let ep: EndpointId = ep_hex.parse().unwrap();
+        assert!(
+            table
+                .peer_registry()
+                .get_membership(ep, net_a)
+                .is_some_and(|m| Arc::ptr_eq(&m, &a.fast))
+        );
+        assert!(
+            table
+                .peer_registry()
+                .get_membership(ep, net_b)
+                .is_some_and(|m| Arc::ptr_eq(&m, &b.fast))
+        );
+        assert_eq!(
+            table.lookup_membership(&ep_hex, net_a).unwrap().network_id,
+            net_a
+        );
+        assert_eq!(
+            table.lookup_membership(&ep_hex, net_b).unwrap().network_id,
+            net_b
+        );
+        assert!(
+            table
+                .lookup_membership(&ep_hex, Uuid::from_u128(0xcc))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn peer_dns_resolves_self() {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
@@ -1063,8 +1383,7 @@ mod tests {
         assert!(table.lookup_endpoint(&peer_b).is_some());
     }
 
-    #[test]
-    fn dynamic_synth_survives_rebuild() {
+    fn wildcard_table() -> (RoutingTable, String, String, Uuid) {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
         let gw = "b".repeat(64);
@@ -1087,11 +1406,18 @@ mod tests {
             &self_id,
             1,
         );
+        (table, self_id, gw, nid)
+    }
+
+    #[test]
+    fn dynamic_synth_cleared_on_rebuild() {
+        // §2.2-5: the synthetic DNS cache never owns membership lifetime.
+        // Any membership rebuild clears it; DNS regenerates on demand.
+        let (table, self_id, gw, nid) = wildcard_table();
         let synth = table.resolve_dns_a("api.internal.tunnet").unwrap();
         table.remember_dns_synth("api.internal.tunnet", synth);
         assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
-
-        // Rebuild via peer delta must keep dynamic_synth.
+        // Unrelated rebuild clears the cache: synth stops routing...
         table.apply_peer_delta(
             nid,
             &[peer(&"d".repeat(64), "10.7.0.7", "dave")],
@@ -1100,7 +1426,51 @@ mod tests {
             &self_id,
             "office",
         );
-        assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+        assert!(
+            matches!(table.route_once(&synth), RouteDecision::NoRoute),
+            "stale synthetic route must not survive rebuild"
+        );
+        // ...but DNS regenerates it immediately (route still exists).
+        let synth2 = table.resolve_dns_a("api.internal.tunnet").unwrap();
+        assert_eq!(synth2, synth);
+        table.remember_dns_synth("api.internal.tunnet", synth2);
+        assert_eq!(table.lookup_ip(&synth2).unwrap().endpoint_hex, gw);
+    }
+
+    #[test]
+    fn synth_peer_removal_revokes_and_deactivates() {
+        // §2.2-5: removing the peer behind a synthetic IP stops the route
+        // AND deactivates its membership (no stale Arc keeps forwarding).
+        use std::sync::atomic::Ordering;
+        let (table, self_id, gw, nid) = wildcard_table();
+        let synth = table.resolve_dns_a("api.internal.tunnet").unwrap();
+        table.remember_dns_synth("api.internal.tunnet", synth);
+        let ep: EndpointId = gw.parse().unwrap();
+        let fast = table
+            .peer_registry()
+            .get_membership(ep, nid)
+            .expect("membership ensured at rebuild");
+        let epoch0 = fast.epoch.load(Ordering::Relaxed);
+        table.apply_peer_delta(nid, &[], std::slice::from_ref(&gw), 2, &self_id, "office");
+        assert!(matches!(table.route_once(&synth), RouteDecision::NoRoute));
+        assert!(table.peer_registry().get_membership(ep, nid).is_none());
+        assert_eq!(
+            fast.epoch.load(Ordering::Relaxed),
+            epoch0 + 1,
+            "removed peer's membership must deactivate"
+        );
+    }
+
+    #[test]
+    fn synth_network_removal_revokes() {
+        // Removing the whole network clears synthetic routes too.
+        let (table, _self_id, _gw, nid) = wildcard_table();
+        let synth = table.resolve_dns_a("api.internal.tunnet").unwrap();
+        table.remember_dns_synth("api.internal.tunnet", synth);
+        assert!(table.lookup_ip(&synth).is_some());
+        table.remove_network(nid);
+        assert!(matches!(table.route_once(&synth), RouteDecision::NoRoute));
+        assert!(table.resolve_dns_a("api.internal.tunnet").is_none());
     }
 
     #[test]

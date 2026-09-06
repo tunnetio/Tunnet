@@ -237,6 +237,35 @@ impl FragmentTable {
         self.map.clear();
     }
 
+    /// Metadata-based lookup for the unified policy fast path (no reparse).
+    pub fn lookup_cached(&mut self, key: &FragKey) -> Option<ResolvedL4> {
+        self.evict_expired();
+        let entry = self.map.get(key)?;
+        if Instant::now() >= entry.expires {
+            self.map.remove(key);
+            return None;
+        }
+        Some(entry.transport.to_resolved())
+    }
+
+    /// Metadata-based insert for first fragments (no reparse).
+    pub fn insert_cached(&mut self, key: FragKey, transport: CachedTransport) {
+        self.evict_expired();
+        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
+            self.evict_oldest();
+        }
+        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
+            return;
+        }
+        self.map.insert(
+            key,
+            Entry {
+                transport,
+                expires: Instant::now() + self.ttl,
+            },
+        );
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

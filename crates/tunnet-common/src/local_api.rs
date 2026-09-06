@@ -117,7 +117,7 @@ impl Default for LocalUiPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Node / network summary (v2 status model)
+// Node / network summary (status model)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +211,30 @@ pub struct NodeSummary {
     pub on_demand: Option<OnDemandStatusInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlPlaneStatusInfo>,
+    /// Short git hash the DAEMON binary was built from ("unknown" when
+    /// unavailable). Compared against the CLI's own hash to catch
+    /// stale-daemon traps (fresh CLI, old service binary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_git: Option<String>,
+    /// Tunnel ALPN the daemon speaks (e.g. `tunnet/tunnel/3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_alpn: Option<String>,
+    /// Dataplane health detail (never "up" with a dead packet worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_plane: Option<DataPlaneInfo>,
+}
+
+/// Dataplane health detail for `tunnet status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DataPlaneInfo {
+    /// `up` | `degraded` | `restarting` | `down`.
+    pub state: String,
+    pub outbound_alive: bool,
+    pub restart_count: u64,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

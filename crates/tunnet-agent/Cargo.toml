@@ -61,6 +61,10 @@ russh-sftp.workspace = true
 async-trait.workspace = true
 rusqlite.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
+
+# Android routes are installed by VpnService.Builder, and route_manager has no
+# Android backend. See src/system_routes_android.rs.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 route_manager.workspace = true
 
 [target.'cfg(unix)'.dependencies]

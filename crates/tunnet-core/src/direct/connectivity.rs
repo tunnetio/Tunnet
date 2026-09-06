@@ -137,7 +137,23 @@ fn apply_relay_mode(builder: Builder, opts: &ConnectivityOptions) -> Builder {
 }
 
 /// Start an endpoint builder with the relay preset for this profile.
+///
+/// The explicit [`crate::transport_profile::TunnetTransportProfile`] is applied
+/// here: every mesh endpoint shares one controlled QUIC transport instead of
+/// inheriting generic Iroh/noq defaults.
 pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
+    endpoint_builder_with_transport(
+        opts,
+        &crate::transport_profile::TunnetTransportProfile::default(),
+    )
+}
+
+/// Same as [`endpoint_builder`] with an explicit transport profile
+/// (e.g. BBRv3 benchmark experiments).
+pub fn endpoint_builder_with_transport(
+    opts: &ConnectivityOptions,
+    profile: &crate::transport_profile::TunnetTransportProfile,
+) -> Builder {
     let builder = match opts.profile {
         ConnectivityProfile::LanOnly => Endpoint::builder(presets::Minimal),
         ConnectivityProfile::TunnetManaged if !opts.custom_relays.is_empty() => {
@@ -153,7 +169,7 @@ pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
         | ConnectivityProfile::TunnetManaged
         | ConnectivityProfile::ServerlessDht => Endpoint::builder(presets::N0),
     };
-    apply_relay_mode(builder, opts)
+    apply_relay_mode(profile.apply(builder), opts)
 }
 
 /// Attach address-lookup services to an endpoint builder.

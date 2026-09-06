@@ -13,11 +13,11 @@ use tunnet_common::ws::ClientMsg;
 use tunnet_common::{RECORDING_ALPN, SEND_ALPN, TUNNEL_ALPN};
 use tunnet_core::Docs;
 use tunnet_core::direct::{
-    AUTH_ALPN, AuthCache, DOCS_ALPN, DocsMembership, FirewallEngine, GOSSIP_ALPN,
-    SharedAuthServerContext, SpoofTracker, run_auth_server,
+    AUTH_ALPN, AuthCache, DOCS_ALPN, DocsMembership, GOSSIP_ALPN, SharedAuthServerContext,
+    SpoofTracker, run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient};
+use tunnet_core::{AclEngine, ConnPool, PolicyRuntime, RoutingTable, SendManager, SignedClient};
 use uuid::Uuid;
 
 use crate::actors::dataplane::PublishedPlane;
@@ -30,6 +30,7 @@ pub struct AcceptDeps {
     pub endpoint: iroh::Endpoint,
     pub routes: RoutingTable,
     pub acl: AclEngine,
+    pub runtime: PolicyRuntime,
     pub metrics: AgentMetrics,
     pub tun: PublishedPlane,
     pub stream_handler: StreamHandler,
@@ -43,9 +44,9 @@ pub struct AcceptDeps {
     pub auth_server_ctx: Option<SharedAuthServerContext>,
     pub state_dir: PathBuf,
     pub docs: HashMap<Uuid, DocsMembership>,
-    pub firewalls: HashMap<Uuid, FirewallEngine>,
     pub spoofs: HashMap<Uuid, SpoofTracker>,
     pub dgram_pool: ConnPool,
+    pub bufs: Arc<tunnet_common::packet::PacketPool>,
     pub agent_gossip: Option<iroh_gossip::net::Gossip>,
     pub shared_docs: Option<Docs>,
     pub ingress: IngressRegistry,
@@ -57,12 +58,13 @@ pub fn spawn(deps: AcceptDeps) -> Router {
         tun: deps.tun,
         routes: deps.routes.clone(),
         acl: deps.acl.clone(),
-        firewalls: deps.firewalls,
+        runtime: deps.runtime.clone(),
         spoofs: deps.spoofs,
         dgram_pool: deps.dgram_pool,
+        bufs: deps.bufs,
         metrics: deps.metrics,
-        direct_auth: deps.direct_auth.clone(),
         ingress: deps.ingress,
+        direct_auth: deps.direct_auth.clone(),
     };
     let stream = StreamProtocolHandler::new(deps.stream_handler);
     let auth = AuthHandler {
@@ -115,12 +117,13 @@ struct TunnelHandler {
     tun: PublishedPlane,
     routes: RoutingTable,
     acl: AclEngine,
-    firewalls: HashMap<Uuid, FirewallEngine>,
+    runtime: PolicyRuntime,
     spoofs: HashMap<Uuid, SpoofTracker>,
     dgram_pool: ConnPool,
+    bufs: Arc<tunnet_common::packet::PacketPool>,
     metrics: AgentMetrics,
-    direct_auth: Option<AuthCache>,
     ingress: IngressRegistry,
+    direct_auth: Option<AuthCache>,
 }
 
 impl fmt::Debug for TunnelHandler {
@@ -148,22 +151,24 @@ impl ProtocolHandler for TunnelHandler {
             let tun = self.tun.clone();
             let routes = self.routes.clone();
             let acl = self.acl.clone();
-            let firewalls = self.firewalls.clone();
+            let runtime = self.runtime.clone();
             let spoofs = self.spoofs.clone();
             let dgram_pool = self.dgram_pool.clone();
+            let bufs = self.bufs.clone();
             let metrics = self.metrics.clone();
-            let direct_auth = self.direct_auth.clone();
+            let auth = self.direct_auth.clone();
             async move {
                 serve_tunnel_connection(InboundDeps {
                     conn,
                     tun,
                     routes,
+                    runtime,
                     acl,
-                    firewalls,
                     spoofs,
                     pool: Some(dgram_pool),
+                    bufs,
                     metrics,
-                    direct_auth,
+                    auth,
                 })
                 .await;
             }

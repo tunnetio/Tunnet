@@ -184,6 +184,11 @@ impl DataPlaneActor {
         self.peer_dns_active.store(false, Ordering::SeqCst);
         self.up = false;
         self.status.set_up(false);
+        self.status.set_outbound_alive(false);
+        // NOTE: `restarting` is deliberately left alone here: teardown runs
+        // on every stop including crashes, and a crash must keep reporting
+        // `restarting` until the next successful bring-up clears it.
+        // `do_bring_down` clears it for intentional shutdowns.
     }
 
     async fn do_bring_up(
@@ -276,12 +281,6 @@ impl DataPlaneActor {
         }
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
 
-        let firewalls: std::collections::HashMap<_, _> = self
-            .node
-            .direct
-            .iter()
-            .map(|(id, rt)| (*id, rt.firewall.clone()))
-            .collect();
         // The outbound loop's unexpected end is abnormal: report it so
         // supervision restarts us. Shutdown ends it via abort (the
         // generation token is already cancelled then, so no report fires).
@@ -289,14 +288,20 @@ impl DataPlaneActor {
             .generation_cancel
             .clone()
             .expect("generation token published above");
+        // Shared tunnel packet resources for this generation: pooled buffers and
+        // the runtime sweeper (tied to the generation token — no leaked tasks
+        // across bring-up cycles).
+        let packet_pool = tunnet_common::packet::PacketPool::new(128);
+        self.node.policy.spawn_sweeper(exit_gen.clone());
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
             tun,
             routes: self.node.routes.clone(),
             pool: self.node.tunnel_pool.clone(),
-            acl: self.node.acl.clone(),
-            firewalls,
+            runtime: self.node.policy.clone(),
             metrics: self.metrics.clone(),
+            bufs: packet_pool,
+            meter: self.node.tunnel_pool.cloud_relay_meter(),
             mtu: self.cfg.mtu,
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
@@ -309,6 +314,38 @@ impl DataPlaneActor {
         self.outbound = Some(outbound);
         self.up = true;
         self.status.set_up(true);
+        self.status.set_restarting(false);
+        self.status.set_outbound_alive(true);
+        self.status.set_generation(generation);
+        // Eager preconnect (keep-alive): dial every known peer NOW so the
+        // first real packet doesn't pay connection setup (the classic
+        // first-ping-timeout). Best-effort and bounded: skipped peers are
+        // still dialed on demand by the pump. Skipped entirely without
+        // keep-alive.
+        if self.node.tunnel_pool.keep_alive() {
+            let pool = self.node.tunnel_pool.clone();
+            let routes = self.node.routes.clone();
+            let local = pool.endpoint().id();
+            tokio::spawn(async move {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+                let mut set = tokio::task::JoinSet::new();
+                for peer in routes.peers() {
+                    if peer.endpoint == local {
+                        continue;
+                    }
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let pool = pool.clone();
+                    let ep = peer.endpoint;
+                    set.spawn(async move {
+                        let _permit = permit;
+                        let _ = pool.get(ep).await;
+                    });
+                }
+                while set.join_next().await.is_some() {}
+            });
+        }
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: true });
         tracing::info!("data plane up");
         Ok(())
@@ -323,6 +360,7 @@ impl DataPlaneActor {
         // readers also self-remove from the registry on exit.
         self.ingress.abort_all();
         self.teardown().await;
+        self.status.set_restarting(false);
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });
         tracing::info!("data plane down");
         Ok(())
@@ -373,7 +411,13 @@ impl Message<BringUp> for DataPlaneActor {
 
     async fn handle(&mut self, _msg: BringUp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         let weak = ctx.actor_ref().downgrade();
-        self.do_bring_up(weak).await
+        let res = self.do_bring_up(weak).await;
+        if let Err(e) = &res {
+            // Failed bring-up is Down, not restarting: record the cause.
+            self.status.set_restarting(false);
+            self.status.set_last_error(format!("bring-up failed: {e}"));
+        }
+        res
     }
 }
 
@@ -400,6 +444,13 @@ impl Message<OutboundExited> for DataPlaneActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
+        // Publish degraded state BEFORE supervision restarts us, so status
+        // readers see `restarting` (with the error and restart count)
+        // instead of a stale healthy `up`.
+        self.status
+            .note_restart("outbound TUN loop unexpectedly terminated".into());
+        self.status.set_outbound_alive(false);
+        self.status.set_restarting(true);
         panic!("outbound TUN loop unexpectedly terminated");
     }
 }
@@ -479,6 +530,16 @@ impl ActorDataPlaneControl {
 impl DataPlaneControl for ActorDataPlaneControl {
     fn is_up(&self) -> bool {
         self.status.is_up()
+    }
+
+    fn data_plane_info(&self) -> tunnet_common::local_api::DataPlaneInfo {
+        tunnet_common::local_api::DataPlaneInfo {
+            state: self.status.state().to_string(),
+            outbound_alive: self.status.outbound_alive(),
+            restart_count: self.status.restart_count(),
+            generation: self.status.generation(),
+            last_error: self.status.last_error(),
+        }
     }
 
     async fn bring_up(&self) -> Result<(), String> {

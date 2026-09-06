@@ -17,10 +17,25 @@
 
 mod build;
 mod frag;
+mod frame;
+mod meta;
+mod owned;
 mod parse;
 
 pub use build::{set_tcp_ipv4_checksum, synthesize_reject, tcp_ipv4_checksum_of};
-pub use frag::{CachedTransport, FRAGMENT_TTL, FragmentTable, MAX_FRAGMENT_ENTRIES, ResolvedL4};
+pub use frag::{
+    CachedTransport, FRAGMENT_TTL, FragKey, FragmentTable, MAX_FRAGMENT_ENTRIES, ResolvedL4,
+};
+pub use frame::{
+    DecodeError, Frame, KIND_SEGMENT, KIND_SINGLE, MAX_SEGMENTS, MIN_SEGMENT_PAYLOAD,
+    SEGMENT_OVERHEAD, SINGLE_OVERHEAD, SegmentHeader, decode_frame, encode_segment_prefix,
+    encode_single_prefix, segment_count,
+};
+pub use meta::{FlowKey, PacketMeta, SshNatClass};
+pub use owned::{
+    DEFAULT_VIRTUAL_MTU, FRAME_HEADROOM, LogicalPacket, MAX_LOGICAL_LEN, MIN_VIRTUAL_MTU,
+    PacketOwner, PacketPool, PooledBuffer,
+};
 pub use parse::{ParseError, parse};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

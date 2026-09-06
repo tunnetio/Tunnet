@@ -1,4 +1,4 @@
-#[cfg(feature = "direct")]
+#[cfg(any(feature = "managed", feature = "direct"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(feature = "direct")]
@@ -36,6 +36,7 @@ use crate::direct::{
 use crate::direct::{ConnectivityOptions, apply_connectivity, endpoint_builder};
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
+use crate::policy_runtime::PolicyRuntime;
 use crate::routing::RoutingTable;
 #[cfg(feature = "send")]
 use crate::send::SendManager;
@@ -121,6 +122,8 @@ pub struct CoreNode {
     pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
     pub acl: AclEngine,
+    /// Shared packet-policy runtime (dataplane authority, §0.1).
+    pub policy: PolicyRuntime,
     pub version: Arc<ArcSwap<u64>>,
     pub self_ipv4: std::net::Ipv4Addr,
     pub paths: StatePaths,
@@ -453,39 +456,48 @@ impl CoreNode {
             None
         };
 
-        Ok((
-            Self {
-                identity,
-                persisted: PersistedState::Managed(managed),
-                endpoint,
-                pool,
-                tunnel_pool,
-                effective_config,
-                routes,
-                acl,
-                version,
-                self_ipv4: membership.assigned_ipv4,
-                paths,
-                #[cfg(feature = "serve")]
-                serves,
-                #[cfg(feature = "tunnel")]
-                tunnels,
-                #[cfg(feature = "send")]
-                send,
-                signed: Some(signed),
-                control_link,
-                #[cfg(feature = "direct")]
-                direct_auth: None,
-                #[cfg(feature = "direct")]
-                direct: HashMap::new(),
-                gossip,
-                #[cfg(feature = "direct")]
-                docs_engine: None,
-                #[cfg(feature = "direct")]
-                presence_tables: Arc::new(Mutex::new(HashMap::new())),
-            },
-            Some(pending),
-        ))
+        // Shared packet-policy runtime: bootstrapped from live control state,
+        // then wired (engine attach, peer relink, pool registries) below.
+        let policy = PolicyRuntime::bootstrap(
+            &acl.bundle.load(),
+            &HashMap::new(),
+            &acl.self_id.load(),
+            **acl.src_posture_ok.load(),
+            **acl.stale.load(),
+        );
+        let mut node = Self {
+            identity,
+            persisted: PersistedState::Managed(managed),
+            endpoint,
+            pool,
+            tunnel_pool,
+            effective_config,
+            routes,
+            acl,
+            version,
+            self_ipv4: membership.assigned_ipv4,
+            paths,
+            #[cfg(feature = "serve")]
+            serves,
+            #[cfg(feature = "tunnel")]
+            tunnels,
+            #[cfg(feature = "send")]
+            send,
+            signed: Some(signed),
+            control_link,
+            #[cfg(feature = "direct")]
+            direct_auth: None,
+            #[cfg(feature = "direct")]
+            direct: HashMap::new(),
+            gossip,
+            #[cfg(feature = "direct")]
+            docs_engine: None,
+            #[cfg(feature = "direct")]
+            presence_tables: Arc::new(Mutex::new(HashMap::new())),
+            policy,
+        };
+        node.install_policy_runtime();
+        Ok((node, Some(pending)))
     }
 
     #[cfg(feature = "direct")]
@@ -681,7 +693,28 @@ impl CoreNode {
         tracing::info!(%contact, networks = direct_runtimes.len(), "direct contact id");
 
         let _ = cfg.agent_version;
-        Ok(Self {
+        // Shared packet-policy runtime from live control state (per-network
+        // firewall sets included), then wired below.
+        let mut fw_source = HashMap::new();
+        for (network_id, runtime) in &direct_runtimes {
+            let fw = &runtime.firewall;
+            fw_source.insert(
+                *network_id,
+                (
+                    fw.local_rules_snapshot(),
+                    fw.suggested_rules_snapshot(),
+                    fw.stats().enabled,
+                ),
+            );
+        }
+        let policy = PolicyRuntime::bootstrap(
+            &acl.bundle.load(),
+            &fw_source,
+            &acl.self_id.load(),
+            **acl.src_posture_ok.load(),
+            **acl.stale.load(),
+        );
+        let mut node = Self {
             identity,
             persisted: PersistedState::Direct {
                 networks: persisted_networks,
@@ -710,12 +743,34 @@ impl CoreNode {
             gossip: Some(gossip),
             docs_engine: Some(docs_engine),
             presence_tables: Arc::new(Mutex::new(HashMap::new())),
-        })
+            policy,
+        };
+        node.install_policy_runtime();
+        Ok(node)
     }
 
     /// Shared Gossip for presence / service-relay topics.
     pub fn shared_gossip(&self) -> Option<iroh_gossip::net::Gossip> {
         self.gossip.clone()
+    }
+
+    /// Wire the shared policy runtime after construction (both modes):
+    /// attach engines (future mutations publish automatically), install it
+    /// on the routing table (slot assignment at every (re)resolution),
+    /// relink existing peer fast states once, and hand pool slow paths the
+    /// peer registry. Publication after this point needs no relink (§2.1-3).
+    pub fn install_policy_runtime(&mut self) {
+        self.acl.attach_runtime(self.policy.clone());
+        #[cfg(feature = "direct")]
+        for runtime in self.direct.values() {
+            runtime.firewall.attach_runtime(self.policy.clone());
+        }
+        self.routes.set_policy_runtime(self.policy.clone());
+        self.routes.peer_registry().relink_policy(&self.policy);
+        self.pool
+            .set_peer_registry(self.routes.peer_registry().clone());
+        self.tunnel_pool
+            .set_peer_registry(self.routes.peer_registry().clone());
     }
 
     pub fn endpoint_id_hex(&self) -> String {
@@ -830,8 +885,12 @@ async fn bootstrap_one_direct_network(
 
     let fw_cfg = crate::agent_config::load_firewall_for(args.paths, &direct.network_name);
     let policy = firewall_to_policy(&fw_cfg, args.my_id_hex, net_ipv4);
-    let firewall =
-        crate::direct::FirewallEngine::from_config(&fw_cfg, net_ipv4, args.my_id_hex.to_string());
+    let firewall = crate::direct::FirewallEngine::from_config(
+        &fw_cfg,
+        net_ipv4,
+        args.my_id_hex.to_string(),
+        direct.network_id,
+    );
     let spoof_tracker = crate::direct::SpoofTracker::new();
 
     let self_entry = MembershipEntry {

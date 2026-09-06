@@ -1,32 +1,14 @@
-use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
-use parking_lot::Mutex;
-use serde::Serialize;
-use tunnet_common::packet::{FragmentTable, Packet, ResolvedL4, TcpFlags};
+use parking_lot::RwLock;
 use tunnet_common::policy::{
-    Action, Direction, EvalCtx, EvalReason, EvalVerdict, PolicyBundle, Protocol, evaluate_detailed,
+    Action, Direction, EvalCtx, PolicyBundle, Protocol, evaluate_detailed,
 };
 
-use crate::routing::{PeerInfo, RoutingTable};
-
-const DENY_LOG_CAP: usize = 64;
-
-// Match `direct/firewall.rs` conntrack TTLs.
-const TCP_ACTIVE_TTL: Duration = Duration::from_secs(300);
-const TCP_TIME_WAIT_TTL: Duration = Duration::from_secs(10);
-const UDP_TTL: Duration = Duration::from_secs(30);
-const ICMP_TTL: Duration = Duration::from_secs(10);
-const GC_INTERVAL: Duration = Duration::from_secs(10);
-
-const TCP_FIN: u8 = TcpFlags::FIN;
-const TCP_SYN: u8 = TcpFlags::SYN;
-const TCP_RST: u8 = TcpFlags::RST;
-const TCP_ACK: u8 = TcpFlags::ACK;
+use crate::policy_runtime::{AclDenyRecord, PolicyRuntime};
+use crate::routing::RoutingTable;
 
 #[derive(Debug, Clone)]
 pub struct SelfIdentity {
@@ -34,58 +16,6 @@ pub struct SelfIdentity {
     pub ip: Ipv4Addr,
     pub tags: Vec<String>,
     pub network: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AclDenyRecord {
-    pub peer_endpoint: String,
-    pub dst_port: Option<u16>,
-    pub protocol: String,
-    pub reason: String,
-    pub rule_slug: Option<String>,
-    pub scope: Option<String>,
-    pub at_unix: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FlowKey {
-    proto: u8,
-    src: Ipv4Addr,
-    sport: u16,
-    dst: Ipv4Addr,
-    dport: u16,
-}
-
-impl FlowKey {
-    fn reverse(self) -> Self {
-        Self {
-            proto: self.proto,
-            src: self.dst,
-            sport: self.dport,
-            dst: self.src,
-            dport: self.sport,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpPhase {
-    SynSent,
-    Established,
-    TimeWait,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FlowPhase {
-    Tcp(TcpPhase),
-    Udp,
-    Icmp,
-}
-
-#[derive(Debug, Clone)]
-struct FlowState {
-    phase: FlowPhase,
-    last_seen: Instant,
 }
 
 #[derive(Clone)]
@@ -96,9 +26,9 @@ pub struct AclEngine {
     pub stale: Arc<ArcSwap<bool>>,
     /// When false, ACL rules that require source posture do not match.
     pub src_posture_ok: Arc<ArcSwap<bool>>,
-    deny_log: Arc<Mutex<VecDeque<AclDenyRecord>>>,
-    conntrack: Arc<DashMap<FlowKey, FlowState>>,
-    fragments: Arc<Mutex<FragmentTable>>,
+    /// Attached shared runtime. Every mutation publishes a fresh compiled
+    /// snapshot + generation bump (§0.3); packet state lives there, never here.
+    runtime: Arc<RwLock<Option<PolicyRuntime>>>,
 }
 
 impl AclEngine {
@@ -117,48 +47,51 @@ impl AclEngine {
         bundle: PolicyBundle,
         src_posture_ok: Arc<ArcSwap<bool>>,
     ) -> Self {
-        let engine = Self {
+        Self {
             self_id: Arc::new(ArcSwap::from_pointee(self_id)),
             routes,
             bundle: Arc::new(ArcSwap::from_pointee(bundle)),
             stale: Arc::new(ArcSwap::from_pointee(false)),
             src_posture_ok,
-            deny_log: Arc::new(Mutex::new(VecDeque::with_capacity(DENY_LOG_CAP))),
-            conntrack: Arc::new(DashMap::new()),
-            fragments: Arc::new(Mutex::new(FragmentTable::default())),
-        };
-        engine.spawn_gc();
-        engine
+            runtime: Arc::new(RwLock::new(None)),
+        }
     }
 
-    fn spawn_gc(&self) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+    /// Attach the shared runtime (node build / dataplane bring-up). All
+    /// subsequent mutations publish to it.
+    pub fn attach_runtime(&self, runtime: PolicyRuntime) {
+        *self.runtime.write() = Some(runtime);
+        self.publish();
+    }
+
+    /// Compile current state and publish to the shared runtime (§0.3).
+    fn publish(&self) {
+        let Some(rt) = self.runtime.read().clone() else {
             return;
         };
-        let conntrack = self.conntrack.clone();
-        handle.spawn(async move {
-            let mut tick = tokio::time::interval(GC_INTERVAL);
-            loop {
-                tick.tick().await;
-                let now = Instant::now();
-                conntrack.retain(|_, st| !is_expired(st, now));
-            }
-        });
+        rt.publish_acl(
+            &self.bundle.load(),
+            &self.self_id.load(),
+            **self.src_posture_ok.load(),
+            **self.stale.load(),
+        );
     }
 
     pub fn set_src_posture_ok(&self, ok: bool) {
         self.src_posture_ok.store(Arc::new(ok));
+        self.publish();
     }
 
     pub fn replace_bundle(&self, b: PolicyBundle) {
         self.bundle.store(Arc::new(b));
         self.stale.store(Arc::new(false));
-        self.conntrack.clear();
-        self.fragments.lock().clear();
+        self.publish();
     }
 
     pub fn flush_conntrack(&self) {
-        self.conntrack.clear();
+        if let Some(rt) = self.runtime.read().clone() {
+            rt.invalidate();
+        }
     }
 
     pub fn replace_self_tags(&self, tags: Vec<String>) {
@@ -172,14 +105,20 @@ impl AclEngine {
             tags,
             network: current.network.clone(),
         }));
+        self.publish();
     }
 
     pub fn mark_stale(&self) {
         self.stale.store(Arc::new(true));
+        self.publish();
     }
 
     pub fn recent_denies(&self) -> Vec<AclDenyRecord> {
-        self.deny_log.lock().iter().cloned().collect()
+        self.runtime
+            .read()
+            .clone()
+            .map(|rt| rt.recent_denies())
+            .unwrap_or_default()
     }
 
     pub fn allow_inbound_peer(&self, peer_endpoint_hex: &str) -> bool {
@@ -221,325 +160,14 @@ impl AclEngine {
         evaluate_detailed(&bundle, &ctx, direction).action == Action::Allow
     }
 
-    pub fn allow_packet(
-        &self,
-        peer_endpoint_hex: &str,
-        direction: Direction,
-        packet: &Packet<'_>,
-    ) -> bool {
-        self.evaluate_packet(peer_endpoint_hex, direction, packet)
-            .action
-            == Action::Allow
-    }
-
-    pub fn evaluate_packet(
-        &self,
-        peer_endpoint_hex: &str,
-        direction: Direction,
-        packet: &Packet<'_>,
-    ) -> EvalVerdict {
-        let Some(src) = packet.ip.v4_src() else {
-            return EvalVerdict {
-                action: Action::Deny,
-                reason: EvalReason::DefaultDeny,
-                rule_slug: None,
-                scope: None,
-            };
-        };
-        let Some(dst) = packet.ip.v4_dst() else {
-            return EvalVerdict {
-                action: Action::Deny,
-                reason: EvalReason::DefaultDeny,
-                rule_slug: None,
-                scope: None,
-            };
-        };
-        let Some(l4) = self.fragments.lock().resolve(packet) else {
-            return EvalVerdict {
-                action: Action::Deny,
-                reason: EvalReason::DefaultDeny,
-                rule_slug: None,
-                scope: None,
-            };
-        };
-        let peer = self.routes.lookup_endpoint(peer_endpoint_hex);
-        self.check(peer.as_deref(), peer_endpoint_hex, src, dst, direction, l4)
-    }
-
-    fn check(
-        &self,
-        peer: Option<&PeerInfo>,
-        peer_hex: &str,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        direction: Direction,
-        l4: ResolvedL4,
-    ) -> EvalVerdict {
-        let empty_tags: Vec<String> = Vec::new();
-        let self_id = self.self_id.load();
-        let bundle = self.bundle.load();
-
-        let proto = l4.protocol;
-        let src_port = l4.src_port;
-        let dst_port = l4.dst_port;
-        let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-        let peer_ip = match direction {
-            Direction::Outbound => Some(dst),
-            Direction::Inbound => Some(src),
-        };
-
-        // 1) Established / return traffic via conntrack.
-        if let Some(key) = flow_key(proto, src, dst, src_port, dst_port)
-            && self.conntrack_allows(direction, key, tcp_flags)
-        {
-            return EvalVerdict {
-                action: Action::Allow,
-                reason: EvalReason::DefaultAllow,
-                rule_slug: None,
-                scope: None,
-            };
-        }
-
-        let posture_required = !bundle.default_src_posture.is_empty()
-            || bundle.rules.iter().any(|r| !r.src_posture.is_empty());
-        let src_posture_ok = if posture_required {
-            **self.src_posture_ok.load()
-        } else {
-            true
-        };
-        let ctx = EvalCtx {
-            self_endpoint_hex: &self_id.endpoint_hex,
-            self_ip: self_id.ip,
-            self_tags: &self_id.tags,
-            self_network: &self_id.network,
-            peer_endpoint_hex: peer_hex,
-            peer_ip,
-            peer_tags: peer.map(|p| p.tags.as_slice()).unwrap_or(&empty_tags),
-            peer_network: &self_id.network,
-            dst_port,
-            protocol: proto,
-            src_posture_ok,
-        };
-        let verdict = evaluate_detailed(&bundle, &ctx, direction);
-        if verdict.action == Action::Deny {
-            // Fail-open only for open networks with no rules during poll outage.
-            if **self.stale.load()
-                && bundle.rules.is_empty()
-                && bundle.default_action == tunnet_common::policy::DefaultAction::Allow
-            {
-                return EvalVerdict {
-                    action: Action::Allow,
-                    reason: EvalReason::DefaultAllow,
-                    rule_slug: None,
-                    scope: None,
-                };
-            }
-            self.record_deny(peer_hex, dst_port, proto, &verdict);
-            tracing::debug!(
-                peer = %peer_hex,
-                ?dst_port,
-                ?proto,
-                reason = ?verdict.reason,
-                slug = ?verdict.rule_slug,
-                "ACL deny"
-            );
-            return verdict;
-        }
-
-        // 2) Policy allowed → open / refresh flow for return traffic.
-        if let Some(key) = flow_key(proto, src, dst, src_port, dst_port) {
-            self.open_or_refresh_flow(key, proto, tcp_flags);
-        }
-        verdict
-    }
-
-    fn conntrack_allows(&self, direction: Direction, fwd: FlowKey, tcp_flags: u8) -> bool {
-        let now = Instant::now();
-        let rev = fwd.reverse();
-        let key = if self.conntrack.contains_key(&fwd) {
-            fwd
-        } else if self.conntrack.contains_key(&rev) {
-            rev
-        } else {
-            return false;
-        };
-
-        let mut entry = match self.conntrack.get_mut(&key) {
-            Some(e) => e,
-            None => return false,
-        };
-        if is_expired(&entry, now) {
-            drop(entry);
-            self.conntrack.remove(&key);
-            return false;
-        }
-
-        match entry.phase {
-            FlowPhase::Tcp(phase) => match phase {
-                TcpPhase::SynSent => {
-                    if matches!(direction, Direction::Inbound)
-                        || (tcp_flags & TCP_ACK) != 0
-                        || (tcp_flags & TCP_RST) != 0
-                    {
-                        if (tcp_flags & TCP_RST) != 0 || (tcp_flags & TCP_FIN) != 0 {
-                            entry.phase = FlowPhase::Tcp(TcpPhase::TimeWait);
-                        } else {
-                            entry.phase = FlowPhase::Tcp(TcpPhase::Established);
-                        }
-                        entry.last_seen = now;
-                        return true;
-                    }
-                    if matches!(direction, Direction::Outbound) {
-                        entry.last_seen = now;
-                        return true;
-                    }
-                    false
-                }
-                TcpPhase::Established => {
-                    if (tcp_flags & TCP_RST) != 0 || (tcp_flags & TCP_FIN) != 0 {
-                        entry.phase = FlowPhase::Tcp(TcpPhase::TimeWait);
-                    }
-                    entry.last_seen = now;
-                    true
-                }
-                TcpPhase::TimeWait => {
-                    entry.last_seen = now;
-                    true
-                }
-            },
-            FlowPhase::Udp | FlowPhase::Icmp => {
-                entry.last_seen = now;
-                true
-            }
-        }
-    }
-
-    fn open_or_refresh_flow(&self, key: FlowKey, proto: Protocol, tcp_flags: u8) {
-        let now = Instant::now();
-        let phase = match proto {
-            Protocol::Tcp => {
-                if (tcp_flags & TCP_SYN) != 0 && (tcp_flags & TCP_ACK) == 0 {
-                    FlowPhase::Tcp(TcpPhase::SynSent)
-                } else if (tcp_flags & TCP_FIN) != 0 || (tcp_flags & TCP_RST) != 0 {
-                    FlowPhase::Tcp(TcpPhase::TimeWait)
-                } else {
-                    FlowPhase::Tcp(TcpPhase::Established)
-                }
-            }
-            Protocol::Udp => FlowPhase::Udp,
-            Protocol::Icmp | Protocol::Icmpv6 => FlowPhase::Icmp,
-            Protocol::Any | Protocol::Other(_) => return,
-        };
-
-        self.conntrack
-            .entry(key)
-            .and_modify(|st| {
-                st.last_seen = now;
-                if matches!(st.phase, FlowPhase::Tcp(TcpPhase::SynSent))
-                    && matches!(phase, FlowPhase::Tcp(TcpPhase::Established))
-                {
-                    st.phase = phase;
-                }
-                if matches!(phase, FlowPhase::Tcp(TcpPhase::TimeWait)) {
-                    st.phase = phase;
-                }
-            })
-            .or_insert(FlowState {
-                phase,
-                last_seen: now,
-            });
-    }
-
-    fn record_deny(
-        &self,
-        peer_hex: &str,
-        dst_port: Option<u16>,
-        proto: Protocol,
-        verdict: &EvalVerdict,
-    ) {
-        let reason = match verdict.reason {
-            EvalReason::OrgDeny => "org_deny",
-            EvalReason::NetworkDeny => "network_deny",
-            EvalReason::NetworkAllow => "network_allow",
-            EvalReason::DefaultAllow => "default_allow",
-            EvalReason::DefaultDeny => "default_deny",
-            EvalReason::IcmpPolicy => "icmp_policy",
-            EvalReason::PostureSkip => "posture_skip",
-        };
-        let scope = verdict.scope.map(|s| match s {
-            tunnet_common::policy::RuleScope::Organization => "organization".to_string(),
-            tunnet_common::policy::RuleScope::Network => "network".to_string(),
-        });
-        let record = AclDenyRecord {
-            peer_endpoint: peer_hex.to_string(),
-            dst_port,
-            protocol: format!("{proto:?}").to_lowercase(),
-            reason: reason.to_string(),
-            rule_slug: verdict.rule_slug.clone(),
-            scope,
-            at_unix: jiff::Timestamp::now().as_second(),
-        };
-        let mut log = self.deny_log.lock();
-        if log.len() >= DENY_LOG_CAP {
-            log.pop_front();
-        }
-        log.push_back(record);
-    }
-}
-
-fn proto_num(proto: Protocol) -> Option<u8> {
-    match proto {
-        Protocol::Tcp => Some(6),
-        Protocol::Udp => Some(17),
-        Protocol::Icmp => Some(1),
-        Protocol::Icmpv6 => Some(58),
-        Protocol::Other(n) => Some(n),
-        Protocol::Any => None,
-    }
-}
-
-fn flow_key(
-    proto: Protocol,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    src_port: Option<u16>,
-    dst_port: Option<u16>,
-) -> Option<FlowKey> {
-    let proto = proto_num(proto)?;
-    if proto == 1 {
-        return Some(FlowKey {
-            proto,
-            src: src.min(dst),
-            sport: src_port.unwrap_or(0),
-            dst: src.max(dst),
-            dport: 0,
-        });
-    }
-    Some(FlowKey {
-        proto,
-        src,
-        sport: src_port.unwrap_or(0),
-        dst,
-        dport: dst_port.unwrap_or(0),
-    })
-}
-
-fn is_expired(st: &FlowState, now: Instant) -> bool {
-    let ttl = match st.phase {
-        FlowPhase::Tcp(TcpPhase::TimeWait) => TCP_TIME_WAIT_TTL,
-        FlowPhase::Tcp(_) => TCP_ACTIVE_TTL,
-        FlowPhase::Udp => UDP_TTL,
-        FlowPhase::Icmp => ICMP_TTL,
-    };
-    now.duration_since(st.last_seen) > ttl
+    // Packet-level evaluation lives in PolicyRuntime (§13); this engine owns
+    // connection admission (allow_peer above) and publishes configuration.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnet_common::policy::{
-        Action, DefaultAction, IcmpPolicy, PolicyRule, PortRange, RuleScope, Selector,
-    };
+    use tunnet_common::policy::PolicyBundle;
 
     fn test_engine(bundle: PolicyBundle) -> AclEngine {
         let self_id = SelfIdentity {
@@ -551,91 +179,73 @@ mod tests {
         AclEngine::new(self_id, RoutingTable::new(), bundle)
     }
 
-    fn allow_tcp_80_bundle() -> PolicyBundle {
-        PolicyBundle {
-            rules: vec![PolicyRule {
-                src: Selector::Any,
-                dst: Selector::Any,
-                action: Action::Allow,
-                ports: vec![PortRange { start: 80, end: 80 }],
-                protocol: Some(Protocol::Tcp),
-                priority: 100,
-                order_index: 0,
-                scope: RuleScope::Network,
-                enabled: true,
-                slug: Some("allow-http".into()),
-                src_posture: vec![],
-            }],
-            ssh_rules: vec![],
-            version: 1,
-            signature: String::new(),
-            default_action: DefaultAction::Deny,
-            icmp_policy: IcmpPolicy::Deny,
-            postures: Default::default(),
-            default_src_posture: vec![],
-            posture_enforcement: None,
-        }
-    }
-
-    fn tcp_pkt(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, flags: u8) -> Vec<u8> {
-        let mut b = etherparse::PacketBuilder::ipv4(src.octets(), dst.octets(), 64)
-            .tcp(sport, dport, 1, 1000);
-        if flags & TCP_SYN != 0 {
-            b = b.syn();
-        }
-        if flags & TCP_ACK != 0 {
-            b = b.ack(1);
-        }
-        let mut out = Vec::new();
-        b.write(&mut out, &[]).unwrap();
-        out
+    #[test]
+    fn admission_follows_bundle_default() {
+        // Connection admission (not packet policy) still lives here.
+        let open = test_engine(PolicyBundle::default());
+        assert!(open.allow_inbound_peer(&"bb".repeat(32)));
+        let restricted = test_engine(PolicyBundle {
+            default_action: tunnet_common::policy::DefaultAction::Deny,
+            ..PolicyBundle::default()
+        });
+        assert!(!restricted.allow_inbound_peer(&"bb".repeat(32)));
     }
 
     #[test]
-    fn outbound_allow_opens_flow_for_inbound_return() {
-        let acl = test_engine(allow_tcp_80_bundle());
-        let peer = "bb".repeat(32);
-        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
-        let ephemeral = 52_000u16;
-
-        let out = tcp_pkt(self_ip, peer_ip, ephemeral, 80, TCP_SYN);
-        let pkt = tunnet_common::packet::parse(&out).unwrap();
-        assert!(acl.allow_packet(&peer, Direction::Outbound, &pkt));
-
-        let ret = tcp_pkt(peer_ip, self_ip, 80, ephemeral, TCP_ACK | TCP_SYN);
-        let pkt = tunnet_common::packet::parse(&ret).unwrap();
-        assert!(acl.allow_packet(&peer, Direction::Inbound, &pkt));
+    fn mutations_publish_to_attached_runtime() {
+        use crate::policy_runtime::PolicyRuntime;
+        use std::collections::HashMap;
+        let acl = test_engine(PolicyBundle::default());
+        let rt = PolicyRuntime::bootstrap(
+            &PolicyBundle::default(),
+            &HashMap::new(),
+            &SelfIdentity {
+                endpoint_hex: "aa".repeat(32),
+                ip: Ipv4Addr::new(100, 64, 0, 1),
+                tags: vec![],
+                network: "net".into(),
+            },
+            true,
+            false,
+        );
+        let policy_gen = rt.generation();
+        acl.attach_runtime(rt.clone());
+        // attach publishes: generation bumps.
+        assert!(rt.generation() > policy_gen);
+        let gen2 = rt.generation();
+        acl.replace_bundle(PolicyBundle::default());
+        assert!(rt.generation() > gen2);
+        acl.mark_stale();
+        // Stale flag propagates to the runtime snapshot.
+        assert!(rt.generation() > gen2);
     }
 
     #[test]
-    fn inbound_ephemeral_denied_without_prior_outbound() {
-        let acl = test_engine(allow_tcp_80_bundle());
-        let peer = "bb".repeat(32);
-        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
-
-        let p = tcp_pkt(peer_ip, self_ip, 80, 52_000, TCP_ACK | TCP_SYN);
-        let pkt = tunnet_common::packet::parse(&p).unwrap();
-        assert!(!acl.allow_packet(&peer, Direction::Inbound, &pkt));
-    }
-
-    #[test]
-    fn replace_bundle_flushes_conntrack() {
-        let acl = test_engine(allow_tcp_80_bundle());
-        let peer = "bb".repeat(32);
-        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
-        let ephemeral = 52_000u16;
-
-        let out = tcp_pkt(self_ip, peer_ip, ephemeral, 80, TCP_SYN);
-        let pkt = tunnet_common::packet::parse(&out).unwrap();
-        assert!(acl.allow_packet(&peer, Direction::Outbound, &pkt));
-
-        acl.replace_bundle(allow_tcp_80_bundle());
-
-        let ret = tcp_pkt(peer_ip, self_ip, 80, ephemeral, TCP_ACK);
-        let pkt = tunnet_common::packet::parse(&ret).unwrap();
-        assert!(!acl.allow_packet(&peer, Direction::Inbound, &pkt));
+    fn replace_self_tags_noop_skips_publish() {
+        use crate::policy_runtime::PolicyRuntime;
+        use std::collections::HashMap;
+        let acl = test_engine(PolicyBundle::default());
+        let rt = PolicyRuntime::bootstrap(
+            &PolicyBundle::default(),
+            &HashMap::new(),
+            &SelfIdentity {
+                endpoint_hex: "aa".repeat(32),
+                ip: Ipv4Addr::new(100, 64, 0, 1),
+                tags: vec![],
+                network: "net".into(),
+            },
+            true,
+            false,
+        );
+        acl.attach_runtime(rt.clone());
+        let policy_gen = rt.generation();
+        acl.replace_self_tags(vec![]);
+        assert_eq!(
+            rt.generation(),
+            policy_gen,
+            "unchanged tags must not republish"
+        );
+        acl.replace_self_tags(vec!["x".into()]);
+        assert!(rt.generation() > policy_gen);
     }
 }

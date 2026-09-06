@@ -1,0 +1,40 @@
+[package]
+name = "tunnet-mobile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MPL-2.0"
+description = "Tunnet agent embedded in a mobile app process (Android VpnService)"
+repository = "https://github.com/tunnetio/Tunnet"
+publish = false
+
+[lib]
+# `tunnet_mobile` so the APK carries `libtunnet_mobile.so` and Kotlin loads it
+# via System.loadLibrary("tunnet_mobile").
+name = "tunnet_mobile"
+# cdylib: the .so the APK packages. rlib: so the host `cargo test` can exercise
+# the JVM-free session logic without linking against a JVM.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tunnet-agent.workspace = true
+tunnet-client.workspace = true
+tunnet-common.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+# The JNI bridge is Android-only: the host test build stays JVM-free, exactly as
+# the `werust-android-core` crate does it.
+ndk-context = "0.1"
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+tracing-android = "0.2"
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

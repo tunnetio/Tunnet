@@ -1,9 +1,11 @@
-//! Userspace stateful firewall for Direct mode.
+//! Userspace stateful firewall configuration for Direct mode.
 //!
-//! Defaults (authenticated mesh peers):
-//! - Outbound: allow all (opens flow)
-//! - Inbound from a known mesh peer: allow all (QUIC already gated by PSK/AuthCache)
-//! - Inbound without a peer identity: ICMP echo only; TCP/UDP deny
+//! This engine is a control-plane object: it owns firewall configuration
+//! (local rules, suggested rules, enabled flag) and publishes compiled
+//! snapshots to the shared [`crate::policy_runtime::PolicyRuntime`], which
+//! owns all packet evaluation, conntrack, and expiry. Packet verdicts,
+//! defaults (outbound allow; inbound from known peers allow; otherwise ICMP
+//! echo only) and reject synthesis live in the runtime.
 //!
 //! Restrict further with local ACL rules (`tunnet firewall`).
 
@@ -11,25 +13,16 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use bytes::Bytes;
-use dashmap::DashMap;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use tunnet_common::packet::{FragmentTable, Packet, ResolvedL4, TcpFlags, synthesize_reject};
 use tunnet_common::policy::{Action, PolicyBundle, PolicyRule, PortRange, Protocol, Selector};
 use uuid::Uuid;
 
+use crate::policy_runtime::PolicyRuntime;
 use crate::state::StatePaths;
-
-const TCP_ACTIVE_TTL: Duration = Duration::from_secs(300);
-const TCP_TIME_WAIT_TTL: Duration = Duration::from_secs(10);
-const UDP_TTL: Duration = Duration::from_secs(30);
-const ICMP_TTL: Duration = Duration::from_secs(10);
-const GC_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -191,96 +184,7 @@ pub fn direction_display(d: FirewallDirection) -> &'static str {
     }
 }
 
-pub const TCP_FIN: u8 = TcpFlags::FIN;
-pub const TCP_SYN: u8 = TcpFlags::SYN;
-pub const TCP_RST: u8 = TcpFlags::RST;
-pub const TCP_ACK: u8 = TcpFlags::ACK;
-
-// ── Conntrack ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FlowKey {
-    proto: u8,
-    src: Ipv4Addr,
-    sport: u16,
-    dst: Ipv4Addr,
-    dport: u16,
-}
-
-impl FlowKey {
-    fn forward(src: Ipv4Addr, dst: Ipv4Addr, l4: ResolvedL4) -> Option<Self> {
-        let proto = l4.protocol.ip_number()?;
-        if l4.protocol.is_icmp() {
-            Some(Self {
-                proto,
-                src: src.min(dst),
-                sport: l4.icmp_id.unwrap_or(0),
-                dst: src.max(dst),
-                dport: 0,
-            })
-        } else {
-            Some(Self {
-                proto,
-                src,
-                sport: l4.src_port.unwrap_or(0),
-                dst,
-                dport: l4.dst_port.unwrap_or(0),
-            })
-        }
-    }
-
-    fn reverse(src: Ipv4Addr, dst: Ipv4Addr, l4: ResolvedL4) -> Option<Self> {
-        if l4.protocol.is_icmp() {
-            Self::forward(src, dst, l4)
-        } else {
-            Some(Self {
-                proto: l4.protocol.ip_number()?,
-                src: dst,
-                sport: l4.dst_port.unwrap_or(0),
-                dst: src,
-                dport: l4.src_port.unwrap_or(0),
-            })
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpPhase {
-    SynSent,
-    Established,
-    TimeWait,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum FlowPhase {
-    Tcp(TcpPhase),
-    Udp,
-    Icmp,
-}
-
-#[derive(Debug, Clone)]
-struct FlowState {
-    phase: FlowPhase,
-    last_seen: Instant,
-}
-
-// ── Evaluation ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PacketDirection {
-    Inbound,
-    Outbound,
-}
-
-#[derive(Debug)]
-pub enum EvalResult {
-    Allow,
-    Deny,
-    /// Synthesized RST / ICMP unreachable for the local TUN.
-    Reject {
-        reply: Bytes,
-    },
-}
+// ── Engine (control-plane configuration + runtime publishing) ─────────────
 
 pub struct FirewallStats {
     pub conntrack_entries: usize,
@@ -305,13 +209,13 @@ struct EngineInner {
     local_rules: ArcSwap<Vec<FirewallRule>>,
     suggested_rules: ArcSwap<Vec<FirewallRule>>,
     version: AtomicU64,
-    conntrack: DashMap<FlowKey, FlowState>,
-    fragments: Mutex<FragmentTable>,
-    allowed: AtomicU64,
-    denied: AtomicU64,
-    rejected: AtomicU64,
-    /// Self mesh IP for default policy and reject synthesis.
+    /// Self mesh IP (kept for diagnostics/compat; policy uses runtime state).
     self_ip: ArcSwap<Ipv4Addr>,
+    /// Owning Direct network: published snapshots stay network-scoped (§0.2).
+    network_id: Uuid,
+    /// Attached shared runtime. Every mutation publishes a fresh compiled
+    /// snapshot + generation bump (§0.3); packet state lives there, never here.
+    runtime: RwLock<Option<PolicyRuntime>>,
 }
 
 impl FirewallEngine {
@@ -319,54 +223,72 @@ impl FirewallEngine {
         cfg: &FirewallConfig,
         self_ip: Ipv4Addr,
         _self_endpoint_hex: String,
+        network_id: Uuid,
     ) -> Self {
-        let engine = Self {
+        Self {
             inner: Arc::new(EngineInner {
                 enabled: ArcSwap::from_pointee(cfg.enabled),
                 local_rules: ArcSwap::from_pointee(cfg.rules.clone()),
                 suggested_rules: ArcSwap::from_pointee(Vec::new()),
                 version: AtomicU64::new(cfg.version),
-                conntrack: DashMap::new(),
-                fragments: Mutex::new(FragmentTable::default()),
-                allowed: AtomicU64::new(0),
-                denied: AtomicU64::new(0),
-                rejected: AtomicU64::new(0),
                 self_ip: ArcSwap::from_pointee(self_ip),
+                network_id,
+                runtime: RwLock::new(None),
             }),
-        };
-        engine.spawn_gc();
-        engine
+        }
     }
 
-    fn spawn_gc(&self) {
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(GC_INTERVAL);
-            loop {
-                tick.tick().await;
-                let now = Instant::now();
-                inner.conntrack.retain(|_, st| !is_expired(st, now));
-            }
-        });
+    /// Attach the shared runtime (node build / dataplane bring-up). All
+    /// subsequent mutations publish to it.
+    pub fn attach_runtime(&self, runtime: PolicyRuntime) {
+        *self.inner.runtime.write() = Some(runtime);
+        self.publish();
+    }
+
+    /// Compile this network's rules and publish to the shared runtime.
+    fn publish(&self) {
+        let Some(rt) = self.inner.runtime.read().clone() else {
+            return;
+        };
+        rt.publish_firewall(
+            self.inner.network_id,
+            self.local_rules_snapshot(),
+            self.suggested_rules_snapshot(),
+            **self.inner.enabled.load(),
+        );
+    }
+
+    fn bump_version(&self) -> u64 {
+        self.inner.version.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn reload_local(&self, cfg: &FirewallConfig) {
         self.inner.enabled.store(Arc::new(cfg.enabled));
         self.inner.local_rules.store(Arc::new(cfg.rules.clone()));
         self.inner.version.store(cfg.version, Ordering::Relaxed);
+        self.bump_version();
+        self.publish();
     }
 
     pub fn set_suggested(&self, rules: Vec<FirewallRule>) {
         self.inner.suggested_rules.store(Arc::new(rules));
+        // Version bump is the reliable generation signal (§0.3): the legacy
+        // code never bumped here, so suggested-rule edits were invisible.
+        self.bump_version();
+        self.publish();
     }
 
     pub fn clear_suggested(&self) {
         self.inner.suggested_rules.store(Arc::new(Vec::new()));
+        self.bump_version();
+        self.publish();
     }
 
+    /// Invalidate shared conntrack via the runtime (CLI flush, teardown).
     pub fn flush_conntrack(&self) {
-        self.inner.conntrack.clear();
-        self.inner.fragments.lock().clear();
+        if let Some(rt) = self.inner.runtime.read().clone() {
+            rt.invalidate();
+        }
     }
 
     pub fn set_self_ip(&self, ip: Ipv4Addr) {
@@ -374,15 +296,30 @@ impl FirewallEngine {
     }
 
     pub fn stats(&self) -> FirewallStats {
+        // Packet counters live in the shared runtime now (this engine no
+        // longer sees packets); conntrack_entries is dataplane-wide.
+        let (allowed, denied, rejected, conntrack_entries) = match self.inner.runtime.read().clone()
+        {
+            Some(rt) => {
+                let c = rt.fw_counters_for(self.inner.network_id);
+                (
+                    c.allowed.load(Ordering::Relaxed),
+                    c.denied.load(Ordering::Relaxed),
+                    c.rejected.load(Ordering::Relaxed),
+                    rt.conntrack_len(),
+                )
+            }
+            None => (0, 0, 0, 0),
+        };
         FirewallStats {
-            conntrack_entries: self.inner.conntrack.len(),
+            conntrack_entries,
             local_rules: self.inner.local_rules.load().len(),
             suggested_rules: self.inner.suggested_rules.load().len(),
             enabled: **self.inner.enabled.load(),
             version: self.inner.version.load(Ordering::Relaxed),
-            packets_allowed: self.inner.allowed.load(Ordering::Relaxed),
-            packets_denied: self.inner.denied.load(Ordering::Relaxed),
-            packets_rejected: self.inner.rejected.load(Ordering::Relaxed),
+            packets_allowed: allowed,
+            packets_denied: denied,
+            packets_rejected: rejected,
         }
     }
 
@@ -422,299 +359,8 @@ impl FirewallEngine {
         self.inner.local_rules.store(Arc::new(rules));
         self.inner.version.store(version, Ordering::Relaxed);
         tracing::info!(port, "firewall: ensured inbound TCP allow for SSH");
+        self.publish();
     }
-
-    /// Evaluate a packet. `peer_endpoint_hex` is the remote mesh peer (if known).
-    /// `network_id` is the peer's Direct network (for `PeerFilter::NetworkId`).
-    pub fn evaluate(
-        &self,
-        direction: PacketDirection,
-        packet: &Packet<'_>,
-        peer_endpoint_hex: Option<&str>,
-        peer_hostname: Option<&str>,
-        network_id: Option<Uuid>,
-    ) -> EvalResult {
-        if !**self.inner.enabled.load() {
-            self.inner.allowed.fetch_add(1, Ordering::Relaxed);
-            return EvalResult::Allow;
-        }
-
-        let Some(src) = packet.ip.v4_src() else {
-            self.inner.denied.fetch_add(1, Ordering::Relaxed);
-            return EvalResult::Deny;
-        };
-        let Some(dst) = packet.ip.v4_dst() else {
-            self.inner.denied.fetch_add(1, Ordering::Relaxed);
-            return EvalResult::Deny;
-        };
-        let Some(l4) = self.inner.fragments.lock().resolve(packet) else {
-            self.inner.denied.fetch_add(1, Ordering::Relaxed);
-            return EvalResult::Deny;
-        };
-
-        if self.conntrack_allows(direction, src, dst, l4) {
-            self.inner.allowed.fetch_add(1, Ordering::Relaxed);
-            return EvalResult::Allow;
-        }
-
-        if let Some(action) = self.match_rules(
-            &self.inner.local_rules.load(),
-            direction,
-            l4,
-            peer_endpoint_hex,
-            peer_hostname,
-            network_id,
-        ) {
-            return self.apply_action(action, direction, packet, src, dst, l4);
-        }
-        if let Some(action) = self.match_rules(
-            &self.inner.suggested_rules.load(),
-            direction,
-            l4,
-            peer_endpoint_hex,
-            peer_hostname,
-            network_id,
-        ) {
-            return self.apply_action(action, direction, packet, src, dst, l4);
-        }
-
-        let default = default_policy(direction, l4, peer_endpoint_hex);
-        self.apply_action(default, direction, packet, src, dst, l4)
-    }
-
-    fn apply_action(
-        &self,
-        action: FirewallAction,
-        direction: PacketDirection,
-        packet: &Packet<'_>,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        l4: ResolvedL4,
-    ) -> EvalResult {
-        match action {
-            FirewallAction::Allow => {
-                self.open_or_refresh_flow(direction, src, dst, l4);
-                self.inner.allowed.fetch_add(1, Ordering::Relaxed);
-                EvalResult::Allow
-            }
-            FirewallAction::Deny => {
-                self.inner.denied.fetch_add(1, Ordering::Relaxed);
-                EvalResult::Deny
-            }
-            FirewallAction::Reject => {
-                self.inner.rejected.fetch_add(1, Ordering::Relaxed);
-                let reply = synthesize_reject(packet).unwrap_or_default();
-                EvalResult::Reject { reply }
-            }
-        }
-    }
-
-    fn match_rules(
-        &self,
-        rules: &[FirewallRule],
-        direction: PacketDirection,
-        l4: ResolvedL4,
-        peer_hex: Option<&str>,
-        peer_hostname: Option<&str>,
-        network_id: Option<Uuid>,
-    ) -> Option<FirewallAction> {
-        let want_dir = match direction {
-            PacketDirection::Inbound => FirewallDirection::In,
-            PacketDirection::Outbound => FirewallDirection::Out,
-        };
-        for rule in rules {
-            if rule.direction != want_dir {
-                continue;
-            }
-            if !l4.protocol.matches_rule(Some(rule.protocol)) {
-                continue;
-            }
-            if !rule.ports.is_empty() && !l4.protocol.is_icmp() {
-                let Some(port) = l4.dst_port else {
-                    continue;
-                };
-                if !rule.ports.iter().any(|p| p.contains(port)) {
-                    continue;
-                }
-            }
-            if !peer_matches(&rule.peer, peer_hex, peer_hostname, network_id) {
-                continue;
-            }
-            return Some(rule.action);
-        }
-        None
-    }
-
-    fn conntrack_allows(
-        &self,
-        direction: PacketDirection,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        l4: ResolvedL4,
-    ) -> bool {
-        let now = Instant::now();
-        let Some(fwd) = FlowKey::forward(src, dst, l4) else {
-            return false;
-        };
-        let Some(rev) = FlowKey::reverse(src, dst, l4) else {
-            return false;
-        };
-        let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-
-        let key = if self.inner.conntrack.contains_key(&fwd) {
-            fwd
-        } else if self.inner.conntrack.contains_key(&rev) {
-            rev
-        } else {
-            return false;
-        };
-
-        let mut entry = match self.inner.conntrack.get_mut(&key) {
-            Some(e) => e,
-            None => return false,
-        };
-        if is_expired(&entry, now) {
-            drop(entry);
-            self.inner.conntrack.remove(&key);
-            return false;
-        }
-
-        match entry.phase {
-            FlowPhase::Tcp(phase) => match phase {
-                TcpPhase::SynSent => {
-                    if direction == PacketDirection::Inbound
-                        || (tcp_flags & TCP_ACK) != 0
-                        || (tcp_flags & TCP_RST) != 0
-                    {
-                        if (tcp_flags & TCP_RST) != 0 || (tcp_flags & TCP_FIN) != 0 {
-                            entry.phase = FlowPhase::Tcp(TcpPhase::TimeWait);
-                        } else {
-                            entry.phase = FlowPhase::Tcp(TcpPhase::Established);
-                        }
-                        entry.last_seen = now;
-                        return true;
-                    }
-                    if direction == PacketDirection::Outbound {
-                        entry.last_seen = now;
-                        return true;
-                    }
-                    false
-                }
-                TcpPhase::Established => {
-                    if (tcp_flags & TCP_RST) != 0 || (tcp_flags & TCP_FIN) != 0 {
-                        entry.phase = FlowPhase::Tcp(TcpPhase::TimeWait);
-                    }
-                    entry.last_seen = now;
-                    true
-                }
-                TcpPhase::TimeWait => {
-                    entry.last_seen = now;
-                    true
-                }
-            },
-            FlowPhase::Udp | FlowPhase::Icmp => {
-                entry.last_seen = now;
-                true
-            }
-        }
-    }
-
-    fn open_or_refresh_flow(
-        &self,
-        _direction: PacketDirection,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        l4: ResolvedL4,
-    ) {
-        let now = Instant::now();
-        let Some(key) = FlowKey::forward(src, dst, l4) else {
-            return;
-        };
-        let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-
-        let phase = match l4.protocol {
-            Protocol::Tcp => {
-                if (tcp_flags & TCP_SYN) != 0 && (tcp_flags & TCP_ACK) == 0 {
-                    FlowPhase::Tcp(TcpPhase::SynSent)
-                } else if (tcp_flags & TCP_FIN) != 0 || (tcp_flags & TCP_RST) != 0 {
-                    FlowPhase::Tcp(TcpPhase::TimeWait)
-                } else {
-                    FlowPhase::Tcp(TcpPhase::Established)
-                }
-            }
-            Protocol::Udp => FlowPhase::Udp,
-            Protocol::Icmp | Protocol::Icmpv6 => FlowPhase::Icmp,
-            Protocol::Any | Protocol::Other(_) => return,
-        };
-
-        self.inner
-            .conntrack
-            .entry(key)
-            .and_modify(|st| {
-                st.last_seen = now;
-                if matches!(st.phase, FlowPhase::Tcp(TcpPhase::SynSent))
-                    && matches!(phase, FlowPhase::Tcp(TcpPhase::Established))
-                {
-                    st.phase = phase;
-                }
-                if matches!(phase, FlowPhase::Tcp(TcpPhase::TimeWait)) {
-                    st.phase = phase;
-                }
-            })
-            .or_insert(FlowState {
-                phase,
-                last_seen: now,
-            });
-    }
-}
-fn peer_matches(
-    filter: &PeerFilter,
-    peer_hex: Option<&str>,
-    peer_hostname: Option<&str>,
-    network_id: Option<Uuid>,
-) -> bool {
-    match filter {
-        PeerFilter::Any => true,
-        PeerFilter::Endpoint(id) => peer_hex.is_some_and(|h| h.eq_ignore_ascii_case(id)),
-        PeerFilter::Hostname(h) => peer_hostname.is_some_and(|n| n.eq_ignore_ascii_case(h)),
-        PeerFilter::NetworkId(n) => {
-            let Some(id) = network_id else {
-                return false;
-            };
-            id.to_string().eq_ignore_ascii_case(n)
-                || n.parse::<Uuid>().ok().is_some_and(|parsed| parsed == id)
-        }
-    }
-}
-
-fn default_policy(
-    direction: PacketDirection,
-    l4: ResolvedL4,
-    peer_endpoint_hex: Option<&str>,
-) -> FirewallAction {
-    match direction {
-        PacketDirection::Outbound => FirewallAction::Allow,
-        PacketDirection::Inbound => {
-            if peer_endpoint_hex.is_some() {
-                return FirewallAction::Allow;
-            }
-            if l4.protocol == Protocol::Icmp && matches!(l4.icmp_type, Some(0) | Some(8)) {
-                FirewallAction::Allow
-            } else {
-                FirewallAction::Deny
-            }
-        }
-    }
-}
-
-fn is_expired(st: &FlowState, now: Instant) -> bool {
-    let ttl = match st.phase {
-        FlowPhase::Tcp(TcpPhase::TimeWait) => TCP_TIME_WAIT_TTL,
-        FlowPhase::Tcp(_) => TCP_ACTIVE_TTL,
-        FlowPhase::Udp => UDP_TTL,
-        FlowPhase::Icmp => ICMP_TTL,
-    };
-    now.duration_since(st.last_seen) > ttl
 }
 
 pub fn firewall_to_policy(
@@ -829,17 +475,14 @@ pub fn firewall_to_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunnet_common::packet::synthesize_reject;
 
     fn engine() -> FirewallEngine {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _guard = rt.enter();
         FirewallEngine::from_config(
             &default_firewall(),
             Ipv4Addr::new(100, 64, 0, 1),
             "aa".repeat(32),
+            Uuid::nil(),
         )
     }
 
@@ -861,16 +504,6 @@ mod tests {
         out
     }
 
-    fn eval(
-        e: &FirewallEngine,
-        dir: PacketDirection,
-        raw: &[u8],
-        peer: Option<&str>,
-    ) -> EvalResult {
-        let pkt = tunnet_common::packet::parse(raw).unwrap();
-        e.evaluate(dir, &pkt, peer, None, None)
-    }
-
     #[test]
     fn parse_tcp() {
         let src = Ipv4Addr::new(100, 64, 0, 1);
@@ -881,136 +514,41 @@ mod tests {
         assert_eq!(v.transport.src_port(), Some(12345));
         assert_eq!(v.transport.dst_port(), Some(80));
         assert!(v.transport.tcp_flags().unwrap().syn());
+        let _ = tcp_ack(src, dst, 80, 12345);
     }
 
     #[test]
-    fn outbound_allowed_by_default() {
+    fn suggested_rules_bump_version() {
+        // Regression: legacy set_suggested never bumped the version, so
+        // suggested-rule edits were invisible to generation signals.
         let e = engine();
-        let p = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
-            12345,
-            443,
-        );
-        assert!(matches!(
-            eval(&e, PacketDirection::Outbound, &p, Some("peer")),
-            EvalResult::Allow
-        ));
+        let v0 = e.stats().version;
+        e.set_suggested(vec![FirewallRule {
+            direction: FirewallDirection::Out,
+            action: FirewallAction::Deny,
+            protocol: Protocol::Tcp,
+            ports: vec![],
+            peer: PeerFilter::Any,
+        }]);
+        assert!(e.stats().version > v0);
+        assert_eq!(e.suggested_rules_snapshot().len(), 1);
+        e.clear_suggested();
+        assert!(e.suggested_rules_snapshot().is_empty());
     }
 
     #[test]
-    fn inbound_tcp_allowed_from_authenticated_peer() {
+    fn ensure_inbound_tcp_allow_idempotent() {
         let e = engine();
-        let p = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 2),
-            Ipv4Addr::new(100, 64, 0, 1),
-            443,
-            12345,
+        e.ensure_inbound_tcp_allow(22);
+        e.ensure_inbound_tcp_allow(22);
+        let rules = e.local_rules_snapshot();
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|r| r.direction == FirewallDirection::In)
+                .count(),
+            1
         );
-        assert!(matches!(
-            eval(&e, PacketDirection::Inbound, &p, Some("peer")),
-            EvalResult::Allow
-        ));
-    }
-
-    #[test]
-    fn inbound_tcp_denied_without_peer_identity() {
-        let e = engine();
-        let p = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 2),
-            Ipv4Addr::new(100, 64, 0, 1),
-            443,
-            12345,
-        );
-        assert!(matches!(
-            eval(&e, PacketDirection::Inbound, &p, None),
-            EvalResult::Deny
-        ));
-    }
-
-    #[test]
-    fn return_traffic_allowed_via_conntrack() {
-        let e = engine();
-        let out = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
-            12345,
-            443,
-        );
-        assert!(matches!(
-            eval(&e, PacketDirection::Outbound, &out, Some("peer")),
-            EvalResult::Allow
-        ));
-        let ret = tcp_ack(
-            Ipv4Addr::new(100, 64, 0, 2),
-            Ipv4Addr::new(100, 64, 0, 1),
-            443,
-            12345,
-        );
-        assert!(matches!(
-            eval(&e, PacketDirection::Inbound, &ret, Some("peer")),
-            EvalResult::Allow
-        ));
-    }
-
-    #[test]
-    fn local_deny_outbound() {
-        let e = engine();
-        e.reload_local(&FirewallConfig {
-            enabled: true,
-            version: 2,
-            rules: vec![FirewallRule {
-                direction: FirewallDirection::Out,
-                action: FirewallAction::Deny,
-                protocol: Protocol::Tcp,
-                ports: vec![PortRange {
-                    start: 443,
-                    end: 443,
-                }],
-                peer: PeerFilter::Any,
-            }],
-        });
-        let p = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
-            12345,
-            443,
-        );
-        assert!(matches!(
-            eval(&e, PacketDirection::Outbound, &p, Some("peer")),
-            EvalResult::Deny
-        ));
-    }
-
-    #[test]
-    fn later_fragment_cannot_bypass_port_deny() {
-        let e = engine();
-        e.reload_local(&FirewallConfig {
-            enabled: true,
-            version: 2,
-            rules: vec![FirewallRule {
-                direction: FirewallDirection::Out,
-                action: FirewallAction::Deny,
-                protocol: Protocol::Tcp,
-                ports: vec![PortRange {
-                    start: 443,
-                    end: 443,
-                }],
-                peer: PeerFilter::Any,
-            }],
-        });
-        let mut later = tcp_syn(
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(100, 64, 0, 2),
-            12345,
-            443,
-        );
-        later[6] = 0;
-        later[7] = 8;
-        assert!(matches!(
-            eval(&e, PacketDirection::Outbound, &later, Some("peer")),
-            EvalResult::Deny
-        ));
     }
 
     #[test]

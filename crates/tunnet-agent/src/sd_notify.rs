@@ -47,7 +47,9 @@ fn send(payload: &str) {
 }
 
 fn connect_notify(sock: &UnixDatagram, path: &str) -> std::io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // Abstract-namespace sockets: `std::os::linux` is Linux-only, and Android
+    // has no systemd, so NOTIFY_SOCKET is never set there.
+    #[cfg(target_os = "linux")]
     {
         use std::os::linux::net::SocketAddrExt;
         use std::os::unix::net::SocketAddr;

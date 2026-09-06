@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tunnet_common::packet::PacketPool;
 use tunnet_core::ConnPool;
-use tunnet_core::direct::{AuthCache, FirewallEngine, SpoofTracker};
-use tunnet_core::{AclEngine, RoutingTable};
+use tunnet_core::direct::SpoofTracker;
+use tunnet_core::{AclEngine, PolicyRuntime, RoutingTable};
 use uuid::Uuid;
 
 use crate::actors::dataplane::PublishedPlane;
@@ -24,10 +25,10 @@ pub fn install_dialer_datagram_pump(
     tun_slot: PublishedPlane,
     routes: RoutingTable,
     acl: AclEngine,
-    firewalls: HashMap<Uuid, FirewallEngine>,
+    runtime: PolicyRuntime,
     spoofs: HashMap<Uuid, SpoofTracker>,
     metrics: AgentMetrics,
-    direct_auth: Option<AuthCache>,
+    bufs: Arc<PacketPool>,
     ingress: IngressRegistry,
 ) {
     let pool_for_hook = pool.clone();
@@ -35,10 +36,10 @@ pub fn install_dialer_datagram_pump(
         let tun_slot = tun_slot.clone();
         let routes = routes.clone();
         let acl = acl.clone();
-        let firewalls = firewalls.clone();
+        let runtime = runtime.clone();
         let spoofs = spoofs.clone();
         let metrics = metrics.clone();
-        let direct_auth = direct_auth.clone();
+        let bufs = bufs.clone();
         let pool = pool_for_hook.clone();
         let ingress = ingress.clone();
         ingress.force_spawn(peer, async move {
@@ -49,12 +50,15 @@ pub fn install_dialer_datagram_pump(
                 conn,
                 tun: tun_slot,
                 routes,
+                runtime,
                 acl,
-                firewalls,
                 spoofs,
                 pool: Some(pool),
+                bufs,
                 metrics,
-                direct_auth,
+                // Dialer-side readers have no AuthCache handle; membership
+                // existence still gates every frame network.
+                auth: None,
             })
             .await;
         });

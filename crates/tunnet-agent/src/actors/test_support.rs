@@ -44,6 +44,18 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
     )
     .await
     .expect("open send manager");
+    let policy = tunnet_core::PolicyRuntime::bootstrap(
+        &tunnet_common::policy::PolicyBundle::default(),
+        &std::collections::HashMap::new(),
+        &tunnet_core::SelfIdentity {
+            endpoint_hex: identity.endpoint_id_hex(),
+            ip: "10.9.0.1".parse().unwrap(),
+            tags: vec![],
+            network: "test".into(),
+        },
+        true,
+        false,
+    );
     let node = tunnet_core::CoreNode {
         identity,
         persisted: tunnet_core::PersistedState::Direct { networks: vec![] },
@@ -66,6 +78,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         gossip: None,
         docs_engine: None,
         presence_tables: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        policy,
     };
     (node, tmp)
 }

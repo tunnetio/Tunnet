@@ -24,8 +24,22 @@ use uuid::Uuid;
 
 pub type EndpointIdHex = String;
 
-/// ALPN identifier for our tunnel protocol (mesh datagrams).
-pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/1";
+/// Short git hash baked at compile time (build.rs), `"unknown"` when git
+/// was unavailable. Rendered by `tunnet status` for both the CLI and the
+/// daemon so stale-binary mismatches are visible instead of debuggable
+/// for hours.
+pub fn git_hash() -> &'static str {
+    option_env!("GIT_HASH").unwrap_or("unknown")
+}
+
+/// ALPN identifier for the tunnel protocol (mesh datagrams).
+/// Tunnel framing is the only wire format (segmented logical packets, every
+/// frame bound to one network). The `/3` is only the negotiated
+/// wire-protocol version: it keeps older binaries (raw-IP `/1`, undisclosed
+/// `/2` framing) from accidentally speaking an incompatible format. It does
+/// not imply any older implementation remains — there is none, and there is
+/// no compatibility decoder.
+pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/3";
 
 /// ALPN for agent ↔ public edge reverse tunnels.
 pub const EDGE_ALPN: &[u8] = b"tunnet/edge/1";

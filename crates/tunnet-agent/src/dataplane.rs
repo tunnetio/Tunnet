@@ -8,7 +8,8 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use tun_rs::AsyncDevice;
-use tunnet_core::{AclEngine, ConnPool, RoutingTable};
+use tunnet_common::packet::PacketPool;
+use tunnet_core::{ConnPool, PolicyRuntime, RoutingTable};
 
 use crate::metrics::AgentMetrics;
 
@@ -16,9 +17,10 @@ pub struct OutboundSpawn {
     pub tun: Arc<AsyncDevice>,
     pub routes: RoutingTable,
     pub pool: ConnPool,
-    pub acl: AclEngine,
-    pub firewalls: std::collections::HashMap<uuid::Uuid, tunnet_core::direct::FirewallEngine>,
+    pub runtime: PolicyRuntime,
     pub metrics: AgentMetrics,
+    pub bufs: Arc<PacketPool>,
+    pub meter: tunnet_core::CloudRelayMeter,
     pub mtu: u16,
     /// Called when the loop ends without shutdown (abnormal service death).
     pub on_unexpected_end: Box<dyn FnOnce() + Send + 'static>,
@@ -29,9 +31,10 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
         tun,
         routes,
         pool,
-        acl,
-        firewalls,
+        runtime,
         metrics,
+        bufs,
+        meter,
         mtu,
         on_unexpected_end,
     } = spawn;
@@ -40,9 +43,10 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
             tun,
             routes,
             pool,
-            acl,
-            firewalls,
+            runtime,
             metrics,
+            bufs,
+            meter,
             mtu,
         })
         .await

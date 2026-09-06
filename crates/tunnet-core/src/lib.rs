@@ -19,10 +19,14 @@ pub mod local_api;
 #[cfg(feature = "direct")]
 pub mod mdns_relay;
 pub mod node;
+pub mod peers;
 pub mod ping;
+pub mod policy_runtime;
+pub mod reassembly;
 #[cfg(feature = "recording")]
 pub mod recording;
 pub mod routing;
+pub mod scheduler;
 pub mod secret_store;
 #[cfg(feature = "send")]
 pub mod send;
@@ -33,6 +37,7 @@ pub mod stream;
 pub mod stream_proxy;
 #[cfg(feature = "managed")]
 pub mod sync;
+pub mod transport_profile;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
 #[cfg(feature = "managed")]
@@ -52,12 +57,17 @@ pub use control::{ManagementClient, SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
 #[cfg(feature = "direct")]
 pub use iroh_docs::protocol::Docs;
-pub use iroh_pool::ConnPool;
+pub use iroh_pool::{ConnPool, TrySendError, try_send_datagram};
 pub use leave::leave_direct_network;
 #[cfg(feature = "direct")]
 pub use node::DirectNetworkRuntime;
 pub use node::{CoreNode, CoreNodeConfig};
-pub use routing::{PeerInfo, RoutingTable};
+pub use peers::{
+    FastSendError, PeerIdentity, PeerMembershipState, PeerRegistry, PeerTransportState,
+};
+pub use policy_runtime::AclDenyRecord;
+pub use policy_runtime::{FwCounters, FwSet, FwSlot, FwSnapshot, PolicyRuntime, PolicyVerdict};
+pub use routing::{FastPeerHandle, PeerInfo, RouteDecision, RoutingTable};
 #[cfg(feature = "send")]
 pub use send::{SendConfig, SendManager, TransferDirection, TransferRecord, TransferStatus};
 #[cfg(feature = "serve")]

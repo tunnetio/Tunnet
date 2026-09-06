@@ -590,6 +590,13 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             packets_dropped_timeout: od.packets_dropped_timeout,
         }),
         control,
+        daemon_git: Some(tunnet_common::git_hash().to_string()),
+        tunnel_alpn: Some(
+            std::str::from_utf8(tunnet_common::TUNNEL_ALPN)
+                .unwrap_or("?")
+                .to_string(),
+        ),
+        data_plane: Some(state.data_plane.data_plane_info()),
     }
 }
 
@@ -646,6 +653,13 @@ pub(crate) fn idle_node_summary(daemon_version: &str) -> NodeSummary {
         networks: vec![],
         on_demand: None,
         control: None,
+        daemon_git: Some(tunnet_common::git_hash().to_string()),
+        tunnel_alpn: Some(
+            std::str::from_utf8(tunnet_common::TUNNEL_ALPN)
+                .unwrap_or("?")
+                .to_string(),
+        ),
+        data_plane: None,
     }
 }
 

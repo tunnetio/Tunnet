@@ -1,0 +1,120 @@
+//! Tunnet agent runtime.
+//!
+//! This crate is both the `tunnetd` daemon binary and a library, because mobile
+//! platforms cannot spawn a daemon process. Android runs the agent in-process
+//! inside the app's `VpnService`, so the runtime has to be linkable (see
+//! `tunnet-mobile`). The binary is a thin shim over [`run_cli`].
+
+mod accept;
+mod actors;
+// Unix-shaped in content (it owns a raw fd), Android-only in use. Also built
+// under `test` on Unix hosts so its behaviour is covered by the host test run
+// rather than only on a device. The `unix` bound is required: `test` alone is
+// true on Windows too, where `std::os::fd` does not exist and `libc` is not a
+// dependency.
+#[cfg(any(target_os = "android", all(test, unix)))]
+pub mod android_tun;
+mod api_bootstrap;
+mod auto_update;
+mod cli;
+mod cmds;
+mod cmds_device;
+mod cmds_direct;
+mod cmds_login;
+mod cmds_update;
+mod core_update;
+pub mod daemon;
+mod dataplane;
+mod dgram_pump;
+mod forward;
+mod ingress;
+mod magic_dns;
+mod metrics;
+mod policy_api;
+mod pump;
+mod recorder;
+mod runtime;
+#[cfg(unix)]
+mod sd_notify;
+mod service;
+mod ssh;
+mod ssh_nat;
+mod system_dns;
+mod system_firewall;
+mod system_info;
+mod system_routes;
+mod tun_fast;
+mod tun_io;
+mod underlay;
+#[cfg(unix)]
+mod upgrade;
+#[cfg(windows)]
+mod win_service;
+#[cfg(windows)]
+mod wintun;
+
+use clap::Parser;
+
+/// Install the process-wide rustls provider. Idempotent, and required before
+/// any TLS work. Embedders must call this before starting the agent.
+pub fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls CryptoProvider");
+}
+
+/// `tunnetd` entry point. Parses argv, so only the binary should call it.
+pub fn run_cli() {
+    install_crypto_provider();
+
+    match crate::core_update::maybe_run_activation_worker() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("Core update activation failed: {error:#}");
+            exit_with(1);
+        }
+    }
+
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--service") {
+        if let Err(e) = crate::win_service::run_as_service() {
+            eprintln!("{e:#}");
+            exit_with(1);
+        }
+        return;
+    }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to create tokio runtime: {e}");
+            exit_with(1);
+        }
+    };
+
+    if let Err(e) = rt.block_on(async_main()) {
+        eprintln!("{e:#}");
+        exit_with(1);
+    }
+}
+
+fn exit_with(code: i32) -> ! {
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::exit(code);
+}
+
+async fn async_main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
+    let cli = daemon::DaemonCli::parse();
+
+    daemon::init_logging(&cli);
+    daemon::run(cli.state_dir.as_deref(), cli.run).await
+}

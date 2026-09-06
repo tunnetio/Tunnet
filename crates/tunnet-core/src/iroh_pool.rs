@@ -174,15 +174,16 @@ pub struct ConnPool {
     /// Keyed by endpoint only for the pool's default ALPN (on-demand state).
     /// Secondary ALPNs use `extra` without idle management.
     entries: Arc<DashMap<EndpointId, Arc<AsyncMutex<PeerSlot>>>>,
+    /// Established fast states (owned by routing; slow paths only: adopt,
+    /// dial, close, drop, heartbeats). The established packet path never
+    /// touches this — it uses the `Arc<PeerMembershipState>` from routing.
+    peer_registry: Arc<Mutex<Option<Arc<crate::peers::PeerRegistry>>>>,
     extra: Arc<ExtraConnMap>,
     policy: Arc<PoolPolicy>,
     metrics: Arc<PoolMetrics>,
-    bytes_in: Arc<DashMap<EndpointId, AtomicU64>>,
-    bytes_out: Arc<DashMap<EndpointId, AtomicU64>>,
     tunnel_hook: Arc<Mutex<Option<TunnelConnHook>>>,
     cloud_relay_meter: CloudRelayMeter,
     cloud_relay_urls: Arc<RwLock<HashSet<String>>>,
-    peer_cloud_relay: Arc<DashMap<EndpointId, AtomicBool>>,
 }
 
 struct PoolPolicy {
@@ -198,6 +199,7 @@ impl ConnPool {
             endpoint,
             alpn,
             entries: Arc::new(DashMap::new()),
+            peer_registry: Arc::new(Mutex::new(None)),
             extra: Arc::new(DashMap::new()),
             policy: Arc::new(PoolPolicy {
                 keep_alive: AtomicBool::new(true),
@@ -206,12 +208,9 @@ impl ConnPool {
                 keep_alive_peers: DashMap::new(),
             }),
             metrics: Arc::new(PoolMetrics::default()),
-            bytes_in: Arc::new(DashMap::new()),
-            bytes_out: Arc::new(DashMap::new()),
             tunnel_hook: Arc::new(Mutex::new(None)),
             cloud_relay_meter: CloudRelayMeter::new(),
             cloud_relay_urls: Arc::new(RwLock::new(HashSet::new())),
-            peer_cloud_relay: Arc::new(DashMap::new()),
         };
         pool.spawn_idle_sweeper();
         pool
@@ -226,21 +225,35 @@ impl ConnPool {
             endpoint,
             alpn,
             entries: Arc::new(DashMap::new()),
+            peer_registry: other.peer_registry.clone(),
             extra: Arc::new(DashMap::new()),
             policy: other.policy.clone(),
             metrics: other.metrics.clone(),
-            bytes_in: other.bytes_in.clone(),
-            bytes_out: other.bytes_out.clone(),
             tunnel_hook: Arc::new(Mutex::new(None)),
             cloud_relay_meter: other.cloud_relay_meter.clone(),
             cloud_relay_urls: other.cloud_relay_urls.clone(),
-            peer_cloud_relay: other.peer_cloud_relay.clone(),
         }
     }
 
     /// Register a hook invoked whenever this pool dials a tunnel connection.
+    /// Dialed connections are read ONLY by this hook (single ownership);
+    /// accepted connections are read ONLY by the accept path (`adopt`
+    /// never fires the hook).
     pub fn set_tunnel_hook(&self, hook: TunnelConnHook) {
         *self.tunnel_hook.lock() = Some(hook);
+    }
+
+    /// Attach the shared established-peer registry (slow-path mirror for
+    /// adopt/dial/close/drop; the packet path never touches it).
+    pub fn set_peer_registry(&self, registry: Arc<crate::peers::PeerRegistry>) {
+        *self.peer_registry.lock() = Some(registry);
+    }
+
+    /// Mirror a live connection into its endpoint transport (slow paths only).
+    fn sync_fast_conn(&self, peer: EndpointId, conn: Option<Connection>) {
+        if let Some(reg) = self.peer_registry.lock().clone() {
+            reg.set_transport_conn(peer, conn);
+        }
     }
 
     pub fn cloud_relay_meter(&self) -> CloudRelayMeter {
@@ -252,20 +265,17 @@ impl ConnPool {
         let normalized: HashSet<String> =
             urls.into_iter().map(|u| normalize_relay_url(&u)).collect();
         *self.cloud_relay_urls.write() = normalized;
-        // Clear stale peer flags; path watchers will recompute on next event.
-        self.peer_cloud_relay.clear();
     }
 
     fn spawn_cloud_relay_path_watch(&self, peer: EndpointId, conn: Connection) {
         let urls = self.cloud_relay_urls.clone();
-        let flags = self.peer_cloud_relay.clone();
+        let registry = self.peer_registry.lock().clone();
         tokio::spawn(async move {
             let refresh = |conn: &Connection| {
                 let metered = selected_path_is_cloud_relay(conn, &urls.read());
-                flags
-                    .entry(peer)
-                    .or_insert_with(|| AtomicBool::new(false))
-                    .store(metered, Ordering::Relaxed);
+                if let Some(reg) = &registry {
+                    reg.refresh_transport_path(peer, Some(metered));
+                }
             };
             refresh(&conn);
             let mut events = conn.path_events();
@@ -280,7 +290,6 @@ impl ConnPool {
                     _ => {}
                 }
             }
-            flags.remove(&peer);
         });
     }
 
@@ -307,6 +316,13 @@ impl ConnPool {
     }
 
     /// Install an accepted connection. Returns false if tie-break keeps the existing conn.
+    ///
+    /// Ownership rule: whoever calls `adopt` owns reading this connection
+    /// (accept path) or takes over an existing reader explicitly. `adopt`
+    /// deliberately does NOT fire the dialer tunnel hook — that hook belongs
+    /// to connections this pool dialed itself (`get`), so each connection
+    /// has exactly one reader and datagrams are never split across two
+    /// tasks (the loser would silently eat packets before being aborted).
     pub async fn adopt(&self, peer: EndpointId, conn: Connection) -> bool {
         let local = self.endpoint.id();
         let slot = self.slot(peer);
@@ -314,6 +330,8 @@ impl ConnPool {
         if let Some(existing) = guard.live_conn() {
             if existing.stable_id() == conn.stable_id() {
                 guard.touch();
+                drop(guard);
+                self.sync_fast_conn(peer, Some(conn));
                 return true;
             }
             if !Self::prefer_incoming(local, peer, guard.opened_by_us, false) {
@@ -328,7 +346,7 @@ impl ConnPool {
         guard.state = PeerConnState::Connected;
         guard.touch();
         drop(guard);
-        self.fire_tunnel_hook(peer, conn);
+        self.sync_fast_conn(peer, Some(conn));
         true
     }
 
@@ -348,6 +366,7 @@ impl ConnPool {
             g.state = PeerConnState::Suspended;
             g.drop_buf();
             tracing::debug!(%peer, "closed tunnel pool connection");
+            self.sync_fast_conn(peer, None);
         }
         for entry in self.extra.iter() {
             let mut g = entry.value().lock().await;
@@ -594,6 +613,11 @@ impl ConnPool {
                             let buffered = guard.take_buf();
                             (conn, buffered, true)
                         } else {
+                            // Tie-break loss: keep the existing connection
+                            // (already owned+read by whoever installed it)
+                            // and close ours. Do NOT fire the hook: firing
+                            // would spawn a second reader on a connection
+                            // that already has one, splitting datagrams.
                             let existing = existing.clone();
                             if let Some(tx) = guard.dial_waiters.take() {
                                 let _ = tx.send(Ok(existing.clone()));
@@ -601,7 +625,7 @@ impl ConnPool {
                             let buffered = guard.take_buf();
                             drop(guard);
                             conn.close(0u32.into(), b"tie_break");
-                            (existing, buffered, true)
+                            (existing, buffered, false)
                         }
                     } else {
                         guard.conn = Some(conn.clone());
@@ -618,9 +642,10 @@ impl ConnPool {
 
                 for pkt in buffered {
                     if let Err(e) = send_datagram(&canonical, pkt).await {
-                        tracing::warn!(%peer, ?e, "flush buffered datagram failed");
+                        tracing::debug!(%peer, ?e, "flush buffered datagram dropped");
                     }
                 }
+                self.sync_fast_conn(peer, Some(canonical.clone()));
                 if fire_hook {
                     self.fire_tunnel_hook(peer, canonical.clone());
                 }
@@ -665,6 +690,9 @@ impl ConnPool {
     }
 
     /// Send a packet, buffering + reconnecting when the peer is suspended (on-demand).
+    ///
+    /// Slow path only: connection setup, reconnect buffering, tie-breaking.
+    /// Established forwarding goes through `PeerMembershipState::try_send_frame`.
     pub async fn send_or_buffer(&self, peer: EndpointId, packet: Bytes) -> anyhow::Result<()> {
         let slot = self.slot(peer);
         {
@@ -709,8 +737,19 @@ impl ConnPool {
         }
     }
 
+    /// Hard-drop a peer (§2.1-9, §2.2-1): close the live tunnel connection,
+    /// deactivate ALL of its memberships (epoch bumps close readers/pumps
+    /// holding Arcs), and forget the slot. Idempotent.
     pub async fn drop_peer(&self, peer: EndpointId) {
-        self.entries.remove(&peer);
+        if let Some((_, slot)) = self.entries.remove(&peer) {
+            let mut g = slot.lock().await;
+            if let Some(c) = g.conn.take() {
+                c.close(0u32.into(), b"membership_removed");
+            }
+        }
+        if let Some(reg) = self.peer_registry.lock().clone() {
+            reg.remove_transport(peer);
+        }
         self.extra.retain(|(p, _), _| *p != peer);
     }
 
@@ -734,6 +773,7 @@ impl ConnPool {
     }
 
     /// Counts live on-demand slots plus aggregated byte counters for heartbeats.
+    /// Byte totals come from the shared fast-state registry (slow path only).
     pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
         let active_conns = self
             .entries
@@ -743,56 +783,25 @@ impl ConnPool {
                 Err(_) => true,
             })
             .count() as u32;
-        let bytes_rx: u64 = self
-            .bytes_in
-            .iter()
-            .map(|e| e.value().load(Ordering::Relaxed))
-            .sum();
-        let bytes_tx: u64 = self
-            .bytes_out
-            .iter()
-            .map(|e| e.value().load(Ordering::Relaxed))
-            .sum();
-        (active_conns, bytes_tx, bytes_rx)
+        let (extra_conns, bytes_tx, bytes_rx) = self
+            .peer_registry
+            .lock()
+            .clone()
+            .map(|r| r.heartbeat_counters())
+            .unwrap_or((0, 0, 0));
+        (active_conns.max(extra_conns), bytes_tx, bytes_rx)
     }
 
     pub fn keep_alive_global(&self) -> bool {
         self.policy.keep_alive.load(Ordering::Relaxed)
     }
 
-    pub fn record_bytes_out(&self, peer: EndpointId, n: u64) {
-        self.bytes_out
-            .entry(peer)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(n, Ordering::Relaxed);
-        if self
-            .peer_cloud_relay
-            .get(&peer)
-            .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            self.cloud_relay_meter.record(n);
-        }
-    }
-
-    pub fn record_bytes_in(&self, peer: EndpointId, n: u64) {
-        self.bytes_in
-            .entry(peer)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(n, Ordering::Relaxed);
-    }
-
     pub fn peer_bytes(&self, peer: EndpointId) -> (u64, u64) {
-        let inn = self
-            .bytes_in
-            .get(&peer)
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        let out = self
-            .bytes_out
-            .get(&peer)
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0);
-        (inn, out)
+        self.peer_registry
+            .lock()
+            .clone()
+            .map(|r| r.peer_bytes(peer))
+            .unwrap_or((0, 0))
     }
 
     /// Best-effort snapshot of a peer's on-demand connection state.
@@ -832,28 +841,59 @@ impl ConnPool {
     }
 }
 
-/// Send a datagram, waiting for buffer space when congested instead of dropping.
+/// Non-blocking DATAGRAM error. The scheduler owns drop/retry decisions;
+/// the transport is never awaited while holding a stale packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendError {
+    Full,
+    TooLarge,
+    Closed,
+}
+
+impl std::fmt::Display for TrySendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => write!(f, "transport buffer full"),
+            Self::TooLarge => write!(f, "datagram_too_large"),
+            Self::Closed => write!(f, "connection closed"),
+        }
+    }
+}
+
+impl std::error::Error for TrySendError {}
+
+/// Non-blocking DATAGRAM submit with Model A ownership (§0.6): never awaits
+/// transport capacity, and never submits unless the reported free space fits
+/// the ENTIRE frame.
 ///
-/// Drops packets larger than the connection's current `max_datagram_size`.
-pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
+/// Iroh guarantees no older buffered datagram is displaced only when the new
+/// datagram is `<= datagram_send_buffer_space()`; plain `send_datagram`
+/// otherwise discards oldest-first to make room. Tunnet therefore treats
+/// insufficient space as [`TrySendError::Full`] and lets its flow-aware
+/// scheduler own the drop/retry decision (QUIC has no flow information).
+pub fn try_send_datagram(conn: &Connection, packet: Bytes) -> Result<(), TrySendError> {
+    if conn.close_reason().is_some() {
+        return Err(TrySendError::Closed);
+    }
     if let Some(max) = conn.max_datagram_size()
         && packet.len() > max
     {
-        anyhow::bail!(
-            "datagram_too_large: packet {} > max_datagram_size {}",
-            packet.len(),
-            max
-        );
+        return Err(TrySendError::TooLarge);
     }
-    if conn.datagram_send_buffer_space() == 0 {
-        conn.send_datagram_wait(packet)
-            .await
-            .context("send_datagram_wait (datagram buffer full or connection closed)")?;
-        return Ok(());
+    if conn.datagram_send_buffer_space() < packet.len() {
+        return Err(TrySendError::Full);
     }
-    conn.send_datagram(packet)
-        .context("send_datagram (packet too big or unsupported)")?;
-    Ok(())
+    conn.send_datagram(packet).map_err(|_| TrySendError::Closed)
+}
+
+/// Send a datagram without ever awaiting transport capacity.
+///
+/// Replaces the old `send_datagram_wait` semantics: when the QUIC DATAGRAM
+/// buffer is full the packet is dropped (caller records `transport_full`)
+/// instead of converting one stale packet into an arbitrarily long awaited
+/// future that blocks the whole peer scheduler.
+pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
+    try_send_datagram(conn, packet).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@ members = [
   "crates/tunnet-common",
   "crates/tunnet-core",
   "crates/tunnet-client",
+  "crates/tunnet-mobile",
   "crates/tunnet",
   "crates/tunnet-control",
   "crates/tunnet-agent",
@@ -144,6 +145,8 @@ rcgen = "0.14"
 
 # Networking
 iroh = { version = "1.1.0" }
+noq = { version = "1.2.0" }
+noq-proto = { version = "1.2.0" }
 iroh-relay = { version = "1.1.0", default-features = false, features = [
   "server",
 ] }
@@ -180,6 +183,7 @@ napi-derive = "3"
 napi-build = "2"
 
 # Local
+tunnet-agent = { version = "0.9.1", path = "crates/tunnet-agent" }
 tunnet-common = { version = "0.9.1", path = "crates/tunnet-common" }
 tunnet-core = { version = "0.9.1", path = "crates/tunnet-core" }
 tunnet-client = { version = "0.9.1", path = "crates/tunnet-client" }

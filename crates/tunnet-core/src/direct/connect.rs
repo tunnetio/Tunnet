@@ -13,7 +13,6 @@ use crate::identity::AgentIdentity;
 use tunnet_common::local_api::DirectConnectPendingInfo;
 
 use crate::local_api::LocalApiState;
-use crate::routing::PeerInfo;
 use crate::state::PersistedState;
 
 const CONNECT_PENDING_FILE: &str = "connect_pending.json";
@@ -71,16 +70,6 @@ fn install_peer_route(
         .unwrap_or(0) as u64;
 
     let hex = format!("{endpoint}");
-    let _info = std::sync::Arc::new(PeerInfo {
-        endpoint,
-        endpoint_hex: hex.clone(),
-        hostname: hostname.to_string(),
-        ip,
-        tags: vec!["connect".into()],
-        network_id,
-        network_name: network_name.clone(),
-        ssh_host_key: None,
-    });
     // Merge into routing table via replace with existing peers + this one.
     let mut peers: Vec<tunnet_common::PeerEntry> = state
         .node
