@@ -389,7 +389,7 @@ fn offline_status(_paths: &StatePaths, persisted: &PersistedState) -> OfflineSta
             OfflineStatus {
                 hostname: d.map(|d| d.hostname.clone()).unwrap_or_else(|| "-".into()),
                 ip: d
-                    .map(|d| d.assigned_ipv4.to_string())
+                    .map(|d| d.assigned_ipv4().to_string())
                     .unwrap_or_else(|| "-".into()),
                 network_name: d
                     .map(|d| d.network_name.clone())
@@ -750,8 +750,7 @@ pub async fn run_dns_status(args: DnsStatusArgs) -> anyhow::Result<()> {
         }
     ));
     out.writeln(format!("cache     {} entries", info.cached_entries));
-    out.writeln(format!("synthetic {}", info.synthetic_base));
-    out.writeln(format!("magic     {}", info.magic_ip));
+    out.writeln(format!("resolver  {}", info.resolver_endpoint));
     out.writeln(format!("bind      {}", info.bind));
     Ok(())
 }

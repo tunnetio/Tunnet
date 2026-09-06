@@ -3,9 +3,8 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
 use tunnet_common::local_api::{
-    DirectFirewallAddRequest, DirectInviteRequest, DirectKeepAliveRequest, DirectOverrideIpRequest,
-    DirectPolicySetRequest, NetworkCreateRequest, NetworkJoinRequest, NetworkLeaveRequest,
-    NetworkUpgradeRequest,
+    DirectFirewallAddRequest, DirectInviteRequest, DirectKeepAliveRequest, DirectPolicySetRequest,
+    NetworkCreateRequest, NetworkJoinRequest, NetworkLeaveRequest, NetworkUpgradeRequest,
 };
 
 use crate::cmds::ipc_or_err;
@@ -20,6 +19,8 @@ pub struct CreateArgs {
     pub network_name: Option<String>,
     #[arg(long)]
     pub secret: Option<String>,
+    #[arg(long)]
+    pub cidr: Option<String>,
     #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
 }
@@ -117,16 +118,6 @@ pub struct LeaveArgs {
     pub name: Option<String>,
 }
 
-#[derive(Args, Debug)]
-pub struct OverrideIpArgs {
-    #[arg(long)]
-    pub network: Option<String>,
-    #[arg(long)]
-    pub peer: String,
-    #[arg(long)]
-    pub ip: String,
-}
-
 #[derive(Subcommand, Debug)]
 pub enum FirewallCommand {
     Show,
@@ -162,6 +153,7 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         open: args.open,
         network_name: args.network_name.clone(),
         secret: args.secret,
+        cidr: args.cidr,
         no_encrypt_state: args.no_encrypt_state,
     };
     match client.network_create(&body).await {
@@ -223,7 +215,7 @@ pub async fn run_requests(args: RequestsArgs, state_dir: Option<&str>) -> anyhow
         return Ok(());
     }
     for (i, p) in resp.requests.iter().enumerate() {
-        println!("{i}: {} {} {}", p.endpoint_id, p.hostname, p.ipv4);
+        println!("{i}: {} {}", p.endpoint_id, p.hostname);
     }
     Ok(())
 }
@@ -453,16 +445,4 @@ pub async fn run_leave(args: LeaveArgs, state_dir: Option<&str>) -> anyhow::Resu
             Ok(())
         }
     }
-}
-
-pub async fn run_override_ip(args: OverrideIpArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
-    let client = ipc_or_err(state_dir).await?;
-    let body = DirectOverrideIpRequest {
-        network: args.network,
-        peer: args.peer,
-        ip: args.ip,
-    };
-    let resp = client.direct_override_ip(&body).await?;
-    println!("{}", resp.message);
-    Ok(())
 }

@@ -139,6 +139,7 @@ impl BootstrapOps for AgentBootstrapOps {
             open: req.open,
             network_name: req.network_name,
             secret: req.secret,
+            cidr: req.cidr,
             no_encrypt_state: req.no_encrypt_state,
         };
         crate::cmds_direct::run_create(args, self.state_dir().as_deref())

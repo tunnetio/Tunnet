@@ -76,7 +76,6 @@ pub fn answer_owned(
     match qtype {
         RecordType::A => {
             if let Some(ip) = routes.resolve_dns_a(name_str) {
-                routes.remember_dns_synth(name_str, ip);
                 response.add_answer(Record::from_rdata(qname.clone(), TTL_SECS, RData::A(A(ip))));
                 response.metadata.response_code = ResponseCode::NoError;
             } else {
@@ -151,7 +150,7 @@ pub fn answer_ptr(
         response.metadata.response_code = ResponseCode::NoError;
         return Some(response);
     }
-    if routes.is_magic_dns_destination(&ip) {
+    if ip == tunnet_common::LocalResolverEndpoint::default().ip {
         let ns = Name::from_utf8(format!("ns.{suffix}."))
             .unwrap_or_else(|_| Name::from_utf8("ns.tunnet.").expect("literal"));
         response.add_answer(Record::from_rdata(

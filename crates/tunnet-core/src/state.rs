@@ -1,4 +1,3 @@
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -100,10 +99,6 @@ impl StatePaths {
             .join("direct_pending")
             .join(format!("{network_id}.json"))
     }
-    /// Manual IP overrides for birthday collisions (`override-ip`).
-    pub fn ip_overrides_file(&self) -> PathBuf {
-        self.dir.join("ip_overrides.json")
-    }
 
     pub fn ensure(&self) -> anyhow::Result<()> {
         std::fs::create_dir_all(&self.dir)
@@ -170,9 +165,6 @@ pub struct DirectState {
     /// Auto-admit valid invite codes without manual approval.
     #[serde(default)]
     pub open: bool,
-    pub assigned_ipv4: Ipv4Addr,
-    #[serde(default)]
-    pub collision_index: u8,
     pub hostname: String,
     /// Optional coordinator endpoint id (hex) known at join time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +175,10 @@ pub struct DirectState {
     /// Current network epoch (revocation watermark).
     #[serde(default)]
     pub network_epoch: u64,
+    /// Signed network authority. Entire address plan is covered by the signature.
+    pub genesis: crate::direct::Genesis,
+    /// Local node's signed member record. Authoritative self address.
+    pub self_record: crate::direct::SignedMemberRecord,
     /// iroh-docs ticket. In-memory only - sealed in `state.enc`.
     #[serde(skip)]
     pub doc_ticket: Option<String>,
@@ -202,6 +198,16 @@ pub struct DirectState {
     #[serde(default)]
     pub auto_accept_firewall: bool,
     pub created_at: Timestamp,
+}
+
+impl DirectState {
+    pub fn self_ipv4(&self) -> std::net::Ipv4Addr {
+        self.self_record.ipv4
+    }
+
+    pub fn address_plan(&self) -> crate::direct::AddressPlan {
+        self.genesis.address_plan
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,31 +429,80 @@ pub fn load_snapshot_cache(paths: &StatePaths) -> Option<tunnet_common::Endpoint
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct::{GENESIS_SCHEMA_VERSION, MEMBER_SCHEMA_VERSION, MemberRole, NetworkGrant};
+
+    fn test_genesis(network_id: Uuid, cidr: &str) -> crate::direct::Genesis {
+        crate::direct::Genesis {
+            schema_version: GENESIS_SCHEMA_VERSION,
+            network_id,
+            network_name: "home".into(),
+            coordinator_endpoint_id: "aa".repeat(32),
+            coordinator_verifying_key: "bb".repeat(32),
+            address_plan: crate::direct::AddressPlan {
+                peer_cidr: cidr.parse().unwrap(),
+            },
+            created_at: Timestamp::now(),
+            sig: String::new(),
+        }
+    }
+
+    fn test_record(network_id: Uuid, ip: &str) -> crate::direct::SignedMemberRecord {
+        let now = Timestamp::now();
+        crate::direct::SignedMemberRecord {
+            schema_version: MEMBER_SCHEMA_VERSION,
+            network_id,
+            endpoint_id: "aa".repeat(32),
+            hostname: "laptop".into(),
+            ipv4: ip.parse().unwrap(),
+            tags: vec![],
+            status: "active".into(),
+            ssh_host_key: None,
+            sequence: 1,
+            joined_at: now,
+            grant: NetworkGrant {
+                network_id,
+                endpoint_id: "aa".repeat(32),
+                role: MemberRole::Coordinator,
+                network_epoch: 0,
+                issued_at: now,
+                expires_at: now,
+                content_key: hex::encode([0u8; 32]),
+                sig: String::new(),
+            },
+            endpoint_sig: String::new(),
+            coordinator: true,
+        }
+    }
+
+    fn test_direct(name: &str, id: Uuid, cidr: &str, ip: &str) -> DirectState {
+        DirectState {
+            network_name: name.into(),
+            join_secret: String::new(),
+            topic_hash: "bb".repeat(32),
+            network_id: id,
+            coordinator: true,
+            open: true,
+            hostname: "laptop".into(),
+            coordinator_endpoint_id: None,
+            coordinator_verifying_key: None,
+            network_epoch: 0,
+            genesis: test_genesis(id, cidr),
+            self_record: test_record(id, ip),
+            doc_ticket: None,
+            namespace_id: None,
+            coordinator_signing_key: None,
+            network_grant: None,
+            content_key: None,
+            auto_accept_firewall: false,
+            created_at: Timestamp::now(),
+        }
+    }
 
     #[test]
     fn tagged_direct_roundtrip() {
+        let id = Uuid::nil();
         let s = PersistedState::Direct {
-            networks: vec![DirectState {
-                network_name: "home".into(),
-                join_secret: String::new(),
-                topic_hash: "bb".repeat(32),
-                network_id: Uuid::nil(),
-                coordinator: true,
-                open: true,
-                assigned_ipv4: "100.64.0.1".parse().unwrap(),
-                collision_index: 0,
-                hostname: "laptop".into(),
-                coordinator_endpoint_id: None,
-                coordinator_verifying_key: None,
-                network_epoch: 0,
-                doc_ticket: None,
-                namespace_id: None,
-                coordinator_signing_key: None,
-                network_grant: None,
-                content_key: None,
-                auto_accept_firewall: false,
-                created_at: Timestamp::now(),
-            }],
+            networks: vec![test_direct("home", id, "10.21.0.0/24", "10.21.0.1")],
         };
         let bytes = serde_json::to_vec(&s).unwrap();
         let loaded: PersistedState = serde_json::from_slice(&bytes).unwrap();
@@ -482,48 +537,8 @@ mod tests {
     fn require_direct_network_multi() {
         let s = PersistedState::Direct {
             networks: vec![
-                DirectState {
-                    network_name: "gaming".into(),
-                    join_secret: String::new(),
-                    topic_hash: "aa".repeat(32),
-                    network_id: Uuid::from_u128(1),
-                    coordinator: true,
-                    open: false,
-                    assigned_ipv4: "100.64.0.1".parse().unwrap(),
-                    collision_index: 0,
-                    hostname: "laptop".into(),
-                    coordinator_endpoint_id: None,
-                    coordinator_verifying_key: None,
-                    network_epoch: 0,
-                    doc_ticket: None,
-                    namespace_id: None,
-                    coordinator_signing_key: None,
-                    network_grant: None,
-                    content_key: None,
-                    auto_accept_firewall: false,
-                    created_at: Timestamp::now(),
-                },
-                DirectState {
-                    network_name: "homelab".into(),
-                    join_secret: String::new(),
-                    topic_hash: "bb".repeat(32),
-                    network_id: Uuid::from_u128(2),
-                    coordinator: false,
-                    open: false,
-                    assigned_ipv4: "100.64.0.1".parse().unwrap(),
-                    collision_index: 0,
-                    hostname: "laptop".into(),
-                    coordinator_endpoint_id: None,
-                    coordinator_verifying_key: None,
-                    network_epoch: 0,
-                    doc_ticket: None,
-                    namespace_id: None,
-                    coordinator_signing_key: None,
-                    network_grant: None,
-                    content_key: None,
-                    auto_accept_firewall: false,
-                    created_at: Timestamp::now(),
-                },
+                test_direct("gaming", Uuid::from_u128(1), "10.31.0.0/24", "10.31.0.1"),
+                test_direct("homelab", Uuid::from_u128(2), "10.32.0.0/24", "10.32.0.1"),
             ],
         };
         assert!(s.require_direct_network(None).is_err());

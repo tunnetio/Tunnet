@@ -135,13 +135,13 @@ mod tests {
     #[test]
     fn formats_known_hosts_line() {
         let line = known_hosts_line(
-            &["100.64.0.1", "db"],
+            &["10.21.0.1", "db"],
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake comment",
         )
         .unwrap();
         assert_eq!(
             line,
-            "100.64.0.1,db ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake"
+            "10.21.0.1,db ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFake"
         );
     }
 
@@ -149,7 +149,7 @@ mod tests {
     fn sync_writes_file() {
         let dir = tempfile::tempdir().unwrap();
         let peers = vec![PeerEntry {
-            ip: Ipv4Addr::new(100, 64, 0, 2),
+            ip: Ipv4Addr::new(10, 21, 0, 2),
             endpoint_id: "abcd".into(),
             hostname: "db".into(),
             tags: vec![],
@@ -157,7 +157,7 @@ mod tests {
         }];
         sync_known_hosts(dir.path(), &peers, "tunnet").unwrap();
         let body = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();
-        assert!(body.contains("100.64.0.2"));
+        assert!(body.contains("10.21.0.2"));
         assert!(body.contains("db.tunnet"));
         assert!(body.contains("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest"));
     }

@@ -1,13 +1,12 @@
 //! PeerDNS stub: authoritative mesh answers, Hickory for everything else.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
-
 use anyhow::Context;
 use hickory_proto::op::{DEFAULT_MAX_PAYLOAD_LEN, Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::RecordType;
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tunnet_common::DnsConfig;
 
@@ -40,8 +39,23 @@ pub fn spawn(
     })
 }
 
-pub fn bind_addr(magic_or_tun_ip: Ipv4Addr) -> SocketAddr {
-    SocketAddr::from((magic_or_tun_ip, 53))
+pub fn loopback_endpoint() -> SocketAddr {
+    SocketAddr::from((
+        tunnet_common::LocalResolverEndpoint::default().ip,
+        tunnet_common::LocalResolverEndpoint::default().port,
+    ))
+}
+
+pub fn bind_addr() -> SocketAddr {
+    loopback_endpoint()
+}
+
+pub async fn probe_endpoint(bind: SocketAddr) -> anyhow::Result<()> {
+    let sock = tokio::net::UdpSocket::bind(bind)
+        .await
+        .with_context(|| format!("probe PeerDNS UDP {bind}"))?;
+    drop(sock);
+    Ok(())
 }
 
 async fn bind_udp_with_retry(bind: SocketAddr) -> anyhow::Result<UdpSocket> {
@@ -67,7 +81,7 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
     // Loop-prevention invariant: resolve a `"system"` upstream to the
     // explicit underlay snapshot NOW, before the agent installs the osdns
     // overlay that points the OS at PeerDNS. `build_resolver` additionally
-    // filters our own magic IP so even a post-overlay rebuild cannot loop.
+    // filters our own loopback endpoint so even a post-overlay rebuild cannot loop.
     let dns = with_underlay_upstream(&dns);
     let lookup = match HickoryLookup::from_dns_config(&dns) {
         Ok(l) => Arc::new(l),
@@ -80,29 +94,12 @@ async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::
         }
     };
 
-    let any = SocketAddr::from((Ipv4Addr::UNSPECIFIED, bind.port()));
-    let sock = match UdpSocket::bind(any).await {
-        Ok(s) => {
-            tracing::info!(
-                %any,
-                via = %bind,
-                magic = %dns.magic_ip,
-                suffix = %dns.suffix,
-                "PeerDNS stub listening"
-            );
-            s
-        }
-        Err(e) => {
-            tracing::debug!(?e, %any, "PeerDNS wildcard bind failed; trying magic IP");
-            let magic_bind = SocketAddr::from((dns.magic_ip, bind.port()));
-            let s = match bind_udp_with_retry(magic_bind).await {
-                Ok(s) => s,
-                Err(_) => bind_udp_with_retry(bind).await?,
-            };
-            tracing::info!(%bind, magic = %dns.magic_ip, suffix = %dns.suffix, "PeerDNS stub listening");
-            s
-        }
-    };
+    if bind.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) && !bind.ip().is_loopback()
+    {
+        anyhow::bail!("PeerDNS must bind a loopback address, got {bind}");
+    }
+    let sock = bind_udp_with_retry(bind).await?;
+    tracing::info!(%bind, suffix = %dns.suffix, "PeerDNS stub listening");
     let sock = Arc::new(sock);
     let suffix = Arc::new(dns.suffix);
     let mut buf = vec![0u8; UDP_BUF];
@@ -231,6 +228,7 @@ fn formerr_from_raw(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use std::str::FromStr;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -299,7 +297,7 @@ mod tests {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
         table.replace(
-            &[peer(&self_id, "100.64.0.2", "desktop")],
+            &[peer(&self_id, "10.21.0.2", "desktop")],
             &[],
             &[],
             &[],
@@ -334,11 +332,8 @@ mod tests {
 
     #[test]
     fn parse_reverse_arpa() {
-        let n = Name::from_str("53.100.100.100.in-addr.arpa.").unwrap();
-        assert_eq!(
-            parse_in_addr_arpa(&n),
-            Some(Ipv4Addr::new(100, 100, 100, 53))
-        );
+        let n = Name::from_str("1.0.0.127.in-addr.arpa.").unwrap();
+        assert_eq!(parse_in_addr_arpa(&n), Some(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
     #[test]
@@ -473,43 +468,46 @@ mod tests {
     }
 
     #[test]
-    fn loop_prevention_filters_peerdns_magic_from_candidates() {
-        let magic = Ipv4Addr::new(100, 100, 100, 53);
+    fn loop_prevention_filters_peerdns_loopback_from_candidates() {
+        use super::upstream::local_resolver_ip;
+        let loopback = local_resolver_ip();
         let filtered = filter_self_nameservers(
             [
-                std::net::IpAddr::V4(magic),
+                std::net::IpAddr::V4(loopback),
                 std::net::IpAddr::from([1, 1, 1, 1]),
-                std::net::IpAddr::V4(magic),
+                std::net::IpAddr::V4(loopback),
             ],
-            magic,
+            loopback,
         );
         assert_eq!(filtered, vec![std::net::IpAddr::from([1, 1, 1, 1])]);
-        // A post-overlay system state pointing only at PeerDNS leaves
-        // nothing usable; the resolver must fail closed instead of looping.
-        assert!(filter_self_nameservers([std::net::IpAddr::V4(magic)], magic).is_empty());
+        assert!(filter_self_nameservers([std::net::IpAddr::V4(loopback)], loopback).is_empty());
+    }
+
+    #[test]
+    fn peerdns_never_wildcard_binds() {
+        let bind = bind_addr();
+        assert!(bind.ip().is_loopback());
+        assert_ne!(bind.ip(), std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
     #[test]
     fn underlay_snapshot_never_selects_peerdns_itself() {
+        use super::upstream::local_resolver_ip;
         let dns = DnsConfig {
             upstream: vec!["system".into()],
             ..DnsConfig::default()
         };
-        assert_eq!(dns.magic_ip, Ipv4Addr::new(100, 100, 100, 53));
-        // Must run BEFORE the osdns overlay is installed; afterwards the OS
-        // state points at PeerDNS and only the explicit snapshot is safe.
+        let loopback = local_resolver_ip();
         let pinned = with_underlay_upstream(&dns);
         match parse_upstream(&pinned.upstream).unwrap() {
-            UpstreamSource::System => {
-                // Host without system DNS: `build_resolver` fails closed.
-            }
+            UpstreamSource::System => {}
             UpstreamSource::Config(config) => {
                 assert!(!config.name_servers.is_empty());
                 assert!(
                     config
                         .name_servers
                         .iter()
-                        .all(|ns| ns.ip != std::net::IpAddr::V4(dns.magic_ip)),
+                        .all(|ns| ns.ip != std::net::IpAddr::V4(loopback)),
                     "Hickory must never use PeerDNS as its own upstream"
                 );
             }
@@ -538,7 +536,6 @@ mod tests {
                 format!("tcp://{}:{}", tcp_addr.ip(), tcp_addr.port()),
             ],
             dnssec: false,
-            ..DnsConfig::default()
         };
         let parsed = match parse_upstream(&dns.upstream).unwrap() {
             UpstreamSource::Config(c) => c,

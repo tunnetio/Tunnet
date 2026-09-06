@@ -1,15 +1,16 @@
-//! Direct-mode bootstrap: create / join / leave / upgrade + AUTH post-auth.
-
-use std::net::Ipv4Addr;
+use std::collections::HashSet;
 
 use anyhow::Context;
 use clap::Args;
 use tunnet_core::direct::admin::{PendingJoin, push_pending};
 use tunnet_core::direct::{
-    AUTH_ALPN, AuthClientMode, ConnectivityOptions, ConnectivityProfile, DocsMembership,
-    MemberRole, MembershipEntry, NetworkGrant, apply_connectivity, decode_invite, derive_ipv4,
+    AUTH_ALPN, AddressPlan, AuthClientMode, ConnectivityOptions, ConnectivityProfile,
+    DocsMembership, GENESIS_SCHEMA_VERSION, Genesis, MEMBER_SCHEMA_VERSION, MemberRole,
+    MembershipEntry, NetworkGrant, allocate_peer_ip, apply_connectivity, decode_invite,
     endpoint_builder, generate_coordinator_keypair, grant_expiry, load_approved,
-    network_id_from_topic, run_auth_client, save_approved, sign_grant, topic_from_name_secret,
+    network_id_from_topic, run_auth_client, save_approved, sign_genesis, sign_grant,
+    sign_member_record, topic_from_name_secret, validate_member_against_genesis,
+    validate_peer_cidr, verify_genesis, verify_member_record, verifying_key_from_hex,
 };
 use tunnet_core::{
     AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, load_agent, persist_agent,
@@ -19,17 +20,14 @@ use tunnet_core::{
 pub struct CreateArgs {
     #[arg(long, env = "TUNNET_HOSTNAME")]
     pub hostname: Option<String>,
-    /// Auto-admit peers with a valid invite (no manual approval queue).
     #[arg(long)]
     pub open: bool,
-    /// Network name (default: direct).
     #[arg(long = "name")]
     pub network_name: Option<String>,
-    /// Shared passphrase for this network.
-    /// If omitted, a random secret is generated and printed.
     #[arg(long)]
     pub secret: Option<String>,
-    /// Store secrets in plaintext (no TPM/Keychain/derived seal).
+    #[arg(long)]
+    pub cidr: Option<String>,
     #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
 }
@@ -39,10 +37,8 @@ pub struct JoinArgs {
     pub invite_code: String,
     #[arg(long, env = "TUNNET_HOSTNAME")]
     pub hostname: Option<String>,
-    /// Automatically accept coordinator firewall policy suggestions.
     #[arg(long)]
     pub auto_accept_firewall: bool,
-    /// Store secrets in plaintext (no TPM/Keychain/derived seal).
     #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
 }
@@ -61,7 +57,6 @@ pub struct UpgradeArgs {
 
 #[derive(Args, Debug)]
 pub struct LeaveArgs {
-    /// Network name to leave
     #[arg(long)]
     pub network: Option<String>,
     pub name: Option<String>,
@@ -78,6 +73,27 @@ fn hostname_arg(explicit: Option<String>) -> String {
         .unwrap_or_else(|| "tunnet-node".into())
 }
 
+pub fn collect_host_nets() -> Vec<ipnet::Ipv4Net> {
+    let mut out = Vec::new();
+    for iface in netdev::get_interfaces() {
+        for n in iface.ipv4 {
+            if let Ok(net) = ipnet::Ipv4Net::new(n.addr(), n.prefix_len()) {
+                out.push(net.trunc());
+            }
+        }
+    }
+    out.sort_by_key(|n| (u32::from(n.network()), n.prefix_len()));
+    out.dedup();
+    out
+}
+
+fn existing_plans(networks: &[DirectState]) -> Vec<(uuid::Uuid, ipnet::Ipv4Net)> {
+    networks
+        .iter()
+        .map(|d| (d.network_id, d.genesis.address_plan.peer_cidr))
+        .collect()
+}
+
 async fn write_post_auth_response(
     send: &mut iroh::endpoint::SendStream,
     resp: &[u8],
@@ -86,7 +102,6 @@ async fn write_post_auth_response(
     send.write_all(&len).await?;
     send.write_all(resp).await?;
     send.finish()?;
-    // Ensure the peer can finish reading before this connection is torn down.
     let _ = send.stopped().await;
     Ok(())
 }
@@ -105,7 +120,7 @@ pub async fn try_handle_post_auth(
     conn: &iroh::endpoint::Connection,
     state_dir: &std::path::Path,
     docs: Option<&DocsMembership>,
-    self_endpoint_id: &str,
+    _self_endpoint_id: &str,
     network_id: uuid::Uuid,
     auth: &tunnet_core::direct::auth::AuthCache,
     routes: &tunnet_core::RoutingTable,
@@ -115,8 +130,8 @@ pub async fn try_handle_post_auth(
         dir: state_dir.to_path_buf(),
     };
     let policy = SealPolicy::from_env_and_flag(false);
+    let remote_id = format!("{}", conn.remote_id());
 
-    // Client opens a bi after PSK; wait briefly.
     let (mut send, mut recv) =
         match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await {
             Ok(Ok(streams)) => streams,
@@ -153,32 +168,29 @@ pub async fn try_handle_post_auth(
     let msg_type = req.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     let resp = match msg_type {
-        "join_request" if direct.coordinator => {
-            handle_join_request_bytes(&paths, direct, docs, auth, routes, acl, &body).await?
+        "join_prepare" if direct.coordinator => {
+            handle_join_prepare(&paths, direct, &remote_id, &body).await?
         }
-        "join_request" => post_auth_deny("not_coordinator"),
+        "join_prepare" => post_auth_deny("not_coordinator"),
+        "join_commit" if direct.coordinator => {
+            handle_join_commit(&paths, direct, docs, auth, routes, acl, &remote_id, &body).await?
+        }
+        "join_commit" => post_auth_deny("not_coordinator"),
+        "join_request" => post_auth_deny("unsupported_legacy_join"),
         "connect_request" => {
             let allowlist = tunnet_core::direct::connect::load_allowlist_from_dir(state_dir);
             let (_accepted, resp_bytes) = tunnet_core::direct::connect::handle_inbound_connect(
                 state_dir,
-                &format!("{}", conn.remote_id()),
+                &remote_id,
                 &body,
                 &allowlist,
                 &direct.hostname,
-                direct.assigned_ipv4,
+                direct.self_record.ipv4,
             )
             .await?;
-            let _ = self_endpoint_id;
             resp_bytes
         }
         "connect_accepted" => {
-            // Peer notified us they accepted; install route if present.
-            if let (Some(ipv4), Some(hostname)) = (
-                req.get("ipv4").and_then(|v| v.as_str()),
-                req.get("hostname").and_then(|v| v.as_str()),
-            ) {
-                tracing::info!(%hostname, %ipv4, "remote accepted connect");
-            }
             return Ok(());
         }
         _ => post_auth_deny("unknown_request"),
@@ -186,6 +198,203 @@ pub async fn try_handle_post_auth(
 
     write_post_auth_response(&mut send, &resp).await?;
     Ok(())
+}
+
+async fn handle_join_prepare(
+    paths: &StatePaths,
+    direct: &DirectState,
+    remote_id: &str,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let req: serde_json::Value = serde_json::from_slice(body)?;
+    let hostname = req
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .unwrap_or("peer")
+        .to_string();
+    let invite_id = req
+        .get("invite_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let _reusable = req
+        .get("reusable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let approved = load_approved(paths).unwrap_or_default();
+    let pre_approved = approved.iter().any(|id| id == remote_id);
+    let issued =
+        tunnet_core::direct::admin::load_invite_ids(paths, direct.network_id).unwrap_or_default();
+    let invite_ok = invite_id.as_ref().is_some_and(|id| issued.contains(id));
+
+    if !direct.open && !pre_approved && !invite_ok {
+        if invite_id.is_some() {
+            return Ok(serde_json::to_vec(&serde_json::json!({
+                "accepted": false,
+                "reason": "invalid_or_used_invite",
+            }))?);
+        }
+        push_pending(
+            paths,
+            direct.network_id,
+            &PendingJoin {
+                endpoint_id: remote_id.to_string(),
+                hostname,
+            },
+        )?;
+        return Ok(serde_json::to_vec(&serde_json::json!({
+            "accepted": false,
+            "reason": "pending_approval",
+            "genesis": direct.genesis,
+        }))?);
+    }
+
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "accepted": true,
+        "genesis": direct.genesis,
+    }))?)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_join_commit(
+    paths: &StatePaths,
+    direct: &DirectState,
+    docs: Option<&DocsMembership>,
+    auth: &tunnet_core::direct::auth::AuthCache,
+    routes: &tunnet_core::RoutingTable,
+    acl: &tunnet_core::AclEngine,
+    remote_id: &str,
+    body: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let req: serde_json::Value = serde_json::from_slice(body)?;
+    let hostname = req
+        .get("hostname")
+        .and_then(|v| v.as_str())
+        .unwrap_or("peer")
+        .to_string();
+    let invite_id = req
+        .get("invite_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let reusable = req
+        .get("reusable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let approved = load_approved(paths).unwrap_or_default();
+    let pre_approved = approved.iter().any(|id| id == remote_id);
+    let issued =
+        tunnet_core::direct::admin::load_invite_ids(paths, direct.network_id).unwrap_or_default();
+    let invite_ok = invite_id.as_ref().is_some_and(|id| issued.contains(id));
+
+    if !direct.open && !pre_approved && !invite_ok {
+        push_pending(
+            paths,
+            direct.network_id,
+            &PendingJoin {
+                endpoint_id: remote_id.to_string(),
+                hostname,
+            },
+        )?;
+        return Ok(serde_json::to_vec(&serde_json::json!({
+            "accepted": false,
+            "reason": "pending_approval",
+        }))?);
+    }
+
+    let Some(docs) = docs else {
+        return Ok(serde_json::to_vec(&serde_json::json!({
+            "accepted": false,
+            "reason": "coordinator_docs_not_ready",
+        }))?);
+    };
+
+    let plan = direct.genesis.address_plan;
+    let occupied: HashSet<std::net::Ipv4Addr> = docs
+        .snapshot_members()
+        .into_iter()
+        .filter(|m| m.endpoint_id != remote_id)
+        .map(|m| m.ipv4)
+        .collect();
+    if let Some(existing) = docs
+        .snapshot_members()
+        .into_iter()
+        .find(|m| m.endpoint_id == remote_id)
+    {
+        let entry = MembershipEntry {
+            endpoint_id: remote_id.to_string(),
+            hostname: hostname.clone(),
+            ipv4: existing.ipv4,
+            tags: vec![],
+            joined_at: existing.joined_at,
+            coordinator: false,
+            status: "active".into(),
+            ssh_host_key: None,
+        };
+        let (grant, content_key, record) = docs.admit_peer(&entry, auth).await?;
+        docs.refresh_seed_peers();
+        let policy = (**acl.bundle.load()).clone();
+        docs.apply_to_routes(routes, acl, &policy);
+        let ticket = docs.share_read_ticket().await?;
+        if pre_approved {
+            let mut ids = approved;
+            ids.retain(|id| id != remote_id);
+            let _ = save_approved(paths, &ids);
+        }
+        if !reusable && let Some(id) = invite_id.as_ref() {
+            let mut ids = issued;
+            ids.remove(id);
+            let _ = tunnet_core::direct::admin::save_invite_ids(paths, direct.network_id, &ids);
+        }
+        return Ok(serde_json::to_vec(&serde_json::json!({
+            "accepted": true,
+            "ipv4": existing.ipv4.to_string(),
+            "doc_ticket": ticket,
+            "network_grant": grant,
+            "member_record": record,
+            "genesis": direct.genesis,
+            "content_key": content_key,
+        }))?);
+    }
+    let ip = allocate_peer_ip(&plan, &direct.network_id, remote_id, &occupied)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let entry = MembershipEntry {
+        endpoint_id: remote_id.to_string(),
+        hostname,
+        ipv4: ip,
+        tags: vec![],
+        joined_at: jiff::Timestamp::now(),
+        coordinator: false,
+        status: "active".into(),
+        ssh_host_key: None,
+    };
+    let (grant, content_key, record) = docs.admit_peer(&entry, auth).await?;
+    docs.refresh_seed_peers();
+    let policy = (**acl.bundle.load()).clone();
+    docs.apply_to_routes(routes, acl, &policy);
+    let ticket = docs.share_read_ticket().await?;
+
+    if pre_approved {
+        let mut ids = approved;
+        ids.retain(|id| id != remote_id);
+        let _ = save_approved(paths, &ids);
+    }
+    if !reusable && let Some(id) = invite_id.as_ref() {
+        let mut ids = issued;
+        ids.remove(id);
+        let _ = tunnet_core::direct::admin::save_invite_ids(paths, direct.network_id, &ids);
+    }
+
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "accepted": true,
+        "ipv4": ip.to_string(),
+        "doc_ticket": ticket,
+        "network_grant": grant,
+        "member_record": record,
+        "genesis": direct.genesis,
+        "content_key": content_key,
+    }))?)
 }
 
 pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
@@ -251,16 +460,57 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         _ => (AgentIdentity::generate(), Vec::new()),
     };
     let my_id = identity.endpoint_id_hex();
-    let assigned_ipv4 = derive_ipv4(&my_id, 0);
 
-    let network_id_for_grant = network_id;
-    // One reading of the clock: two `now()` calls made `issued_at` and the base
-    // for `expires_at` disagree by however long the call took.
+    let host_nets = collect_host_nets();
+    let plans = existing_plans(&networks);
+    let address_plan = if let Some(cidr_str) = args.cidr.as_deref() {
+        let cidr: ipnet::Ipv4Net = cidr_str.parse().context("invalid --cidr")?;
+        validate_peer_cidr(&cidr, &plans, &host_nets)
+            .map_err(|e| anyhow::anyhow!("invalid --cidr {cidr_str}: {e}"))?;
+        AddressPlan { peer_cidr: cidr }
+    } else {
+        tunnet_core::direct::select_peer_cidr(&plans, &host_nets)
+            .map_err(|e| anyhow::anyhow!("no safe IPv4 peer range on this host: {e}"))?
+    };
+    for d in &networks {
+        let other = d.genesis.address_plan.peer_cidr;
+        let cidr = address_plan.peer_cidr;
+        if cidr.contains(&other.network())
+            || cidr.contains(&other.broadcast())
+            || other.contains(&cidr.network())
+            || other.contains(&cidr.broadcast())
+        {
+            anyhow::bail!(
+                "new network CIDR {cidr} overlaps active Direct network '{}' ({other})",
+                d.network_name
+            );
+        }
+    }
+
+    let created_at = jiff::Timestamp::now();
+    let genesis = sign_genesis(
+        &coord_sk,
+        Genesis {
+            schema_version: GENESIS_SCHEMA_VERSION,
+            network_id,
+            network_name: network_name.clone(),
+            coordinator_endpoint_id: my_id.clone(),
+            coordinator_verifying_key: coord_vk_hex.clone(),
+            address_plan,
+            created_at,
+            sig: String::new(),
+        },
+    )?;
+
+    let occupied = HashSet::new();
+    let self_ip = allocate_peer_ip(&address_plan, &network_id, &my_id, &occupied)
+        .map_err(|e| anyhow::anyhow!("address allocation failed: {e}"))?;
+
     let issued_at = jiff::Timestamp::now();
     let self_grant = sign_grant(
         &coord_sk,
         NetworkGrant {
-            network_id: network_id_for_grant,
+            network_id,
             endpoint_id: my_id.clone(),
             role: MemberRole::Coordinator,
             network_epoch: 0,
@@ -268,6 +518,24 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
             expires_at: grant_expiry(issued_at)?,
             content_key: content_key.clone(),
             sig: String::new(),
+        },
+    )?;
+    let self_record = sign_member_record(
+        &coord_sk,
+        tunnet_core::direct::SignedMemberRecord {
+            schema_version: MEMBER_SCHEMA_VERSION,
+            network_id,
+            endpoint_id: my_id.clone(),
+            hostname: hostname.clone(),
+            ipv4: self_ip,
+            tags: vec![],
+            status: "active".into(),
+            ssh_host_key: None,
+            sequence: 1,
+            joined_at: created_at,
+            grant: self_grant.clone(),
+            endpoint_sig: String::new(),
+            coordinator: true,
         },
     )?;
     let grant_json = serde_json::to_string(&self_grant)?;
@@ -279,19 +547,19 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         network_id,
         coordinator: true,
         open: args.open,
-        assigned_ipv4,
-        collision_index: 0,
         hostname: hostname.clone(),
         coordinator_endpoint_id: Some(my_id.clone()),
         coordinator_verifying_key: Some(coord_vk_hex),
         network_epoch: 0,
+        genesis,
+        self_record,
         doc_ticket: None,
         namespace_id: None,
         coordinator_signing_key: Some(coord_sk_hex),
         network_grant: Some(grant_json),
         content_key: Some(content_key),
         auto_accept_firewall: false,
-        created_at: jiff::Timestamp::now(),
+        created_at,
     });
     let persisted = PersistedState::Direct { networks };
     let tier = persist_agent(&paths, &identity, persisted, policy)?;
@@ -303,10 +571,11 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
     }
 
     println!(
-        "Created Direct network '{}'. endpoint_id={} ip={} (secrets: {})",
+        "Created Direct network '{}'. endpoint_id={} ip={} cidr={} (secrets: {})",
         network_name,
         my_id,
-        assigned_ipv4,
+        self_ip,
+        address_plan.peer_cidr,
         tier.as_str()
     );
     println!("State directory: {}", paths.dir.display());
@@ -314,6 +583,29 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
     println!("Next: `tunnet invite` and share the code.");
     Ok(())
 }
+
+async fn rpc_send_recv(
+    conn: &iroh::endpoint::Connection,
+    value: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open rpc stream")?;
+    let bytes = serde_json::to_vec(value)?;
+    send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+    send.write_all(&bytes).await?;
+    send.finish()?;
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf)
+        .await
+        .context("read rpc response")?;
+    let n = u32::from_be_bytes(len_buf) as usize;
+    if n > 256 * 1024 {
+        anyhow::bail!("rpc response too large");
+    }
+    let mut body = vec![0u8; n];
+    recv.read_exact(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
 pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
     paths.ensure()?;
@@ -349,10 +641,7 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
     };
 
     let my_id = identity.endpoint_id_hex();
-    let mut collision_index = 0u8;
-    let mut assigned_ipv4 = derive_ipv4(&my_id, collision_index);
 
-    // Dial coordinator and prove PSK.
     let secret = iroh::SecretKey::from_bytes(&identity.secret_bytes);
     let connectivity = ConnectivityOptions {
         profile: ConnectivityProfile::ServerlessDht,
@@ -396,67 +685,143 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         .await
         .context("invite auth with coordinator")?;
 
-        // Send join request over the same connection.
-        let (mut send, mut recv) = conn.open_bi().await.context("open join stream")?;
-        let req = serde_json::json!({
-            "type": "join_request",
-            "endpoint_id": my_id,
-            "hostname": hostname,
-            "ipv4": assigned_ipv4.to_string(),
-            "collision_index": collision_index,
-            "invite_id": invite.invite_id,
-            "reusable": invite.reusable,
-        });
-        let bytes = serde_json::to_vec(&req)?;
-        let len = (bytes.len() as u32).to_be_bytes();
-        send.write_all(&len).await.context("write join request")?;
-        send.write_all(&bytes).await.context("write join request")?;
-        send.finish().context("finish join request")?;
-
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf)
-            .await
-            .context("read join response (is the coordinator agent running `tunnetd`?)")?;
-        let n = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; n];
-        recv.read_exact(&mut body)
-            .await
-            .context("read join response body")?;
-        let resp: serde_json::Value = serde_json::from_slice(&body)?;
-        if resp.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
-            let reason = resp
+        let prepare = rpc_send_recv(
+            &conn,
+            &serde_json::json!({
+                "type": "join_prepare",
+                "hostname": hostname,
+                "invite_id": invite.invite_id,
+                "reusable": invite.reusable,
+            }),
+        )
+        .await?;
+        if prepare.get("accepted").and_then(|v| v.as_bool()) != Some(true)
+            && prepare.get("reason").and_then(|v| v.as_str()) != Some("pending_approval")
+        {
+            let reason = prepare
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .unwrap_or("denied");
             anyhow::bail!("join denied: {reason}");
         }
-        if let Some(ip) = resp.get("ipv4").and_then(|v| v.as_str()) {
-            assigned_ipv4 = ip.parse().unwrap_or(assigned_ipv4);
+        let genesis: Genesis = serde_json::from_value(
+            prepare
+                .get("genesis")
+                .cloned()
+                .context("coordinator did not return genesis")?,
+        )
+        .context("invalid genesis")?;
+
+        let vk = verifying_key_from_hex(&invite.coordinator_verifying_key)
+            .context("invalid coordinator key in invite")?;
+        verify_genesis(&vk, &genesis).context("genesis signature invalid")?;
+        if genesis.network_id != network_id {
+            anyhow::bail!("genesis network mismatch");
         }
-        if let Some(ci) = resp.get("collision_index").and_then(|v| v.as_u64()) {
-            collision_index = ci as u8;
+        if genesis.coordinator_endpoint_id != invite.coordinator {
+            anyhow::bail!("genesis coordinator mismatch");
         }
-        let doc_ticket = resp
+        if genesis.coordinator_verifying_key != invite.coordinator_verifying_key {
+            anyhow::bail!("genesis coordinator key mismatch");
+        }
+        let plans = existing_plans(&existing_networks);
+        validate_peer_cidr(
+            &genesis.address_plan.peer_cidr,
+            &plans,
+            &collect_host_nets(),
+        )
+        .map_err(|e| anyhow::anyhow!("address plan cannot operate locally: {e}"))?;
+
+        let commit = rpc_send_recv(
+            &conn,
+            &serde_json::json!({
+                "type": "join_commit",
+                "hostname": hostname,
+                "invite_id": invite.invite_id,
+                "reusable": invite.reusable,
+            }),
+        )
+        .await?;
+        if commit.get("accepted").and_then(|v| v.as_bool()) != Some(true) {
+            let reason = commit
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("denied");
+            anyhow::bail!("join denied: {reason}");
+        }
+        let genesis_commit: Genesis = serde_json::from_value(
+            commit
+                .get("genesis")
+                .cloned()
+                .context("missing genesis in commit")?,
+        )?;
+        if genesis_commit.address_plan != genesis.address_plan {
+            anyhow::bail!("genesis changed between prepare and commit");
+        }
+        let ipv4: std::net::Ipv4Addr = commit
+            .get("ipv4")
+            .and_then(|v| v.as_str())
+            .context("missing ipv4")?
+            .parse()
+            .context("invalid ipv4")?;
+        let doc_ticket = commit
             .get("doc_ticket")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .context(
-                "coordinator did not return a doc_ticket (is `tunnetd` up on the coordinator?)",
-            )?;
-        let network_grant = resp
+            .context("coordinator did not return a doc_ticket")?;
+        let network_grant = commit
             .get("network_grant")
             .map(|v| serde_json::to_string(v).unwrap_or_default())
             .filter(|s| !s.is_empty());
-        let content_key = resp
+        let content_key = commit
             .get("content_key")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        Ok::<_, anyhow::Error>((doc_ticket, network_grant, content_key))
+        let member_record: Option<tunnet_core::direct::SignedMemberRecord> = commit
+            .get("member_record")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let grant: tunnet_core::direct::NetworkGrant = network_grant
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("invalid grant")?
+            .context("missing grant")?;
+        verify_genesis(&vk, &genesis_commit)?;
+        let record = member_record.unwrap_or(tunnet_core::direct::SignedMemberRecord {
+            schema_version: MEMBER_SCHEMA_VERSION,
+            network_id,
+            endpoint_id: my_id.clone(),
+            hostname: hostname.clone(),
+            ipv4,
+            tags: vec![],
+            status: "active".into(),
+            ssh_host_key: None,
+            sequence: 1,
+            joined_at: jiff::Timestamp::now(),
+            grant: grant.clone(),
+            endpoint_sig: String::new(),
+            coordinator: false,
+        });
+        if record.ipv4 != ipv4 {
+            anyhow::bail!("membership address mismatch");
+        }
+        if !record.endpoint_sig.is_empty() {
+            verify_member_record(&vk, &record, 0)?;
+            validate_member_against_genesis(&genesis_commit, &record)?;
+        }
+        Ok::<_, anyhow::Error>((
+            genesis_commit,
+            ipv4,
+            record,
+            doc_ticket,
+            network_grant,
+            content_key,
+        ))
     }
     .await;
 
     endpoint.close().await;
-    let (doc_ticket, network_grant, content_key) = join_result?;
+    let (genesis, _ipv4, record, doc_ticket, network_grant, content_key) = join_result?;
 
     let mut networks = existing_networks;
     networks.push(DirectState {
@@ -466,12 +831,12 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         network_id,
         coordinator: false,
         open: false,
-        assigned_ipv4,
-        collision_index,
         hostname: hostname.clone(),
         coordinator_endpoint_id: Some(invite.coordinator),
         coordinator_verifying_key: Some(invite.coordinator_verifying_key),
         network_epoch: 0,
+        genesis,
+        self_record: record,
         doc_ticket: Some(doc_ticket),
         namespace_id: None,
         coordinator_signing_key: None,
@@ -493,145 +858,11 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         "Joined Direct network '{}'. endpoint_id={} ip={} (secrets: {})",
         network_name,
         my_id,
-        assigned_ipv4,
+        _ipv4,
         tier.as_str()
     );
     crate::cmds::finish_after_config(state_dir, had_networks).await?;
     Ok(())
-}
-/// Coordinator-side: handle join over AUTH connection (called from accept loop).
-/// Requires a live [`DocsMembership`] to issue a write ticket.
-pub async fn handle_join_request_bytes(
-    paths: &StatePaths,
-    direct: &DirectState,
-    docs: Option<&DocsMembership>,
-    auth: &tunnet_core::direct::auth::AuthCache,
-    routes: &tunnet_core::RoutingTable,
-    acl: &tunnet_core::AclEngine,
-    body: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    let req: serde_json::Value = serde_json::from_slice(body)?;
-    let endpoint_id = req
-        .get("endpoint_id")
-        .and_then(|v| v.as_str())
-        .context("endpoint_id")?
-        .to_string();
-    let hostname = req
-        .get("hostname")
-        .and_then(|v| v.as_str())
-        .unwrap_or("peer")
-        .to_string();
-    let ipv4: Ipv4Addr = req
-        .get("ipv4")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.0.0.0")
-        .parse()
-        .unwrap_or(Ipv4Addr::UNSPECIFIED);
-    let collision_index = req
-        .get("collision_index")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u8;
-    let invite_id = req
-        .get("invite_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let reusable = req
-        .get("reusable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let approved = load_approved(paths).unwrap_or_default();
-    let pre_approved = approved.iter().any(|id| id == &endpoint_id);
-
-    let issued =
-        tunnet_core::direct::admin::load_invite_ids(paths, direct.network_id).unwrap_or_default();
-    let invite_ok = invite_id.as_ref().is_some_and(|id| issued.contains(id));
-
-    if !direct.open && !pre_approved && !invite_ok {
-        if invite_id.is_some() {
-            return Ok(serde_json::to_vec(&serde_json::json!({
-                "accepted": false,
-                "reason": "invalid_or_used_invite",
-            }))?);
-        }
-        push_pending(
-            paths,
-            direct.network_id,
-            &PendingJoin {
-                endpoint_id: endpoint_id.clone(),
-                hostname: hostname.clone(),
-                ipv4,
-                collision_index,
-            },
-        )?;
-        return Ok(serde_json::to_vec(&serde_json::json!({
-            "accepted": false,
-            "reason": "pending_approval",
-        }))?);
-    }
-
-    let Some(docs) = docs else {
-        return Ok(serde_json::to_vec(&serde_json::json!({
-            "accepted": false,
-            "reason": "coordinator_docs_not_ready",
-        }))?);
-    };
-
-    let members = docs.snapshot_members();
-    let mut ci = collision_index;
-    let mut ip = if ipv4.is_unspecified() {
-        derive_ipv4(&endpoint_id, ci)
-    } else {
-        ipv4
-    };
-    while members
-        .iter()
-        .any(|m| m.ipv4 == ip && m.endpoint_id != endpoint_id)
-    {
-        ci = ci.saturating_add(1);
-        ip = derive_ipv4(&endpoint_id, ci);
-    }
-
-    let entry = MembershipEntry {
-        endpoint_id: endpoint_id.clone(),
-        hostname: hostname.clone(),
-        ipv4: ip,
-        collision_index: ci,
-        tags: vec![],
-        joined_at: jiff::Timestamp::now(),
-        coordinator: false,
-        status: "active".into(),
-        ssh_host_key: None,
-    };
-    let (grant, content_key) = docs.admit_peer(&entry, auth).await?;
-    docs.refresh_seed_peers();
-    let policy = (**acl.bundle.load()).clone();
-    docs.apply_to_routes(routes, acl, &policy);
-    let ticket = docs.share_read_ticket().await?;
-
-    // Drop from approved list once ticket issued.
-    if pre_approved {
-        let mut ids = approved;
-        ids.retain(|id| id != &endpoint_id);
-        let _ = save_approved(paths, &ids);
-    }
-
-    // Consume one-time invites after a successful ticket issue.
-    if !reusable && let Some(id) = invite_id.as_ref() {
-        let mut ids = issued;
-        ids.remove(id);
-        let _ = tunnet_core::direct::admin::save_invite_ids(paths, direct.network_id, &ids);
-    }
-
-    let _ = (hostname,);
-    Ok(serde_json::to_vec(&serde_json::json!({
-        "accepted": true,
-        "ipv4": ip.to_string(),
-        "collision_index": ci,
-        "doc_ticket": ticket,
-        "network_grant": grant,
-        "content_key": content_key,
-    }))?)
 }
 pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
@@ -642,7 +873,6 @@ pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::
         anyhow::bail!("only the coordinator should run upgrade-to-managed first");
     }
 
-    // Prefer live docs cache if present from a previous run; else empty members list.
     let members_path = paths.dir.join("direct_members_cache.json");
     let members: Vec<MembershipEntry> = if members_path.exists() {
         serde_json::from_slice(&std::fs::read(&members_path)?).unwrap_or_default()

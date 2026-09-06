@@ -55,10 +55,9 @@ sudo tunnet join <OTHER_INVITE>
 
 When more than one network is active, pass the network name to management commands (`tunnet invite gaming`, `tunnet requests gaming`, …).
 
-If mesh IPs collide across networks, the first-joined network wins outbound traffic. Override with:
+If mesh IPs collide across networks, the overlapping Direct networks are rejected.  Override with:
 
 ```bash
-tunnet override-ip --peer other-machine --ip 10.7.0.50 --network gaming
 ```
 
 Leave a network (not the last one):

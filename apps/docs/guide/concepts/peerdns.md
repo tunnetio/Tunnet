@@ -18,7 +18,7 @@ Non-matching queries are forwarded to configured upstream resolvers (default: 1.
 
 ```toml
 [direct.homelab.dns]
-magic-ip = "100.100.100.53"
+magic-ip = "the gateway peer address
 tld = "tunnet"
 upstream = ["1.1.1.1", "8.8.8.8"]
 ```

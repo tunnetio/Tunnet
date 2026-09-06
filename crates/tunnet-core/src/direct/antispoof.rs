@@ -85,10 +85,10 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case::assigned_address("100.64.0.1", "100.64.0.1", true)]
-    #[case::different_host("100.64.0.1", "100.64.0.2", false)]
-    #[case::different_subnet("100.64.0.1", "100.65.0.1", false)]
-    #[case::unspecified_is_not_peer("0.0.0.0", "100.64.0.1", false)]
+    #[case::assigned_address("10.21.0.1", "10.21.0.1", true)]
+    #[case::different_host("10.21.0.1", "10.21.0.2", false)]
+    #[case::different_subnet("10.21.0.1", "10.22.0.1", false)]
+    #[case::unspecified_is_not_peer("0.0.0.0", "10.21.0.1", false)]
     fn source_must_match_assigned_peer(
         #[case] packet_source: &str,
         #[case] assigned_peer: &str,

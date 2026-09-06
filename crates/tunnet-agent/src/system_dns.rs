@@ -13,7 +13,7 @@
 //!        ↓
 //! capture underlay upstream (PeerDNS start, before overlay)
 //!        ↓
-//! apply(ifname, magic_ip, suffix)            // apply → hold Lease
+//! apply(ifname, resolver_ip, suffix)            // apply → hold Lease
 //!        ↓
 //! update(...) on change                      // Lease::update (transactional)
 //!        ↓
@@ -111,11 +111,11 @@ impl DnsController {
     /// Blocking; call via `spawn_blocking`. On failure nothing is mutated
     /// that was not already ours, and [`DnsController::is_active`] stays
     /// `false` so callers never claim PeerDNS is active without the overlay.
-    pub fn apply(&self, ifname: &str, magic_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
+    pub fn apply(&self, ifname: &str, resolver_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
         if self.state.lock().lease.is_some() {
-            return self.update(ifname, magic_ip, suffix);
+            return self.update(ifname, resolver_ip, suffix);
         }
-        self.apply_fresh(ifname, magic_ip, suffix)
+        self.apply_fresh(ifname, resolver_ip, suffix)
     }
 
     /// Move to the current desired configuration.
@@ -126,12 +126,12 @@ impl DnsController {
     /// or guesses identity: it only reacts to typed outcomes.
     ///
     /// Blocking; call via `spawn_blocking`.
-    pub fn update(&self, ifname: &str, magic_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
+    pub fn update(&self, ifname: &str, resolver_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
         if self.state.lock().lease.is_none() {
-            return self.apply_fresh(ifname, magic_ip, suffix);
+            return self.apply_fresh(ifname, resolver_ip, suffix);
         }
         let caps = self.manager.capabilities()?;
-        let config = desired_config(&caps, tun_selector(ifname), magic_ip, suffix)?;
+        let config = desired_config(&caps, tun_selector(ifname), resolver_ip, suffix)?;
         // `apply`/`update` validate again before mutation, so no separate
         // preflight is needed here: osdns guarantees every explicitly
         // requested semantic is representable when these succeed.
@@ -142,7 +142,7 @@ impl DnsController {
         };
         match result {
             Ok(()) => {
-                tracing::info!(%magic_ip, suffix, ifname, "PeerDNS lease updated");
+                tracing::info!(%resolver_ip, suffix, ifname, "PeerDNS lease updated");
                 self.flush_cache_best_effort();
                 Ok(())
             }
@@ -153,7 +153,7 @@ impl DnsController {
                     "DNS resource set changed; ending old lease for a fresh one"
                 );
                 self.restore()?;
-                self.apply_fresh(ifname, magic_ip, suffix)
+                self.apply_fresh(ifname, resolver_ip, suffix)
             }
             Err(osdns::Error::ResourceGone { resource, .. }) => {
                 tracing::info!(
@@ -161,7 +161,7 @@ impl DnsController {
                     "DNS resource incarnation is gone; ending lease for a fresh apply"
                 );
                 self.restore()?;
-                self.apply_fresh(ifname, magic_ip, suffix)
+                self.apply_fresh(ifname, resolver_ip, suffix)
             }
             Err(e @ osdns::Error::ResourceIdentity { .. }) => {
                 tracing::error!(
@@ -212,21 +212,30 @@ impl DnsController {
         }
     }
 
-    fn apply_fresh(&self, ifname: &str, magic_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
+    fn apply_fresh(&self, ifname: &str, resolver_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
         let caps = self.manager.capabilities()?;
-        let config = desired_config(&caps, tun_selector(ifname), magic_ip, suffix)?;
+        let config = desired_config(&caps, tun_selector(ifname), resolver_ip, suffix)?;
         match self.manager.apply(&config) {
             Ok(lease) => {
-                tracing::info!(
-                    %magic_ip,
-                    suffix,
-                    ifname,
-                    backend = %caps.backend,
-                    split = caps.split_dns,
-                    lease_id = %lease.lease_id(),
-                    noop = lease.is_noop(),
-                    "PeerDNS lease applied"
-                );
+                if lease.is_noop() {
+                    tracing::info!(
+                        %resolver_ip,
+                        suffix,
+                        ifname,
+                        lease_id = %lease.lease_id(),
+                        "PeerDNS DNS already in effect; no-op lease"
+                    );
+                } else {
+                    tracing::info!(
+                        %resolver_ip,
+                        suffix,
+                        ifname,
+                        backend = %caps.backend,
+                        split = caps.split_dns,
+                        lease_id = %lease.lease_id(),
+                        "PeerDNS lease applied"
+                    );
+                }
                 self.state.lock().lease = Some(lease);
                 self.flush_cache_best_effort();
                 Ok(())
@@ -429,11 +438,11 @@ mod tests {
         let config = desired_config(
             &split_caps(),
             selector(),
-            Ipv4Addr::new(100, 100, 100, 53),
+            Ipv4Addr::new(127, 0, 0, 1),
             "tunnet",
         )
         .unwrap();
-        assert_eq!(config.nameservers(), &[IpAddr::from([100, 100, 100, 53])]);
+        assert_eq!(config.nameservers(), &[IpAddr::from([127, 0, 0, 1])]);
         assert_eq!(config.routing_domains().len(), 1);
         assert!(
             format!("{:?}", config.routing_domains()).contains("tunnet"),
@@ -451,11 +460,11 @@ mod tests {
         let config = desired_config(
             &split_caps_no_default_route(),
             selector(),
-            Ipv4Addr::new(100, 100, 100, 53),
+            Ipv4Addr::new(127, 0, 0, 1),
             "tunnet",
         )
         .unwrap();
-        assert_eq!(config.nameservers(), &[IpAddr::from([100, 100, 100, 53])]);
+        assert_eq!(config.nameservers(), &[IpAddr::from([127, 0, 0, 1])]);
         assert_eq!(config.routing_domains().len(), 1);
         // Never fake `false`: None means preserve/unspecified.
         assert_eq!(config.default_route(), None);
@@ -464,7 +473,7 @@ mod tests {
     #[test]
     fn multiple_routing_domains_preserved_when_supported() {
         let config = DnsConfig::builder(DnsScope::Interface(selector()))
-            .nameserver(IpAddr::from([100, 100, 100, 53]))
+            .nameserver(IpAddr::from([127, 0, 0, 1]))
             .routing_domain("tunnet")
             .routing_domain("office.tunnet")
             .default_route(false)
@@ -476,42 +485,27 @@ mod tests {
     #[test]
     fn backend_without_split_dns_uses_full_peerdns_fallback() {
         let caps = Capabilities::new(BackendKind::Fake).with_per_interface_dns(true);
-        let config = desired_config(
-            &caps,
-            selector(),
-            Ipv4Addr::new(100, 100, 100, 53),
-            "tunnet",
-        )
-        .unwrap();
+        let config =
+            desired_config(&caps, selector(), Ipv4Addr::new(127, 0, 0, 1), "tunnet").unwrap();
         assert!(config.routing_domains().is_empty());
-        assert_eq!(config.nameservers(), &[IpAddr::from([100, 100, 100, 53])]);
+        assert_eq!(config.nameservers(), &[IpAddr::from([127, 0, 0, 1])]);
         assert!(matches!(config.scope(), DnsScope::Interface(_)));
     }
 
     #[test]
     fn global_only_backend_uses_global_fallback() {
         let caps = Capabilities::new(BackendKind::Fake).with_global_dns(true);
-        let config = desired_config(
-            &caps,
-            selector(),
-            Ipv4Addr::new(100, 100, 100, 53),
-            "tunnet",
-        )
-        .unwrap();
+        let config =
+            desired_config(&caps, selector(), Ipv4Addr::new(127, 0, 0, 1), "tunnet").unwrap();
         assert_eq!(*config.scope(), DnsScope::Global);
-        assert_eq!(config.nameservers(), &[IpAddr::from([100, 100, 100, 53])]);
+        assert_eq!(config.nameservers(), &[IpAddr::from([127, 0, 0, 1])]);
     }
 
     #[test]
     fn unsupported_capability_combination_fails_clearly() {
         let caps = Capabilities::new(BackendKind::Fake);
-        let err = desired_config(
-            &caps,
-            selector(),
-            Ipv4Addr::new(100, 100, 100, 53),
-            "tunnet",
-        )
-        .expect_err("backend with no DNS scope must fail");
+        let err = desired_config(&caps, selector(), Ipv4Addr::new(127, 0, 0, 1), "tunnet")
+            .expect_err("backend with no DNS scope must fail");
         assert!(matches!(err, osdns::Error::Unsupported { .. }));
     }
 
@@ -520,7 +514,7 @@ mod tests {
         let config = desired_config(
             &split_caps(),
             InterfaceSelector::Name(OsString::from("custom0")),
-            Ipv4Addr::new(100, 100, 100, 53),
+            Ipv4Addr::new(127, 0, 0, 1),
             "tunnet",
         )
         .unwrap();
@@ -577,11 +571,11 @@ mod tests {
             let dns = DnsController::wrap(manager).unwrap();
             assert!(!dns.is_active());
 
-            dns.apply("eth0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+            dns.apply("eth0", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .unwrap();
             assert!(dns.is_active());
 
-            dns.update("eth0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+            dns.update("eth0", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .unwrap();
             assert!(dns.is_active());
 
@@ -600,12 +594,12 @@ mod tests {
         fn tun_recreation_releases_old_lease_and_applies_new() {
             let (manager, fake, _dir) = enforce_manager(full_caps());
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+            dns.apply("eth0", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .unwrap();
 
-            // A different interface resolves to a different resource set;
-            // osdns reports UpdateRequiresRebind, Tunnet restores and reapplies.
-            dns.update("wlan1", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+            // A different native identity resolves to a different resource
+            // set; osdns reports it, Tunnet safely rebinds.
+            dns.update("wlan1", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .unwrap();
             assert!(dns.is_active());
             assert_eq!(
@@ -626,7 +620,7 @@ mod tests {
         fn invalid_config_is_not_a_rebind() {
             let (manager, fake, _dir) = enforce_manager(full_caps());
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
 
             // A malformed suffix is a real configuration error: the lease
             // must be retained untouched, never restored + re-applied.
@@ -634,7 +628,7 @@ mod tests {
             // label to force a genuine `InvalidConfig`.)
             let bad_suffix = format!("{}.tunnet", "a".repeat(64));
             let err = dns
-                .update("eth0", MAGIC_IP, &bad_suffix)
+                .update("eth0", RESOLVER_IP, &bad_suffix)
                 .expect_err("overlong label must fail");
             assert!(matches!(err, osdns::Error::InvalidConfig(_)));
             assert!(dns.is_active());
@@ -644,7 +638,7 @@ mod tests {
                 .expect("resource exists");
             assert!(
                 matches!(&current, FakeState::Configured { nameservers, .. }
-                    if nameservers == &vec![IpAddr::V4(MAGIC_IP)]),
+                    if nameservers == &vec![IpAddr::V4(RESOLVER_IP)]),
                 "previous configuration must be preserved, got {current:?}"
             );
         }
@@ -667,9 +661,9 @@ mod tests {
             )
             .unwrap();
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
 
-            dns.update("eth0", MAGIC_IP, "office.tunnet").unwrap();
+            dns.update("eth0", RESOLVER_IP, "office.tunnet").unwrap();
             assert!(dns.is_active());
             assert!(matches!(
                 fake.current_state("fake:resolver:office.tunnet").unwrap(),
@@ -689,7 +683,7 @@ mod tests {
         fn failed_update_preserves_previous_complete_configuration() {
             let (manager, fake, _dir) = enforce_manager(full_caps());
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
 
             // The transactional update fails mid-mutation...
             fake.inject_backend_failure(FakeOp::Apply, 1, "simulated OS failure");
@@ -705,7 +699,7 @@ mod tests {
                 .expect("resource exists");
             assert!(
                 matches!(&current, FakeState::Configured { nameservers, .. }
-                    if nameservers == &vec![IpAddr::V4(MAGIC_IP)]),
+                    if nameservers == &vec![IpAddr::V4(RESOLVER_IP)]),
                 "previous configuration must be preserved, got {current:?}"
             );
         }
@@ -715,7 +709,7 @@ mod tests {
                 enforce_manager(Capabilities::new(BackendKind::Fake).with_watch(true));
             let dns = DnsController::wrap(manager).unwrap();
             let err = dns
-                .apply("tunnet0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+                .apply("tunnet0", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .expect_err("backend without DNS scopes must fail");
             assert!(matches!(err, osdns::Error::Unsupported { .. }));
             assert!(!dns.is_active());
@@ -739,7 +733,7 @@ mod tests {
                 .with_watch(true);
             let (manager, _fake, _dir) = enforce_manager(caps);
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("tunnet0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
+            dns.apply("tunnet0", Ipv4Addr::new(127, 0, 0, 1), "tunnet")
                 .unwrap();
             assert!(dns.is_active());
             dns.restore().unwrap();
@@ -753,7 +747,7 @@ mod tests {
             // Simulate an OS whose read-back disagrees with what was applied.
             fake.lie_once_on_readback(FakeState::Empty);
             let err = dns
-                .apply("eth0", MAGIC_IP, "tunnet")
+                .apply("eth0", RESOLVER_IP, "tunnet")
                 .expect_err("read-back mismatch must fail");
             assert!(matches!(err, osdns::Error::VerificationFailed { .. }));
             assert!(!dns.is_active());
@@ -774,7 +768,7 @@ mod tests {
             let dns = DnsController::wrap(manager).unwrap();
             // An explicitly requested `default_route(false)` would be
             // rejected here; Tunnet leaves it unspecified instead.
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
             assert!(dns.is_active());
             let current = fake
                 .current_state("fake:interface:1")
@@ -800,7 +794,7 @@ mod tests {
             let (manager, fake, _dir) = enforce_manager(full_caps());
             let probe = manager.clone();
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
 
             // Enforce observation is internal to osdns: Tunnet holds no
             // public watch() subscription, yet the live lease is observed.
@@ -820,7 +814,7 @@ mod tests {
                 .expect("resource exists");
             assert!(
                 matches!(&current, FakeState::Configured { nameservers, .. }
-                    if nameservers.contains(&IpAddr::V4(MAGIC_IP))),
+                    if nameservers.contains(&IpAddr::V4(RESOLVER_IP))),
                 "overlay must be reapplied, got {current:?}"
             );
 
@@ -852,7 +846,7 @@ mod tests {
                 manager_for_testing("io.tunnet.agent", dir.path(), &fake, Duration::from_secs(5))
                     .unwrap();
             let dns = DnsController::wrap(manager).unwrap();
-            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            dns.apply("eth0", RESOLVER_IP, "tunnet").unwrap();
 
             fake.external_change("fake:interface:1", foreign_state())
                 .unwrap();
@@ -1230,6 +1224,7 @@ mod tests {
             assert!(!dns.is_active());
         }
 
+        const RESOLVER_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
         const MAGIC_IP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
         const FOREIGN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
 
@@ -1248,7 +1243,7 @@ mod tests {
 
         fn global_config() -> DnsConfig {
             DnsConfig::builder(DnsScope::Global)
-                .nameserver(IpAddr::V4(MAGIC_IP))
+                .nameserver(IpAddr::V4(RESOLVER_IP))
                 .build()
                 .unwrap()
         }

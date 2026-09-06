@@ -35,7 +35,6 @@ export {
   type DirectInviteResponse,
   type DirectKeepAliveRequest,
   type DirectNetworkRequest,
-  type DirectOverrideIpRequest,
   type DirectPeerRequest,
   type DirectPendingInfo,
   type DirectPendingResponse,

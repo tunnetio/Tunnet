@@ -361,8 +361,8 @@ mod tests {
             ifname: "tunnet-test-nonexistent".into(),
             tun_if_index: Some(0),
             profile: DeviceProfile::default(),
-            mesh_cidr: None,
             remote_subnets: vec![],
+            peer_routes: vec![],
             has_exit: false,
             underlay_hosts: vec![],
             underlay: Some(UnderlayInfo {
