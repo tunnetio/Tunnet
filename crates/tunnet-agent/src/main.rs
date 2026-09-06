@@ -2,6 +2,7 @@ mod accept;
 mod actors;
 mod api_bootstrap;
 mod auto_update;
+mod cidr_collision;
 mod cli;
 mod cmds;
 mod cmds_device;
