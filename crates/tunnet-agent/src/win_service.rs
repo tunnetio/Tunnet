@@ -161,7 +161,8 @@ async fn run_agent_service(
     // Do not pass `--service` here: main already routed us into the SCM path.
     // Parsing only daemon options avoids clap aborting before Local API binds.
     let cli = DaemonCli::parse_from(std::env::args().filter(|a| a != "--service"));
-    crate::daemon::init_logging(&cli);
+    // Own the log worker guard past daemon shutdown so the error below flushes.
+    let _log_guard = crate::daemon::init_logging(&cli);
 
     let result = crate::daemon::run_with_shutdown(
         cli.run,

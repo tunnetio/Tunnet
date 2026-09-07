@@ -142,7 +142,7 @@ pub struct PeerSummary {
     pub latency_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
-    /// connected | dialing | idle | backoff | blocked
+    /// connected | dialing | idle | backoff | blocked | rejected
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_state: Option<String>,
     /// direct | relay | unknown

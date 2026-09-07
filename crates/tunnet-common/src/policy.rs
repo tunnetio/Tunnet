@@ -358,6 +358,56 @@ pub struct EvalCtx<'a> {
     pub src_posture_ok: bool,
 }
 
+/// One side of a flow: a mesh member or an external (non-mesh) target.
+///
+/// External sides carry no hex/tags/network, so only `Any` and `Cidr`
+/// selectors can match them.
+#[derive(Debug, Clone)]
+pub struct FlowEndpoint {
+    pub endpoint_hex: String,
+    pub tags: Vec<String>,
+    pub network: String,
+    pub ip: Option<Ipv4Addr>,
+}
+
+impl FlowEndpoint {
+    pub fn member(
+        endpoint_hex: String,
+        tags: Vec<String>,
+        network: String,
+        ip: Option<Ipv4Addr>,
+    ) -> Self {
+        Self {
+            endpoint_hex,
+            tags,
+            network,
+            ip,
+        }
+    }
+
+    pub fn external(ip: Option<Ipv4Addr>) -> Self {
+        Self {
+            endpoint_hex: String::new(),
+            tags: Vec::new(),
+            network: String::new(),
+            ip,
+        }
+    }
+}
+
+/// Complete flow context: the requesting principal and the actual destination.
+/// Unlike direction-implied evaluation, both sides are explicit, so gatewayed
+/// flows (initiator ≠ local node) evaluate against the real entities.
+#[derive(Debug, Clone)]
+pub struct FlowContext {
+    pub src: FlowEndpoint,
+    pub dst: FlowEndpoint,
+    pub protocol: Protocol,
+    pub dst_port: Option<u16>,
+    /// When false, rules with non-empty `src_posture` do not match.
+    pub src_posture_ok: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Ipv6EvalCtx<'a> {
     pub self_endpoint_hex: &'a str,
@@ -535,8 +585,7 @@ pub fn evaluate_detailed(
     }
     evaluate_phases(
         bundle,
-        |r, dir| rule_matches_v4(r, ctx, dir),
-        direction,
+        |r| rule_matches_v4(r, ctx, direction),
         ctx.src_posture_ok,
     )
 }
@@ -559,20 +608,25 @@ pub fn evaluate_ipv6_detailed(
     }
     evaluate_phases(
         bundle,
-        |r, dir| rule_matches_v6(r, ctx, dir),
-        direction,
+        |r| rule_matches_v6(r, ctx, direction),
         ctx.src_posture_ok,
     )
 }
 
-fn evaluate_phases<F>(
-    bundle: &PolicyBundle,
-    mut matcher: F,
-    direction: Direction,
-    src_posture_ok: bool,
-) -> EvalVerdict
+pub fn evaluate_flow(bundle: &PolicyBundle, flow: &FlowContext) -> EvalVerdict {
+    if flow.protocol == Protocol::Icmp {
+        match bundle.icmp_policy {
+            IcmpPolicy::Allow => return EvalVerdict::icmp(Action::Allow),
+            IcmpPolicy::Deny => return EvalVerdict::icmp(Action::Deny),
+            IcmpPolicy::Acl => {}
+        }
+    }
+    evaluate_phases(bundle, |r| rule_matches_flow(r, flow), flow.src_posture_ok)
+}
+
+fn evaluate_phases<F>(bundle: &PolicyBundle, mut matcher: F, src_posture_ok: bool) -> EvalVerdict
 where
-    F: FnMut(&PolicyRule, Direction) -> bool,
+    F: FnMut(&PolicyRule) -> bool,
 {
     let mut posture_skip: Option<&PolicyRule> = None;
 
@@ -582,7 +636,6 @@ where
         RuleScope::Organization,
         Action::Deny,
         &mut matcher,
-        direction,
         src_posture_ok,
         &mut posture_skip,
     ) {
@@ -595,7 +648,6 @@ where
         RuleScope::Network,
         Action::Deny,
         &mut matcher,
-        direction,
         src_posture_ok,
         &mut posture_skip,
     ) {
@@ -608,7 +660,6 @@ where
         RuleScope::Network,
         Action::Allow,
         &mut matcher,
-        direction,
         src_posture_ok,
         &mut posture_skip,
     ) {
@@ -632,12 +683,11 @@ fn first_matching_in_phase<'a, F>(
     scope: RuleScope,
     action: Action,
     matcher: &mut F,
-    direction: Direction,
     src_posture_ok: bool,
     posture_skip: &mut Option<&'a PolicyRule>,
 ) -> Option<&'a PolicyRule>
 where
-    F: FnMut(&PolicyRule, Direction) -> bool,
+    F: FnMut(&PolicyRule) -> bool,
 {
     let mut candidates: Vec<&PolicyRule> = rules
         .iter()
@@ -650,7 +700,7 @@ where
     });
 
     for rule in candidates {
-        if !matcher(rule, direction) {
+        if !matcher(rule) {
             continue;
         }
         if !rule.src_posture.is_empty() && !src_posture_ok {
@@ -699,6 +749,25 @@ fn rule_matches_v4(r: &PolicyRule, ctx: &EvalCtx<'_>, direction: Direction) -> b
         return false;
     }
     proto_port_ok(r, ctx.protocol, ctx.dst_port)
+}
+
+fn rule_matches_flow(r: &PolicyRule, flow: &FlowContext) -> bool {
+    let src_ok = r.src.matches_endpoint(
+        &flow.src.endpoint_hex,
+        &flow.src.tags,
+        &flow.src.network,
+        flow.src.ip,
+    );
+    let dst_ok = r.dst.matches_endpoint(
+        &flow.dst.endpoint_hex,
+        &flow.dst.tags,
+        &flow.dst.network,
+        flow.dst.ip,
+    );
+    if !src_ok || !dst_ok {
+        return false;
+    }
+    proto_port_ok(r, flow.protocol, flow.dst_port)
 }
 
 fn rule_matches_v6(r: &PolicyRule, ctx: &Ipv6EvalCtx<'_>, direction: Direction) -> bool {
@@ -1162,5 +1231,90 @@ mod tests {
             verify_policy_bundle_signature(&nonempty, &verifying_key),
             Err(crate::ProtocolError::BadSignature)
         ));
+    }
+
+    fn flow_rule(src: Selector, dst: Selector, port: u16) -> PolicyRule {
+        PolicyRule {
+            src,
+            dst,
+            action: Action::Allow,
+            ports: vec![PortRange {
+                start: port,
+                end: port,
+            }],
+            protocol: Some(Protocol::Tcp),
+            priority: 0,
+            order_index: 0,
+            scope: RuleScope::Network,
+            enabled: true,
+            slug: None,
+            src_posture: vec![],
+        }
+    }
+
+    fn deny_bundle_with(rules: Vec<PolicyRule>) -> PolicyBundle {
+        PolicyBundle {
+            rules,
+            default_action: DefaultAction::Deny,
+            ..PolicyBundle::default()
+        }
+    }
+
+    fn member_flow(src_tags: Vec<String>, dst_ip: Option<Ipv4Addr>, port: u16) -> FlowContext {
+        FlowContext {
+            src: FlowEndpoint::member("peer".into(), src_tags, "net".into(), None),
+            dst: FlowEndpoint::external(dst_ip),
+            protocol: Protocol::Tcp,
+            dst_port: Some(port),
+            src_posture_ok: true,
+        }
+    }
+
+    #[test]
+    fn flow_matches_explicit_src_and_dst() {
+        let bundle = deny_bundle_with(vec![flow_rule(
+            Selector::Tag("frontend".into()),
+            Selector::Cidr("10.8.0.0/16".parse().unwrap()),
+            443,
+        )]);
+        let allowed = member_flow(
+            vec!["frontend".into()],
+            Some(Ipv4Addr::new(10, 8, 0, 7)),
+            443,
+        );
+        assert_eq!(evaluate_flow(&bundle, &allowed).action, Action::Allow);
+        // Wrong destination network: the destination entity decides, not the port alone.
+        let wrong_net = member_flow(
+            vec!["frontend".into()],
+            Some(Ipv4Addr::new(192, 168, 1, 7)),
+            443,
+        );
+        assert_eq!(evaluate_flow(&bundle, &wrong_net).action, Action::Deny);
+        // Wrong port on the right destination.
+        let wrong_port = member_flow(
+            vec!["frontend".into()],
+            Some(Ipv4Addr::new(10, 8, 0, 7)),
+            22,
+        );
+        assert_eq!(evaluate_flow(&bundle, &wrong_port).action, Action::Deny);
+        // Right destination and port, wrong source principal.
+        let wrong_src = member_flow(
+            vec!["backend".into()],
+            Some(Ipv4Addr::new(10, 8, 0, 7)),
+            443,
+        );
+        assert_eq!(evaluate_flow(&bundle, &wrong_src).action, Action::Deny);
+    }
+
+    #[test]
+    fn flow_external_dst_matches_no_identity_selectors() {
+        let bundle = deny_bundle_with(vec![flow_rule(
+            Selector::Any,
+            Selector::Tag("backend".into()),
+            443,
+        )]);
+        // An external target has no tags: tag-scoped destination rules cannot match it.
+        let flow = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Deny);
     }
 }

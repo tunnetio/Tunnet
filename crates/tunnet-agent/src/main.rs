@@ -97,6 +97,7 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     let cli = daemon::DaemonCli::parse();
 
-    daemon::init_logging(&cli);
+    // Own the log worker guard so shutdown flushes remaining lines.
+    let _log_guard = daemon::init_logging(&cli);
     daemon::run(cli.state_dir.as_deref(), cli.run).await
 }

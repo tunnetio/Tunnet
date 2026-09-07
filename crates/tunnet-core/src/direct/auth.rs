@@ -162,8 +162,8 @@ impl EndpointHooks for DirectAuthHook {
         } else {
             tracing::debug!(%peer_hex, "inbound connection blocked (not authenticated)");
             AfterHandshakeOutcome::Reject {
-                error_code: 401u32.into(),
-                reason: b"auth_required".to_vec(),
+                error_code: crate::transport_auth::CLOSE_AUTH_REQUIRED.into(),
+                reason: crate::transport_auth::CLOSE_AUTH_REQUIRED_REASON.to_vec(),
             }
         }
     }

@@ -1,13 +1,8 @@
 //! Transport admission: authenticated membership only, never L3/L4 policy.
 //!
-//! The old design evaluated the L3/L4 policy engine without flow context
-//! (`Protocol::Any`, no ports) to admit QUIC connections. Any port-specific
-//! rule then contradicted the dataplane: the TUN path allowed TCP/443 while
-//! the transport hook rejected the connection carrying it.
-//!
 //! Admission answers one question: is this peer currently a trusted member?
 //! Flow policy ([`AclEngine::allow_packet`], [`AclEngine::allow_flow`]) runs
-//! where real flow context exists.
+//! where real flow context exists, never here.
 
 use std::fmt;
 
@@ -20,7 +15,25 @@ use iroh::endpoint::{
 use crate::direct::AuthCache;
 use crate::routing::RoutingTable;
 
-const CLOSE_NOT_MEMBER: u32 = 403;
+/// Wire contract for authorization rejections, shared by the endpoint hooks
+/// and the connection pool's failure classifier.
+pub const CLOSE_NOT_MEMBER: u32 = 403;
+pub const CLOSE_NOT_MEMBER_REASON: &[u8] = b"not_member";
+pub const CLOSE_AUTH_REQUIRED: u32 = 401;
+pub const CLOSE_AUTH_REQUIRED_REASON: &[u8] = b"auth_required";
+/// Reason used before the contract above; still honored from older peers.
+pub const CLOSE_LEGACY_POLICY_DENY_REASON: &[u8] = b"policy_deny";
+
+/// True when an application close carries this crate's authorization rejection.
+pub fn is_authorization_close(code: u32, reason: &[u8]) -> bool {
+    match code {
+        CLOSE_NOT_MEMBER => {
+            reason == CLOSE_NOT_MEMBER_REASON || reason == CLOSE_LEGACY_POLICY_DENY_REASON
+        }
+        CLOSE_AUTH_REQUIRED => reason == CLOSE_AUTH_REQUIRED_REASON,
+        _ => false,
+    }
+}
 
 /// Membership-backed transport gate shared by endpoint hooks and [`crate::ConnPool`].
 ///
@@ -35,7 +48,6 @@ pub struct TransportAuth {
 
 #[derive(Clone)]
 enum TransportAuthInner {
-    Open,
     Managed {
         routes: RoutingTable,
     },
@@ -61,31 +73,19 @@ impl TransportAuth {
         }
     }
 
-    /// Open transport when no membership source is configured (tests, SDK shells).
-    pub fn open() -> Self {
-        Self {
-            inner: TransportAuthInner::Open,
-        }
-    }
-
     pub fn allows(&self, peer_hex: &str) -> bool {
         match &self.inner {
-            TransportAuthInner::Open => {
-                let _ = peer_hex;
-                true
-            }
             TransportAuthInner::Managed { routes } => routes.lookup_endpoint(peer_hex).is_some(),
             #[cfg(feature = "direct")]
             TransportAuthInner::Direct { auth } => auth.contains(peer_hex),
         }
     }
 
-    /// Membership generation authorizing `peer`. Blocked connection state pins
-    /// this value and only retries once it moves: retry on state change, never
-    /// on timers.
+    /// Membership generation: local denials pin this value and retry only once
+    /// it moves. Remote rejections additionally re-probe on a bounded cooldown
+    /// since remote membership is unobservable locally.
     pub fn generation(&self) -> u64 {
         match &self.inner {
-            TransportAuthInner::Open => 0,
             TransportAuthInner::Managed { routes } => routes.change_seq(),
             #[cfg(feature = "direct")]
             TransportAuthInner::Direct { auth } => auth.version(),
@@ -153,7 +153,7 @@ impl EndpointHooks for TransportHook {
             );
             AfterHandshakeOutcome::Reject {
                 error_code: CLOSE_NOT_MEMBER.into(),
-                reason: b"not_member".to_vec(),
+                reason: CLOSE_NOT_MEMBER_REASON.to_vec(),
             }
         }
     }
@@ -216,6 +216,16 @@ mod tests {
         let auth = TransportAuth::managed(&routes);
         assert!(auth.allows(&peer));
         assert!(!auth.allows(&"cc".repeat(32)));
+    }
+
+    #[test]
+    fn authorization_close_contract() {
+        assert!(is_authorization_close(403, b"not_member"));
+        assert!(is_authorization_close(401, b"auth_required"));
+        assert!(is_authorization_close(403, b"policy_deny"));
+        assert!(!is_authorization_close(0, b"tie_break"));
+        assert!(!is_authorization_close(1, b"dataplane_down"));
+        assert!(!is_authorization_close(403, b"something_else"));
     }
 
     #[cfg(feature = "direct")]

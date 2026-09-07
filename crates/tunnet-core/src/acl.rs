@@ -9,10 +9,11 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use tunnet_common::packet::{FragmentTable, Packet, ResolvedL4, TcpFlags};
 use tunnet_common::policy::{
-    Action, Direction, EvalCtx, EvalReason, EvalVerdict, PolicyBundle, Protocol, evaluate_detailed,
+    Action, Direction, EvalReason, EvalVerdict, FlowContext, FlowEndpoint, PolicyBundle, Protocol,
+    evaluate_flow as evaluate_flow_policy,
 };
 
-use crate::routing::{PeerInfo, RoutingTable};
+use crate::routing::RoutingTable;
 
 const DENY_LOG_CAP: usize = 64;
 
@@ -182,38 +183,78 @@ impl AclEngine {
         self.deny_log.lock().iter().cloned().collect()
     }
 
-    /// Policy for an explicit flow (e.g. a proxied TCP stream) with real
-    /// protocol/port context. Stateless: proxied return traffic shares the
-    /// originating connection, so no conntrack entry is opened.
-    pub fn allow_flow(
-        &self,
-        peer_endpoint_hex: &str,
-        direction: Direction,
-        protocol: Protocol,
-        dst_port: Option<u16>,
-    ) -> bool {
-        self.evaluate_flow(peer_endpoint_hex, direction, protocol, dst_port)
-            .action
-            == Action::Allow
+    /// This node's own identity as a flow side.
+    pub fn self_endpoint(&self) -> FlowEndpoint {
+        let id = self.self_id.load();
+        FlowEndpoint::member(
+            id.endpoint_hex.clone(),
+            id.tags.clone(),
+            id.network.clone(),
+            Some(id.ip),
+        )
     }
 
-    pub fn evaluate_flow(
-        &self,
-        peer_endpoint_hex: &str,
-        direction: Direction,
-        protocol: Protocol,
-        dst_port: Option<u16>,
-    ) -> EvalVerdict {
-        let peer = self.routes.lookup_endpoint(peer_endpoint_hex);
-        let peer_ip = peer.as_ref().map(|p| p.ip);
-        self.eval_policy(
-            peer.as_deref(),
-            peer_endpoint_hex,
-            peer_ip,
-            direction,
-            protocol,
-            dst_port,
-        )
+    /// Membership-resolved identity for a mesh peer. Unknown peers resolve to
+    /// an empty identity, so only broad selectors match them. The network
+    /// mirrors our own, preserving historical selector matching.
+    pub fn peer_endpoint(&self, peer_endpoint_hex: &str) -> FlowEndpoint {
+        let network = self.self_id.load().network.clone();
+        match self.routes.lookup_endpoint(peer_endpoint_hex) {
+            Some(p) => FlowEndpoint::member(
+                peer_endpoint_hex.to_string(),
+                p.tags.clone(),
+                network,
+                Some(p.ip),
+            ),
+            None => FlowEndpoint::member(peer_endpoint_hex.to_string(), Vec::new(), network, None),
+        }
+    }
+
+    /// Policy for an explicit flow carrying real source/destination context.
+    /// Stateless: proxied return traffic shares the originating connection, so
+    /// no conntrack entry is opened. `peer_endpoint_hex` is the mesh peer the
+    /// record concerns, used for deny observability.
+    pub fn allow_flow(&self, flow: &FlowContext, peer_endpoint_hex: &str) -> bool {
+        self.evaluate_flow(flow, peer_endpoint_hex).action == Action::Allow
+    }
+
+    pub fn evaluate_flow(&self, flow: &FlowContext, peer_endpoint_hex: &str) -> EvalVerdict {
+        let bundle = self.bundle.load();
+        let posture_required = !bundle.default_src_posture.is_empty()
+            || bundle.rules.iter().any(|r| !r.src_posture.is_empty());
+        let flow = FlowContext {
+            src_posture_ok: if posture_required {
+                flow.src_posture_ok
+            } else {
+                true
+            },
+            ..flow.clone()
+        };
+        let verdict = evaluate_flow_policy(&bundle, &flow);
+        if verdict.action == Action::Deny {
+            // Fail-open only for open networks with no rules during poll outage.
+            if **self.stale.load()
+                && bundle.rules.is_empty()
+                && bundle.default_action == tunnet_common::policy::DefaultAction::Allow
+            {
+                return EvalVerdict {
+                    action: Action::Allow,
+                    reason: EvalReason::DefaultAllow,
+                    rule_slug: None,
+                    scope: None,
+                };
+            }
+            self.record_deny(peer_endpoint_hex, flow.dst_port, flow.protocol, &verdict);
+            tracing::debug!(
+                peer = %peer_endpoint_hex,
+                dst_port = ?flow.dst_port,
+                proto = ?flow.protocol,
+                reason = ?verdict.reason,
+                slug = ?verdict.rule_slug,
+                "ACL deny"
+            );
+        }
+        verdict
     }
 
     pub fn allow_packet(
@@ -257,13 +298,11 @@ impl AclEngine {
                 scope: None,
             };
         };
-        let peer = self.routes.lookup_endpoint(peer_endpoint_hex);
-        self.check(peer.as_deref(), peer_endpoint_hex, src, dst, direction, l4)
+        self.check(peer_endpoint_hex, src, dst, direction, l4)
     }
 
     fn check(
         &self,
-        peer: Option<&PeerInfo>,
         peer_hex: &str,
         src: Ipv4Addr,
         dst: Ipv4Addr,
@@ -274,10 +313,6 @@ impl AclEngine {
         let src_port = l4.src_port;
         let dst_port = l4.dst_port;
         let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-        let peer_ip = match direction {
-            Direction::Outbound => Some(dst),
-            Direction::Inbound => Some(src),
-        };
 
         // 1) Established / return traffic via conntrack.
         if let Some(key) = flow_key(proto, src, dst, src_port, dst_port)
@@ -291,7 +326,28 @@ impl AclEngine {
             };
         }
 
-        let verdict = self.eval_policy(peer, peer_hex, peer_ip, direction, proto, dst_port);
+        let mut peer_side = self.peer_endpoint(peer_hex);
+        let self_side = self.self_endpoint();
+        // The packet's wire addresses pinpoint the peer side more precisely
+        // than the routed address.
+        let (src_side, dst_side) = match direction {
+            Direction::Outbound => {
+                peer_side.ip = Some(dst);
+                (self_side, peer_side)
+            }
+            Direction::Inbound => {
+                peer_side.ip = Some(src);
+                (peer_side, self_side)
+            }
+        };
+        let flow = FlowContext {
+            src: src_side,
+            dst: dst_side,
+            protocol: proto,
+            dst_port,
+            src_posture_ok: **self.src_posture_ok.load(),
+        };
+        let verdict = self.evaluate_flow(&flow, peer_hex);
         if verdict.action == Action::Deny {
             return verdict;
         }
@@ -299,65 +355,6 @@ impl AclEngine {
         // 2) Policy allowed → open / refresh flow for return traffic.
         if let Some(key) = flow_key(proto, src, dst, src_port, dst_port) {
             self.open_or_refresh_flow(key, proto, tcp_flags);
-        }
-        verdict
-    }
-
-    fn eval_policy(
-        &self,
-        peer: Option<&PeerInfo>,
-        peer_hex: &str,
-        peer_ip: Option<Ipv4Addr>,
-        direction: Direction,
-        proto: Protocol,
-        dst_port: Option<u16>,
-    ) -> EvalVerdict {
-        let empty_tags: Vec<String> = Vec::new();
-        let self_id = self.self_id.load();
-        let bundle = self.bundle.load();
-        let posture_required = !bundle.default_src_posture.is_empty()
-            || bundle.rules.iter().any(|r| !r.src_posture.is_empty());
-        let src_posture_ok = if posture_required {
-            **self.src_posture_ok.load()
-        } else {
-            true
-        };
-        let ctx = EvalCtx {
-            self_endpoint_hex: &self_id.endpoint_hex,
-            self_ip: self_id.ip,
-            self_tags: &self_id.tags,
-            self_network: &self_id.network,
-            peer_endpoint_hex: peer_hex,
-            peer_ip,
-            peer_tags: peer.map(|p| p.tags.as_slice()).unwrap_or(&empty_tags),
-            peer_network: &self_id.network,
-            dst_port,
-            protocol: proto,
-            src_posture_ok,
-        };
-        let verdict = evaluate_detailed(&bundle, &ctx, direction);
-        if verdict.action == Action::Deny {
-            // Fail-open only for open networks with no rules during poll outage.
-            if **self.stale.load()
-                && bundle.rules.is_empty()
-                && bundle.default_action == tunnet_common::policy::DefaultAction::Allow
-            {
-                return EvalVerdict {
-                    action: Action::Allow,
-                    reason: EvalReason::DefaultAllow,
-                    rule_slug: None,
-                    scope: None,
-                };
-            }
-            self.record_deny(peer_hex, dst_port, proto, &verdict);
-            tracing::debug!(
-                peer = %peer_hex,
-                ?dst_port,
-                ?proto,
-                reason = ?verdict.reason,
-                slug = ?verdict.rule_slug,
-                "ACL deny"
-            );
         }
         verdict
     }
@@ -658,13 +655,58 @@ mod tests {
         b
     }
 
+    fn gateway_flow(
+        acl: &AclEngine,
+        peer_hex: &str,
+        dst_ip: Option<Ipv4Addr>,
+        port: u16,
+    ) -> FlowContext {
+        FlowContext {
+            src: acl.peer_endpoint(peer_hex),
+            dst: FlowEndpoint::external(dst_ip),
+            protocol: Protocol::Tcp,
+            dst_port: Some(port),
+            src_posture_ok: true,
+        }
+    }
+
     #[test]
     fn explicit_flow_enforces_real_port_under_default_deny() {
         let acl = test_engine(allow_tcp_443_bundle());
         let peer = "bb".repeat(32);
-        assert!(acl.allow_flow(&peer, Direction::Outbound, Protocol::Tcp, Some(443)));
-        assert!(!acl.allow_flow(&peer, Direction::Outbound, Protocol::Tcp, Some(22)));
-        assert!(!acl.allow_flow(&peer, Direction::Outbound, Protocol::Tcp, None));
-        assert!(!acl.allow_flow(&peer, Direction::Outbound, Protocol::Udp, Some(443)));
+        let lan = Some(Ipv4Addr::new(10, 8, 0, 7));
+        assert!(acl.allow_flow(&gateway_flow(&acl, &peer, lan, 443), &peer));
+        assert!(!acl.allow_flow(&gateway_flow(&acl, &peer, lan, 22), &peer));
+        assert!(!acl.allow_flow(
+            &FlowContext {
+                dst_port: None,
+                ..gateway_flow(&acl, &peer, lan, 443)
+            },
+            &peer
+        ));
+        assert!(!acl.allow_flow(
+            &FlowContext {
+                protocol: Protocol::Udp,
+                ..gateway_flow(&acl, &peer, lan, 443)
+            },
+            &peer
+        ));
+    }
+
+    #[test]
+    fn gateway_flow_evaluates_actual_destination_entity() {
+        let mut bundle = allow_tcp_443_bundle();
+        bundle.rules[0].dst = Selector::Cidr("10.8.0.0/16".parse().unwrap());
+        let acl = test_engine(bundle);
+        let peer = "bb".repeat(32);
+        assert!(acl.allow_flow(
+            &gateway_flow(&acl, &peer, Some(Ipv4Addr::new(10, 8, 0, 7)), 443),
+            &peer
+        ));
+        // Same port, destination outside the allowed CIDR.
+        assert!(!acl.allow_flow(
+            &gateway_flow(&acl, &peer, Some(Ipv4Addr::new(192, 168, 1, 7)), 443),
+            &peer
+        ));
     }
 }

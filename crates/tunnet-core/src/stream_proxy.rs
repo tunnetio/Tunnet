@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
-use tunnet_common::policy::{Direction, Protocol};
+use tunnet_common::policy::{FlowContext, FlowEndpoint, Protocol};
 
 use crate::acl::AclEngine;
 use crate::routing::RoutingTable;
@@ -20,19 +20,24 @@ pub fn stream_handler(routes: RoutingTable, acl: AclEngine) -> StreamHandler {
     })
 }
 
-/// Flow authorize a proxied stream against real TCP/port context before dialing
-/// the LAN target. Mirrors the outbound TUN verdict for the same destination.
-fn authorize_stream(acl: &AclEngine, peer_hex: &str, dst_port: u16) -> Result<(), FlowDeny> {
-    if acl.allow_flow(peer_hex, Direction::Outbound, Protocol::Tcp, Some(dst_port)) {
-        Ok(())
-    } else {
-        Err(FlowDeny { dst_port })
-    }
-}
-
-#[derive(Debug)]
-struct FlowDeny {
+/// Authorize a proxied stream against the real flow: the requesting peer as
+/// source principal, the LAN/hostname target as destination. Source posture is
+/// attested by the initiating node on its own egress; the gateway authorizes
+/// the destination.
+fn authorize_stream(
+    acl: &AclEngine,
+    peer_hex: &str,
+    dst_ip: Option<std::net::Ipv4Addr>,
     dst_port: u16,
+) -> bool {
+    let flow = FlowContext {
+        src: acl.peer_endpoint(peer_hex),
+        dst: FlowEndpoint::external(dst_ip),
+        protocol: Protocol::Tcp,
+        dst_port: Some(dst_port),
+        src_posture_ok: true,
+    };
+    acl.allow_flow(&flow, peer_hex)
 }
 
 async fn handle_accepted(accepted: AcceptedStream, routes: &RoutingTable, acl: &AclEngine) {
@@ -46,31 +51,31 @@ async fn handle_accepted(accepted: AcceptedStream, routes: &RoutingTable, acl: &
         return;
     }
 
-    let connect_host = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+    let (connect_host, dst_ip) = if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
         if !routes.is_advertised_destination(&ip) {
             tracing::warn!(%peer_hex, %host, port, "refusing stream: destination not routable here");
             return;
         }
-        host.clone()
+        (host.clone(), Some(ip))
     } else if let Some(info) = routes.lookup_hostname_route(&host) {
         if !routes.is_advertised_hostname(&host) {
             tracing::warn!(%peer_hex, %host, port, "refusing stream: not our hostname route");
             return;
         }
         if let Some(target) = info.target_ip {
-            target.to_string()
+            (target.to_string(), Some(target))
         } else {
-            host.clone()
+            (host.clone(), None)
         }
     } else if routes.is_advertised_hostname(&host) {
-        host.clone()
+        (host.clone(), None)
     } else {
         tracing::warn!(%peer_hex, %host, port, "refusing stream: destination not routable here");
         return;
     };
 
-    if let Err(deny) = authorize_stream(acl, &peer_hex, port) {
-        tracing::warn!(%peer_hex, %host, dst_port = deny.dst_port, "refusing stream: flow policy denies TCP destination port");
+    if !authorize_stream(acl, &peer_hex, dst_ip, port) {
+        tracing::warn!(%peer_hex, %host, port, "refusing stream: flow policy denies the destination");
         return;
     }
 
@@ -102,7 +107,7 @@ mod tests {
         Protocol as PolProto, RuleScope, Selector,
     };
 
-    fn engine_with(rule_port: u16) -> AclEngine {
+    fn engine_with(src: Selector, dst: Selector, rule_port: u16) -> AclEngine {
         let routes = RoutingTable::new();
         AclEngine::new(
             crate::acl::SelfIdentity {
@@ -114,8 +119,8 @@ mod tests {
             routes,
             PolicyBundle {
                 rules: vec![PolicyRule {
-                    src: Selector::Any,
-                    dst: Selector::Any,
+                    src,
+                    dst,
                     action: Action::Allow,
                     ports: vec![PortRange {
                         start: rule_port,
@@ -143,10 +148,31 @@ mod tests {
 
     #[test]
     fn stream_authorize_enforces_destination_port() {
-        let acl = engine_with(443);
+        let acl = engine_with(Selector::Any, Selector::Any, 443);
         let peer = "bb".repeat(32);
-        assert!(authorize_stream(&acl, &peer, 443).is_ok());
-        assert!(authorize_stream(&acl, &peer, 22).is_err());
-        assert!(authorize_stream(&acl, &peer, 80).is_err());
+        let lan = Some(Ipv4Addr::new(10, 8, 0, 7));
+        assert!(authorize_stream(&acl, &peer, lan, 443));
+        assert!(!authorize_stream(&acl, &peer, lan, 22));
+        assert!(!authorize_stream(&acl, &peer, lan, 80));
+    }
+
+    #[test]
+    fn stream_authorize_evaluates_destination_entity_not_self() {
+        use ipnet::IpNet;
+        let lan: IpNet = "10.8.0.0/16".parse().unwrap();
+        let acl = engine_with(Selector::Any, Selector::Cidr(lan), 443);
+        let peer = "bb".repeat(32);
+        assert!(authorize_stream(
+            &acl,
+            &peer,
+            Some(Ipv4Addr::new(10, 8, 0, 7)),
+            443
+        ));
+        assert!(!authorize_stream(
+            &acl,
+            &peer,
+            Some(Ipv4Addr::new(192, 168, 1, 7)),
+            443
+        ));
     }
 }

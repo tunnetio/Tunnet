@@ -42,14 +42,13 @@ pub struct RunArgs {
     pub no_encrypt_state: bool,
 }
 
-pub fn init_logging(cli: &DaemonCli) {
+pub fn init_logging(cli: &DaemonCli) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     #[cfg(windows)]
     if std::env::var_os("TUNNET_SERVICE_MODE").is_some() {
-        init_service_logging(filter);
-        return;
+        return init_service_logging(filter);
     }
 
     let sub = tracing_subscriber::fmt().with_env_filter(filter);
@@ -58,6 +57,7 @@ pub fn init_logging(cli: &DaemonCli) {
     } else {
         let _ = sub.try_init();
     }
+    None
 }
 
 /// Windows service log sink with a hard disk budget.
@@ -65,34 +65,51 @@ pub fn init_logging(cli: &DaemonCli) {
 /// `service.log` is size-rotated with gzip compression and a fixed file count,
 /// so disk usage is bounded regardless of event rate. The non-blocking layer
 /// drops lines instead of stalling dataplane threads when the disk is slow.
+/// The returned guard owns the background writer: dropping it flushes the
+/// remaining lines, so the service runner holds it for process lifetime.
 #[cfg(windows)]
-fn init_service_logging(filter: tracing_subscriber::EnvFilter) {
+fn init_service_logging(
+    filter: tracing_subscriber::EnvFilter,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // 8 MiB × (1 active + 10 rotated, compressed) ≈ ≤ 88 MiB on disk worst case.
     const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
     const MAX_FILES: usize = 10;
     const QUEUE_LINES: usize = 8192;
 
     let path = tunnet_core::StatePaths::system_dir().join("service.log");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let appender = file_rotate::FileRotate::new(
-        &path,
-        file_rotate::suffix::AppendCount::new(MAX_FILES),
-        file_rotate::ContentLimit::Bytes(MAX_FILE_BYTES),
-        file_rotate::compression::Compression::OnRotate(0),
-        None,
-    );
-    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
-        .lossy(true)
-        .buffered_lines_limit(QUEUE_LINES)
-        .finish(appender);
-    std::mem::forget(guard);
+    let (writer, guard) = service_log_pipeline(&path, MAX_FILE_BYTES, MAX_FILES, QUEUE_LINES);
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
         .with_writer(writer)
         .try_init();
+    Some(guard)
+}
+
+/// Size-rotated file appender behind a bounded lossy queue.
+fn service_log_pipeline(
+    path: &std::path::Path,
+    max_file_bytes: usize,
+    max_files: usize,
+    queue_lines: usize,
+) -> (
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let appender = file_rotate::FileRotate::new(
+        path,
+        file_rotate::suffix::AppendCount::new(max_files),
+        file_rotate::ContentLimit::Bytes(max_file_bytes),
+        file_rotate::compression::Compression::OnRotate(0),
+        None,
+    );
+    tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(queue_lines)
+        .finish(appender)
 }
 
 fn paths(cli_state_dir: Option<&str>) -> StatePaths {
@@ -237,6 +254,20 @@ async fn wait_for_network_state(
 mod tests {
     use std::io::Write;
 
+    use super::service_log_pipeline;
+
+    fn dir_total_bytes(dir: &std::path::Path) -> (usize, u64) {
+        let entries: Vec<_> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        let total = entries
+            .iter()
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        (entries.len(), total)
+    }
+
     /// A synthetic log storm must stay within a deterministic disk budget:
     /// at most `MAX_FILES + 1` files of at most `MAX_FILE_BYTES` each.
     #[test]
@@ -260,22 +291,71 @@ mod tests {
         }
         appender.flush().ok();
 
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("read_dir")
-            .filter_map(|e| e.ok())
-            .collect();
+        let (count, total) = dir_total_bytes(dir.path());
         assert!(
-            entries.len() <= MAX_FILES + 1,
-            "rotation must cap file count, found {}",
-            entries.len()
+            count <= MAX_FILES + 1,
+            "rotation must cap file count, found {count}"
         );
-        let total: u64 = entries
-            .iter()
-            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-            .sum();
         assert!(
             total <= (MAX_FILES as u64 + 1) * MAX_FILE_BYTES as u64,
             "disk use must stay bounded, found {total} bytes"
         );
+    }
+
+    /// The composed pipeline (bounded lossy queue over rotation) swallows a
+    /// multi-threaded storm without blocking and stays within budget.
+    #[test]
+    fn pipeline_absorbs_storm_without_blocking() {
+        const MAX_FILE_BYTES: usize = 4096;
+        const MAX_FILES: usize = 2;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (writer, guard) = service_log_pipeline(
+            &dir.path().join("service.log"),
+            MAX_FILE_BYTES,
+            MAX_FILES,
+            16,
+        );
+        let line = vec![b'y'; 128];
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let mut writer = writer.clone();
+                let line = line.clone();
+                s.spawn(move || {
+                    for _ in 0..5000 {
+                        let _ = writer.write_all(&line);
+                        let _ = writer.write_all(b"\n");
+                    }
+                });
+            }
+        });
+        drop(guard);
+
+        let (count, total) = dir_total_bytes(dir.path());
+        assert!(
+            count <= MAX_FILES + 1,
+            "rotation must cap file count, found {count}"
+        );
+        assert!(
+            total <= (MAX_FILES as u64 + 1) * MAX_FILE_BYTES as u64,
+            "disk use must stay bounded, found {total} bytes"
+        );
+    }
+
+    /// Below capacity nothing is dropped: guard shutdown flushes every line.
+    #[test]
+    fn pipeline_flushes_everything_on_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("service.log");
+        let (mut writer, guard) = service_log_pipeline(&path, 1024 * 1024, 2, 4096);
+        for i in 0..100u32 {
+            writeln!(writer, "line-{i:04}").expect("write");
+        }
+        drop(guard);
+
+        let body = std::fs::read_to_string(&path).expect("read log");
+        assert_eq!(body.lines().count(), 100);
+        assert!(body.contains("line-0000"));
+        assert!(body.contains("line-0099"));
     }
 }
