@@ -3653,7 +3653,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -3875,10 +3875,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
 dependencies = [
  "bitflags 2.13.1",
- "futures-util",
  "inotify-sys",
  "libc",
- "tokio",
 ]
 
 [[package]]
@@ -3964,7 +3962,7 @@ checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
  "socket2 0.6.5",
  "widestring",
- "windows-registry",
+ "windows-registry 0.6.1",
  "windows-result 0.4.1",
  "windows-sys 0.61.2",
 ]
@@ -6410,15 +6408,18 @@ dependencies = [
 
 [[package]]
 name = "osdns"
-version = "0.1.3"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0527d6bdce06a6ade96927aa1bf816d40c584701ee503194fd6e3b4032007df7"
+checksum = "35b5d3839f1ab9af4fcbb53f76c2b74714c91415c1e27f9fff482b6e982cf1cb"
 dependencies = [
  "atomic-write-file",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "idna",
  "inotify",
+ "netlink-packet-core 0.9.0",
+ "netlink-packet-route 0.33.0",
+ "netlink-sys 0.9.0",
  "notify",
  "resolv-conf",
  "serde",
@@ -6427,8 +6428,9 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "uuid",
- "windows 0.62.2",
- "windows-registry",
+ "windows-link 0.100.0",
+ "windows-registry 0.100.0",
+ "windows-result 0.100.0",
  "zbus",
 ]
 
@@ -11979,6 +11981,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-link"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b39de7c7fe78858b0144c50c3fc000bab3be17d5e9b85b1053871693c7f7415"
+
+[[package]]
 name = "windows-numerics"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12010,6 +12018,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-registry"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a14b75dbbc0f2bb1ebbf6dcb6dc0035ae17f10ec280045d10fa27ad8874903b2"
+dependencies = [
+ "windows-link 0.100.0",
+ "windows-result 0.100.0",
+ "windows-strings 0.100.0",
+]
+
+[[package]]
 name = "windows-result"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12025,6 +12044,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44873a1ef61c85d5e2991db91fe656cfcf0731097e00dff1ac860f1cb3b752a0"
+dependencies = [
+ "windows-link 0.100.0",
 ]
 
 [[package]]
@@ -12054,6 +12082,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
 dependencies = [
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a70b590c684f1d2854f74999896f7c0558f1bdde62f599088599e20ea1d2f60"
+dependencies = [
+ "windows-link 0.100.0",
 ]
 
 [[package]]

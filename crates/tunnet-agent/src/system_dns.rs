@@ -22,10 +22,11 @@
 //!
 //! `ConflictPolicy::Enforce` is self-contained: osdns starts its own internal
 //! native observation once an active lease exists, so Tunnet holds no public
-//! watcher. If the TUN interface is destroyed and recreated — even under the
-//! same name with a different native identity — [`Lease::update`] reports
-//! `Error::UpdateRequiresRebind` and the old lease is safely ended before a
-//! fresh one is applied.
+//! watcher. Resource-set changes report [`osdns::Error::UpdateRequiresRebind`].
+//! A vanished native incarnation reports [`osdns::Error::ResourceGone`]. Both
+//! are terminal for the current lease: restore it, then apply fresh.
+//! [`osdns::Error::ResourceIdentity`] means incarnation equality is unproven
+//! (replacement or ambiguity). That is not a rebind signal; Tunnet fails closed.
 
 use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr};
@@ -86,6 +87,9 @@ impl DnsController {
                 default_route = caps.default_route,
                 watch = caps.watch,
                 cache_flush = caps.cache_flush,
+                mutation_guard = ?caps.mutation_guard,
+                ownership_identity = ?caps.ownership_identity,
+                resource_binding = ?caps.resource_binding,
                 "osdns DNS integration enabled"
             ),
             Err(e) => tracing::warn!(error = %e, "osdns capabilities unavailable"),
@@ -117,12 +121,9 @@ impl DnsController {
     /// Move to the current desired configuration.
     ///
     /// With a live lease this is one transactional [`Lease::update`] across
-    /// all owned resources: DNS IP changes, suffix changes, TUN renames, and
-    /// TUN recreations that keep the same name but change the native identity
-    /// (ifindex, GUID, service UUID) are all detected by osdns itself. When
-    /// the update resolves to a different resource set, osdns reports
-    /// `Error::UpdateRequiresRebind` and the old lease is safely ended before
-    /// a fresh one is applied — Tunnet never predicts the resource set.
+    /// all owned resources. osdns binds the lease to the native incarnation,
+    /// not the reusable name/selector. Tunnet never predicts the resource set
+    /// or guesses identity: it only reacts to typed outcomes.
     ///
     /// Blocking; call via `spawn_blocking`.
     pub fn update(&self, ifname: &str, magic_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
@@ -149,10 +150,25 @@ impl DnsController {
                 tracing::info!(
                     ?owned,
                     ?requested,
-                    "DNS resource ownership changed; ending old lease for a fresh one"
+                    "DNS resource set changed; ending old lease for a fresh one"
                 );
                 self.restore()?;
                 self.apply_fresh(ifname, magic_ip, suffix)
+            }
+            Err(osdns::Error::ResourceGone { resource, .. }) => {
+                tracing::info!(
+                    ?resource,
+                    "DNS resource incarnation is gone; ending lease for a fresh apply"
+                );
+                self.restore()?;
+                self.apply_fresh(ifname, magic_ip, suffix)
+            }
+            Err(e @ osdns::Error::ResourceIdentity { .. }) => {
+                tracing::error!(
+                    error = %e,
+                    "DNS resource identity is unproven; refusing to rebind or mutate"
+                );
+                Err(e)
             }
             Err(e) => {
                 tracing::error!(error = %e, "PeerDNS lease update failed");
@@ -201,23 +217,16 @@ impl DnsController {
         let config = desired_config(&caps, tun_selector(ifname), magic_ip, suffix)?;
         match self.manager.apply(&config) {
             Ok(lease) => {
-                if lease.is_noop() {
-                    tracing::info!(
-                        %magic_ip,
-                        suffix,
-                        ifname,
-                        "PeerDNS DNS already in effect; no-op lease"
-                    );
-                } else {
-                    tracing::info!(
-                        %magic_ip,
-                        suffix,
-                        ifname,
-                        backend = %caps.backend,
-                        split = caps.split_dns,
-                        "PeerDNS lease applied"
-                    );
-                }
+                tracing::info!(
+                    %magic_ip,
+                    suffix,
+                    ifname,
+                    backend = %caps.backend,
+                    split = caps.split_dns,
+                    lease_id = %lease.lease_id(),
+                    noop = lease.is_noop(),
+                    "PeerDNS lease applied"
+                );
                 self.state.lock().lease = Some(lease);
                 self.flush_cache_best_effort();
                 Ok(())
@@ -244,9 +253,9 @@ impl DnsController {
 }
 
 /// Tunnet's product identity for its TUN interface: "use this interface".
-/// `osdns` resolves the name to the backend's stable native identity (Linux
-/// ifindex, Windows GUID, macOS service UUID) at apply/update time, and the
-/// lease owns that identity — so Tunnet never resolves OS identity itself.
+/// `osdns` resolves the name to a native incarnation (Linux ifindex, Windows
+/// GUID, macOS service UUID, plus backend identity evidence) at apply time.
+/// The lease owns that incarnation, so Tunnet never resolves OS identity.
 fn tun_selector(ifname: &str) -> InterfaceSelector {
     InterfaceSelector::Name(OsString::from(ifname))
 }
@@ -304,9 +313,9 @@ pub fn desired_config(
 /// Agent-startup crash recovery: let `osdns` inspect its durable journal and
 /// safely recover stale ownership from a crashed daemon process.
 ///
-/// Never guesses ownership: external conflicts are surfaced and left
-/// untouched rather than blindly restoring old DNS state. Corrupt journals
-/// fail closed.
+/// Never guesses ownership: per-resource outcomes are logged and left as
+/// osdns reported them. Enumeration, schema, and integrity errors fail
+/// closed. Per-resource failures do not abort recovery of unrelated records.
 fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
     match manager.recover_stale() {
         Ok(outcomes) => {
@@ -318,6 +327,39 @@ fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
                     RecoveryOutcome::JournalCleared { resource, lease_id } => {
                         tracing::info!(?resource, %lease_id, "cleared stale DNS journal")
                     }
+                    RecoveryOutcome::Gone { resource, lease_id } => {
+                        tracing::info!(
+                            ?resource,
+                            %lease_id,
+                            "stale DNS resource incarnation is gone; journal cleared"
+                        )
+                    }
+                    RecoveryOutcome::Replaced { resource, lease_id } => {
+                        tracing::info!(
+                            ?resource,
+                            %lease_id,
+                            "stale DNS resource was replaced; journal cleared"
+                        )
+                    }
+                    RecoveryOutcome::IdentityMismatch { resource, lease_id } => {
+                        tracing::error!(
+                            ?resource,
+                            %lease_id,
+                            "stale DNS incarnation is unproven; left untouched"
+                        )
+                    }
+                    RecoveryOutcome::Failed {
+                        resource,
+                        lease_id,
+                        detail,
+                    } => {
+                        tracing::error!(
+                            ?resource,
+                            %lease_id,
+                            detail,
+                            "stale DNS recovery failed for one resource; continuing"
+                        )
+                    }
                     RecoveryOutcome::ExternalConflict { resource, lease_id } => {
                         tracing::error!(
                             ?resource,
@@ -328,7 +370,10 @@ fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
                     RecoveryOutcome::Busy { resource } => {
                         tracing::warn!(?resource, "stale DNS resource busy; left untouched")
                     }
-                    _ => tracing::debug!("unrecognized DNS recovery outcome"),
+                    other => tracing::error!(
+                        ?other,
+                        "unrecognized DNS recovery outcome; leaving resource untouched"
+                    ),
                 }
             }
             Ok(())
@@ -488,7 +533,7 @@ mod tests {
     mod backend_tests {
         use super::*;
         use osdns::ConflictPolicy;
-        use osdns::testing::{FakeDns, FakeState, manager_for_testing_with_policy};
+        use osdns::testing::{FakeDns, FakeOp, FakeState, manager_for_testing_with_policy};
         use std::time::Duration;
 
         fn enforce_manager(caps: Capabilities) -> (DnsManager, FakeDns, tempfile::TempDir) {
@@ -558,8 +603,8 @@ mod tests {
             dns.apply("eth0", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
                 .unwrap();
 
-            // A different native identity resolves to a different resource
-            // set; osdns reports it, Tunnet safely rebinds.
+            // A different interface resolves to a different resource set;
+            // osdns reports UpdateRequiresRebind, Tunnet restores and reapplies.
             dns.update("wlan1", Ipv4Addr::new(100, 100, 100, 53), "tunnet")
                 .unwrap();
             assert!(dns.is_active());
@@ -642,8 +687,6 @@ mod tests {
 
         #[test]
         fn failed_update_preserves_previous_complete_configuration() {
-            use osdns::testing::FakeOp;
-
             let (manager, fake, _dir) = enforce_manager(full_caps());
             let dns = DnsController::wrap(manager).unwrap();
             dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
@@ -976,16 +1019,231 @@ mod tests {
             assert!(matches!(err, osdns::Error::JournalCorrupt(_)));
         }
 
+        #[test]
+        fn legacy_journal_schema_fails_closed_without_reinterpretation() {
+            let (manager, _fake, dir) = enforce_manager(full_caps());
+            let journal_dir = dir.path().join("journal");
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            std::fs::write(
+                journal_dir.join("v1.json"),
+                br#"{"schema_version":1,"owner":"io.tunnet.agent"}"#,
+            )
+            .unwrap();
+            let err = manager
+                .recover_stale()
+                .expect_err("0.1.x journals must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    osdns::Error::UnsupportedJournalVersion {
+                        found: 1,
+                        supported: 3,
+                        ..
+                    }
+                ),
+                "got {err:?}"
+            );
+            assert!(
+                DnsController::wrap(manager).is_err(),
+                "controller must not start on a v1 journal"
+            );
+        }
+
+        #[test]
+        fn recovery_reports_gone_replaced_identity_mismatch_and_failed() {
+            use osdns::testing::{CrashOutcome, FaultInjector, TxPoint, catch_crash};
+
+            let crash_apply = |manager: &DnsManager| {
+                let injector = FaultInjector::new();
+                injector.crash_at(TxPoint::AfterApplied);
+                manager.install_fault_injector(injector.clone());
+                let outcome = catch_crash(|| manager.apply(&global_config()));
+                assert!(matches!(outcome, CrashOutcome::Crashed));
+                injector.clear();
+            };
+
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            crash_apply(&manager);
+            fake.external_remove("fake:global").unwrap();
+            let outcomes = manager.recover_stale().unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, RecoveryOutcome::Gone { .. })),
+                "expected Gone, got {outcomes:?}"
+            );
+            DnsController::wrap(manager).unwrap();
+
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            crash_apply(&manager);
+            fake.external_remove("fake:global").unwrap();
+            fake.external_change("fake:global", foreign_state())
+                .unwrap();
+            let outcomes = manager.recover_stale().unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, RecoveryOutcome::Replaced { .. })),
+                "expected Replaced, got {outcomes:?}"
+            );
+            assert_eq!(
+                fake.current_state("fake:global").unwrap(),
+                Some(foreign_state()),
+                "replacement must not be rewritten during recovery"
+            );
+
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            crash_apply(&manager);
+            fake.set_identity_ambiguous("fake:global", true).unwrap();
+            let outcomes = manager.recover_stale().unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, RecoveryOutcome::IdentityMismatch { .. })),
+                "expected IdentityMismatch, got {outcomes:?}"
+            );
+            assert!(
+                matches!(
+                    fake.current_state("fake:global").unwrap(),
+                    Some(FakeState::Configured { .. })
+                ),
+                "ambiguous identity must not be restored"
+            );
+
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            crash_apply(&manager);
+            fake.inject_backend_failure(FakeOp::Identity, 1, "identity probe failed");
+            let outcomes = manager.recover_stale().unwrap();
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| matches!(o, RecoveryOutcome::Failed { .. })),
+                "expected Failed, got {outcomes:?}"
+            );
+            DnsController::wrap(manager)
+                .expect("per-resource Failed must not fail controller creation");
+        }
+
+        #[test]
+        fn noop_lease_is_owned_and_restores_to_preexisting_state() {
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            let probe = manager.clone();
+            let dns = DnsController::wrap(manager).unwrap();
+            fake.external_change("fake:interface:1", configured(MAGIC_IP))
+                .unwrap();
+
+            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            assert!(dns.is_active());
+            assert!(probe.debug_enforce_refs() >= 1);
+
+            dns.update("eth0", Ipv4Addr::new(100, 100, 100, 54), "tunnet")
+                .unwrap();
+            let current = fake
+                .current_state("fake:interface:1")
+                .unwrap()
+                .expect("resource exists");
+            assert!(
+                matches!(&current, FakeState::Configured { nameservers, .. }
+                    if nameservers == &vec![IpAddr::V4(Ipv4Addr::new(100, 100, 100, 54))]),
+                "owned no-op lease must be updatable, got {current:?}"
+            );
+
+            dns.restore().unwrap();
+            assert!(!dns.is_active());
+            assert_eq!(
+                fake.current_state("fake:interface:1").unwrap(),
+                Some(configured(MAGIC_IP)),
+                "restore must return to the pre-lease base captured by the no-op apply"
+            );
+            assert_eq!(probe.debug_enforce_refs(), 0);
+        }
+
+        #[test]
+        fn vanished_tun_ends_lease_then_fresh_apply_can_target_a_live_interface() {
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            let dns = DnsController::wrap(manager).unwrap();
+            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+
+            fake.external_remove("fake:interface:1").unwrap();
+            dns.update("wlan1", MAGIC_IP, "tunnet").unwrap();
+            assert!(dns.is_active());
+            assert_eq!(fake.current_state("fake:interface:1").unwrap(), None);
+            assert!(matches!(
+                fake.current_state("fake:interface:2").unwrap(),
+                Some(FakeState::Configured { .. })
+            ));
+
+            dns.restore().unwrap();
+            assert!(!dns.is_active());
+        }
+
+        #[test]
+        fn reincarnated_resource_fails_closed_without_rebinding() {
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            let dns = DnsController::wrap(manager).unwrap();
+            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+
+            fake.external_remove("fake:interface:1").unwrap();
+            fake.external_change("fake:interface:1", foreign_state())
+                .unwrap();
+            let err = dns
+                .update("eth0", MAGIC_IP, "tunnet")
+                .expect_err("replaced incarnation must not be rebound");
+            assert!(
+                matches!(err, osdns::Error::ResourceIdentity { .. }),
+                "got {err:?}"
+            );
+            assert!(dns.is_active());
+            assert_eq!(
+                fake.current_state("fake:interface:1").unwrap(),
+                Some(foreign_state()),
+                "ambiguous replacement must not be overwritten"
+            );
+        }
+
+        #[test]
+        fn ambiguous_identity_on_update_fails_closed() {
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            let dns = DnsController::wrap(manager).unwrap();
+            dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+            fake.set_identity_ambiguous("fake:interface:1", true)
+                .unwrap();
+
+            let err = dns
+                .update("eth0", Ipv4Addr::new(100, 100, 100, 54), "tunnet")
+                .expect_err("ambiguous identity must fail closed");
+            assert!(matches!(err, osdns::Error::ResourceIdentity { .. }));
+            assert!(dns.is_active());
+            let current = fake
+                .current_state("fake:interface:1")
+                .unwrap()
+                .expect("resource exists");
+            assert!(
+                matches!(&current, FakeState::Configured { nameservers, .. }
+                    if nameservers == &vec![IpAddr::V4(MAGIC_IP)]),
+                "previous configuration must be preserved, got {current:?}"
+            );
+
+            fake.set_identity_ambiguous("fake:interface:1", false)
+                .unwrap();
+            dns.restore().unwrap();
+            assert!(!dns.is_active());
+        }
+
         const MAGIC_IP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
         const FOREIGN_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
 
-        fn foreign_state() -> FakeState {
+        fn configured(ip: Ipv4Addr) -> FakeState {
             FakeState::Configured {
-                nameservers: vec![FOREIGN_IP],
+                nameservers: vec![IpAddr::V4(ip)],
                 search_domains: vec![],
                 routing_domains: vec![],
                 default_route: None,
             }
+        }
+
+        fn foreign_state() -> FakeState {
+            configured(Ipv4Addr::new(9, 9, 9, 9))
         }
 
         fn global_config() -> DnsConfig {
