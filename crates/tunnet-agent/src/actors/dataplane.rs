@@ -300,8 +300,7 @@ impl DataPlaneActor {
         );
         crate::system_firewall::configure(&self.cfg.ifname);
 
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
+        let generation = self.generation.wrapping_add(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         self.published.store(Some(Arc::new(PublishedDataPlane {
             generation,
@@ -371,6 +370,7 @@ impl DataPlaneActor {
             }),
         });
         self.outbound = Some(outbound);
+        self.generation = generation;
         self.up = true;
         self.status.set_up(true);
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: true });
