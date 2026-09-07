@@ -307,35 +307,124 @@ pub fn desired_config(
 /// Never guesses ownership: external conflicts are surfaced and left
 /// untouched rather than blindly restoring old DNS state. Corrupt journals
 /// fail closed.
+/// Upper bound on pre-upgrade journal records discarded in one startup. Each
+/// clear removes exactly one named file, so the loop always terminates; the
+/// bound only stops an unbounded retry if removal silently fails to make
+/// progress.
+const MAX_LEGACY_JOURNAL_CLEARS: usize = 64;
+
 fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
-    match manager.recover_stale() {
-        Ok(outcomes) => {
-            for outcome in outcomes {
-                match outcome {
-                    RecoveryOutcome::Restored { resource, lease_id } => {
-                        tracing::info!(?resource, %lease_id, "recovered stale DNS transaction")
-                    }
-                    RecoveryOutcome::JournalCleared { resource, lease_id } => {
-                        tracing::info!(?resource, %lease_id, "cleared stale DNS journal")
-                    }
-                    RecoveryOutcome::ExternalConflict { resource, lease_id } => {
-                        tracing::error!(
-                            ?resource,
-                            %lease_id,
-                            "stale DNS transaction conflicts with external state; left untouched"
-                        )
-                    }
-                    RecoveryOutcome::Busy { resource } => {
-                        tracing::warn!(?resource, "stale DNS resource busy; left untouched")
-                    }
-                    _ => tracing::debug!("unrecognized DNS recovery outcome"),
-                }
+    for _ in 0..MAX_LEGACY_JOURNAL_CLEARS {
+        let error = match manager.recover_stale() {
+            Ok(outcomes) => {
+                report_recovery_outcomes(outcomes);
+                return Ok(());
             }
-            Ok(())
+            Err(e) => e,
+        };
+
+        // osdns 0.2 deliberately does not migrate 0.1.x journal records, and a
+        // single leftover record fails `recover_stale`, `abandon_journal` and
+        // `apply` alike, so DNS integration stays dead until the file is gone.
+        // The machines carrying such records are exactly the ones that crashed
+        // before the upgrade, so clearing them is the agent's job. osdns names
+        // the offending file, so remove precisely that record rather than
+        // wiping a state directory we do not own.
+        let legacy = match &error {
+            osdns::Error::UnsupportedJournalVersion {
+                path,
+                found,
+                supported,
+            } => Some((path.clone(), *found, *supported)),
+            _ => None,
+        };
+        let Some((path, found, supported)) = legacy else {
+            tracing::error!(error = %error, "DNS journal recovery failed; failing closed");
+            return Err(error);
+        };
+
+        tracing::warn!(
+            path = %path.display(),
+            found,
+            supported,
+            "discarding a pre-upgrade osdns journal record; 0.1.x DNS state is not migrated \
+             and any DNS settings it described are not restored"
+        );
+        if let Err(io) = std::fs::remove_file(&path) {
+            tracing::error!(
+                path = %path.display(),
+                error = %io,
+                "could not remove the pre-upgrade DNS journal record; failing closed"
+            );
+            return Err(error);
         }
-        Err(e) => {
-            tracing::error!(error = %e, "DNS journal recovery failed; failing closed");
-            Err(e)
+    }
+
+    tracing::error!(
+        limit = MAX_LEGACY_JOURNAL_CLEARS,
+        "gave up clearing pre-upgrade DNS journal records; failing closed"
+    );
+    report_recovery_outcomes(manager.recover_stale()?);
+    Ok(())
+}
+
+fn report_recovery_outcomes(outcomes: Vec<RecoveryOutcome>) {
+    for outcome in outcomes {
+        match outcome {
+            RecoveryOutcome::Restored { resource, lease_id } => {
+                tracing::info!(?resource, %lease_id, "recovered stale DNS transaction")
+            }
+            RecoveryOutcome::JournalCleared { resource, lease_id } => {
+                tracing::info!(?resource, %lease_id, "cleared stale DNS journal")
+            }
+            RecoveryOutcome::Gone { resource, lease_id } => {
+                tracing::info!(
+                    ?resource,
+                    %lease_id,
+                    "DNS resource no longer exists; stale journal record cleared"
+                )
+            }
+            RecoveryOutcome::Replaced { resource, lease_id } => {
+                tracing::info!(
+                    ?resource,
+                    %lease_id,
+                    "DNS resource now names a different incarnation; nothing restored"
+                )
+            }
+            RecoveryOutcome::IdentityMismatch { resource, lease_id } => {
+                tracing::warn!(
+                    ?resource,
+                    %lease_id,
+                    "DNS resource identity could not be proven; left untouched for a later pass"
+                )
+            }
+            // Since osdns 0.2 a per-record failure is an outcome rather than an
+            // Err, so recovery as a whole reports success. Logging this at
+            // anything less than error would hide failures the previous version
+            // surfaced by failing the call.
+            RecoveryOutcome::Failed {
+                resource,
+                lease_id,
+                detail,
+            } => {
+                tracing::error!(
+                    ?resource,
+                    %lease_id,
+                    %detail,
+                    "stale DNS transaction could not be recovered; record kept for a later pass"
+                )
+            }
+            RecoveryOutcome::ExternalConflict { resource, lease_id } => {
+                tracing::error!(
+                    ?resource,
+                    %lease_id,
+                    "stale DNS transaction conflicts with external state; left untouched"
+                )
+            }
+            RecoveryOutcome::Busy { resource } => {
+                tracing::warn!(?resource, "stale DNS resource busy; left untouched")
+            }
+            _ => tracing::warn!("unrecognized DNS recovery outcome"),
         }
     }
 }
@@ -974,6 +1063,80 @@ mod tests {
                 .recover_stale()
                 .expect_err("corrupt journal must fail closed");
             assert!(matches!(err, osdns::Error::JournalCorrupt(_)));
+        }
+
+        /// osdns 0.2 does not migrate 0.1.x journal records: one leftover
+        /// record fails `recover_stale`, `abandon_journal` and `apply` alike,
+        /// so an upgraded agent would lose DNS integration entirely on exactly
+        /// the machines that crashed before upgrading, with no way out through
+        /// the osdns API.
+        #[test]
+        fn pre_upgrade_journal_record_is_discarded_instead_of_disabling_dns() {
+            let (manager, _fake, dir) = enforce_manager(full_caps());
+            let journal_dir = dir.path().join("journal");
+            std::fs::create_dir_all(&journal_dir).unwrap();
+            let legacy = journal_dir.join("pre-upgrade.json");
+            // osdns reads a `{ schema_version }` envelope before the record
+            // proper, so this is rejected exactly as a real 0.1.x record is.
+            std::fs::write(&legacy, br#"{"schema_version":1}"#).unwrap();
+
+            assert!(
+                matches!(
+                    manager.recover_stale(),
+                    Err(osdns::Error::UnsupportedJournalVersion { .. })
+                ),
+                "osdns itself must refuse the legacy record"
+            );
+
+            crate::system_dns::recover_stale(&manager)
+                .expect("a pre-upgrade record must not disable DNS integration");
+
+            assert!(!legacy.exists(), "the legacy record must be removed");
+            manager
+                .recover_stale()
+                .expect("osdns must be usable once the legacy record is gone");
+        }
+
+        /// A legacy record must not take healthy records down with it: osdns
+        /// aborts the whole read on the first bad file, so clearing has to
+        /// happen before the rest of the journal can be recovered at all.
+        #[test]
+        fn a_pre_upgrade_record_does_not_block_recovery_of_current_records() {
+            use osdns::testing::{CrashOutcome, FaultInjector, TxPoint, catch_crash};
+
+            let (manager, _fake, dir) = enforce_manager(full_caps());
+            let injector = FaultInjector::new();
+            injector.crash_at(TxPoint::AfterPrepared);
+            manager.install_fault_injector(injector.clone());
+            let outcome = catch_crash(|| manager.apply(&global_config()));
+            assert!(matches!(outcome, CrashOutcome::Crashed));
+            injector.clear();
+
+            let journal_dir = dir.path().join("journal");
+            let json_files = || {
+                std::fs::read_dir(&journal_dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            };
+            assert_eq!(json_files(), 1, "the crash should leave one live record");
+
+            let legacy = journal_dir.join("pre-upgrade.json");
+            std::fs::write(&legacy, br#"{"schema_version":1}"#).unwrap();
+            assert_eq!(json_files(), 2);
+
+            crate::system_dns::recover_stale(&manager)
+                .expect("recovery must proceed once the legacy record is cleared");
+
+            assert_eq!(
+                json_files(),
+                0,
+                "both the legacy record and the recovered record should be gone"
+            );
         }
 
         const MAGIC_IP: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 53);
