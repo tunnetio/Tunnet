@@ -1,8 +1,6 @@
 //! Disk-backed Direct admin helpers (pending joins, invite ids).
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -13,8 +11,6 @@ use crate::state::StatePaths;
 pub struct PendingJoin {
     pub endpoint_id: String,
     pub hostname: String,
-    pub ipv4: Ipv4Addr,
-    pub collision_index: u8,
 }
 
 pub fn load_pending(paths: &StatePaths, network_id: Uuid) -> anyhow::Result<Vec<PendingJoin>> {
@@ -88,6 +84,6 @@ pub fn queue_kick(paths: &StatePaths, network_id: Uuid, peer_id: &str) -> anyhow
     Ok(())
 }
 
-pub fn pending_path(paths: &StatePaths, network_id: Uuid) -> PathBuf {
+pub fn pending_path(paths: &StatePaths, network_id: Uuid) -> std::path::PathBuf {
     paths.pending_file(network_id)
 }

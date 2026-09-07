@@ -4,7 +4,9 @@ Hostname routes map DNS names to services accessible through a gateway machine. 
 
 ## How they work
 
-When you create a hostname route for `internal-app`, PeerDNS resolves `internal-app.tunnet` to a synthetic IP in the CGNAT range (100.100.x.x). Traffic to that IP is routed through the designated gateway machine, which forwards it to the actual service.
+Hostname routes are used by Tunnet's stream APIs. The client sends the requested hostname in the authenticated stream header, so the gateway can distinguish exact and wildcard targets and connect to the intended service.
+
+PeerDNS does not publish A records for hostname routes. A normal TCP connection to an IP address does not retain the hostname, so mapping the name to the gateway's peer address would silently connect to the gateway itself. Use a Tunnet stream client for hostname routes; use a subnet route when an unmodified IP application must reach the destination.
 
 ## Wildcard routes
 

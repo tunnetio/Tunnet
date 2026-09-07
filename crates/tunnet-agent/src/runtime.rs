@@ -154,14 +154,21 @@ pub async fn run(
         }
     }
 
-    let (assigned_ipv4, prefix, mtu, dns_cfg) = if is_direct {
+    let (local_addrs, mtu, dns_cfg) = if is_direct {
         let _ = tunnet_core::TunnetConfig::ensure(&node.paths);
-        (
-            node.self_ipv4,
-            10u8,
-            1280u16,
-            tunnet_core::load_dns(&node.paths),
-        )
+        let mut active: Vec<_> = node
+            .direct
+            .iter()
+            .map(|(network_id, runtime)| (*network_id, runtime.state.self_record.ipv4))
+            .collect();
+        active.sort_by_key(|(network_id, _)| *network_id);
+        let addrs: Vec<_> = active.into_iter().map(|(_, address)| address).collect();
+        let addrs = if addrs.is_empty() {
+            vec![node.self_ipv4]
+        } else {
+            addrs
+        };
+        (addrs, 1280u16, tunnet_core::load_dns(&node.paths))
     } else {
         let membership_snap = tunnet_core::state::load_snapshot_cache(&node.paths)
             .and_then(|s| {
@@ -171,19 +178,14 @@ pub async fn run(
             })
             .context("cached snapshot missing enrolled network")?;
         let effective_mtu = config_store.load().effective.tunnel_mtu.value.max(576);
-        (
-            membership_snap.assigned_ipv4,
-            membership_snap.prefix,
-            effective_mtu,
-            {
-                let mut dns = membership_snap.dns.clone();
-                let eff = config_store.load();
-                dns.suffix = eff.effective.dns_suffix.value.clone();
-                dns.upstream = eff.effective.dns_upstream.value.clone();
-                dns.dnssec = eff.effective.dnssec.value;
-                dns
-            },
-        )
+        (vec![membership_snap.assigned_ipv4], effective_mtu, {
+            let mut dns = membership_snap.dns.clone();
+            let eff = config_store.load();
+            dns.suffix = eff.effective.dns_suffix.value.clone();
+            dns.upstream = eff.effective.dns_upstream.value.clone();
+            dns.dnssec = eff.effective.dnssec.value;
+            dns
+        })
     };
 
     // One long-lived osdns manager for the agent lifetime. Owned by the
@@ -209,10 +211,10 @@ pub async fn run(
     let status_snapshot = tunnet_core::local_api::DataPlaneStatusSnapshot::new(false);
 
     // Child configs for the supervisor tree.
+    let ssh_bind = dataplane_ssh_bind(&node);
     let dataplane_cfg = DataPlaneActorConfig {
         ifname: args.ifname.clone(),
-        assigned_ipv4,
-        prefix,
+        local_addrs,
         mtu,
         dns_cfg: dns_cfg.clone(),
         dns: dns_controller.clone(),
@@ -338,8 +340,9 @@ pub async fn run(
         started_at,
         dns_upstream: dns_cfg.upstream.clone(),
         dnssec: dns_cfg.dnssec,
-        synthetic_base: dns_cfg.synthetic_base.to_string(),
-        magic_ip: dns_cfg.magic_ip.to_string(),
+        resolver_endpoint: tunnet_common::LocalResolverEndpoint::default()
+            .socket_addr()
+            .to_string(),
         peer_dns_active: peer_dns_active.clone(),
         peer_rtt: Arc::new(dashmap::DashMap::new()),
         serves: node.serves.clone(),
@@ -368,10 +371,36 @@ pub async fn run(
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
-    dataplane_ref
-        .ask(crate::actors::dataplane::BringUp)
-        .await
-        .map_err(|e| anyhow::anyhow!("dataplane bring-up failed: {e}"))?;
+    // A Direct address conflict degrades bring-up instead of reporting healthy.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        dataplane_ref.ask(crate::actors::dataplane::BringUp),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "dataplane degraded at startup");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "dataplane bring-up timed out; degraded");
+        }
+    }
+    {
+        let dataplane_bg = dataplane_ref.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if let Err(error) = dataplane_bg
+                    .ask(crate::actors::dataplane::ReconcileDirectState)
+                    .await
+                {
+                    tracing::warn!(%error, "Direct lifecycle reconciliation degraded");
+                }
+            }
+        });
+    }
 
     let recording_store = match RecordingStore::open(recordings_dir(&node.paths.dir)) {
         Ok(s) => Some(Arc::new(s)),
@@ -420,12 +449,20 @@ pub async fn run(
     for docs in docs_map.values() {
         let stream_pool = node.pool.clone();
         let dgram_pool = node.tunnel_pool.clone();
+        let dataplane = dataplane_ref.clone();
         docs.set_change_hook(Arc::new(move || {
             let stream_pool = stream_pool.clone();
             let dgram_pool = dgram_pool.clone();
+            let dataplane = dataplane.clone();
             tokio::spawn(async move {
                 stream_pool.reconcile().await;
                 dgram_pool.reconcile().await;
+                if let Err(error) = dataplane
+                    .ask(crate::actors::dataplane::ReconcileDirectState)
+                    .await
+                {
+                    tracing::warn!(%error, "membership route reconciliation degraded");
+                }
             });
         }));
     }
@@ -477,14 +514,14 @@ pub async fn run(
             "SSH session reporting disabled (no control-plane WS channel yet); sessions will not appear in the dashboard"
         );
     }
-    let ssh_handle =
-        match crate::ssh::spawn_ssh_listener(assigned_ipv4, &node.paths.dir, ssh_deps).await {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                tracing::error!(?e, "failed to start SSH listener");
-                None
-            }
-        };
+    let ssh_handle = match crate::ssh::spawn_ssh_listener(ssh_bind, &node.paths.dir, ssh_deps).await
+    {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::error!(?e, "failed to start SSH listener");
+            None
+        }
+    };
 
     // Publish host pubkey: control-plane metadata (managed) / iroh-docs (direct).
     let ssh_pubkey = match crate::ssh::host_pubkey_openssh(&node.paths.dir) {
@@ -550,12 +587,8 @@ pub async fn run(
         ingress: ingress.clone(),
     });
 
-    // PeerDNS first: its Hickory upstream is snapshotted from the underlay
-    // resolver *before* the osdns overlay points the OS at PeerDNS.
-    let dns_bind = tunnet_core::dns::bind_addr(dns_cfg.magic_ip);
-    let _dns_task = tunnet_core::dns::spawn(dns_bind, node.routes.clone(), dns_cfg.clone());
-
-    crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, assigned_ipv4);
+    let first_local = ssh_bind;
+    crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, first_local);
 
     if agent_cfg.effective_service_relay() {
         if let Some(gossip) = node.shared_gossip() {
@@ -606,6 +639,14 @@ pub async fn run(
 }
 
 /// Graceful drain with bounded waits; abort only as a final fallback.
+fn dataplane_ssh_bind(node: &CoreNode) -> std::net::Ipv4Addr {
+    node.persisted
+        .direct_networks()
+        .first()
+        .map(|d| d.self_record.ipv4)
+        .unwrap_or(node.self_ipv4)
+}
+
 async fn drain(
     supervisor: kameo::actor::ActorRef<AgentSupervisor>,
     ssh_handle: Option<tokio::task::JoinHandle<()>>,
@@ -676,7 +717,7 @@ fn build_presence_args(
                     signing_key: signing_key.clone(),
                     self_endpoint_id: self_endpoint_id.clone(),
                     hostname: rt.state.hostname.clone(),
-                    mesh_ip: Some(rt.state.assigned_ipv4.to_string()),
+                    mesh_ip: Some(rt.state.self_record.ipv4.to_string()),
                     ssh_host_key: None,
                     agent_version: agent_version.clone(),
                     bootstrap: peers,

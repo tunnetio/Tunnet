@@ -33,10 +33,9 @@ sudo tunnet create --name gaming --secret "other-secret"
 
 When more than one network is active, pass the network name to commands that need it (`tunnet invite homelab`, `tunnet kick gaming <peer>`, `tunnet firewall add --network homelab …`).
 
-Join order matters: if two peers in different networks share the same derived mesh IP (birthday collision), the **first-joined** network wins for outbound routing. Fix collisions with:
+Join order matters: if two peers in different networks share the same derived mesh IP (birthday collision), the **overlapping Direct networks are rejected.  Fix collisions with:
 
 ```bash
-tunnet override-ip --peer <hostname-or-endpoint> --ip 10.7.0.50 --network gaming
 ```
 
 Leave one network (not the last - use `tunnet reset --yes` for that):
@@ -72,7 +71,6 @@ tunnet kick my-net <endpoint_id>
 
 # Leave / IP override
 tunnet leave --network my-net
-tunnet override-ip --peer other-host --ip 10.7.0.42 --network my-net
 
 # Firewall (also editable in tunnet.toml)
 tunnet firewall show

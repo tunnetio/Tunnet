@@ -298,7 +298,7 @@ mod tests {
             Uuid::new_v4(),
             &sk,
             "host-a",
-            Some("100.64.0.2".into()),
+            Some("10.21.0.2".into()),
             None,
             "0.1.0",
             now,

@@ -16,16 +16,16 @@ use tunnet_common::local_api::{
     DirectConnectPendingResponse, DirectConnectRequest, DirectContactResponse,
     DirectFirewallAddRequest, DirectFirewallPendingResponse, DirectFirewallResponse,
     DirectInviteRequest, DirectInviteResponse, DirectKeepAliveRequest, DirectNetworkRequest,
-    DirectOverrideIpRequest, DirectPendingResponse, DirectPolicyResponse, DirectPolicySetRequest,
-    DnsStatusInfo, JsonPayload, LocalEnrollRequest, LocalEvent, MetaInfo, NetcheckInfo,
-    NetworkCreateRequest, NetworkJoinRequest, NetworkLeaveRequest, NetworkSummary,
-    NetworkUpgradeRequest, NetworksResponse, NodeSummary, OkResponse, PeersResponse, PingEvent,
-    PolicyOpRequest, PostureCheckRequest, ResetRequest, RouteAddRequest, RouteAddedResponse,
-    RoutesInfo, SendAcceptRequest, SendConfigInfo, SendFileRequest, SendRejectRequest,
-    SendSetConfigRequest, ServeInfo, ServeStartRequest, ServesResponse, SshAuthPollRequest,
-    SshAuthPollResponse, SshCastResponse, SshRecordingsResponse, SshSessionsResponse, TransferInfo,
-    TransfersResponse, TunnelInfo, TunnelStartRequest, TunnelsResponse, UpdateRequest,
-    ValidateConfigRequest, format_api_error,
+    DirectPendingResponse, DirectPolicyResponse, DirectPolicySetRequest, DnsStatusInfo,
+    JsonPayload, LocalEnrollRequest, LocalEvent, MetaInfo, NetcheckInfo, NetworkCreateRequest,
+    NetworkJoinRequest, NetworkLeaveRequest, NetworkSummary, NetworkUpgradeRequest,
+    NetworksResponse, NodeSummary, OkResponse, PeersResponse, PingEvent, PolicyOpRequest,
+    PostureCheckRequest, ResetRequest, RouteAddRequest, RouteAddedResponse, RoutesInfo,
+    SendAcceptRequest, SendConfigInfo, SendFileRequest, SendRejectRequest, SendSetConfigRequest,
+    ServeInfo, ServeStartRequest, ServesResponse, SshAuthPollRequest, SshAuthPollResponse,
+    SshCastResponse, SshRecordingsResponse, SshSessionsResponse, TransferInfo, TransfersResponse,
+    TunnelInfo, TunnelStartRequest, TunnelsResponse, UpdateRequest, ValidateConfigRequest,
+    format_api_error,
 };
 
 use crate::transport::{self, default_api_path};
@@ -521,13 +521,6 @@ impl TunnetClient {
         body: &DirectKeepAliveRequest,
     ) -> anyhow::Result<OkResponse> {
         self.post_json("/v1/direct/keep-alive", body).await
-    }
-
-    pub async fn direct_override_ip(
-        &self,
-        body: &DirectOverrideIpRequest,
-    ) -> anyhow::Result<OkResponse> {
-        self.post_json("/v1/direct/ip-overrides", body).await
     }
 
     pub async fn direct_connect(

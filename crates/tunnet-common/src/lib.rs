@@ -155,14 +155,6 @@ pub struct HostnameRoute {
     pub target_ip: Option<Ipv4Addr>,
 }
 
-fn default_magic_ip() -> Ipv4Addr {
-    Ipv4Addr::new(100, 100, 100, 53)
-}
-
-fn default_synthetic_base() -> Ipv4Addr {
-    Ipv4Addr::new(100, 100, 0, 1)
-}
-
 /// Upstream resolver list. `"system"` (alone) uses OS DNS configuration.
 /// Otherwise each entry is a nameserver URL (`udp+tcp://1.1.1.1:53`, `tls://1.1.1.1:853#cloudflare-dns.com`, …).
 pub fn default_dns_upstream() -> Vec<String> {
@@ -178,10 +170,6 @@ pub struct DnsConfig {
     /// middleboxes break signed zones. Turn on when upstreams are validating-capable.
     #[serde(default)]
     pub dnssec: bool,
-    #[serde(default = "default_synthetic_base")]
-    pub synthetic_base: Ipv4Addr,
-    #[serde(default = "default_magic_ip")]
-    pub magic_ip: Ipv4Addr,
 }
 
 impl Default for DnsConfig {
@@ -190,9 +178,29 @@ impl Default for DnsConfig {
             suffix: "tunnet".into(),
             upstream: default_dns_upstream(),
             dnssec: false,
-            synthetic_base: default_synthetic_base(),
-            magic_ip: default_magic_ip(),
         }
+    }
+}
+
+/// Host-local PeerDNS resolver endpoint. Never part of Direct network state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalResolverEndpoint {
+    pub ip: std::net::Ipv4Addr,
+    pub port: u16,
+}
+
+impl Default for LocalResolverEndpoint {
+    fn default() -> Self {
+        Self {
+            ip: std::net::Ipv4Addr::new(127, 0, 0, 1),
+            port: 53,
+        }
+    }
+}
+
+impl LocalResolverEndpoint {
+    pub fn socket_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from((self.ip, self.port))
     }
 }
 
