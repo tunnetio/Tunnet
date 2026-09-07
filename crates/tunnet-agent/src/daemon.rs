@@ -43,50 +43,13 @@ pub struct RunArgs {
 }
 
 pub fn init_logging(cli: &DaemonCli) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,tunnet_agent=debug,tunnet_core=debug")
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
     #[cfg(windows)]
     if std::env::var_os("TUNNET_SERVICE_MODE").is_some() {
-        use std::fs::OpenOptions;
-        use std::sync::{Arc, Mutex};
-
-        let path = tunnet_core::StatePaths::system_dir().join("service.log");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)
-        {
-            #[derive(Clone)]
-            struct FileWriter(Arc<Mutex<std::fs::File>>);
-            impl std::io::Write for FileWriter {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
-                }
-            }
-            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileWriter {
-                type Writer = FileWriter;
-                fn make_writer(&'a self) -> Self::Writer {
-                    self.clone()
-                }
-            }
-
-            let writer = FileWriter(Arc::new(Mutex::new(file)));
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_ansi(false)
-                .with_writer(writer)
-                .try_init();
-            return;
-        }
+        init_service_logging(filter);
+        return;
     }
 
     let sub = tracing_subscriber::fmt().with_env_filter(filter);
@@ -95,6 +58,41 @@ pub fn init_logging(cli: &DaemonCli) {
     } else {
         let _ = sub.try_init();
     }
+}
+
+/// Windows service log sink with a hard disk budget.
+///
+/// `service.log` is size-rotated with gzip compression and a fixed file count,
+/// so disk usage is bounded regardless of event rate. The non-blocking layer
+/// drops lines instead of stalling dataplane threads when the disk is slow.
+#[cfg(windows)]
+fn init_service_logging(filter: tracing_subscriber::EnvFilter) {
+    // 8 MiB × (1 active + 10 rotated, compressed) ≈ ≤ 88 MiB on disk worst case.
+    const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_FILES: usize = 10;
+    const QUEUE_LINES: usize = 8192;
+
+    let path = tunnet_core::StatePaths::system_dir().join("service.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let appender = file_rotate::FileRotate::new(
+        &path,
+        file_rotate::suffix::AppendCount::new(MAX_FILES),
+        file_rotate::ContentLimit::Bytes(MAX_FILE_BYTES),
+        file_rotate::compression::Compression::OnRotate(0),
+        None,
+    );
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(QUEUE_LINES)
+        .finish(appender);
+    std::mem::forget(guard);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(writer)
+        .try_init();
 }
 
 fn paths(cli_state_dir: Option<&str>) -> StatePaths {
@@ -232,5 +230,52 @@ async fn wait_for_network_state(
         } else {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    /// A synthetic log storm must stay within a deterministic disk budget:
+    /// at most `MAX_FILES + 1` files of at most `MAX_FILE_BYTES` each.
+    #[test]
+    fn rotation_bounds_disk_under_log_storm() {
+        const MAX_FILE_BYTES: usize = 1024;
+        const MAX_FILES: usize = 3;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("service.log");
+        let mut appender = file_rotate::FileRotate::new(
+            &path,
+            file_rotate::suffix::AppendCount::new(MAX_FILES),
+            file_rotate::ContentLimit::Bytes(MAX_FILE_BYTES),
+            file_rotate::compression::Compression::OnRotate(0),
+            None,
+        );
+        let line = vec![b'x'; 256];
+        for _ in 0..2000 {
+            appender.write_all(&line).expect("write");
+            appender.write_all(b"\n").expect("write");
+        }
+        appender.flush().ok();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            entries.len() <= MAX_FILES + 1,
+            "rotation must cap file count, found {}",
+            entries.len()
+        );
+        let total: u64 = entries
+            .iter()
+            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            total <= (MAX_FILES as u64 + 1) * MAX_FILE_BYTES as u64,
+            "disk use must stay bounded, found {total} bytes"
+        );
     }
 }

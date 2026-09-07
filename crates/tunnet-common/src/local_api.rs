@@ -142,7 +142,7 @@ pub struct PeerSummary {
     pub latency_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
-    /// connected | suspended | reconnecting
+    /// connected | dialing | idle | backoff | blocked
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_state: Option<String>,
     /// direct | relay | unknown
@@ -970,6 +970,10 @@ pub struct OnDemandStatusInfo {
     pub reconnect_fail: u64,
     pub packets_buffered: u64,
     pub packets_dropped_timeout: u64,
+    #[serde(default)]
+    pub packets_dropped_blocked: u64,
+    #[serde(default)]
+    pub dials_suppressed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

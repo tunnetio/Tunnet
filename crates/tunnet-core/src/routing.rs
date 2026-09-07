@@ -84,6 +84,10 @@ pub struct RoutingTable {
     slices: Arc<Mutex<BTreeMap<Uuid, NetworkSlice>>>,
     /// Manual IP overrides: (network_id, peer_key) → ip. peer_key is hostname or endpoint hex.
     overrides: Arc<DashMap<(Uuid, String), Ipv4Addr>>,
+    /// Monotonic membership-write sequence. Moves on every table rebuild even
+    /// when the protocol version does not, so blocked connection state can
+    /// retry on actual change rather than on timers.
+    change_seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for RoutingTable {
@@ -116,6 +120,7 @@ impl RoutingTable {
             dynamic_synth: Arc::new(DashMap::new()),
             slices: Arc::new(Mutex::new(BTreeMap::new())),
             overrides: Arc::new(DashMap::new()),
+            change_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -257,6 +262,10 @@ impl RoutingTable {
 
     pub fn version(&self) -> u64 {
         self.inner.load().version
+    }
+
+    pub fn change_seq(&self) -> u64 {
+        self.change_seq.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn dns_suffix(&self) -> String {
@@ -553,6 +562,8 @@ impl RoutingTable {
     }
 
     fn rebuild(&self, version: Option<u64>) {
+        self.change_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let slices: Vec<(Uuid, NetworkSlice)> = {
             let g = self.slices.lock();
             let mut v: Vec<_> = g.iter().map(|(k, s)| (*k, s.clone())).collect();

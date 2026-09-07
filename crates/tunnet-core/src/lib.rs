@@ -1,5 +1,4 @@
 pub mod acl;
-pub mod acl_hook;
 pub mod agent_config;
 pub mod cloud_relay_meter;
 #[cfg(feature = "managed")]
@@ -33,6 +32,7 @@ pub mod stream;
 pub mod stream_proxy;
 #[cfg(feature = "managed")]
 pub mod sync;
+pub mod transport_auth;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
 #[cfg(feature = "managed")]
@@ -46,7 +46,6 @@ pub use secret_store::{
 };
 
 pub use acl::{AclEngine, SelfIdentity};
-pub use acl_hook::AclHook;
 #[cfg(feature = "managed")]
 pub use control::{ManagementClient, SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
@@ -67,5 +66,6 @@ pub use stream::{
     StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN, dial_stream, serve_stream_connection,
 };
 pub use stream_proxy::stream_handler;
+pub use transport_auth::{TransportAuth, TransportHook};
 #[cfg(feature = "tunnel")]
 pub use tunnel::TunnelManager;

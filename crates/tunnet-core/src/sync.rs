@@ -160,6 +160,7 @@ pub struct ManagedDriverCtx {
     #[cfg(feature = "send")]
     pub send: Option<crate::send::SendManager>,
     pub tunnel_pool: Option<crate::iroh_pool::ConnPool>,
+    pub pool: Option<crate::iroh_pool::ConnPool>,
     pub effective_config: Option<crate::EffectiveConfigStore>,
 }
 
@@ -191,6 +192,7 @@ impl ManagedDriverCtx {
             #[cfg(feature = "send")]
             send: Some(node.send.clone()),
             tunnel_pool: Some(node.tunnel_pool.clone()),
+            pool: Some(node.pool.clone()),
             effective_config: Some(node.effective_config.clone()),
         }
     }
@@ -219,6 +221,7 @@ pub fn spawn_managed_driver(
             #[cfg(feature = "send")]
             send,
             tunnel_pool,
+            pool,
             effective_config,
         } = ctx;
         let crate::ws_client::PendingControl {
@@ -243,6 +246,8 @@ pub fn spawn_managed_driver(
                 known_version: **version.load(),
             })
             .await;
+        let pools: Vec<crate::iroh_pool::ConnPool> =
+            pool.into_iter().chain(tunnel_pool.clone()).collect();
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -265,6 +270,7 @@ pub fn spawn_managed_driver(
                             &self_endpoint_id,
                             &self_hostname,
                             Some(paths.dir.as_path()),
+                            &pools,
                         )
                         .await;
                     }
@@ -293,6 +299,9 @@ pub fn spawn_managed_driver(
                                     &self_hostname,
                                     Some(paths.dir.as_path()),
                                 );
+                                for p in &pools {
+                                    p.reconcile().await;
+                                }
                                 save_snapshot_cache(&paths, &snap).ok();
                                 tracing::info!(
                                     v = m.version,
@@ -348,6 +357,9 @@ pub fn spawn_managed_driver(
                                 network_id,
                                 &network_name,
                             );
+                            for p in &pools {
+                                p.reconcile().await;
+                            }
                         }
                         ServerMsg::Policy(bundle) => acl.replace_bundle(bundle),
                         ServerMsg::ForceReenroll { reason } => {
@@ -375,6 +387,9 @@ pub fn spawn_managed_driver(
                                                 &self_hostname,
                                                 Some(paths.dir.as_path()),
                                             );
+                                            for p in &pools {
+                                                p.reconcile().await;
+                                            }
                                             save_snapshot_cache(&paths, &snap).ok();
                                             tracing::info!(
                                                 v = m.version,
@@ -743,6 +758,7 @@ pub async fn poll_once(
     self_endpoint_id: &str,
     self_hostname: &str,
     known_hosts_dir: Option<&std::path::Path>,
+    pools: &[crate::iroh_pool::ConnPool],
 ) {
     match client.poll(**version.load()).await {
         Ok(snap) => {
@@ -767,6 +783,9 @@ pub async fn poll_once(
                     self_hostname,
                     known_hosts_dir,
                 );
+                for p in pools {
+                    p.reconcile().await;
+                }
                 tracing::info!(
                     v = m.version,
                     peers = m.ipv4_peers.len(),

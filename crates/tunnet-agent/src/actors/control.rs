@@ -281,6 +281,8 @@ impl ControlPlaneActor {
                         &self.cfg.hostname,
                         Some(self.cfg.paths.dir.as_path()),
                     );
+                    node.pool.reconcile().await;
+                    node.tunnel_pool.reconcile().await;
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
                     // The snapshot version travels with the work so a lagging
                     // task can never overwrite newer desired routes.
@@ -382,6 +384,8 @@ impl ControlPlaneActor {
                     self.cfg.network_id,
                     &network_name,
                 );
+                node.pool.reconcile().await;
+                node.tunnel_pool.reconcile().await;
                 tracing::info!(
                     v = delta.version,
                     added = delta.added.len(),
@@ -400,6 +404,7 @@ impl ControlPlaneActor {
                 if let Some(signed) = node.signed.clone() {
                     let routes = node.routes.clone();
                     let acl = node.acl.clone();
+                    let pools = vec![node.pool.clone(), node.tunnel_pool.clone()];
                     let version = self.version.clone();
                     let nid = self.cfg.network_id;
                     let eid = self.cfg.transport.endpoint_id.clone();
@@ -415,6 +420,7 @@ impl ControlPlaneActor {
                             &eid,
                             &hostname,
                             Some(dir.as_path()),
+                            &pools,
                         )
                         .await;
                     });
@@ -758,6 +764,7 @@ impl Message<PollNow> for ControlPlaneActor {
             let hostname = self.cfg.hostname.clone();
             let dir = self.cfg.paths.dir.clone();
             tokio::spawn(async move {
+                let pools = vec![node.pool.clone(), node.tunnel_pool.clone()];
                 tunnet_core::sync::poll_once(
                     &signed,
                     &version,
@@ -767,6 +774,7 @@ impl Message<PollNow> for ControlPlaneActor {
                     &endpoint_id,
                     &hostname,
                     Some(dir.as_path()),
+                    &pools,
                 )
                 .await;
             });

@@ -384,7 +384,7 @@ pub async fn run(
         tracing::info!("session recorder enabled (ALPN tunnet/recording/1)");
     }
 
-    let stream_handler = tunnet_core::stream_handler(node.routes.clone());
+    let stream_handler = tunnet_core::stream_handler(node.routes.clone(), node.acl.clone());
     let dgram_pool = node.tunnel_pool.clone();
 
     let firewalls: HashMap<_, _> = node
@@ -415,6 +415,20 @@ pub async fn run(
         .iter()
         .map(|(id, rt)| (*id, rt.docs.clone()))
         .collect();
+
+    // Direct membership sync drives pool invalidation by event, never by timer.
+    for docs in docs_map.values() {
+        let stream_pool = node.pool.clone();
+        let dgram_pool = node.tunnel_pool.clone();
+        docs.set_change_hook(Arc::new(move || {
+            let stream_pool = stream_pool.clone();
+            let dgram_pool = dgram_pool.clone();
+            tokio::spawn(async move {
+                stream_pool.reconcile().await;
+                dgram_pool.reconcile().await;
+            });
+        }));
+    }
 
     let auth_server_ctx = if is_direct {
         Some(build_auth_server_context(

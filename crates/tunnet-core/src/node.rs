@@ -21,8 +21,6 @@ use crate::acl::AclEngine;
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::acl::SelfIdentity;
 #[cfg(feature = "managed")]
-use crate::acl_hook::AclHook;
-#[cfg(feature = "managed")]
 use crate::control::{SignedClient, basic_metadata};
 #[cfg(feature = "direct")]
 use crate::direct::PresenceTable;
@@ -386,7 +384,7 @@ impl CoreNode {
         let builder = endpoint_builder(&connectivity)
             .secret_key(secret)
             .alpns(alpns)
-            .hooks(AclHook::new(acl.clone()));
+            .hooks(crate::transport_auth::TransportHook::managed(&routes));
         let endpoint = apply_connectivity(builder, &connectivity)
             .bind()
             .await
@@ -409,6 +407,7 @@ impl CoreNode {
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
         let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        pool.set_transport_auth(crate::transport_auth::TransportAuth::managed(&routes));
         pool.set_cloud_relay_urls(
             snapshot
                 .connectivity_relays
@@ -534,7 +533,7 @@ impl CoreNode {
         let builder = endpoint_builder(&cfg.connectivity)
             .secret_key(secret)
             .alpns(alpns)
-            .hooks(DirectAuthHook::new(acl.clone(), auth.clone()));
+            .hooks(DirectAuthHook::new(auth.clone()));
         let endpoint = apply_connectivity(builder, &cfg.connectivity)
             .bind()
             .await
@@ -554,6 +553,7 @@ impl CoreNode {
         let serves = ServeManager::new(self_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
         let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        pool.set_transport_auth(crate::transport_auth::TransportAuth::direct(&auth));
         let effective_config = cfg.effective_config.clone().unwrap_or_default();
         pool.set_keep_alive(cfg.keep_alive);
         #[cfg(feature = "tunnel")]
@@ -589,6 +589,7 @@ impl CoreNode {
             if let Some(key) = primary.content_key.clone() {
                 mgr.set_content_key(Some(key));
             }
+            mgr.set_transport_auth(crate::transport_auth::TransportAuth::direct(&auth));
             mgr
         };
 

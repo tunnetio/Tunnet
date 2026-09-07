@@ -124,6 +124,9 @@ struct DocsInner {
     /// Shared with [`crate::direct::spawn_seed_auth`] so membership updates refresh dials.
     seed_peers: Arc<Mutex<Vec<String>>>,
     coordinator_endpoint_id: Option<String>,
+    /// Fired after live membership sync (docs events). The agent uses it to
+    /// reconcile connection pools: no polling timers for auth changes.
+    change_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Inputs for [`DocsMembership::bootstrap`].
@@ -169,6 +172,27 @@ impl DocsMembership {
 
     pub fn revoked_snapshot(&self) -> HashSet<String> {
         self.inner.revoked.lock().clone()
+    }
+
+    /// Register a hook fired after live membership sync. Used to reconcile
+    /// connection pools without polling.
+    pub fn set_change_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.change_hook.lock() = Some(hook);
+    }
+
+    fn fire_change_hook(&self) {
+        if let Some(hook) = self.inner.change_hook.lock().clone() {
+            hook();
+        }
+    }
+
+    /// Drop Grant AUTH for peers the doc now lists as revoked/kicked, so the
+    /// transport gate closes for them on the next event (not on a timer).
+    pub fn evict_revoked_from_auth(&self, auth: &AuthCache) {
+        let network_id = self.inner.network_id;
+        for id in self.revoked_snapshot() {
+            auth.remove_network(&id, network_id);
+        }
     }
 
     pub fn coordinator_verifying_key(&self) -> &str {
@@ -297,6 +321,7 @@ impl DocsMembership {
                 dns: Arc::new(ArcSwap::from_pointee(dns)),
                 seed_peers: seed_peers.clone(),
                 coordinator_endpoint_id: direct.coordinator_endpoint_id.clone(),
+                change_hook: Mutex::new(None),
             }),
         };
 
@@ -341,8 +366,10 @@ impl DocsMembership {
                                     tracing::debug!(?e, "docs membership rebuild");
                                     continue;
                                 }
+                                bg.evict_revoked_from_auth(&auth_bg);
                                 bg.apply_to_routes(&routes_bg, &acl_bg, &policy_bg);
                                 bg.refresh_seed_peers();
+                                bg.fire_change_hook();
                                 if let Err(e) = bg.sync_firewall_policy().await {
                                     tracing::debug!(?e, "docs firewall policy sync");
                                 }

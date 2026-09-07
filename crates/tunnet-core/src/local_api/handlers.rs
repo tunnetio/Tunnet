@@ -588,6 +588,8 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             reconnect_fail: od.reconnect_fail,
             packets_buffered: od.packets_buffered,
             packets_dropped_timeout: od.packets_dropped_timeout,
+            packets_dropped_blocked: od.packets_dropped_blocked,
+            dials_suppressed: od.dials_suppressed,
         }),
         control,
     }

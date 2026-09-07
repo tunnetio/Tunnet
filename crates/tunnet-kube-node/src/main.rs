@@ -221,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let node = Arc::new(node);
 
     let stream_handler = match &mode {
-        Mode::Connector(_) => stream_handler(node.routes.clone()),
+        Mode::Connector(_) => stream_handler(node.routes.clone(), node.acl.clone()),
         _ => noop_stream_handler(),
     };
     let _router = spawn_unified_acceptor(node.clone(), stream_handler);
@@ -247,9 +247,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("info,tunnet_kube_node=debug,tunnet_core=debug")
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

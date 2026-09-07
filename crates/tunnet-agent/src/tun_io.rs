@@ -181,11 +181,6 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
     } = deps;
     let remote_id = conn.remote_id();
     let remote_hex = format!("{remote_id}");
-    if !acl.allow_inbound_peer(&remote_hex) {
-        tracing::warn!(%remote_id, "policy denied inbound peer");
-        conn.close(1u32.into(), b"policy_deny");
-        return;
-    }
     tracing::info!(%remote_id, "peer connected");
     metrics.active_conns_inc();
     if let Some(p) = &pool {

@@ -4,12 +4,13 @@
 //! or an invite bootstrap proof (HMAC over join secret). The claimed `network_id`
 //! is bound into the proof so the server verifies against that network only.
 //!
-//! [`DirectAuthHook`] blocks data-plane ALPNs until the peer holds a verified grant
-//! (or ACL). Docs / Gossip / Blobs are the membership bootstrap plane and are
+//! [`DirectAuthHook`] blocks data-plane ALPNs until the peer holds a verified grant.
+//! Docs / Gossip / Blobs are the membership bootstrap plane and are
 //! allowed without AuthCache - trust for those is signed records + content keys.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use ed25519_dalek::VerifyingKey;
@@ -24,10 +25,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use crate::acl::AclEngine;
-
-use super::grants::{NetworkGrant, verify_grant, verifying_key_from_hex};
 use super::{DOCS_ALPN, GOSSIP_ALPN};
+use crate::direct::grants::{NetworkGrant, verify_grant, verifying_key_from_hex};
 
 /// Wire version: grant-based auth with invite bootstrap.
 pub const AUTH_ALPN: &[u8] = b"tunnet/direct-auth/3";
@@ -44,6 +43,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct AuthCache {
     /// endpoint_hex → set of network_ids
     inner: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
+    /// Bumped on every insert/remove so connection state can retry on change, not on timers.
+    version: Arc<AtomicU64>,
 }
 
 impl AuthCache {
@@ -52,11 +53,12 @@ impl AuthCache {
     }
 
     pub fn insert(&self, endpoint_hex: impl Into<String>, network_id: Uuid) {
-        self.inner
-            .lock()
-            .entry(endpoint_hex.into())
-            .or_default()
-            .insert(network_id);
+        let mut g = self.inner.lock();
+        let changed = g.entry(endpoint_hex.into()).or_default().insert(network_id);
+        drop(g);
+        if changed {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Authenticated for any joined network.
@@ -83,30 +85,42 @@ impl AuthCache {
     }
 
     pub fn remove(&self, endpoint_hex: &str) {
-        self.inner.lock().remove(endpoint_hex);
+        if self.inner.lock().remove(endpoint_hex).is_some() {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn remove_network(&self, endpoint_hex: &str, network_id: Uuid) {
         let mut g = self.inner.lock();
+        let mut changed = false;
         if let Some(set) = g.get_mut(endpoint_hex) {
-            set.remove(&network_id);
+            changed = set.remove(&network_id);
             if set.is_empty() {
                 g.remove(endpoint_hex);
             }
         }
+        drop(g);
+        if changed {
+            self.version.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
     }
 }
 
-/// Compose ACL + Direct auth gate.
+/// Direct transport gate: Grant AUTH membership only, never L3/L4 policy.
+/// Docs / Gossip / Blobs are the membership bootstrap plane and are
+/// allowed without AuthCache - trust for those is signed records + content keys.
 #[derive(Clone)]
 pub struct DirectAuthHook {
-    acl: AclEngine,
     auth: AuthCache,
 }
 
 impl DirectAuthHook {
-    pub fn new(acl: AclEngine, auth: AuthCache) -> Self {
-        Self { acl, auth }
+    pub fn new(auth: AuthCache) -> Self {
+        Self { auth }
     }
 }
 
@@ -126,10 +140,10 @@ impl EndpointHooks for DirectAuthHook {
         if is_bootstrap_alpn(alpn) {
             return BeforeConnectOutcome::Accept;
         }
-        if self.auth.contains(&peer_hex) || self.acl.allow_outbound_peer(&peer_hex) {
+        if self.auth.contains(&peer_hex) {
             BeforeConnectOutcome::Accept
         } else {
-            tracing::warn!(%peer_hex, "outbound connect blocked (not authenticated)");
+            tracing::debug!(%peer_hex, "outbound connect blocked (not authenticated)");
             BeforeConnectOutcome::Reject
         }
     }
@@ -143,10 +157,10 @@ impl EndpointHooks for DirectAuthHook {
         if is_bootstrap_alpn(alpn) {
             return AfterHandshakeOutcome::Accept;
         }
-        if self.auth.contains(&peer_hex) || self.acl.allow_inbound_peer(&peer_hex) {
+        if self.auth.contains(&peer_hex) {
             AfterHandshakeOutcome::Accept
         } else {
-            tracing::warn!(%peer_hex, "inbound connection blocked (not authenticated)");
+            tracing::debug!(%peer_hex, "inbound connection blocked (not authenticated)");
             AfterHandshakeOutcome::Reject {
                 error_code: 401u32.into(),
                 reason: b"auth_required".to_vec(),

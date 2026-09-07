@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::acl::AclEngine;
 use crate::iroh_pool::ConnPool;
 use crate::routing::RoutingTable;
+use crate::transport_auth::TransportAuth;
 
 const SENDER_TTL: Duration = Duration::from_secs(60 * 60);
 const PROGRESS_THROTTLE: Duration = Duration::from_secs(1);
@@ -115,6 +116,8 @@ struct SendInner {
     pool: ConnPool,
     routes: RoutingTable,
     acl: AclEngine,
+    /// Membership gate for inbound offer/blob connections (never L3/L4 policy).
+    transport: Mutex<TransportAuth>,
     self_endpoint_id: String,
     content_key: Mutex<Option<String>>,
     config: Mutex<SendConfig>,
@@ -158,6 +161,7 @@ impl SendManager {
         self_endpoint_id: String,
     ) -> anyhow::Result<Self> {
         let blobs = BlobsProtocol::new(store.as_ref(), None);
+        let transport = TransportAuth::managed(&routes);
         let mgr = Self {
             inner: Arc::new(SendInner {
                 store,
@@ -165,6 +169,7 @@ impl SendManager {
                 pool,
                 routes,
                 acl,
+                transport: Mutex::new(transport),
                 self_endpoint_id,
                 content_key: Mutex::new(None),
                 config: Mutex::new(SendConfig::default()),
@@ -189,6 +194,10 @@ impl SendManager {
 
     pub fn set_client_tx(&self, tx: mpsc::Sender<ClientMsg>) {
         *self.inner.client_tx.lock() = Some(tx);
+    }
+
+    pub fn set_transport_auth(&self, transport: TransportAuth) {
+        *self.inner.transport.lock() = transport;
     }
 
     pub fn set_events_tx(&self, tx: tokio::sync::broadcast::Sender<LocalEvent>) {
@@ -565,8 +574,9 @@ impl SendManager {
     /// Handle inbound SEND_ALPN connection (offer stream).
     pub async fn handle_offer_connection(&self, conn: Connection) {
         let peer_hex = format!("{}", conn.remote_id());
-        if !self.inner.acl.allow_inbound_peer(&peer_hex) {
-            tracing::warn!(%peer_hex, "send offer blocked by ACL");
+        if !self.inner.transport.lock().allows(&peer_hex) {
+            tracing::debug!(%peer_hex, "send offer from non-member; closing");
+            conn.close(1u32.into(), b"not_member");
             return;
         }
         let (mut send, mut recv) = match conn.accept_bi().await {
@@ -1052,12 +1062,12 @@ impl SendManager {
         }
     }
 
-    /// Serve an inbound blobs ALPN connection (ACL-gated).
+    /// Serve an inbound blobs ALPN connection (membership-gated).
     pub async fn handle_blobs_connection(&self, conn: Connection) {
         let peer_hex = format!("{}", conn.remote_id());
-        if !self.inner.acl.allow_inbound_peer(&peer_hex) {
-            tracing::warn!(%peer_hex, "blobs ALPN blocked by ACL");
-            conn.close(1u32.into(), b"policy_deny");
+        if !self.inner.transport.lock().allows(&peer_hex) {
+            tracing::debug!(%peer_hex, "blobs ALPN from non-member; closing");
+            conn.close(1u32.into(), b"not_member");
             return;
         }
         if let Err(e) = self.inner.blobs.accept(conn).await {
