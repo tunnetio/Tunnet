@@ -217,6 +217,21 @@ impl Message<KernelRoutesChanged> for RouteActor {
 
 /// Read-only status; also published via cheap snapshots where hot.
 pub struct GetRouteStatus;
+pub struct GetKernelRoutes;
+
+impl Message<GetKernelRoutes> for RouteActor {
+    type Reply = Result<(Vec<RouteSpec>, Vec<RouteSpec>), RouteError>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetKernelRoutes,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let engine = self.ensure_engine().await?;
+        let owned = engine.owned_routes();
+        Ok((engine.kernel_routes().await?, owned))
+    }
+}
 
 #[derive(Debug, Clone, kameo::Reply)]
 #[allow(dead_code)]

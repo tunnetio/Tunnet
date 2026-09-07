@@ -156,12 +156,13 @@ pub async fn run(
 
     let (local_addrs, mtu, dns_cfg) = if is_direct {
         let _ = tunnet_core::TunnetConfig::ensure(&node.paths);
-        let addrs: Vec<std::net::Ipv4Addr> = node
-            .persisted
-            .direct_networks()
+        let mut active: Vec<_> = node
+            .direct
             .iter()
-            .map(|d| d.self_record.ipv4)
+            .map(|(network_id, runtime)| (*network_id, runtime.state.self_record.ipv4))
             .collect();
+        active.sort_by_key(|(network_id, _)| *network_id);
+        let addrs: Vec<_> = active.into_iter().map(|(_, address)| address).collect();
         let addrs = if addrs.is_empty() {
             vec![node.self_ipv4]
         } else {
@@ -386,15 +387,16 @@ pub async fn run(
         }
     }
     {
-        let node_bg = node.clone();
-        let metrics_bg = metrics.clone();
+        let dataplane_bg = dataplane_ref.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 tick.tick().await;
-                let conflicts = crate::conflict::check_direct_conflicts(&node_bg, &metrics_bg);
-                if conflicts.is_empty() {
-                    tracing::debug!("Direct conflict poll: healthy");
+                if let Err(error) = dataplane_bg
+                    .ask(crate::actors::dataplane::ReconcileDirectState)
+                    .await
+                {
+                    tracing::warn!(%error, "Direct lifecycle reconciliation degraded");
                 }
             }
         });
@@ -447,12 +449,20 @@ pub async fn run(
     for docs in docs_map.values() {
         let stream_pool = node.pool.clone();
         let dgram_pool = node.tunnel_pool.clone();
+        let dataplane = dataplane_ref.clone();
         docs.set_change_hook(Arc::new(move || {
             let stream_pool = stream_pool.clone();
             let dgram_pool = dgram_pool.clone();
+            let dataplane = dataplane.clone();
             tokio::spawn(async move {
                 stream_pool.reconcile().await;
                 dgram_pool.reconcile().await;
+                if let Err(error) = dataplane
+                    .ask(crate::actors::dataplane::ReconcileDirectState)
+                    .await
+                {
+                    tracing::warn!(%error, "membership route reconciliation degraded");
+                }
             });
         }));
     }
@@ -576,14 +586,6 @@ pub async fn run(
         shared_docs: node.docs_engine.clone(),
         ingress: ingress.clone(),
     });
-
-    // PeerDNS first: its Hickory upstream is snapshotted from the underlay
-    // resolver *before* the osdns overlay points the OS at PeerDNS.
-    let dns_bind = tunnet_core::dns::bind_addr();
-    if let Err(e) = tunnet_core::dns::probe_endpoint(dns_bind).await {
-        tracing::error!(error = %e, "local PeerDNS endpoint unavailable; DNS degraded");
-    }
-    let _dns_task = tunnet_core::dns::spawn(dns_bind, node.routes.clone(), dns_cfg.clone());
 
     let first_local = ssh_bind;
     crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, first_local);

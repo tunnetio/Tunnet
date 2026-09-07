@@ -28,7 +28,7 @@ use crate::direct::PresenceTable;
 use crate::direct::{
     AUTH_ALPN, AuthCache, DirectAuthHook, DocsBootstrap, DocsMembership, MembershipEntry,
     NetworkGrant, firewall_to_policy, signing_key_from_hex, spawn_discovery, spawn_seed_auth,
-    validate_member_against_genesis, verify_genesis, verifying_key_from_hex,
+    validate_member_against_genesis, verify_genesis, verify_member_record, verifying_key_from_hex,
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::direct::{ConnectivityOptions, apply_connectivity, endpoint_builder};
@@ -507,6 +507,8 @@ impl CoreNode {
                 verifying_key_from_hex(d.coordinator_verifying_key.as_deref().unwrap_or_default())
                     .with_context(|| format!("coordinator key for '{}'", d.network_name))?;
             verify_genesis(&vk, &d.genesis)?;
+            verify_member_record(&vk, &d.self_record, d.network_epoch)
+                .with_context(|| format!("self membership signature for '{}'", d.network_name))?;
             validate_member_against_genesis(&d.genesis, &d.self_record)?;
             if d.self_record.endpoint_id != my_id_hex {
                 anyhow::bail!(

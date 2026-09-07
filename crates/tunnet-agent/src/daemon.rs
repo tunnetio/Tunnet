@@ -87,6 +87,7 @@ fn init_service_logging(
 }
 
 /// Size-rotated file appender behind a bounded lossy queue.
+#[cfg(any(windows, test))]
 fn service_log_pipeline(
     path: &std::path::Path,
     max_file_bytes: usize,

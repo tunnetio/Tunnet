@@ -307,9 +307,12 @@ impl RoutingTable {
             })
     }
 
-    /// Resolve a PeerDNS name to an IPv4 address.
-    /// Hostname routes resolve to the gateway peer IP; the gateway
-    /// proxies to the real target via explicit hostname/stream routing.
+    /// Resolve a PeerDNS name to a routable peer IPv4 address.
+    ///
+    /// Hostname routes deliberately do not produce A records: an ordinary IP
+    /// packet cannot carry the hostname discriminator required by wildcard or
+    /// target-host routes. Those routes are resolved by the explicit stream
+    /// API, which sends the hostname in its authenticated header.
     pub fn resolve_dns_a(&self, name: &str) -> Option<Ipv4Addr> {
         let tables = self.inner.load();
         let suffix = format!(".{}", tables.dns_suffix);
@@ -348,12 +351,6 @@ impl RoutingTable {
 
         if let Some(peer) = tables.by_hostname.get(peer_name) {
             return Some(peer.ip);
-        }
-
-        for host in [bare, peer_name] {
-            if let Some(info) = self.lookup_hostname_route(host) {
-                return Some(info.peer.ip);
-            }
         }
 
         None
@@ -949,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_dns_resolves_peer_and_hostname_route() {
+    fn peer_dns_resolves_peers_but_stream_hostname_routes_have_no_a_record() {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
         let gw = "b".repeat(64);
@@ -979,9 +976,7 @@ mod tests {
             table.resolve_dns_a("db-server.office.tunnet"),
             Some("10.7.0.5".parse().unwrap())
         );
-        let gw_ip = table.resolve_dns_a("wiki.internal.tunnet").unwrap();
-        assert_eq!(gw_ip, Ipv4Addr::new(10, 7, 0, 5));
-        assert_eq!(table.lookup_ip(&gw_ip).unwrap().endpoint_hex, gw);
+        assert_eq!(table.resolve_dns_a("wiki.internal.tunnet"), None);
         assert!(table.lookup_hostname_route("wiki.internal").is_some());
     }
 
@@ -1032,7 +1027,7 @@ mod tests {
     }
 
     #[test]
-    fn hostname_route_resolves_to_gateway_without_fake_ip() {
+    fn wildcard_hostname_route_never_aliases_the_gateway_ip() {
         let table = RoutingTable::new();
         let self_id = "a".repeat(64);
         let gw = "b".repeat(64);
@@ -1055,9 +1050,7 @@ mod tests {
             &self_id,
             1,
         );
-        let gw_ip = table.resolve_dns_a("api.internal.tunnet").unwrap();
-        assert_eq!(gw_ip, Ipv4Addr::new(10, 7, 0, 5));
-        assert_eq!(table.lookup_ip(&gw_ip).unwrap().endpoint_hex, gw);
+        assert_eq!(table.resolve_dns_a("api.internal.tunnet"), None);
 
         table.apply_peer_delta(
             nid,
@@ -1067,10 +1060,7 @@ mod tests {
             &self_id,
             "office",
         );
-        assert_eq!(
-            table.resolve_dns_a("api.internal.tunnet").unwrap(),
-            Ipv4Addr::new(10, 7, 0, 5)
-        );
+        assert_eq!(table.resolve_dns_a("api.internal.tunnet"), None);
     }
 
     #[test]

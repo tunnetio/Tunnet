@@ -14,21 +14,36 @@ fn category_label(category: ConflictCategory) -> &'static str {
     }
 }
 
-pub fn check_direct_conflicts(
+pub fn check_direct_conflicts_with_routes(
     node: &tunnet_core::CoreNode,
     metrics: &AgentMetrics,
+    kernel_routes: &[crate::system_routes::RouteSpec],
+    owned_routes: &[crate::system_routes::RouteSpec],
 ) -> Vec<NetworkConflict> {
-    let networks = node.persisted.direct_networks();
+    let networks: Vec<_> = node.direct.values().map(|runtime| &runtime.state).collect();
     if networks.is_empty() {
         return Vec::new();
     }
-    let host: Vec<(ipnet::Ipv4Net, Option<String>)> =
-        collect_host_nets().into_iter().map(|n| (n, None)).collect();
-    let owned: Vec<ipnet::Ipv4Net> = node
-        .routes
-        .peers()
+    let mut host: Vec<_> = collect_host_nets()
+        .into_iter()
+        .map(|network| (network, None, ConflictCategory::LanPrefix))
+        .collect();
+    host.extend(kernel_routes.iter().map(|route| {
+        (
+            route.dest,
+            Some(route.if_name.clone()),
+            ConflictCategory::VpnRoute,
+        )
+    }));
+    host.retain(|(network, _, _)| network.prefix_len() != 0);
+    let owned: Vec<ipnet::Ipv4Net> = owned_routes
         .iter()
-        .map(|p| ipnet::Ipv4Net::from(p.ip))
+        .map(|route| route.dest)
+        .chain(
+            node.direct
+                .values()
+                .map(|runtime| ipnet::Ipv4Net::from(runtime.state.self_record.ipv4)),
+        )
         .collect();
     let plans: Vec<(uuid::Uuid, String, ipnet::Ipv4Net)> = networks
         .iter()
@@ -42,7 +57,7 @@ pub fn check_direct_conflicts(
         .collect();
     let mut all = Vec::new();
     let mut by_category: HashMap<&'static str, usize> = HashMap::new();
-    for d in networks {
+    for d in &networks {
         let conflicts = detect_conflicts(
             d.network_id,
             &d.network_name,

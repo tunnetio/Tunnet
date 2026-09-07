@@ -372,6 +372,10 @@ impl RouteEngine {
         self.owned.iter().cloned().collect()
     }
 
+    pub(crate) async fn kernel_routes(&mut self) -> Result<Vec<RouteSpec>, RouteError> {
+        self.backend.list().await
+    }
+
     pub(crate) async fn reconcile_last(&mut self) -> Result<(), RouteError> {
         let Some(desired) = self.last_desired.clone() else {
             return Ok(());

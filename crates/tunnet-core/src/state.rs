@@ -215,7 +215,7 @@ impl DirectState {
 pub enum PersistedState {
     Managed(ManagedState),
     Direct {
-        /// Join order = vec order (first = outbound winner on IP clash).
+        /// Stable persisted order; address plans are required to be disjoint.
         networks: Vec<DirectState>,
     },
 }

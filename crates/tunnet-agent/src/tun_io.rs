@@ -41,9 +41,8 @@ pub fn build_tun_multi(
     };
     let dev = builder.build_async().context("build_async TUN device")?;
     for extra in addrs.iter().skip(1) {
-        if let Err(e) = dev.add_address_v4(*extra, 32) {
-            tracing::warn!(%extra, error = %e, "extra TUN /32 failed");
-        }
+        dev.add_address_v4(*extra, 32)
+            .with_context(|| format!("add required TUN address {extra}/32"))?;
     }
     tracing::info!(addrs = ?addrs, prefix, mtu, "TUN device up");
     Ok(dev)

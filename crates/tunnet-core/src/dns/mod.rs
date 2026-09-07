@@ -27,16 +27,25 @@ use upstream::{ExternalLookup, map_external};
 
 const UDP_BUF: usize = DEFAULT_MAX_PAYLOAD_LEN as usize;
 
-pub fn spawn(
+pub async fn start(
     bind: SocketAddr,
     routes: RoutingTable,
     dns: DnsConfig,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = run(bind, routes, dns).await {
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    // Capture the underlay and bind before returning readiness. The caller may
+    // now safely point OS DNS at this socket.
+    let dns = with_underlay_upstream(&dns);
+    let lookup = Arc::new(HickoryLookup::from_dns_config(&dns)?);
+    if !bind.ip().is_loopback() {
+        anyhow::bail!("PeerDNS must bind a loopback address, got {bind}");
+    }
+    let socket = bind_udp_with_retry(bind).await?;
+    tracing::info!(%bind, suffix = %dns.suffix, "PeerDNS stub listening");
+    Ok(tokio::spawn(async move {
+        if let Err(e) = run_bound(socket, bind, routes, dns, lookup).await {
             tracing::error!(?e, %bind, "PeerDNS stub exited");
         }
-    })
+    }))
 }
 
 pub fn loopback_endpoint() -> SocketAddr {
@@ -48,14 +57,6 @@ pub fn loopback_endpoint() -> SocketAddr {
 
 pub fn bind_addr() -> SocketAddr {
     loopback_endpoint()
-}
-
-pub async fn probe_endpoint(bind: SocketAddr) -> anyhow::Result<()> {
-    let sock = tokio::net::UdpSocket::bind(bind)
-        .await
-        .with_context(|| format!("probe PeerDNS UDP {bind}"))?;
-    drop(sock);
-    Ok(())
 }
 
 async fn bind_udp_with_retry(bind: SocketAddr) -> anyhow::Result<UdpSocket> {
@@ -77,29 +78,13 @@ async fn bind_udp_with_retry(bind: SocketAddr) -> anyhow::Result<UdpSocket> {
     .with_context(|| format!("bind PeerDNS UDP {bind}"))
 }
 
-async fn run(bind: SocketAddr, routes: RoutingTable, dns: DnsConfig) -> anyhow::Result<()> {
-    // Loop-prevention invariant: resolve a `"system"` upstream to the
-    // explicit underlay snapshot NOW, before the agent installs the osdns
-    // overlay that points the OS at PeerDNS. `build_resolver` additionally
-    // filters our own loopback endpoint so even a post-overlay rebuild cannot loop.
-    let dns = with_underlay_upstream(&dns);
-    let lookup = match HickoryLookup::from_dns_config(&dns) {
-        Ok(l) => Arc::new(l),
-        Err(e) => {
-            tracing::error!(
-                ?e,
-                "failed to build Hickory resolver; external DNS will SERVFAIL"
-            );
-            return Err(e);
-        }
-    };
-
-    if bind.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) && !bind.ip().is_loopback()
-    {
-        anyhow::bail!("PeerDNS must bind a loopback address, got {bind}");
-    }
-    let sock = bind_udp_with_retry(bind).await?;
-    tracing::info!(%bind, suffix = %dns.suffix, "PeerDNS stub listening");
+async fn run_bound(
+    sock: UdpSocket,
+    bind: SocketAddr,
+    routes: RoutingTable,
+    dns: DnsConfig,
+    lookup: Arc<HickoryLookup>,
+) -> anyhow::Result<()> {
     let sock = Arc::new(sock);
     let suffix = Arc::new(dns.suffix);
     let mut buf = vec![0u8; UDP_BUF];

@@ -150,14 +150,17 @@ pub fn allocate_peer_ip(
     if total == 0 {
         return Err(AddressPlanError::PoolExhausted);
     }
-    for attempt in 0..total.min(1 << 20) {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(network_id.as_bytes());
-        hasher.update(endpoint_id_hex.as_bytes());
-        hasher.update(&attempt.to_le_bytes());
-        let hash = hasher.finalize();
-        let b = hash.as_bytes();
-        let offset = (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64 % total) + 1;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(network_id.as_bytes());
+    hasher.update(endpoint_id_hex.as_bytes());
+    let hash = hasher.finalize();
+    let b = hash.as_bytes();
+    let start = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64 % total;
+    // A hash chooses only the starting position. Linear wraparound then visits
+    // every usable host exactly once, so PoolExhausted is a proof rather than
+    // a probabilistic sampling result.
+    for attempt in 0..total {
+        let offset = ((start + attempt) % total) + 1;
         let candidate = Ipv4Addr::from(base.wrapping_add(offset as u32));
         if !is_usable_host(&plan.peer_cidr, &candidate) {
             continue;
@@ -180,36 +183,20 @@ pub fn validate_member_ip(plan: &AddressPlan, ip: &Ipv4Addr) -> Result<(), Addre
     Ok(())
 }
 
-fn candidate_pool<R: rand::Rng>(rng: &mut R) -> Vec<Ipv4Net> {
-    use rand::RngExt;
+fn candidate_pool() -> Vec<Ipv4Net> {
     let mut out = Vec::new();
-    for _ in 0..48 {
-        let pick: u8 = rng.random_range(0..3);
-        let cidr: Ipv4Net = match pick {
-            0 => {
-                let b: u8 = rng.random();
-                let c: u8 = rng.random();
-                if b == 0 && c == 0 {
-                    continue;
-                }
-                format!("10.{b}.{c}.0/24").parse().unwrap()
-            }
-            1 => {
-                let b: u8 = rng.random_range(16..32);
-                let c: u8 = rng.random();
-                format!("172.{b}.{c}.0/24").parse().unwrap()
-            }
-            _ => {
-                let b: u8 = rng.random();
-                if b == 0 || b == 255 {
-                    continue;
-                }
-                format!("192.168.{b}.0/24")
-                    .parse()
-                    .unwrap_or("192.168.7.0/24".parse().unwrap())
-            }
-        };
-        out.push(cidr);
+    for b in 0..=255u8 {
+        for c in 0..=255u8 {
+            out.push(Ipv4Net::new(Ipv4Addr::new(10, b, c, 0), 24).unwrap());
+        }
+    }
+    for b in 16..=31u8 {
+        for c in 0..=255u8 {
+            out.push(Ipv4Net::new(Ipv4Addr::new(172, b, c, 0), 24).unwrap());
+        }
+    }
+    for c in 0..=255u8 {
+        out.push(Ipv4Net::new(Ipv4Addr::new(192, 168, c, 0), 24).unwrap());
     }
     out
 }
@@ -227,7 +214,14 @@ fn select_peer_cidr_with_rng<R: rand::Rng>(
     existing_plans: &[(Uuid, Ipv4Net)],
     host_nets: &[Ipv4Net],
 ) -> Result<AddressPlan, AddressPlanError> {
-    for cidr in candidate_pool(rng) {
+    use rand::RngExt;
+    let candidates = candidate_pool();
+    let start = rng.random_range(0..candidates.len());
+    for cidr in candidates[start..]
+        .iter()
+        .chain(&candidates[..start])
+        .copied()
+    {
         if validate_peer_cidr(&cidr, existing_plans, host_nets).is_ok() {
             return Ok(AddressPlan { peer_cidr: cidr });
         }
@@ -240,11 +234,11 @@ pub fn detect_conflicts(
     network_name: &str,
     plan: &AddressPlan,
     other_plans: &[(Uuid, String, Ipv4Net)],
-    host_nets: &[(Ipv4Net, Option<String>)],
+    host_nets: &[(Ipv4Net, Option<String>, ConflictCategory)],
     owned: &[Ipv4Net],
 ) -> Vec<NetworkConflict> {
     let mut out = Vec::new();
-    let owned_hit = |c: &Ipv4Net| owned.iter().any(|o| o == c || overlaps(o, c));
+    let owned_hit = |c: &Ipv4Net| owned.iter().any(|o| o == c);
     for (id, name, other) in other_plans {
         if *id == network_id {
             continue;
@@ -260,7 +254,7 @@ pub fn detect_conflicts(
             });
         }
     }
-    for (h, iface) in host_nets {
+    for (h, iface, category) in host_nets {
         if owned_hit(h) {
             continue;
         }
@@ -271,7 +265,7 @@ pub fn detect_conflicts(
                 peer_cidr: plan.peer_cidr,
                 conflicting_prefix: *h,
                 interface: iface.clone(),
-                category: ConflictCategory::LanPrefix,
+                category: *category,
             });
         }
     }
@@ -346,6 +340,23 @@ mod tests {
     }
 
     #[test]
+    fn allocator_only_reports_exhaustion_after_visiting_every_host() {
+        let plan = AddressPlan {
+            peer_cidr: "192.168.200.0/28".parse().unwrap(),
+        };
+        let nid = Uuid::new_v4();
+        let first = allocate_peer_ip(&plan, &nid, &"cc".repeat(32), &HashSet::new()).unwrap();
+        let occupied: HashSet<_> = (1..15)
+            .map(|offset| Ipv4Addr::new(192, 168, 200, offset))
+            .filter(|ip| *ip != first)
+            .collect();
+        assert_eq!(
+            allocate_peer_ip(&plan, &nid, &"cc".repeat(32), &occupied).unwrap(),
+            first
+        );
+    }
+
+    #[test]
     fn selection_avoids_host_and_existing() {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
@@ -362,14 +373,30 @@ mod tests {
         let plan = AddressPlan {
             peer_cidr: "10.44.0.0/24".parse().unwrap(),
         };
-        let host = vec![("10.44.0.5/32".parse().unwrap(), Some("tunnet0".to_string()))];
+        let host = vec![(
+            "10.44.0.5/32".parse().unwrap(),
+            Some("tunnet0".to_string()),
+            ConflictCategory::LanPrefix,
+        )];
         let owned: Vec<Ipv4Net> = vec!["10.44.0.5/32".parse().unwrap()];
         let conflicts = detect_conflicts(nid, "home", &plan, &[], &host, &owned);
-        assert!(
-            conflicts.is_empty()
-                || !conflicts
-                    .iter()
-                    .any(|c| c.conflicting_prefix == "10.44.0.5/32".parse().unwrap())
-        );
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn broad_foreign_route_is_not_claimed_by_an_owned_peer_host_route() {
+        let nid = Uuid::new_v4();
+        let plan = AddressPlan {
+            peer_cidr: "10.44.0.0/24".parse().unwrap(),
+        };
+        let host = vec![(
+            "10.44.0.0/16".parse().unwrap(),
+            Some("foreign-vpn".to_string()),
+            ConflictCategory::VpnRoute,
+        )];
+        let owned = vec!["10.44.0.5/32".parse().unwrap()];
+        let conflicts = detect_conflicts(nid, "home", &plan, &[], &host, &owned);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].category, ConflictCategory::VpnRoute);
     }
 }

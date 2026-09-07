@@ -309,67 +309,9 @@ pub async fn handle_join_commit(
         }))?);
     };
 
-    let plan = direct.genesis.address_plan;
-    let occupied: HashSet<std::net::Ipv4Addr> = docs
-        .snapshot_members()
-        .into_iter()
-        .filter(|m| m.endpoint_id != remote_id)
-        .map(|m| m.ipv4)
-        .collect();
-    if let Some(existing) = docs
-        .snapshot_members()
-        .into_iter()
-        .find(|m| m.endpoint_id == remote_id)
-    {
-        let entry = MembershipEntry {
-            endpoint_id: remote_id.to_string(),
-            hostname: hostname.clone(),
-            ipv4: existing.ipv4,
-            tags: vec![],
-            joined_at: existing.joined_at,
-            coordinator: false,
-            status: "active".into(),
-            ssh_host_key: None,
-        };
-        let (grant, content_key, record) = docs.admit_peer(&entry, auth).await?;
-        docs.refresh_seed_peers();
-        let policy = (**acl.bundle.load()).clone();
-        docs.apply_to_routes(routes, acl, &policy);
-        let ticket = docs.share_read_ticket().await?;
-        if pre_approved {
-            let mut ids = approved;
-            ids.retain(|id| id != remote_id);
-            let _ = save_approved(paths, &ids);
-        }
-        if !reusable && let Some(id) = invite_id.as_ref() {
-            let mut ids = issued;
-            ids.remove(id);
-            let _ = tunnet_core::direct::admin::save_invite_ids(paths, direct.network_id, &ids);
-        }
-        return Ok(serde_json::to_vec(&serde_json::json!({
-            "accepted": true,
-            "ipv4": existing.ipv4.to_string(),
-            "doc_ticket": ticket,
-            "network_grant": grant,
-            "member_record": record,
-            "genesis": direct.genesis,
-            "content_key": content_key,
-        }))?);
-    }
-    let ip = allocate_peer_ip(&plan, &direct.network_id, remote_id, &occupied)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let entry = MembershipEntry {
-        endpoint_id: remote_id.to_string(),
-        hostname,
-        ipv4: ip,
-        tags: vec![],
-        joined_at: jiff::Timestamp::now(),
-        coordinator: false,
-        status: "active".into(),
-        ssh_host_key: None,
-    };
-    let (grant, content_key, record) = docs.admit_peer(&entry, auth).await?;
+    let (entry, grant, content_key, record) = docs
+        .allocate_and_admit_peer(&direct.genesis.address_plan, remote_id, hostname, auth)
+        .await?;
     docs.refresh_seed_peers();
     let policy = (**acl.bundle.load()).clone();
     docs.apply_to_routes(routes, acl, &policy);
@@ -388,7 +330,7 @@ pub async fn handle_join_commit(
 
     Ok(serde_json::to_vec(&serde_json::json!({
         "accepted": true,
-        "ipv4": ip.to_string(),
+        "ipv4": entry.ipv4.to_string(),
         "doc_ticket": ticket,
         "network_grant": grant,
         "member_record": record,
@@ -769,50 +711,41 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .context("coordinator did not return a doc_ticket")?;
-        let network_grant = commit
+        let network_grant_value = commit
             .get("network_grant")
-            .map(|v| serde_json::to_string(v).unwrap_or_default())
-            .filter(|s| !s.is_empty());
+            .cloned()
+            .context("missing grant")?;
+        let network_grant = Some(serde_json::to_string(&network_grant_value)?);
         let content_key = commit
             .get("content_key")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let member_record: Option<tunnet_core::direct::SignedMemberRecord> = commit
+        let member_record: tunnet_core::direct::SignedMemberRecord = commit
             .get("member_record")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-        let grant: tunnet_core::direct::NetworkGrant = network_grant
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .context("invalid grant")?
-            .context("missing grant")?;
+            .cloned()
+            .context("missing signed member_record")
+            .and_then(|value| serde_json::from_value(value).context("invalid member_record"))?;
+        let grant: tunnet_core::direct::NetworkGrant =
+            serde_json::from_value(network_grant_value).context("invalid grant")?;
         verify_genesis(&vk, &genesis_commit)?;
-        let record = member_record.unwrap_or(tunnet_core::direct::SignedMemberRecord {
-            schema_version: MEMBER_SCHEMA_VERSION,
-            network_id,
-            endpoint_id: my_id.clone(),
-            hostname: hostname.clone(),
-            ipv4,
-            tags: vec![],
-            status: "active".into(),
-            ssh_host_key: None,
-            sequence: 1,
-            joined_at: jiff::Timestamp::now(),
-            grant: grant.clone(),
-            endpoint_sig: String::new(),
-            coordinator: false,
-        });
-        if record.ipv4 != ipv4 {
+        verify_member_record(&vk, &member_record, 0).context("member record signature invalid")?;
+        validate_member_against_genesis(&genesis_commit, &member_record)?;
+        if member_record.endpoint_id != my_id {
+            anyhow::bail!("member record endpoint mismatch");
+        }
+        if member_record.hostname != hostname {
+            anyhow::bail!("member record hostname mismatch");
+        }
+        if member_record.ipv4 != ipv4 {
             anyhow::bail!("membership address mismatch");
         }
-        if !record.endpoint_sig.is_empty() {
-            verify_member_record(&vk, &record, 0)?;
-            validate_member_against_genesis(&genesis_commit, &record)?;
+        if serde_json::to_value(&member_record.grant)? != serde_json::to_value(&grant)? {
+            anyhow::bail!("member record grant mismatch");
         }
         Ok::<_, anyhow::Error>((
             genesis_commit,
             ipv4,
-            record,
+            member_record,
             doc_ticket,
             network_grant,
             content_key,

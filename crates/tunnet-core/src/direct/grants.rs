@@ -222,6 +222,15 @@ pub fn verify_member_record(
             record.schema_version
         );
     }
+    if record.grant.network_id != record.network_id {
+        anyhow::bail!("member record and grant network mismatch");
+    }
+    if record.grant.endpoint_id != record.endpoint_id {
+        anyhow::bail!("member record and grant endpoint mismatch");
+    }
+    if record.coordinator != (record.grant.role == MemberRole::Coordinator) {
+        anyhow::bail!("member record and grant role mismatch");
+    }
     verify_grant(coord_vk, &record.grant, min_epoch)?;
     let payload = member_record_sign_payload(record)?;
     verify_sig(coord_vk, &payload, &record.endpoint_sig)
@@ -486,6 +495,37 @@ mod tests {
         };
         let signed = sign_member_record(&coord_sk, record).unwrap();
         verify_member_record(&coord_vk, &signed, 1).unwrap();
+    }
+
+    #[test]
+    fn member_record_rejects_a_valid_grant_for_another_endpoint() {
+        let (coord_sk, coord_vk) = generate_coordinator_keypair();
+        let network_id = Uuid::new_v4();
+        let grant = sign_grant(
+            &coord_sk,
+            sample_grant(network_id, &"aa".repeat(32), MemberRole::Member),
+        )
+        .unwrap();
+        let record = sign_member_record(
+            &coord_sk,
+            SignedMemberRecord {
+                schema_version: MEMBER_SCHEMA_VERSION,
+                network_id,
+                endpoint_id: "bb".repeat(32),
+                hostname: "bob".into(),
+                ipv4: "10.21.0.8".parse().unwrap(),
+                tags: vec![],
+                status: "active".into(),
+                ssh_host_key: None,
+                sequence: 1,
+                joined_at: Timestamp::now(),
+                grant,
+                endpoint_sig: String::new(),
+                coordinator: false,
+            },
+        )
+        .unwrap();
+        assert!(verify_member_record(&coord_vk, &record, 1).is_err());
     }
 
     #[test]

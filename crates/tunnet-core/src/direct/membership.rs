@@ -123,6 +123,10 @@ struct DocsInner {
     /// Fired after live membership sync (docs events). The agent uses it to
     /// reconcile connection pools: no polling timers for auth changes.
     change_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Serializes the coordinator's read-occupied -> allocate -> publish
+    /// transaction. The document is replicated, but this coordinator is the
+    /// sole address authority for its network.
+    admission: tokio::sync::Mutex<()>,
 }
 
 /// Inputs for [`DocsMembership::bootstrap`].
@@ -316,6 +320,7 @@ impl DocsMembership {
                 seed_peers: seed_peers.clone(),
                 coordinator_endpoint_id: direct.coordinator_endpoint_id.clone(),
                 change_hook: Mutex::new(None),
+                admission: tokio::sync::Mutex::new(()),
             }),
         };
 
@@ -361,7 +366,6 @@ impl DocsMembership {
                                 bg.evict_revoked_from_auth(&auth_bg);
                                 bg.apply_to_routes(&routes_bg, &acl_bg, &policy_bg);
                                 bg.refresh_seed_peers();
-                                bg.fire_change_hook();
                                 if let Err(e) = bg.sync_firewall_policy().await {
                                     tracing::debug!(?e, "docs firewall policy sync");
                                 }
@@ -535,6 +539,48 @@ impl DocsMembership {
             .insert(entry.endpoint_id.clone(), entry.clone());
         auth.insert(entry.endpoint_id.clone(), self.inner.network_id);
         Ok((grant, self.inner.content_key.clone(), record))
+    }
+
+    /// Atomically reuse or allocate an address and publish its signed record.
+    pub async fn allocate_and_admit_peer(
+        &self,
+        plan: &crate::direct::AddressPlan,
+        endpoint_id: &str,
+        hostname: String,
+        auth: &AuthCache,
+    ) -> anyhow::Result<(MembershipEntry, NetworkGrant, String, SignedMemberRecord)> {
+        let _guard = self.inner.admission.lock().await;
+        let members = self.snapshot_members();
+        let existing = members
+            .iter()
+            .find(|member| member.endpoint_id == endpoint_id);
+        let ipv4 = match existing {
+            Some(member) => member.ipv4,
+            None => {
+                let occupied = members.iter().map(|member| member.ipv4).collect();
+                crate::direct::allocate_peer_ip(
+                    plan,
+                    &self.inner.network_id,
+                    endpoint_id,
+                    &occupied,
+                )
+                .map_err(|error| anyhow::anyhow!(error))?
+            }
+        };
+        let entry = MembershipEntry {
+            endpoint_id: endpoint_id.to_string(),
+            hostname,
+            ipv4,
+            tags: existing
+                .map(|member| member.tags.clone())
+                .unwrap_or_default(),
+            joined_at: existing.map_or_else(jiff::Timestamp::now, |member| member.joined_at),
+            coordinator: false,
+            status: "active".into(),
+            ssh_host_key: existing.and_then(|member| member.ssh_host_key.clone()),
+        };
+        let (grant, content_key, record) = self.admit_peer(&entry, auth).await?;
+        Ok((entry, grant, content_key, record))
     }
 
     /// Publish this node's SSH host pubkey by updating the self member record.
@@ -732,10 +778,16 @@ impl DocsMembership {
                 },
             );
         }
-        {
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            map.retain(|_, m| seen.insert(m.ipv4));
+        let mut addresses = HashMap::new();
+        for member in map.values() {
+            if let Some(other) = addresses.insert(member.ipv4, member.endpoint_id.clone()) {
+                anyhow::bail!(
+                    "duplicate signed member address {} for endpoints {} and {}",
+                    member.ipv4,
+                    other,
+                    member.endpoint_id
+                );
+            }
         }
         *self.inner.members.lock() = map;
         Ok(())
@@ -777,6 +829,7 @@ impl DocsMembership {
             peer_cidr,
         );
         acl.replace_bundle(policy.clone());
+        self.fire_change_hook();
         if let Ok(json) = serde_json::to_vec_pretty(&members) {
             let _ = std::fs::write(self.inner.paths.dir.join("direct_members_cache.json"), json);
         }
