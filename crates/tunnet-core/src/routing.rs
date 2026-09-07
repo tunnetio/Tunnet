@@ -144,6 +144,22 @@ impl RoutingTable {
     /// Direct peer IP, subnet LPM, then selected exit node for internet.
     /// On birthday collisions across networks, first-joined network wins.
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
+        // Multicast and broadcast are never routable across the mesh.
+        //
+        // This MUST come before the subnet lookup and the exit-node catch-all.
+        // `is_mesh_or_link_local` covers broadcast but not multicast, so with an
+        // exit node configured multicast passes the internet catch-all and is
+        // tunneled to the exit peer; broadcast leaks the same way via the
+        // `0.0.0.0/0` an exit node contributes to the subnet table. LAN
+        // discovery apps (mDNS, SSDP, Ableton Link) beacon on every interface
+        // including ours, continuously, so this pushes local service
+        // announcements through the tunnel and out of the exit node.
+        //
+        // The mDNS relay is unaffected: it republishes over its own mesh topic
+        // rather than tunneling raw multicast frames.
+        if ip.is_multicast() || ip.is_broadcast() {
+            return None;
+        }
         let tables = self.inner.load();
         if let Some(peer) = tables.by_ip.get(ip).cloned() {
             return Some(peer);
@@ -1101,6 +1117,72 @@ mod tests {
             "office",
         );
         assert_eq!(table.lookup_ip(&synth).unwrap().endpoint_hex, gw);
+    }
+
+    /// Shared fixture: one peer acting as an exit node for 0.0.0.0/0.
+    fn exit_node_table() -> (RoutingTable, String) {
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let exit = "b".repeat(64);
+        let mut profile = profile();
+        profile.exit_node_endpoint_id = Some(exit.clone());
+        profile.split_tunnel_mode = SplitTunnelMode::Exclude;
+        table.replace(
+            &[peer(&exit, "10.7.0.5", "exit")],
+            &[],
+            &[],
+            &[ExitNodeInfo {
+                endpoint_id: exit.clone(),
+                via_ip: "10.7.0.5".parse().unwrap(),
+                allowed_cidrs: vec![Ipv4Net::from_str("0.0.0.0/0").unwrap()],
+            }],
+            &profile,
+            &dns(),
+            "office",
+            Uuid::nil(),
+            &self_id,
+            1,
+        );
+        (table, exit)
+    }
+
+    /// With an exit node configured, multicast passed the internet catch-all
+    /// and was tunneled to the exit peer, pushing LAN service announcements
+    /// off-box continuously.
+    #[test]
+    fn multicast_is_never_routed_to_the_exit_node() {
+        let (table, _) = exit_node_table();
+        for group in ["224.0.0.251", "224.76.78.75", "239.255.255.250"] {
+            assert!(
+                table.lookup_ip(&group.parse().unwrap()).is_none(),
+                "{group} must not be routed off-box"
+            );
+        }
+    }
+
+    /// Broadcast leaked by a different path: the `0.0.0.0/0` an exit node
+    /// contributes to the subnet table matched it before the catch-all.
+    #[test]
+    fn broadcast_is_never_routed_to_the_exit_node() {
+        let (table, _) = exit_node_table();
+        assert!(
+            table
+                .lookup_ip(&"255.255.255.255".parse().unwrap())
+                .is_none()
+        );
+    }
+
+    /// The fix must not disturb what the exit node is actually for.
+    #[test]
+    fn ordinary_internet_traffic_still_reaches_the_exit_node() {
+        let (table, exit) = exit_node_table();
+        assert_eq!(
+            table
+                .lookup_ip(&"8.8.8.8".parse().unwrap())
+                .unwrap()
+                .endpoint_hex,
+            exit
+        );
     }
 
     #[test]
