@@ -1,26 +1,22 @@
-//! Invite codes for Direct mode admission.
+//! Coordinator-issued Direct join capabilities.
+//!
+//! An invite is a bearer secret plus the signed [`Genesis`]. Policy (expiry,
+//! reusable/one-time, revocation, claim) lives on the coordinator and is not
+//! taken from the joining client.
 
 use anyhow::Context;
-use jiff::{Span, Timestamp};
 use serde::{Deserialize, Serialize};
+
+use super::grants::{Genesis, verify_genesis, verifying_key_from_hex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteCode {
-    /// Topic hash (hex).
-    pub topic: String,
-    /// Join secret (hex) - bootstrap only, not ongoing transport auth.
-    pub join_secret: String,
-    /// Network display name.
-    pub network_name: String,
-    /// Coordinator endpoint id (hex).
-    pub coordinator: String,
-    /// Coordinator ed25519 verifying key (hex).
-    pub coordinator_verifying_key: String,
-    pub expires_at: Timestamp,
-    #[serde(default)]
-    pub reusable: bool,
-    /// Opaque invite id for one-time tracking.
-    pub invite_id: String,
+    /// Signed network genesis. Verify before contacting the coordinator.
+    pub genesis: Genesis,
+    /// Unique per-invite secret (hex). Admission capability; not a network-wide secret.
+    pub invite_secret: String,
+    /// Issuance snapshot for client-side early expiry. Coordinator is authoritative.
+    pub expires_at: jiff::Timestamp,
 }
 
 /// Encode invite as URL-safe base64 JSON (no padding).
@@ -40,59 +36,66 @@ pub fn decode_invite(code: &str) -> anyhow::Result<InviteCode> {
     .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, code.trim()))
     .context("invalid invite code encoding")?;
     let invite: InviteCode = serde_json::from_slice(&raw).context("invalid invite payload")?;
-    if invite.expires_at < Timestamp::now() {
+    let vk = verifying_key_from_hex(&invite.genesis.coordinator_verifying_key)
+        .context("invalid coordinator key in invite")?;
+    verify_genesis(&vk, &invite.genesis).context("invite genesis signature invalid")?;
+    if invite.genesis.coordinator_verifying_key.is_empty()
+        || invite.genesis.coordinator_endpoint_id.is_empty()
+    {
+        anyhow::bail!("invite genesis missing coordinator identity");
+    }
+    if hex::decode(invite.invite_secret.trim()).unwrap_or_default().len() < 16 {
+        anyhow::bail!("invite secret too short");
+    }
+    if invite.expires_at < jiff::Timestamp::now() {
         anyhow::bail!("invite code expired at {}", invite.expires_at);
     }
     Ok(invite)
 }
 
-impl InviteCode {
-    pub fn new(
-        topic: String,
-        join_secret: String,
-        network_name: String,
-        coordinator: String,
-        coordinator_verifying_key: String,
-        expires: Span,
-        reusable: bool,
-    ) -> Self {
-        Self {
-            topic,
-            join_secret,
-            network_name,
-            coordinator,
-            coordinator_verifying_key,
-            expires_at: Timestamp::now()
-                .checked_add(expires)
-                .expect("valid invite expiry"),
-            reusable,
-            invite_id: hex::encode(rand::random::<[u8; 16]>()),
-        }
-    }
+pub fn invite_secret_hash(secret_hex: &str) -> String {
+    hex::encode(blake3::hash(secret_hex.trim().as_bytes()).as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct::grants::{
+        GENESIS_SCHEMA_VERSION, generate_coordinator_keypair, sign_genesis,
+    };
+    use crate::direct::addrplan::select_peer_cidr;
+
+    fn signed_genesis() -> (InviteCode, ed25519_dalek::VerifyingKey) {
+        let (sk, vk) = generate_coordinator_keypair();
+        let cidr = select_peer_cidr(&[], &[]).unwrap();
+        let genesis = sign_genesis(
+            &sk,
+            Genesis {
+                schema_version: GENESIS_SCHEMA_VERSION,
+                network_id: uuid::Uuid::nil(),
+                network_name: "home".into(),
+                coordinator_endpoint_id: "cc".repeat(32),
+                coordinator_verifying_key: hex::encode(vk.to_bytes()),
+                address_plan: cidr,
+                created_at: jiff::Timestamp::now(),
+                sig: String::new(),
+            },
+        )
+        .unwrap();
+        let inv = InviteCode {
+            genesis,
+            invite_secret: hex::encode([7u8; 32]),
+            expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
+        };
+        (inv, vk)
+    }
 
     #[test]
     fn roundtrip() {
-        let inv = InviteCode::new(
-            "aa".repeat(32),
-            "bb".repeat(32),
-            "home".into(),
-            "cc".repeat(32),
-            "dd".repeat(32),
-            Span::new().hours(24),
-            false,
-        );
+        let (inv, _) = signed_genesis();
         let code = encode_invite(&inv).unwrap();
         let decoded = decode_invite(&code).unwrap();
-        assert_eq!(decoded.network_name, "home");
-        assert_eq!(decoded.invite_id, inv.invite_id);
-        assert_eq!(
-            decoded.coordinator_verifying_key,
-            inv.coordinator_verifying_key
-        );
+        assert_eq!(decoded.genesis.network_name, "home");
+        assert_eq!(decoded.invite_secret, inv.invite_secret);
     }
 }

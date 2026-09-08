@@ -89,10 +89,13 @@ impl StatePaths {
             .join("firewall_pending")
             .join(format!("{network_id}.json"))
     }
-    pub fn invites_file(&self, network_id: Uuid) -> PathBuf {
+    pub fn authority_file(&self, network_id: Uuid) -> PathBuf {
         self.dir
-            .join("direct_invites")
+            .join("direct_authority")
             .join(format!("{network_id}.json"))
+    }
+    pub fn invites_file(&self, network_id: Uuid) -> PathBuf {
+        self.authority_file(network_id)
     }
     pub fn pending_file(&self, network_id: Uuid) -> PathBuf {
         self.dir
@@ -111,7 +114,7 @@ impl StatePaths {
         for sub in [
             self.docs_dir(network_id),
             self.dir.join("firewall_pending"),
-            self.dir.join("direct_invites"),
+            self.dir.join("direct_authority"),
             self.dir.join("direct_pending"),
         ] {
             std::fs::create_dir_all(&sub).with_context(|| format!("mkdir {}", sub.display()))?;

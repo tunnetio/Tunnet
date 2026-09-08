@@ -102,7 +102,7 @@ struct DocsInner {
     network_id: Uuid,
     network_name: String,
     genesis: parking_lot::RwLock<Option<Genesis>>,
-    join_secret: String,
+    topic_hash: String,
     coordinator_signing_key: Option<SigningKey>,
     coordinator_verifying_key: String,
     network_epoch: Arc<AtomicU64>,
@@ -121,10 +121,6 @@ struct DocsInner {
     /// Fired after live membership sync (docs events). The agent uses it to
     /// reconcile connection pools: no polling timers for auth changes.
     change_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Serializes the coordinator's read-occupied -> allocate -> publish
-    /// transaction. The document is replicated, but this coordinator is the
-    /// sole address authority for its network.
-    admission: tokio::sync::Mutex<()>,
 }
 
 /// Inputs for [`DocsMembership::bootstrap`].
@@ -193,10 +189,6 @@ impl DocsMembership {
 
     pub fn coordinator_verifying_key(&self) -> &str {
         &self.inner.coordinator_verifying_key
-    }
-
-    pub fn join_secret(&self) -> &str {
-        &self.inner.join_secret
     }
 
     pub fn snapshot_members(&self) -> Vec<MembershipEntry> {
@@ -299,7 +291,7 @@ impl DocsMembership {
                 network_id: direct.network_id,
                 network_name: direct.network_name.clone(),
                 genesis: parking_lot::RwLock::new(Some(direct.genesis.clone())),
-                join_secret: direct.join_secret.clone(),
+                topic_hash: direct.topic_hash.clone(),
                 coordinator_signing_key,
                 coordinator_verifying_key,
                 network_epoch: network_epoch.clone(),
@@ -315,7 +307,6 @@ impl DocsMembership {
                 seed_peers: seed_peers.clone(),
                 coordinator_endpoint_id: direct.coordinator_endpoint_id.clone(),
                 change_hook: Mutex::new(None),
-                admission: tokio::sync::Mutex::new(()),
             }),
         };
 
@@ -333,7 +324,7 @@ impl DocsMembership {
         if let Err(e) = membership.sync_firewall_policy().await {
             tracing::debug!(?e, "initial firewall policy sync");
         }
-        if let Err(e) = membership.apply_pending_kicks(&auth).await {
+        if let Err(e) = membership.apply_pending_kicks().await {
             tracing::warn!(?e, "apply pending kicks");
         }
 
@@ -358,9 +349,7 @@ impl DocsMembership {
                                     tracing::debug!(?e, "docs membership rebuild");
                                     continue;
                                 }
-                                bg.evict_revoked_from_auth(&auth_bg);
-                                bg.apply_to_routes(&routes_bg, &acl_bg, &policy_bg);
-                                bg.refresh_seed_peers();
+                                bg.project_runtime(&auth_bg, &routes_bg, &acl_bg, &policy_bg);
                                 if let Err(e) = bg.sync_firewall_policy().await {
                                     tracing::debug!(?e, "docs firewall policy sync");
                                 }
@@ -379,7 +368,7 @@ impl DocsMembership {
                         }
                     }
                     _ = kick_tick.tick() => {
-                        let _ = bg.apply_pending_kicks(&auth_bg).await;
+                        let _ = bg.apply_pending_kicks().await;
                     }
                 }
             }
@@ -502,14 +491,10 @@ impl DocsMembership {
     }
 
     /// Coordinator admits a joiner: issue grant + signed member record.
-    ///
-    /// Inserts the joiner into [`AuthCache`] so the data plane can dial immediately
-    /// (Invite AUTH already succeeded on this connection; Grant AUTH would race the
-    /// joiner restart).
+    /// Runtime projections (AuthCache, routes, seeds) are rebuilt by the caller.
     pub async fn admit_peer(
         &self,
         entry: &MembershipEntry,
-        auth: &AuthCache,
     ) -> anyhow::Result<(NetworkGrant, String, SignedMemberRecord)> {
         let grant = self.issue_grant(
             &entry.endpoint_id,
@@ -532,50 +517,61 @@ impl DocsMembership {
             .members
             .lock()
             .insert(entry.endpoint_id.clone(), entry.clone());
-        auth.insert(entry.endpoint_id.clone(), self.inner.network_id);
         Ok((grant, self.inner.content_key.clone(), record))
     }
 
-    /// Atomically reuse or allocate an address and publish its signed record.
-    pub async fn allocate_and_admit_peer(
+    pub async fn publish_admission(
         &self,
-        plan: &crate::direct::AddressPlan,
-        endpoint_id: &str,
-        hostname: String,
+        entry: MembershipEntry,
+    ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
+        let (grant, content_key, record) = self.admit_peer(&entry).await?;
+        let ticket = self.share_read_ticket().await?;
+        Ok(crate::direct::join::JoinAdmission {
+            genesis: self
+                .genesis()
+                .context("missing genesis")?,
+            ipv4: entry.ipv4,
+            doc_ticket: ticket,
+            network_grant: grant,
+            member_record: record,
+            content_key,
+            topic_hash: self.inner.topic_hash.clone(),
+        })
+    }
+
+    pub async fn recover_admission(
+        &self,
+        entry: &MembershipEntry,
+    ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
+        if self
+            .inner
+            .members
+            .lock()
+            .get(&entry.endpoint_id)
+            .is_none()
+        {
+            anyhow::bail!("member record not published yet");
+        }
+        self.publish_admission(entry.clone()).await
+    }
+
+    /// Rebuild AuthCache, routes, ACL, and seed peers from authoritative membership.
+    pub fn project_runtime(
+        &self,
         auth: &AuthCache,
-    ) -> anyhow::Result<(MembershipEntry, NetworkGrant, String, SignedMemberRecord)> {
-        let _guard = self.inner.admission.lock().await;
-        let members = self.snapshot_members();
-        let existing = members
-            .iter()
-            .find(|member| member.endpoint_id == endpoint_id);
-        let ipv4 = match existing {
-            Some(member) => member.ipv4,
-            None => {
-                let occupied = members.iter().map(|member| member.ipv4).collect();
-                crate::direct::allocate_peer_ip(
-                    plan,
-                    &self.inner.network_id,
-                    endpoint_id,
-                    &occupied,
-                )
-                .map_err(|error| anyhow::anyhow!(error))?
+        routes: &RoutingTable,
+        acl: &AclEngine,
+        policy: &tunnet_common::policy::PolicyBundle,
+    ) {
+        let network_id = self.inner.network_id;
+        for member in self.snapshot_members() {
+            if member.status != "kicked" {
+                auth.insert(member.endpoint_id.clone(), network_id);
             }
-        };
-        let entry = MembershipEntry {
-            endpoint_id: endpoint_id.to_string(),
-            hostname,
-            ipv4,
-            tags: existing
-                .map(|member| member.tags.clone())
-                .unwrap_or_default(),
-            joined_at: existing.map_or_else(jiff::Timestamp::now, |member| member.joined_at),
-            coordinator: false,
-            status: "active".into(),
-            ssh_host_key: existing.and_then(|member| member.ssh_host_key.clone()),
-        };
-        let (grant, content_key, record) = self.admit_peer(&entry, auth).await?;
-        Ok((entry, grant, content_key, record))
+        }
+        self.evict_revoked_from_auth(auth);
+        self.apply_to_routes(routes, acl, policy);
+        self.refresh_seed_peers();
     }
 
     /// Publish this node's SSH host pubkey by updating the self member record.
@@ -599,7 +595,7 @@ impl DocsMembership {
     }
 
     /// Coordinator revokes a peer: bump epoch, write revocation + kicked record.
-    pub async fn kick_peer(&self, endpoint_id: &str, auth: &AuthCache) -> anyhow::Result<()> {
+    pub async fn kick_peer(&self, endpoint_id: &str) -> anyhow::Result<()> {
         let Some(sk) = &self.inner.coordinator_signing_key else {
             anyhow::bail!("coordinator signing key not configured");
         };
@@ -633,9 +629,7 @@ impl DocsMembership {
         .await?;
         self.inner.revoked.lock().insert(endpoint_id.to_string());
 
-        // Do not issue a new grant for the kicked peer - epoch bump invalidates
-        // prior grants; revocation blocks Invite/Grant AUTH.
-        auth.remove_network(endpoint_id, self.inner.network_id);
+        // Epoch bump invalidates prior grants; revocation is membership authority.
         self.inner.members.lock().remove(endpoint_id);
         Ok(())
     }
@@ -862,7 +856,7 @@ impl DocsMembership {
         (**self.inner.dns.load()).clone()
     }
 
-    pub async fn apply_pending_kicks(&self, auth: &AuthCache) -> anyhow::Result<()> {
+    pub async fn apply_pending_kicks(&self) -> anyhow::Result<()> {
         let kick_path = self
             .inner
             .paths
@@ -874,7 +868,7 @@ impl DocsMembership {
         }
         let kicks: Vec<String> = serde_json::from_slice(&std::fs::read(&kick_path)?)?;
         for id in &kicks {
-            self.kick_peer(id, auth).await?;
+            self.kick_peer(id).await?;
         }
         let _ = std::fs::remove_file(&kick_path);
         Ok(())
@@ -1041,19 +1035,25 @@ async fn set_json<T: Serialize>(
     Ok(())
 }
 
-pub fn load_approved(paths: &StatePaths) -> anyhow::Result<Vec<String>> {
-    let p = paths.dir.join("direct_approved.json");
-    if !p.exists() {
-        return Ok(vec![]);
+impl crate::direct::join::JoinPublisher for DocsMembership {
+    fn snapshot(&self) -> crate::direct::authority::JoinSnapshot {
+        crate::direct::authority::JoinSnapshot {
+            members: self.snapshot_members(),
+            revoked: self.revoked_snapshot(),
+        }
     }
-    Ok(serde_json::from_slice(&std::fs::read(p)?)?)
-}
 
-pub fn save_approved(paths: &StatePaths, ids: &[String]) -> anyhow::Result<()> {
-    paths.ensure()?;
-    std::fs::write(
-        paths.dir.join("direct_approved.json"),
-        serde_json::to_vec_pretty(ids)?,
-    )?;
-    Ok(())
+    async fn publish(
+        &self,
+        entry: MembershipEntry,
+    ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
+        self.publish_admission(entry).await
+    }
+
+    async fn recover(
+        &self,
+        entry: &MembershipEntry,
+    ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
+        self.recover_admission(entry).await
+    }
 }

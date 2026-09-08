@@ -9,6 +9,8 @@ pub mod grants;
 #[cfg(feature = "direct")]
 pub mod admin;
 #[cfg(feature = "direct")]
+pub mod authority;
+#[cfg(feature = "direct")]
 pub mod antispoof;
 #[cfg(feature = "direct")]
 pub mod auth;
@@ -23,6 +25,8 @@ pub mod invite;
 #[cfg(feature = "direct")]
 pub mod ip;
 #[cfg(feature = "direct")]
+pub mod join;
+#[cfg(feature = "direct")]
 pub mod mdns;
 #[cfg(feature = "direct")]
 pub mod membership;
@@ -30,8 +34,6 @@ pub mod membership;
 pub mod policy_docs;
 #[cfg(feature = "direct")]
 pub mod presence;
-#[cfg(feature = "direct")]
-pub mod sync;
 
 pub use addrplan::{
     AddressPlan, AddressPlanError, ConflictCategory, NetworkConflict, allocate_peer_ip,
@@ -39,13 +41,15 @@ pub use addrplan::{
     validate_peer_cidr,
 };
 #[cfg(feature = "direct")]
-pub use admin::{PendingJoin, load_pending, push_pending, save_pending};
+pub use admin::queue_kick;
+#[cfg(feature = "direct")]
+pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
 #[cfg(feature = "direct")]
 pub use antispoof::{SpoofTracker, source_matches_peer};
 #[cfg(feature = "direct")]
 pub use auth::{
-    AUTH_ALPN, AuthCache, AuthClientMode, AuthServerContext, DirectAuthHook,
-    SharedAuthServerContext, build_auth_server_context, run_auth_client, run_auth_server,
+    AUTH_ALPN, AuthCache, AuthServerContext, DirectAuthHook, SharedAuthServerContext,
+    build_auth_server_context, run_auth_client, run_auth_server,
 };
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub use connectivity::{
@@ -71,11 +75,15 @@ pub use invite::{InviteCode, decode_invite, encode_invite};
 #[cfg(feature = "direct")]
 pub use ip::network_id_from_topic;
 #[cfg(feature = "direct")]
+pub use join::{
+    JOIN_ALPN, JoinAdmission, JoinPublisher, JoinRequest, JoinResponse, JoinStatus,
+    decode_and_preflight, preflight_invite, run_join_client, run_join_server,
+    run_join_server_dispatch, verify_admission,
+};
+#[cfg(feature = "direct")]
 pub use mdns::apply_mdns;
 #[cfg(feature = "direct")]
-pub use membership::{
-    DocsBootstrap, DocsMembership, MembershipEntry, load_approved, save_approved,
-};
+pub use membership::{DocsBootstrap, DocsMembership, MembershipEntry};
 #[cfg(feature = "direct")]
 pub use policy_docs::{
     POLICY_BUNDLE_KEY, PendingSuggestion, PolicyBundleDoc, SuggestedPolicy, effective_suggested,
@@ -92,3 +100,7 @@ pub use presence::{
 pub const DOCS_ALPN: &[u8] = iroh_docs::ALPN;
 #[cfg(feature = "direct")]
 pub const GOSSIP_ALPN: &[u8] = iroh_gossip::ALPN;
+/// Dedicated Direct connect protocol (not AUTH).
+#[cfg(feature = "direct")]
+pub const CONNECT_ALPN: &[u8] = b"tunnet/direct-connect/1";
+

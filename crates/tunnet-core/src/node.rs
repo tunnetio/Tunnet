@@ -25,9 +25,10 @@ use crate::control::{SignedClient, basic_metadata};
 use crate::direct::PresenceTable;
 #[cfg(feature = "direct")]
 use crate::direct::{
-    AUTH_ALPN, AuthCache, DirectAuthHook, DocsBootstrap, DocsMembership, MembershipEntry,
-    NetworkGrant, firewall_to_policy, signing_key_from_hex, spawn_discovery, spawn_seed_auth,
-    validate_member_against_genesis, verify_genesis, verify_member_record, verifying_key_from_hex,
+    AUTH_ALPN, CONNECT_ALPN, AuthCache, DirectAuthHook, DirectAuthority, DocsBootstrap,
+    DocsMembership, JOIN_ALPN, MembershipEntry, NetworkGrant, firewall_to_policy,
+    signing_key_from_hex, spawn_discovery, spawn_seed_auth, validate_member_against_genesis,
+    verify_genesis, verify_member_record, verifying_key_from_hex,
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::direct::{ConnectivityOptions, apply_connectivity, endpoint_builder};
@@ -62,6 +63,8 @@ pub struct DirectNetworkRuntime {
     pub state: DirectState,
     pub discovery: crate::direct::DiscoveryHandle,
     pub presence: Option<Arc<PresenceTable>>,
+    /// Coordinator-only join/invite authority.
+    pub authority: Option<Arc<DirectAuthority>>,
 }
 
 #[derive(Clone)]
@@ -671,6 +674,7 @@ impl CoreNode {
                             state: direct.clone(),
                             discovery: parts.discovery,
                             presence: None,
+                            authority: parts.authority,
                         },
                     );
                     persisted_networks.push(direct);
@@ -796,6 +800,8 @@ fn build_alpns(cfg: &CoreNodeConfig, direct: bool, enable_gossip: bool) -> Vec<V
         #[cfg(feature = "direct")]
         {
             alpns.push(AUTH_ALPN.to_vec());
+            alpns.push(JOIN_ALPN.to_vec());
+            alpns.push(CONNECT_ALPN.to_vec());
             alpns.push(iroh_gossip::ALPN.to_vec());
             alpns.push(iroh_docs::ALPN.to_vec());
         }
@@ -825,6 +831,7 @@ struct BootstrappedNetwork {
     spoof_tracker: crate::direct::SpoofTracker,
     discovery: crate::direct::DiscoveryHandle,
     secret_updated: bool,
+    authority: Option<Arc<DirectAuthority>>,
 }
 
 #[cfg(feature = "direct")]
@@ -956,11 +963,24 @@ async fn bootstrap_one_direct_network(
         seed_peers,
     );
 
+    let authority = if direct.coordinator {
+        Some(Arc::new(DirectAuthority::load(
+            args.paths,
+            direct.network_id,
+            direct.open,
+            direct.genesis.clone(),
+            direct.topic_hash.clone(),
+        )?))
+    } else {
+        None
+    };
+
     Ok(BootstrappedNetwork {
         docs,
         firewall,
         spoof_tracker,
         discovery,
         secret_updated,
+        authority,
     })
 }

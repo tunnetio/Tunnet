@@ -8,7 +8,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::direct::contact::{contact_id_from_endpoint, parse_contact_id};
-use crate::direct::{AUTH_ALPN, AuthClientMode, run_auth_client};
+use crate::direct::CONNECT_ALPN;
+use crate::direct::grants::NetworkGrant;
 use crate::identity::AgentIdentity;
 use tunnet_common::local_api::DirectConnectPendingInfo;
 
@@ -117,36 +118,32 @@ fn peer_hostname(peer: &crate::routing::PeerInfo) -> &str {
     }
 }
 
+fn require_grant(direct: &crate::state::DirectState) -> anyhow::Result<NetworkGrant> {
+    let raw = direct
+        .network_grant
+        .as_ref()
+        .context("missing network grant; join the network first")?;
+    serde_json::from_str(raw).context("invalid network grant")
+}
+
 /// Initiate a connect dial to a remote contact id.
 pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(None)?;
     let peer = parse_contact_id(contact_id).context("parse contact id")?;
-    let secret = direct.join_secret.clone();
-    let network_id = direct.network_id;
+    let grant = require_grant(direct)?;
     let hostname = direct.hostname.clone();
     let self_hex = state.node.endpoint_id_hex();
 
     let conn = state
         .node
         .endpoint
-        .connect(peer, AUTH_ALPN)
+        .connect(peer, CONNECT_ALPN)
         .await
         .context("dial contact")?;
-    run_auth_client(
-        &conn,
-        AuthClientMode::Invite {
-            network_id,
-            invite_id: "connect".into(),
-            join_secret_hex: secret,
-        },
-        &self_hex,
-    )
-    .await
-    .context("connect auth")?;
 
-    // Send connect request on a bi-stream.
     let (mut send, mut recv) = conn.open_bi().await.context("open bi")?;
     let req = serde_json::json!({
+        "grant": grant,
         "type": "connect_request",
         "contact_id": contact_id_from_endpoint(&state.node.endpoint.id()),
         "endpoint_id": self_hex,
@@ -237,30 +234,21 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
     install_peer_route(state, peer, &pending.hostname, peer_ip)?;
 
     // Best-effort: dial back to notify acceptance.
-    if let Ok(conn) = state.node.endpoint.connect(peer, AUTH_ALPN).await {
-        let self_hex = state.node.endpoint_id_hex();
-        let _ = run_auth_client(
-            &conn,
-            AuthClientMode::Invite {
-                network_id: direct.network_id,
-                invite_id: "connect-accept".into(),
-                join_secret_hex: direct.join_secret.clone(),
-            },
-            &self_hex,
-        )
-        .await;
-        if let Ok((mut send, _)) = conn.open_bi().await {
-            let resp = serde_json::json!({
-                "type": "connect_accepted",
-                "status": "accepted",
-                "ipv4": state.node.self_ipv4.to_string(),
-                "hostname": direct.hostname,
-            });
-            if let Ok(bytes) = serde_json::to_vec(&resp) {
-                let _ = send.write_all(&(bytes.len() as u32).to_be_bytes()).await;
-                let _ = send.write_all(&bytes).await;
-                let _ = send.finish();
-            }
+    if let Ok(conn) = state.node.endpoint.connect(peer, CONNECT_ALPN).await
+        && let Ok(grant) = require_grant(&direct)
+        && let Ok((mut send, _)) = conn.open_bi().await
+    {
+        let resp = serde_json::json!({
+            "grant": grant,
+            "type": "connect_accepted",
+            "status": "accepted",
+            "ipv4": state.node.self_ipv4.to_string(),
+            "hostname": direct.hostname,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&resp) {
+            let _ = send.write_all(&(bytes.len() as u32).to_be_bytes()).await;
+            let _ = send.write_all(&bytes).await;
+            let _ = send.finish();
         }
     }
 
@@ -304,7 +292,7 @@ pub async fn rotate_identity(state: &LocalApiState) -> anyhow::Result<String> {
     Ok(contact)
 }
 
-/// Handle an inbound connect request after AUTH (called from accept path).
+/// Handle an inbound connect request (CONNECT_ALPN). Grant is verified by the caller.
 pub async fn handle_inbound_connect(
     state_dir: &std::path::Path,
     remote_hex: &str,

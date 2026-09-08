@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use super::auth::{AUTH_ALPN, AuthCache, AuthClientMode, run_auth_client};
+use super::auth::{AUTH_ALPN, AuthCache, run_auth_client};
 
 /// Compute topic hash hex from network name + secret hex.
 pub fn topic_from_name_secret(network_name: &str, secret_hex: &str) -> String {
@@ -105,9 +105,7 @@ pub fn spawn_seed_auth(
                     Ok(conn) => {
                         match run_auth_client(
                             &conn,
-                            AuthClientMode::Grant {
-                                grant: grant.clone(),
-                            },
+                            grant.clone(),
                             &self_endpoint_hex,
                         )
                         .await

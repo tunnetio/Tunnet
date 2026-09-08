@@ -473,13 +473,20 @@ pub async fn run(
     }
 
     let auth_server_ctx = if is_direct {
-        Some(build_auth_server_context(
-            node.persisted.direct_networks(),
-            &docs_map,
-        ))
+        Some(build_auth_server_context(&docs_map))
     } else {
         None
     };
+
+    let join_authorities: HashMap<_, _> = node
+        .direct
+        .iter()
+        .filter_map(|(id, rt)| {
+            rt.authority
+                .clone()
+                .map(|auth| (*id, (auth, rt.docs.clone())))
+        })
+        .collect();
 
     if is_direct
         && let Some(key) = node
@@ -582,13 +589,14 @@ pub async fn run(
         direct_auth: node.direct_auth.clone(),
         auth_server_ctx,
         state_dir: node.paths.dir.clone(),
-        docs: docs_map,
+        join_authorities,
         firewalls,
         spoofs,
         dgram_pool: dgram_pool.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
         ingress: ingress.clone(),
+        events: api_state.events.clone(),
     });
 
     let first_local = ssh_bind;

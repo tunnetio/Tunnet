@@ -435,7 +435,9 @@ async fn network_join_requests(
 ) -> ApiResult<Json<DirectPendingResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
     let id = handlers::parse_network_id(&network_id)?;
-    let requests = handlers::direct_requests_for_network(&state, id).map_err(map_anyhow)?;
+    let requests = handlers::direct_requests_for_network(&state, id)
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(DirectPendingResponse { requests }))
 }
 
@@ -446,7 +448,9 @@ async fn network_join_accept(
 ) -> ApiResult<Json<OkResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
     let id = handlers::parse_network_id(&network_id)?;
-    let message = handlers::direct_accept_for_network(&state, id, &peer_id).map_err(map_anyhow)?;
+    let message = handlers::direct_accept_for_network(&state, id, &peer_id)
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 
@@ -457,7 +461,9 @@ async fn network_join_deny(
 ) -> ApiResult<Json<OkResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
     let id = handlers::parse_network_id(&network_id)?;
-    let message = handlers::direct_deny_for_network(&state, id, &peer_id).map_err(map_anyhow)?;
+    let message = handlers::direct_deny_for_network(&state, id, &peer_id)
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 
@@ -914,6 +920,7 @@ async fn direct_invite(
         body.reusable,
         &body.expires,
     )
+    .await
     .map_err(map_anyhow)?;
     Ok(Json(DirectInviteResponse { code }))
 }
@@ -924,7 +931,9 @@ async fn direct_requests(
     Query(q): Query<DirectNetworkRequest>,
 ) -> ApiResult<Json<DirectPendingResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
-    let requests = handlers::direct_requests(&state, q.network.as_deref()).map_err(map_anyhow)?;
+    let requests = handlers::direct_requests(&state, q.network.as_deref())
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(DirectPendingResponse { requests }))
 }
 
@@ -935,8 +944,9 @@ async fn direct_accept(
     Query(q): Query<DirectNetworkRequest>,
 ) -> ApiResult<Json<OkResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
-    let message =
-        handlers::direct_accept(&state, q.network.as_deref(), &peer_id).map_err(map_anyhow)?;
+    let message = handlers::direct_accept(&state, q.network.as_deref(), &peer_id)
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 
@@ -948,7 +958,9 @@ async fn direct_deny(
 ) -> ApiResult<Json<OkResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
     let message =
-        handlers::direct_deny(&state, q.network.as_deref(), &peer_id).map_err(map_anyhow)?;
+        handlers::direct_deny(&state, q.network.as_deref(), &peer_id)
+            .await
+            .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 

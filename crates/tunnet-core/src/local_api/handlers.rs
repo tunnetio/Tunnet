@@ -1132,37 +1132,30 @@ pub(crate) fn require_direct_coord<'a>(
     Ok(d)
 }
 
-pub(crate) fn direct_requests_for_network(
+pub(crate) async fn direct_requests_for_network(
     state: &LocalApiState,
     network_id: uuid::Uuid,
 ) -> anyhow::Result<Vec<DirectPendingInfo>> {
     let direct = state.node.persisted.require_direct_network_id(network_id)?;
-    let list = crate::direct::admin::load_pending(&state.node.paths, direct.network_id)?;
-    Ok(list
-        .into_iter()
-        .map(|p| DirectPendingInfo {
-            endpoint_id: p.endpoint_id,
-            hostname: p.hostname,
-        })
-        .collect())
+    direct_requests(state, Some(&direct.network_name)).await
 }
 
-pub(crate) fn direct_accept_for_network(
+pub(crate) async fn direct_accept_for_network(
     state: &LocalApiState,
     network_id: uuid::Uuid,
     peer_id: &str,
 ) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network_id(network_id)?;
-    direct_accept(state, Some(&direct.network_name), peer_id)
+    direct_accept(state, Some(&direct.network_name), peer_id).await
 }
 
-pub(crate) fn direct_deny_for_network(
+pub(crate) async fn direct_deny_for_network(
     state: &LocalApiState,
     network_id: uuid::Uuid,
     peer_id: &str,
 ) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network_id(network_id)?;
-    direct_deny(state, Some(&direct.network_name), peer_id)
+    direct_deny(state, Some(&direct.network_name), peer_id).await
 }
 
 pub(crate) fn direct_firewall_for_network(
@@ -1173,7 +1166,29 @@ pub(crate) fn direct_firewall_for_network(
     direct_firewall_show(state, Some(&direct.network_name))
 }
 
-pub(crate) fn direct_invite(
+fn authority_for(
+    state: &LocalApiState,
+    network_id: uuid::Uuid,
+) -> anyhow::Result<std::sync::Arc<crate::direct::DirectAuthority>> {
+    if let Some(rt) = state.node.direct.get(&network_id)
+        && let Some(auth) = &rt.authority
+    {
+        return Ok(auth.clone());
+    }
+    let direct = state.node.persisted.require_direct_network_id(network_id)?;
+    if !direct.coordinator {
+        anyhow::bail!("only the coordinator can perform this action");
+    }
+    Ok(std::sync::Arc::new(crate::direct::DirectAuthority::load(
+        &state.node.paths,
+        direct.network_id,
+        direct.open,
+        direct.genesis.clone(),
+        direct.topic_hash.clone(),
+    )?))
+}
+
+pub(crate) async fn direct_invite(
     state: &LocalApiState,
     network: Option<&str>,
     reusable: bool,
@@ -1186,30 +1201,20 @@ pub(crate) fn direct_invite(
     if !expires.is_positive() {
         anyhow::bail!("invite expiry must be positive");
     }
-    let invite = crate::direct::InviteCode::new(
-        direct.topic_hash.clone(),
-        direct.join_secret.clone(),
-        direct.network_name.clone(),
-        state.node.endpoint_id_hex(),
-        direct
-            .coordinator_verifying_key
-            .clone()
-            .context("coordinator verifying key missing")?,
-        expires,
-        reusable,
-    );
-    let mut used = crate::direct::admin::load_invite_ids(&state.node.paths, direct.network_id)?;
-    used.insert(invite.invite_id.clone());
-    crate::direct::admin::save_invite_ids(&state.node.paths, direct.network_id, &used)?;
+    let authority = authority_for(state, direct.network_id)?;
+    let invite = authority
+        .issue_invite(&state.node.endpoint_id_hex(), reusable, expires)
+        .await?;
     crate::direct::encode_invite(&invite)
 }
 
-pub(crate) fn direct_requests(
+pub(crate) async fn direct_requests(
     state: &LocalApiState,
     network: Option<&str>,
 ) -> anyhow::Result<Vec<DirectPendingInfo>> {
     let direct = state.node.persisted.require_direct_network(network)?;
-    let list = crate::direct::admin::load_pending(&state.node.paths, direct.network_id)?;
+    let authority = authority_for(state, direct.network_id)?;
+    let list = authority.pending().await;
     Ok(list
         .into_iter()
         .map(|p| DirectPendingInfo {
@@ -1219,25 +1224,15 @@ pub(crate) fn direct_requests(
         .collect())
 }
 
-pub(crate) fn direct_accept(
+pub(crate) async fn direct_accept(
     state: &LocalApiState,
     network: Option<&str>,
     peer_id: &str,
 ) -> anyhow::Result<String> {
     let direct = require_direct_coord(state, network)?;
     let network_id = direct.network_id;
-    let mut list = crate::direct::admin::load_pending(&state.node.paths, network_id)?;
-    let idx = list
-        .iter()
-        .position(|p| p.endpoint_id == peer_id || p.hostname == peer_id)
-        .context("pending peer not found")?;
-    let pending = list.remove(idx);
-    crate::direct::admin::save_pending(&state.node.paths, network_id, &list)?;
-    let mut approved = crate::direct::load_approved(&state.node.paths)?;
-    if !approved.iter().any(|id| id == &pending.endpoint_id) {
-        approved.push(pending.endpoint_id.clone());
-        crate::direct::save_approved(&state.node.paths, &approved)?;
-    }
+    let authority = authority_for(state, network_id)?;
+    let pending = authority.approve(peer_id).await?;
     state.emit(LocalEvent::PeerOnline {
         network_id: network_id.to_string(),
         endpoint_id: pending.endpoint_id.clone(),
@@ -1248,20 +1243,15 @@ pub(crate) fn direct_accept(
     ))
 }
 
-pub(crate) fn direct_deny(
+pub(crate) async fn direct_deny(
     state: &LocalApiState,
     network: Option<&str>,
     peer_id: &str,
 ) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(network)?;
     let network_id = direct.network_id;
-    let mut list = crate::direct::admin::load_pending(&state.node.paths, network_id)?;
-    let before = list.len();
-    list.retain(|p| p.endpoint_id != peer_id && p.hostname != peer_id);
-    if list.len() == before {
-        anyhow::bail!("pending peer not found");
-    }
-    crate::direct::admin::save_pending(&state.node.paths, network_id, &list)?;
+    let authority = authority_for(state, network_id)?;
+    authority.deny(peer_id).await?;
     Ok(format!("Denied {peer_id}"))
 }
 
@@ -1273,12 +1263,11 @@ pub(crate) async fn direct_kick(
     let direct = require_direct_coord(state, network)?;
     let network_id = direct.network_id;
     let result = if let Some(rt) = state.node.direct.get(&network_id) {
+        rt.docs.kick_peer(peer_id).await?;
         if let Some(auth) = &state.node.direct_auth {
-            rt.docs.kick_peer(peer_id, auth).await?;
-        } else {
+            let policy = (**state.node.acl.bundle.load()).clone();
             rt.docs
-                .kick_peer(peer_id, &crate::direct::AuthCache::new())
-                .await?;
+                .project_runtime(auth, &state.node.routes, &state.node.acl, &policy);
         }
         rt.docs.rebuild_from_doc().await.ok();
         format!("Kicked {peer_id}")
