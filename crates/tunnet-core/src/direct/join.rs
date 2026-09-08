@@ -6,8 +6,8 @@
 use std::net::Ipv4Addr;
 
 use anyhow::Context;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
 use ipnet::Ipv4Net;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,8 +117,12 @@ pub fn preflight_invite(
     let vk = verifying_key_from_hex(&invite.genesis.coordinator_verifying_key)
         .context("invalid coordinator key in invite")?;
     verify_genesis(&vk, &invite.genesis).context("genesis signature invalid")?;
-    validate_peer_cidr(&invite.genesis.address_plan.peer_cidr, existing_plans, host_nets)
-        .map_err(|e| anyhow::anyhow!("address plan cannot operate locally: {e}"))?;
+    validate_peer_cidr(
+        &invite.genesis.address_plan.peer_cidr,
+        existing_plans,
+        host_nets,
+    )
+    .map_err(|e| anyhow::anyhow!("address plan cannot operate locally: {e}"))?;
     Ok(invite.genesis.clone())
 }
 

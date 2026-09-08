@@ -957,10 +957,9 @@ async fn direct_deny(
     Query(q): Query<DirectNetworkRequest>,
 ) -> ApiResult<Json<OkResponse>> {
     peer.require_cap(NETWORK_ADMIT)?;
-    let message =
-        handlers::direct_deny(&state, q.network.as_deref(), &peer_id)
-            .await
-            .map_err(map_anyhow)?;
+    let message = handlers::direct_deny(&state, q.network.as_deref(), &peer_id)
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(result_ok(message)))
 }
 

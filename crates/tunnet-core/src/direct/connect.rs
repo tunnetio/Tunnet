@@ -7,8 +7,8 @@ use iroh::EndpointId;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::direct::contact::{contact_id_from_endpoint, parse_contact_id};
 use crate::direct::CONNECT_ALPN;
+use crate::direct::contact::{contact_id_from_endpoint, parse_contact_id};
 use crate::direct::grants::NetworkGrant;
 use crate::identity::AgentIdentity;
 use tunnet_common::local_api::DirectConnectPendingInfo;

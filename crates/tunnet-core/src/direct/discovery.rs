@@ -103,13 +103,7 @@ pub fn spawn_seed_auth(
                 };
                 match endpoint.connect(peer, AUTH_ALPN).await {
                     Ok(conn) => {
-                        match run_auth_client(
-                            &conn,
-                            grant.clone(),
-                            &self_endpoint_hex,
-                        )
-                        .await
-                        {
+                        match run_auth_client(&conn, grant.clone(), &self_endpoint_hex).await {
                             Ok(()) => {
                                 auth.insert(seed.clone(), network_id);
                                 tracing::info!(%seed, "seed AUTH ok");

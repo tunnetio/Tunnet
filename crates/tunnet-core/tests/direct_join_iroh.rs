@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use iroh::Endpoint;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::Endpoint;
 use parking_lot::Mutex;
 use tunnet_core::direct::addrplan::select_peer_cidr;
 use tunnet_core::direct::grants::{
@@ -15,8 +15,8 @@ use tunnet_core::direct::grants::{
     sign_member_record, verify_grant,
 };
 use tunnet_core::direct::{
-    AUTH_ALPN, AuthCache, DirectAuthority, JOIN_ALPN, JoinAdmission, JoinPublisher,
-    JoinSnapshot, JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant,
+    AUTH_ALPN, AuthCache, DirectAuthority, JOIN_ALPN, JoinAdmission, JoinPublisher, JoinSnapshot,
+    JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant,
     decode_and_preflight, grant_expiry, preflight_invite, run_auth_client, run_auth_server,
     run_join_client, verify_admission,
 };
@@ -236,9 +236,14 @@ async fn harness(open: bool) -> Harness {
         },
     )
     .unwrap();
-    let authority =
-        DirectAuthority::load(&paths, genesis.network_id, open, genesis.clone(), "ab".repeat(32))
-            .unwrap();
+    let authority = DirectAuthority::load(
+        &paths,
+        genesis.network_id,
+        open,
+        genesis.clone(),
+        "ab".repeat(32),
+    )
+    .unwrap();
     let auth = AuthCache::new();
     let net = MemNet::new(genesis, sk, auth.clone());
     let vk_for_ctx = vk;
@@ -298,8 +303,13 @@ async fn join_once(
     secret: &str,
     hostname: &str,
 ) -> tunnet_core::direct::JoinResponse {
-    let conn = peer.connect(coord.id(), JOIN_ALPN).await.expect("dial join");
-    let resp = run_join_client(&conn, secret, hostname).await.expect("join rpc");
+    let conn = peer
+        .connect(coord.id(), JOIN_ALPN)
+        .await
+        .expect("dial join");
+    let resp = run_join_client(&conn, secret, hostname)
+        .await
+        .expect("join rpc");
     conn.close(0u32.into(), b"done");
     resp
 }
@@ -309,7 +319,11 @@ async fn one_time_join_then_same_endpoint_retry() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
@@ -331,13 +345,19 @@ async fn one_time_replay_other_endpoint_denied() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
     let b = peer_endpoint(&h.disco).await;
     assert_eq!(
-        join_once(&a, &h.coord, &invite.invite_secret, "a").await.status,
+        join_once(&a, &h.coord, &invite.invite_secret, "a")
+            .await
+            .status,
         JoinStatus::Admitted
     );
     let r = join_once(&b, &h.coord, &invite.invite_secret, "b").await;
@@ -350,7 +370,11 @@ async fn expired_and_revoked_invite() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), true, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            true,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     h.authority
@@ -368,12 +392,19 @@ async fn local_cidr_conflict_before_admission() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), true, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            true,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let host = vec![invite.genesis.address_plan.peer_cidr];
     let err = preflight_invite(&invite, &[], &host).unwrap_err();
-    assert!(err.to_string().contains("address plan cannot operate locally"));
+    assert!(
+        err.to_string()
+            .contains("address plan cannot operate locally")
+    );
     assert_eq!(h.net.member_count(), 0);
 }
 
@@ -382,7 +413,11 @@ async fn response_loss_retry_recovers_same_ip() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
@@ -399,7 +434,11 @@ async fn pending_approval_then_retry() {
     let h = harness(false).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
@@ -416,7 +455,11 @@ async fn revoked_peer_cannot_rejoin_or_auth() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), true, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            true,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
@@ -425,7 +468,11 @@ async fn revoked_peer_cannot_rejoin_or_auth() {
     h.net.revoke(&format!("{}", a.id()));
     let invite2 = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), true, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            true,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let r2 = join_once(&a, &h.coord, &invite2.invite_secret, "a").await;
@@ -442,7 +489,11 @@ async fn membership_publish_failure_then_retry() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
@@ -461,7 +512,11 @@ async fn create_invite_join_verified_membership_and_auth() {
     let h = harness(true).await;
     let invite = h
         .authority
-        .issue_invite(&format!("{}", h.coord.id()), false, jiff::Span::new().hours(24))
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            jiff::Span::new().hours(24),
+        )
         .await
         .unwrap();
     let encoded = tunnet_core::direct::encode_invite(&invite).unwrap();

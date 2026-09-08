@@ -14,9 +14,8 @@ use tunnet_common::ws::ClientMsg;
 use tunnet_common::{RECORDING_ALPN, SEND_ALPN, TUNNEL_ALPN};
 use tunnet_core::Docs;
 use tunnet_core::direct::{
-    AUTH_ALPN, AuthCache, CONNECT_ALPN, DirectAuthority, DocsMembership, JOIN_ALPN, GOSSIP_ALPN,
-    DOCS_ALPN, SharedAuthServerContext, SpoofTracker, run_auth_server,
-    FirewallEngine,
+    AUTH_ALPN, AuthCache, CONNECT_ALPN, DOCS_ALPN, DirectAuthority, DocsMembership, FirewallEngine,
+    GOSSIP_ALPN, JOIN_ALPN, SharedAuthServerContext, SpoofTracker, run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
 use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient};
@@ -314,16 +313,17 @@ impl ProtocolHandler for ConnectHandler {
             return Ok(());
         }
         let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-        let grant: tunnet_core::direct::NetworkGrant =
-            match serde_json::from_value(req.get("grant").cloned().unwrap_or(serde_json::Value::Null))
-            {
-                Ok(g) => g,
-                Err(_) => {
-                    conn.close(401u32.into(), b"missing_grant");
-                    return Ok(());
-                }
-            };
-        if grant.endpoint_id != remote_id || (ctx.is_revoked)(grant.network_id, &grant.endpoint_id) {
+        let grant: tunnet_core::direct::NetworkGrant = match serde_json::from_value(
+            req.get("grant").cloned().unwrap_or(serde_json::Value::Null),
+        ) {
+            Ok(g) => g,
+            Err(_) => {
+                conn.close(401u32.into(), b"missing_grant");
+                return Ok(());
+            }
+        };
+        if grant.endpoint_id != remote_id || (ctx.is_revoked)(grant.network_id, &grant.endpoint_id)
+        {
             conn.close(401u32.into(), b"grant_denied");
             return Ok(());
         }
@@ -370,7 +370,9 @@ impl ProtocolHandler for ConnectHandler {
         .await
         {
             Ok((_, resp_bytes)) => {
-                let _ = send.write_all(&(resp_bytes.len() as u32).to_be_bytes()).await;
+                let _ = send
+                    .write_all(&(resp_bytes.len() as u32).to_be_bytes())
+                    .await;
                 let _ = send.write_all(&resp_bytes).await;
                 let _ = send.finish();
                 conn.close(0u32.into(), b"ok");

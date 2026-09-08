@@ -218,7 +218,14 @@ impl DirectAuthority {
         snapshot: &JoinSnapshot,
     ) -> JoinDecision {
         let mut g = self.inner.lock().await;
-        match decide_locked(&mut g, &self.genesis, endpoint_id, hostname, invite_secret, snapshot) {
+        match decide_locked(
+            &mut g,
+            &self.genesis,
+            endpoint_id,
+            hostname,
+            invite_secret,
+            snapshot,
+        ) {
             Ok(d) => d,
             Err(reason) => JoinDecision::Denied { reason },
         }
@@ -373,10 +380,10 @@ fn existing_joined_or_now(snapshot: &JoinSnapshot, endpoint_id: &str) -> Timesta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct::addrplan::select_peer_cidr;
     use crate::direct::grants::{
         GENESIS_SCHEMA_VERSION, generate_coordinator_keypair, sign_genesis,
     };
-    use crate::direct::addrplan::select_peer_cidr;
 
     fn genesis() -> Genesis {
         let (sk, vk) = generate_coordinator_keypair();
@@ -403,7 +410,8 @@ mod tests {
             dir: dir.path().to_path_buf(),
         };
         let g = genesis();
-        let auth = DirectAuthority::load(&paths, g.network_id, open, g.clone(), "tt".into()).unwrap();
+        let auth =
+            DirectAuthority::load(&paths, g.network_id, open, g.clone(), "tt".into()).unwrap();
         (dir, auth, g)
     }
 
@@ -465,7 +473,12 @@ mod tests {
         let d = auth
             .decide("endpoint-b", "b".into(), &inv.invite_secret, &empty_snap())
             .await;
-        assert!(matches!(d, JoinDecision::Denied { reason: "invite_claimed" }));
+        assert!(matches!(
+            d,
+            JoinDecision::Denied {
+                reason: "invite_claimed"
+            }
+        ));
     }
 
     #[tokio::test]
@@ -499,12 +512,22 @@ mod tests {
             .await
             .unwrap();
         let d1 = auth
-            .decide("endpoint-a", "host".into(), &inv.invite_secret, &empty_snap())
+            .decide(
+                "endpoint-a",
+                "host".into(),
+                &inv.invite_secret,
+                &empty_snap(),
+            )
             .await;
         assert!(matches!(d1, JoinDecision::Pending));
         auth.approve("endpoint-a").await.unwrap();
         let d2 = auth
-            .decide("endpoint-a", "host".into(), &inv.invite_secret, &empty_snap())
+            .decide(
+                "endpoint-a",
+                "host".into(),
+                &inv.invite_secret,
+                &empty_snap(),
+            )
             .await;
         assert!(matches!(d2, JoinDecision::Admit { recover: false, .. }));
     }
@@ -522,7 +545,12 @@ mod tests {
         let d = auth
             .decide("endpoint-b", "b".into(), &inv.invite_secret, &empty_snap())
             .await;
-        assert!(matches!(d, JoinDecision::Denied { reason: "invite_claimed" }));
+        assert!(matches!(
+            d,
+            JoinDecision::Denied {
+                reason: "invite_claimed"
+            }
+        ));
     }
 
     #[tokio::test]
@@ -542,17 +570,29 @@ mod tests {
         let d = auth
             .decide("e", "h".into(), &inv.invite_secret, &empty_snap())
             .await;
-        assert!(matches!(d, JoinDecision::Denied { reason: "invite_expired" }));
+        assert!(matches!(
+            d,
+            JoinDecision::Denied {
+                reason: "invite_expired"
+            }
+        ));
 
         let inv2 = auth
             .issue_invite("c", true, Span::new().hours(1))
             .await
             .unwrap();
-        auth.revoke_invite_secret(&inv2.invite_secret).await.unwrap();
+        auth.revoke_invite_secret(&inv2.invite_secret)
+            .await
+            .unwrap();
         let d = auth
             .decide("e", "h".into(), &inv2.invite_secret, &empty_snap())
             .await;
-        assert!(matches!(d, JoinDecision::Denied { reason: "invite_revoked" }));
+        assert!(matches!(
+            d,
+            JoinDecision::Denied {
+                reason: "invite_revoked"
+            }
+        ));
     }
 
     #[tokio::test]

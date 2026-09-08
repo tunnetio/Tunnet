@@ -527,9 +527,7 @@ impl DocsMembership {
         let (grant, content_key, record) = self.admit_peer(&entry).await?;
         let ticket = self.share_read_ticket().await?;
         Ok(crate::direct::join::JoinAdmission {
-            genesis: self
-                .genesis()
-                .context("missing genesis")?,
+            genesis: self.genesis().context("missing genesis")?,
             ipv4: entry.ipv4,
             doc_ticket: ticket,
             network_grant: grant,
@@ -543,13 +541,7 @@ impl DocsMembership {
         &self,
         entry: &MembershipEntry,
     ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
-        if self
-            .inner
-            .members
-            .lock()
-            .get(&entry.endpoint_id)
-            .is_none()
-        {
+        if self.inner.members.lock().get(&entry.endpoint_id).is_none() {
             anyhow::bail!("member record not published yet");
         }
         self.publish_admission(entry.clone()).await

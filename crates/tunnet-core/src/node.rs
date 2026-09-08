@@ -25,7 +25,7 @@ use crate::control::{SignedClient, basic_metadata};
 use crate::direct::PresenceTable;
 #[cfg(feature = "direct")]
 use crate::direct::{
-    AUTH_ALPN, CONNECT_ALPN, AuthCache, DirectAuthHook, DirectAuthority, DocsBootstrap,
+    AUTH_ALPN, AuthCache, CONNECT_ALPN, DirectAuthHook, DirectAuthority, DocsBootstrap,
     DocsMembership, JOIN_ALPN, MembershipEntry, NetworkGrant, firewall_to_policy,
     signing_key_from_hex, spawn_discovery, spawn_seed_auth, validate_member_against_genesis,
     verify_genesis, verify_member_record, verifying_key_from_hex,

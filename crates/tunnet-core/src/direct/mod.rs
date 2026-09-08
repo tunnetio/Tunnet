@@ -9,11 +9,11 @@ pub mod grants;
 #[cfg(feature = "direct")]
 pub mod admin;
 #[cfg(feature = "direct")]
-pub mod authority;
-#[cfg(feature = "direct")]
 pub mod antispoof;
 #[cfg(feature = "direct")]
 pub mod auth;
+#[cfg(feature = "direct")]
+pub mod authority;
 #[cfg(all(feature = "direct", feature = "local_api"))]
 pub mod connect;
 #[cfg(any(feature = "direct", feature = "managed"))]
@@ -43,14 +43,14 @@ pub use addrplan::{
 #[cfg(feature = "direct")]
 pub use admin::queue_kick;
 #[cfg(feature = "direct")]
-pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
-#[cfg(feature = "direct")]
 pub use antispoof::{SpoofTracker, source_matches_peer};
 #[cfg(feature = "direct")]
 pub use auth::{
     AUTH_ALPN, AuthCache, AuthServerContext, DirectAuthHook, SharedAuthServerContext,
     build_auth_server_context, run_auth_client, run_auth_server,
 };
+#[cfg(feature = "direct")]
+pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub use connectivity::{
     ConnectivityOptions, ConnectivityProfile, apply_connectivity, endpoint_builder,
@@ -103,4 +103,3 @@ pub const GOSSIP_ALPN: &[u8] = iroh_gossip::ALPN;
 /// Dedicated Direct connect protocol (not AUTH).
 #[cfg(feature = "direct")]
 pub const CONNECT_ALPN: &[u8] = b"tunnet/direct-connect/1";
-

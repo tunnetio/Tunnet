@@ -237,7 +237,8 @@ pub async fn run_auth_server(
     let grant = hello.grant;
     let network_id = grant.network_id;
 
-    let ok = if grant.endpoint_id != remote_hex || (ctx.is_revoked)(network_id, &grant.endpoint_id) {
+    let ok = if grant.endpoint_id != remote_hex || (ctx.is_revoked)(network_id, &grant.endpoint_id)
+    {
         false
     } else if let Some(vk) = (ctx.resolve_coord_vk)(network_id) {
         let min_epoch = (ctx.resolve_min_epoch)(network_id);

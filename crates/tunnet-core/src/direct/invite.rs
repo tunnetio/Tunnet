@@ -44,7 +44,11 @@ pub fn decode_invite(code: &str) -> anyhow::Result<InviteCode> {
     {
         anyhow::bail!("invite genesis missing coordinator identity");
     }
-    if hex::decode(invite.invite_secret.trim()).unwrap_or_default().len() < 16 {
+    if hex::decode(invite.invite_secret.trim())
+        .unwrap_or_default()
+        .len()
+        < 16
+    {
         anyhow::bail!("invite secret too short");
     }
     if invite.expires_at < jiff::Timestamp::now() {
@@ -60,10 +64,10 @@ pub fn invite_secret_hash(secret_hex: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::direct::addrplan::select_peer_cidr;
     use crate::direct::grants::{
         GENESIS_SCHEMA_VERSION, generate_coordinator_keypair, sign_genesis,
     };
-    use crate::direct::addrplan::select_peer_cidr;
 
     fn signed_genesis() -> (InviteCode, ed25519_dalek::VerifyingKey) {
         let (sk, vk) = generate_coordinator_keypair();

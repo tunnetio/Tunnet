@@ -18,3 +18,9 @@ pre-commit:
         cargo clippy -p tunnet-core --no-default-features -- -D warnings &&
         cargo clippy -p tunnet --no-default-features --features managed -- -D warnings &&
         cargo clippy -p tunnet --no-default-features --features direct -- -D warnings
+
+pre-push:
+  jobs:
+    - name: rust-nextest
+      glob: "**/*.rs"
+      run: cargo nextest run --workspace --exclude tunnet-desktop --all-features

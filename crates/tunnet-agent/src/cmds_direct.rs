@@ -3,11 +3,12 @@ use std::collections::HashSet;
 use anyhow::Context;
 use clap::Args;
 use tunnet_core::direct::{
-    AddressPlan, ConnectivityOptions, ConnectivityProfile, GENESIS_SCHEMA_VERSION, JOIN_ALPN,
-    JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant, allocate_peer_ip,
-    apply_connectivity, decode_and_preflight, endpoint_builder, generate_coordinator_keypair,
-    grant_expiry, network_id_from_topic, run_join_client, sign_genesis, sign_grant,
-    sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission, Genesis,
+    AddressPlan, ConnectivityOptions, ConnectivityProfile, GENESIS_SCHEMA_VERSION, Genesis,
+    JOIN_ALPN, JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant,
+    allocate_peer_ip, apply_connectivity, decode_and_preflight, endpoint_builder,
+    generate_coordinator_keypair, grant_expiry, network_id_from_topic, run_join_client,
+    sign_genesis, sign_grant, sign_member_record, topic_from_name_secret, validate_peer_cidr,
+    verify_admission,
 };
 use tunnet_core::{
     AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, load_agent, persist_agent,
