@@ -323,9 +323,35 @@ pub fn desired_config(
 /// safely recover stale ownership from a crashed daemon process.
 ///
 /// Never guesses ownership: per-resource outcomes are logged and left as
-/// osdns reported them. Enumeration, schema, and integrity errors fail
-/// closed. Per-resource failures do not abort recovery of unrelated records.
+/// osdns reported them. Integrity errors fail closed. Per-resource failures do
+/// not abort recovery of unrelated records.
+///
+/// The one exception is a pre-upgrade journal record. osdns 0.2 does not
+/// migrate 0.1.x records and refuses to read them, which fails `recover_stale`,
+/// `abandon_journal` and `apply` alike, so the agent would run with DNS
+/// integration off on every start until someone deleted the file. Nothing is
+/// reinterpreted by removing it: no osdns version will ever act on that record,
+/// so the choice is between discarding an unreadable file and losing DNS.
 fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
+    for _ in 0..MAX_LEGACY_JOURNAL_CLEARS {
+        let Err(error) = manager.recover_stale() else {
+            break;
+        };
+        let osdns::Error::UnsupportedJournalVersion { path, found, .. } = &error else {
+            break;
+        };
+        tracing::warn!(
+            path = %path.display(),
+            found,
+            "discarding a pre-upgrade osdns journal record; the DNS settings it \
+             described are not restored"
+        );
+        if let Err(io) = std::fs::remove_file(path) {
+            tracing::error!(path = %path.display(), error = %io, "could not remove it");
+            break;
+        }
+    }
+
     match manager.recover_stale() {
         Ok(outcomes) => {
             for outcome in outcomes {
@@ -393,6 +419,11 @@ fn recover_stale(manager: &DnsManager) -> osdns::Result<()> {
         }
     }
 }
+
+/// Bound on pre-upgrade records discarded per start. Each pass removes exactly
+/// one named file, so this only caps the retry if removal stops making
+/// progress.
+const MAX_LEGACY_JOURNAL_CLEARS: usize = 64;
 
 fn log_apply_failure(e: &osdns::Error) {
     match e {
@@ -1014,18 +1045,22 @@ mod tests {
         }
 
         #[test]
-        fn legacy_journal_schema_fails_closed_without_reinterpretation() {
+        fn legacy_journal_is_never_reinterpreted_but_does_not_disable_dns() {
             let (manager, _fake, dir) = enforce_manager(full_caps());
             let journal_dir = dir.path().join("journal");
             std::fs::create_dir_all(&journal_dir).unwrap();
+            let legacy = journal_dir.join("v1.json");
             std::fs::write(
-                journal_dir.join("v1.json"),
+                &legacy,
                 br#"{"schema_version":1,"owner":"io.tunnet.agent"}"#,
             )
             .unwrap();
+
+            // osdns still refuses to read it, and that must not change: the
+            // record is never parsed, trusted, or acted on.
             let err = manager
                 .recover_stale()
-                .expect_err("0.1.x journals must fail closed");
+                .expect_err("0.1.x journals must fail closed inside osdns");
             assert!(
                 matches!(
                     err,
@@ -1037,10 +1072,50 @@ mod tests {
                 ),
                 "got {err:?}"
             );
-            assert!(
-                DnsController::wrap(manager).is_err(),
-                "controller must not start on a v1 journal"
-            );
+
+            // The agent discards the unreadable file rather than running with
+            // DNS integration off on every start until a human intervenes.
+            let controller = DnsController::wrap(manager)
+                .expect("a pre-upgrade record must not disable DNS integration");
+            drop(controller);
+            assert!(!legacy.exists(), "the unreadable record should be gone");
+        }
+
+        /// osdns aborts the whole journal read on the first unreadable file, so
+        /// a single pre-upgrade record otherwise blocks recovery of unrelated
+        /// current-schema records too.
+        #[test]
+        fn legacy_journal_does_not_block_recovery_of_current_records() {
+            use osdns::testing::{CrashOutcome, FaultInjector, TxPoint, catch_crash};
+
+            let (manager, _fake, dir) = enforce_manager(full_caps());
+            let injector = FaultInjector::new();
+            injector.crash_at(TxPoint::AfterPrepared);
+            manager.install_fault_injector(injector.clone());
+            let outcome = catch_crash(|| manager.apply(&global_config()));
+            assert!(matches!(outcome, CrashOutcome::Crashed));
+            injector.clear();
+
+            let journal_dir = dir.path().join("journal");
+            let json_count = || {
+                std::fs::read_dir(&journal_dir)
+                    .map(|e| {
+                        e.flatten()
+                            .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            };
+            assert_eq!(json_count(), 1, "the crash should leave one live record");
+            std::fs::write(
+                journal_dir.join("v1.json"),
+                br#"{"schema_version":1,"owner":"io.tunnet.agent"}"#,
+            )
+            .unwrap();
+
+            super::super::recover_stale(&manager)
+                .expect("recovery must proceed once the unreadable record is cleared");
+            assert_eq!(json_count(), 0, "both records should be resolved");
         }
 
         #[test]
