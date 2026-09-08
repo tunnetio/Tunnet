@@ -35,7 +35,7 @@ pub struct ConnectivityOptions {
     pub enable_mdns: bool,
     /// Custom connectivity relays from the control-plane snapshot (managed).
     pub custom_relays: Vec<ConnectivityRelayConfig>,
-    /// When `custom_relays` is empty: use n0 public relays or disable relays.
+    /// Control-plane policy when `custom_relays` is empty: n0 public relays or disable.
     pub relay_fallback: ConnectivityRelayFallback,
 }
 
@@ -65,28 +65,19 @@ impl ConnectivityOptions {
             profile: ConnectivityProfile::TunnetManaged,
             enable_mdns: false,
             custom_relays: Vec::new(),
-            // Overridden from EndpointSnapshot at managed bind time.
-            relay_fallback: ConnectivityRelayFallback::N0,
+            // Fail-closed until EndpointSnapshot applies the control-plane policy.
+            relay_fallback: ConnectivityRelayFallback::None,
         }
     }
 
-    /// Apply snapshot relay list / fallback for managed agents (bind-time).
+    /// Apply the control plane's relay list and fallback. The snapshot is authoritative.
     pub fn with_snapshot_relays(
         mut self,
         relays: Vec<ConnectivityRelayConfig>,
         fallback: ConnectivityRelayFallback,
     ) -> Self {
         self.custom_relays = relays;
-        self.relay_fallback = if self.custom_relays.is_empty()
-            && fallback == ConnectivityRelayFallback::None
-        {
-            tracing::warn!(
-                "snapshot has no connectivity relays; using n0 so mesh peers can discover each other"
-            );
-            ConnectivityRelayFallback::N0
-        } else {
-            fallback
-        };
+        self.relay_fallback = fallback;
         self
     }
 }
@@ -107,10 +98,17 @@ pub fn relay_map_from_configs(
     Ok(map)
 }
 
-fn apply_relay_mode(builder: Builder, opts: &ConnectivityOptions) -> Builder {
+#[derive(Debug)]
+enum AppliedRelayMode {
+    Custom(RelayMap),
+    PresetUnchanged,
+    Disabled,
+}
+
+fn applied_relay_mode(opts: &ConnectivityOptions) -> AppliedRelayMode {
     if !opts.custom_relays.is_empty() {
         match relay_map_from_configs(&opts.custom_relays) {
-            Ok(map) => return builder.relay_mode(RelayMode::Custom(map)),
+            Ok(map) => return AppliedRelayMode::Custom(map),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -121,16 +119,19 @@ fn apply_relay_mode(builder: Builder, opts: &ConnectivityOptions) -> Builder {
     }
 
     match (opts.profile, opts.relay_fallback) {
-        (ConnectivityProfile::TunnetManaged, ConnectivityRelayFallback::None) => {
-            tracing::warn!(
-                "managed endpoint has no connectivity relays; disabling iroh relay (peer dials will fail across NAT)"
-            );
-            builder.relay_mode(RelayMode::Disabled)
+        (ConnectivityProfile::LanOnly, _) | (_, ConnectivityRelayFallback::N0) => {
+            AppliedRelayMode::PresetUnchanged
         }
-        (ConnectivityProfile::LanOnly, _) => builder,
-        (_, ConnectivityRelayFallback::N0) => builder,
-        (_, ConnectivityRelayFallback::None) => {
-            tracing::warn!("iroh relays disabled by snapshot fallback");
+        (_, ConnectivityRelayFallback::None) => AppliedRelayMode::Disabled,
+    }
+}
+
+fn apply_relay_mode(builder: Builder, opts: &ConnectivityOptions) -> Builder {
+    match applied_relay_mode(opts) {
+        AppliedRelayMode::Custom(map) => builder.relay_mode(RelayMode::Custom(map)),
+        AppliedRelayMode::PresetUnchanged => builder,
+        AppliedRelayMode::Disabled => {
+            tracing::info!("iroh relays disabled by control-plane policy");
             builder.relay_mode(RelayMode::Disabled)
         }
     }
@@ -185,7 +186,7 @@ mod tests {
         assert_eq!(opts.profile, ConnectivityProfile::TunnetManaged);
         assert!(!opts.enable_mdns);
         assert!(opts.custom_relays.is_empty());
-        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::N0);
+        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::None);
     }
 
     #[cfg(feature = "direct")]
@@ -253,23 +254,38 @@ mod tests {
 
     #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn managed_empty_none_falls_back_to_n0() {
+    fn snapshot_none_stays_disabled() {
         let opts = ConnectivityOptions::managed_default()
             .with_snapshot_relays(vec![], ConnectivityRelayFallback::None);
         assert!(opts.custom_relays.is_empty());
-        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::N0);
+        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::None);
+        assert!(matches!(
+            applied_relay_mode(&opts),
+            AppliedRelayMode::Disabled
+        ));
         let _builder = endpoint_builder(&opts);
     }
 
     #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn managed_empty_cloud_fallback_disables_relays() {
-        let opts = ConnectivityOptions {
-            profile: ConnectivityProfile::TunnetManaged,
-            enable_mdns: false,
-            custom_relays: Vec::new(),
-            relay_fallback: ConnectivityRelayFallback::None,
-        };
+    fn snapshot_empty_n0_keeps_n0() {
+        let opts = ConnectivityOptions::managed_default()
+            .with_snapshot_relays(vec![], ConnectivityRelayFallback::N0);
+        assert!(opts.custom_relays.is_empty());
+        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::N0);
+        assert!(matches!(
+            applied_relay_mode(&opts),
+            AppliedRelayMode::PresetUnchanged
+        ));
         let _builder = endpoint_builder(&opts);
+    }
+
+    #[cfg(any(feature = "direct", feature = "managed"))]
+    #[test]
+    fn with_snapshot_relays_does_not_upgrade_none_to_n0() {
+        let before = ConnectivityRelayFallback::None;
+        let opts = ConnectivityOptions::managed_default().with_snapshot_relays(vec![], before);
+        assert_eq!(opts.relay_fallback, before);
+        assert_ne!(opts.relay_fallback, ConnectivityRelayFallback::N0);
     }
 }

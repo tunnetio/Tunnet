@@ -8,7 +8,7 @@ Tunnet is under active development and is still pre-1.0. The project favors clea
 
 ### Required
 
-* **Rust 1.98.0**
+* **Rust 1.98.1**
 * **Bun 1.4.0**
 * **Git**
 * A platform-appropriate native build toolchain

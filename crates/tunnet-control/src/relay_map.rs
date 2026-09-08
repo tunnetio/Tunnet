@@ -54,7 +54,7 @@ pub fn deployment_relay_mode() -> DeploymentRelayMode {
     }
 }
 
-/// Snapshot hint for agents when the effective relay list is empty.
+/// Authoritative snapshot policy when the effective relay list is empty.
 pub fn connectivity_relay_fallback(
     effective: &[ConnectivityRelayConfig],
 ) -> ConnectivityRelayFallback {
@@ -70,7 +70,7 @@ pub fn connectivity_relay_fallback_for(
         DeploymentRelayMode::Disabled => ConnectivityRelayFallback::None,
         // Custom relays present: stay on that map (Cloud fail-closed vs n0).
         DeploymentRelayMode::Custom if !effective.is_empty() => ConnectivityRelayFallback::None,
-        // Empty custom list: n0 so mesh discovery still works until relays are healthy.
+        // Empty custom list: control plane chooses n0 until custom relays are healthy.
         DeploymentRelayMode::Custom | DeploymentRelayMode::N0 => ConnectivityRelayFallback::N0,
     }
 }
@@ -196,15 +196,39 @@ mod tests {
     }
 
     #[test]
-    fn cloud_empty_custom_falls_back_to_n0() {
+    fn disabled_is_none_even_when_list_is_empty() {
         assert_eq!(
-            connectivity_relay_fallback_for(LicenseTier::Cloud, DeploymentRelayMode::N0, &[]),
-            ConnectivityRelayFallback::N0
+            connectivity_relay_fallback_for(LicenseTier::Cloud, DeploymentRelayMode::Disabled, &[]),
+            ConnectivityRelayFallback::None
         );
+        assert_eq!(
+            connectivity_relay_fallback_for(
+                LicenseTier::Community,
+                DeploymentRelayMode::Disabled,
+                &[]
+            ),
+            ConnectivityRelayFallback::None
+        );
+    }
+
+    #[test]
+    fn empty_custom_resolves_to_n0() {
         assert_eq!(
             connectivity_relay_fallback_for(LicenseTier::Cloud, DeploymentRelayMode::Custom, &[]),
             ConnectivityRelayFallback::N0
         );
+        assert_eq!(
+            connectivity_relay_fallback_for(
+                LicenseTier::Enterprise,
+                DeploymentRelayMode::Custom,
+                &[]
+            ),
+            ConnectivityRelayFallback::N0
+        );
+    }
+
+    #[test]
+    fn nonempty_custom_is_none_not_n0() {
         let relay = ConnectivityRelayConfig {
             url: "https://r.example".into(),
             region: None,
@@ -215,50 +239,28 @@ mod tests {
             connectivity_relay_fallback_for(
                 LicenseTier::Cloud,
                 DeploymentRelayMode::Custom,
-                &[relay]
+                &[relay.clone()]
             ),
             ConnectivityRelayFallback::None
         );
         assert_eq!(
-            connectivity_relay_fallback_for(LicenseTier::Cloud, DeploymentRelayMode::Disabled, &[]),
+            connectivity_relay_fallback_for(
+                LicenseTier::Enterprise,
+                DeploymentRelayMode::Custom,
+                &[relay]
+            ),
             ConnectivityRelayFallback::None
         );
     }
 
     #[test]
-    fn community_n0_unless_disabled_or_custom_nonempty() {
+    fn n0_mode_is_n0() {
         assert_eq!(
-            connectivity_relay_fallback_for(LicenseTier::Community, DeploymentRelayMode::N0, &[]),
+            connectivity_relay_fallback_for(LicenseTier::Cloud, DeploymentRelayMode::N0, &[]),
             ConnectivityRelayFallback::N0
         );
         assert_eq!(
-            connectivity_relay_fallback_for(
-                LicenseTier::Community,
-                DeploymentRelayMode::Disabled,
-                &[]
-            ),
-            ConnectivityRelayFallback::None
-        );
-        let relay = ConnectivityRelayConfig {
-            url: "https://r.example".into(),
-            region: None,
-            auth_token: None,
-            metering: false,
-        };
-        assert_eq!(
-            connectivity_relay_fallback_for(
-                LicenseTier::Enterprise,
-                DeploymentRelayMode::Custom,
-                &[relay]
-            ),
-            ConnectivityRelayFallback::None
-        );
-        assert_eq!(
-            connectivity_relay_fallback_for(
-                LicenseTier::Enterprise,
-                DeploymentRelayMode::Custom,
-                &[]
-            ),
+            connectivity_relay_fallback_for(LicenseTier::Community, DeploymentRelayMode::N0, &[]),
             ConnectivityRelayFallback::N0
         );
     }

@@ -402,7 +402,7 @@ pub struct EndpointSnapshot {
     /// Effective connectivity relays for this endpoint (after org policy).
     #[serde(default)]
     pub connectivity_relays: Vec<ConnectivityRelayConfig>,
-    /// Fallback when `connectivity_relays` is empty (agent-side n0 vs disabled).
+    /// Authoritative policy when `connectivity_relays` is empty (n0 vs disabled).
     #[serde(default)]
     pub connectivity_relay_fallback: ConnectivityRelayFallback,
     /// Org internal CA root cert (PEM) so agents can verify peer Serve TLS.
