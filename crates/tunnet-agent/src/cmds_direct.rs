@@ -132,12 +132,53 @@ pub async fn try_handle_post_auth(
     let policy = SealPolicy::from_env_and_flag(false);
     let remote_id = format!("{}", conn.remote_id());
 
-    let (mut send, mut recv) =
+    // Serve every request the peer sends on this connection, not just the
+    // first. Joining is two round trips (`join_prepare` then `join_commit`)
+    // over one authenticated connection, so answering once and letting the
+    // caller close the connection strands the peer waiting for the second
+    // response.
+    let mut served = 0usize;
+    loop {
         match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await {
-            Ok(Ok(streams)) => streams,
+            Ok(Ok(streams)) => {
+                serve_post_auth_request(
+                    streams, &paths, state_dir, docs, network_id, auth, routes, acl, &remote_id,
+                    policy,
+                )
+                .await?;
+                served += 1;
+            }
+            // The peer finished and hung up. Only the first request is
+            // mandatory; after that a closed connection is the normal end.
+            Ok(Err(e)) if served > 0 => {
+                tracing::debug!(?e, served, "post-auth peer closed the connection");
+                return Ok(());
+            }
+            Err(_) if served > 0 => {
+                tracing::debug!(served, "post-auth peer went idle");
+                return Ok(());
+            }
             Ok(Err(e)) => anyhow::bail!("accept post-auth stream: {e}"),
             Err(_) => anyhow::bail!("timed out waiting for post-auth stream from peer"),
-        };
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_post_auth_request(
+    streams: (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
+    paths: &StatePaths,
+    state_dir: &std::path::Path,
+    docs: Option<&DocsMembership>,
+    network_id: uuid::Uuid,
+    auth: &tunnet_core::direct::auth::AuthCache,
+    routes: &tunnet_core::RoutingTable,
+    acl: &tunnet_core::AclEngine,
+    remote_id: &str,
+    policy: SealPolicy,
+) -> anyhow::Result<()> {
+    let (mut send, mut recv) = streams;
+    let remote_id = remote_id.to_string();
 
     let Ok((_identity, persisted, _)) = load_agent(&paths, policy) else {
         write_post_auth_response(&mut send, &post_auth_deny("coordinator_state_unavailable"))
