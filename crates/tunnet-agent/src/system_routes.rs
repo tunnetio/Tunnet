@@ -432,7 +432,23 @@ impl RouteEngine {
 
     pub(crate) async fn reconcile(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
         self.last_desired = Some(desired.clone());
+        #[cfg(target_os = "android")]
+        {
+            // Routes were declared to `VpnService` when the tunnel was
+            // established, so there is nothing to reconcile. Returning early
+            // also avoids the interface lookup in the native path: the agent's
+            // configured `ifname` does not exist on Android, where the
+            // framework names the device (`tun0`), so resolving it yields
+            // `InvalidInterface`. That degrades the Direct lifecycle, which
+            // retries, which re-establishes the tunnel every couple of seconds.
+            Ok(())
+        }
+        #[cfg(not(target_os = "android"))]
+        self.reconcile_native(desired).await
+    }
 
+    #[cfg(not(target_os = "android"))]
+    async fn reconcile_native(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
         let underlay = desired.underlay.clone().or_else(UnderlayInfo::discover);
         let gateway = underlay.as_ref().and_then(UnderlayInfo::gateway_v4);
         let underlay_if = underlay
