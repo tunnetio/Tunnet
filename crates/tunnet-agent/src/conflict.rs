@@ -1,3 +1,36 @@
+//! Startup reporting of overlaps between a Direct network's peer CIDR and
+//! prefixes already present on the host.
+//!
+//! `select_peer_cidr` picks a range that avoids the host's networks at
+//! creation time, so a fresh network does not collide. That is not sufficient
+//! on its own: the host changes afterwards. A user installs another VPN, joins
+//! a different LAN, or a DHCP lease moves, and a plan that was safe when it
+//! was signed becomes unsafe later. Genesis is signed and the peer CIDR cannot
+//! be renegotiated on the fly, so the overlap has to be reported rather than
+//! avoided.
+//!
+//! Reporting matters because the resulting failure is silent in both
+//! directions and produces no error on either side. A measured example, and
+//! the reason `ConflictCategory::VpnRoute` exists: Tailscale claims
+//! `100.64.0.0/10` and installs
+//!
+//! ```text
+//! -A ts-input -s 100.64.0.0/10 ! -i tailscale0 -j DROP
+//! ```
+//!
+//! The match is on **source**, not destination, so it also drops the host's
+//! own traffic to any address in that range, including over loopback. On an
+//! affected host, 50 of 50 packets to the mesh address and 50 of 50 to a
+//! resolver inside the range were dropped, while a `127.0.0.1` control was
+//! untouched. A DNS resolver in an overlapping range therefore stays listening
+//! and simply never receives a query: no error, no log line, and both products
+//! reporting "connected" while nothing works.
+//!
+//! Note when diagnosing a suspected overlap by hand: ICMP is not a valid
+//! probe. Hosts that drop ICMP machine-wide make a working path look broken,
+//! and the reverse is easy to misread too. Use a TCP connection to a real
+//! listener instead.
+
 use std::collections::HashMap;
 
 use tunnet_core::direct::{ConflictCategory, NetworkConflict, detect_conflicts};
