@@ -155,7 +155,7 @@ pub async fn run_with_shutdown(
     let (identity, persisted, tier) = load_agent(&paths, policy).with_context(|| {
         format!(
             "no persisted identity in {}; run `tunnet enroll` or `tunnet create` first",
-            paths.dir.display()
+            paths.root().display()
         )
     })?;
     match &persisted {
@@ -232,7 +232,7 @@ async fn wait_for_network_state(
         }
         if !logged {
             tracing::info!(
-                dir = %paths.dir.display(),
+                dir = %paths.root().display(),
                 "agent idle - waiting for `tunnet create`, `tunnet enroll`, or `tunnet join`"
             );
             logged = true;

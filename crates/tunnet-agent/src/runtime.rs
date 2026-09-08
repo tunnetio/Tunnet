@@ -32,7 +32,7 @@ use crate::actors::update::{UpdateActorArgs, UpdateState};
 use crate::daemon::RunArgs;
 use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
-use crate::recorder::{RecordingStore, recordings_dir};
+use crate::recorder::RecordingStore;
 use crate::system_dns::DnsController;
 
 pub async fn run(
@@ -433,7 +433,7 @@ pub async fn run(
         });
     }
 
-    let recording_store = match RecordingStore::open(recordings_dir(&node.paths.dir)) {
+    let recording_store = match RecordingStore::open(node.paths.recordings_dir()) {
         Ok(s) => Some(Arc::new(s)),
         Err(e) => {
             tracing::warn!(?e, "recording store unavailable");
@@ -551,8 +551,7 @@ pub async fn run(
             "SSH session reporting disabled (no control-plane WS channel yet); sessions will not appear in the dashboard"
         );
     }
-    let ssh_handle = match crate::ssh::spawn_ssh_listener(ssh_bind, &node.paths.dir, ssh_deps).await
-    {
+    let ssh_handle = match crate::ssh::spawn_ssh_listener(ssh_bind, &node.paths, ssh_deps).await {
         Ok(handle) => Some(handle),
         Err(e) => {
             tracing::error!(?e, "failed to start SSH listener");
@@ -561,7 +560,7 @@ pub async fn run(
     };
 
     // Publish host pubkey: control-plane metadata (managed) / iroh-docs (direct).
-    let ssh_pubkey = match crate::ssh::host_pubkey_openssh(&node.paths.dir) {
+    let ssh_pubkey = match crate::ssh::host_pubkey_openssh(&node.paths) {
         Ok(k) => Some(k),
         Err(e) => {
             tracing::warn!(?e, "SSH host pubkey unavailable for distribution");
@@ -614,7 +613,7 @@ pub async fn run(
         send: node.send.clone(),
         direct_auth: node.direct_auth.clone(),
         auth_server_ctx,
-        state_dir: node.paths.dir.clone(),
+        paths: node.paths.clone(),
         join_authorities,
         firewalls,
         spoofs,
@@ -738,7 +737,7 @@ fn build_presence_args(
     let signing_key = node.identity.signing_key.clone();
     let self_endpoint_id = node.endpoint_id_hex();
     let agent_version = env!("CARGO_PKG_VERSION").to_string();
-    let state_dir = node.paths.dir.clone();
+    let known_hosts_file = node.paths.known_hosts_file();
     let mut out = Vec::new();
     if is_direct {
         for rt in node.direct.values() {
@@ -760,7 +759,7 @@ fn build_presence_args(
                     ssh_host_key: None,
                     agent_version: agent_version.clone(),
                     bootstrap: peers,
-                    state_dir: Some(state_dir.clone()),
+                    known_hosts_file: Some(known_hosts_file.clone()),
                     dns_suffix: Some(dns_suffix.to_string()),
                 },
                 tables: node.presence_tables.clone(),
@@ -785,7 +784,7 @@ fn build_presence_args(
                 ssh_host_key: None,
                 agent_version,
                 bootstrap: peers,
-                state_dir: Some(state_dir),
+                known_hosts_file: Some(known_hosts_file),
                 dns_suffix: Some(dns_suffix.to_string()),
             },
             tables: node.presence_tables.clone(),

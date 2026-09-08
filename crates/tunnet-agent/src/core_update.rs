@@ -183,7 +183,7 @@ impl CoreUpdater {
             std::fs::copy(root.join("tunnetd.exe"), &worker)?;
             std::process::Command::new(worker)
                 .arg("--activate-core-update")
-                .arg(&self.paths.dir)
+                .arg(self.paths.root())
                 .arg(std::process::id().to_string())
                 .creation_flags(0x08000000)
                 .spawn()?;
@@ -279,7 +279,7 @@ pub fn schedule_rollback(paths: &StatePaths) -> anyhow::Result<()> {
     std::fs::copy(previous.join("tunnetd.exe"), &worker)?;
     std::process::Command::new(worker)
         .arg("--rollback-core-update")
-        .arg(&paths.dir)
+        .arg(paths.root())
         .arg(std::process::id().to_string())
         .creation_flags(0x08000000)
         .spawn()?;

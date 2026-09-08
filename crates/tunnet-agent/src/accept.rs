@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
@@ -18,7 +17,7 @@ use tunnet_core::direct::{
     GOSSIP_ALPN, JOIN_ALPN, SharedAuthServerContext, SpoofTracker, run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient};
+use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient, StatePaths};
 use uuid::Uuid;
 
 use crate::actors::dataplane::PublishedPlane;
@@ -42,7 +41,7 @@ pub struct AcceptDeps {
     pub send: SendManager,
     pub direct_auth: Option<AuthCache>,
     pub auth_server_ctx: Option<SharedAuthServerContext>,
-    pub state_dir: PathBuf,
+    pub paths: StatePaths,
     pub join_authorities: HashMap<Uuid, (Arc<DirectAuthority>, DocsMembership)>,
     pub firewalls: HashMap<Uuid, FirewallEngine>,
     pub spoofs: HashMap<Uuid, SpoofTracker>,
@@ -82,7 +81,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
     };
     let connect = ConnectHandler {
         auth_server_ctx,
-        state_dir: deps.state_dir.clone(),
+        paths: deps.paths.clone(),
     };
     let docs = DocsHandler {
         shared_docs: deps.shared_docs,
@@ -273,7 +272,7 @@ impl ProtocolHandler for JoinHandler {
 #[derive(Clone)]
 struct ConnectHandler {
     auth_server_ctx: Option<SharedAuthServerContext>,
-    state_dir: PathBuf,
+    paths: StatePaths,
 }
 
 impl fmt::Debug for ConnectHandler {
@@ -336,12 +335,9 @@ impl ProtocolHandler for ConnectHandler {
             conn.close(401u32.into(), b"grant_denied");
             return Ok(());
         }
-        let allowlist = tunnet_core::direct::connect::load_allowlist_from_dir(&self.state_dir);
+        let allowlist = tunnet_core::agent_config::load_connect_allowlist(&self.paths);
         let (hostname, self_ipv4) = {
-            let paths = tunnet_core::StatePaths {
-                dir: self.state_dir.clone(),
-            };
-            match tunnet_core::PersistedState::try_load(&paths)
+            match tunnet_core::PersistedState::try_load(&self.paths)
                 .ok()
                 .flatten()
                 .as_ref()
@@ -360,7 +356,7 @@ impl ProtocolHandler for ConnectHandler {
             return Ok(());
         }
         match tunnet_core::direct::connect::handle_inbound_connect(
-            &self.state_dir,
+            &self.paths,
             &remote_id,
             &body,
             &allowlist,

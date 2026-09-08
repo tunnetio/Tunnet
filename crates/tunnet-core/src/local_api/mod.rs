@@ -47,7 +47,7 @@ pub fn discover_agent_state(
         format!(
             "not connected to a network yet (no state in {}). \
                  Use `tunnet create` for Direct or `tunnet enroll` for Managed",
-            paths.dir.display()
+            paths.state_file().display()
         )
     })
 }

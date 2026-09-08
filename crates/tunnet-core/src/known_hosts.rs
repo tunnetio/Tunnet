@@ -33,13 +33,8 @@ pub fn known_hosts_line(hosts: &[&str], openssh_pubkey: &str) -> Option<String> 
     Some(format!("{} {} {}", host_list.join(","), key_type, key_data))
 }
 
-/// Rewrite `state_dir/known_hosts` from peers that advertise an SSH host key.
-pub fn sync_known_hosts(
-    state_dir: &Path,
-    peers: &[PeerEntry],
-    dns_suffix: &str,
-) -> anyhow::Result<()> {
-    let path = state_dir.join("known_hosts");
+/// Rewrite the Tunnet `known_hosts` file from peers that advertise an SSH host key.
+pub fn sync_known_hosts(path: &Path, peers: &[PeerEntry], dns_suffix: &str) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create known_hosts dir {}", parent.display()))?;
@@ -80,25 +75,24 @@ pub fn sync_known_hosts(
     if !body.is_empty() {
         body.push('\n');
     }
-    std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(path, body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 /// Upsert one peer's host key into an existing known_hosts file (gossip path).
 pub fn upsert_known_hosts_entry(
-    state_dir: &Path,
+    path: &Path,
     hosts: &[&str],
     openssh_pubkey: &str,
 ) -> anyhow::Result<()> {
     let Some(new_line) = known_hosts_line(hosts, openssh_pubkey) else {
         return Ok(());
     };
-    let path = state_dir.join("known_hosts");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
     let host_set: std::collections::HashSet<&str> = hosts.iter().copied().collect();
     let mut kept = Vec::new();
     for line in existing.lines() {
@@ -123,7 +117,7 @@ pub fn upsert_known_hosts_entry(
     if !body.is_empty() {
         body.push('\n');
     }
-    std::fs::write(&path, body)?;
+    std::fs::write(path, body)?;
     Ok(())
 }
 
@@ -155,7 +149,7 @@ mod tests {
             tags: vec![],
             ssh_host_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".into()),
         }];
-        sync_known_hosts(dir.path(), &peers, "tunnet").unwrap();
+        sync_known_hosts(&dir.path().join("known_hosts"), &peers, "tunnet").unwrap();
         let body = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();
         assert!(body.contains("10.21.0.2"));
         assert!(body.contains("db.tunnet"));

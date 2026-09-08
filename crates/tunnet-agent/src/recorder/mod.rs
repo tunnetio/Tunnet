@@ -2,7 +2,6 @@
 
 mod store;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use iroh::endpoint::Connection;
@@ -104,8 +103,4 @@ async fn handle_recording_stream(
     }
 
     Ok(())
-}
-
-pub fn recordings_dir(state_dir: &std::path::Path) -> PathBuf {
-    state_dir.join("recordings")
 }

@@ -406,9 +406,7 @@ mod tests {
 
     fn tmp_auth(open: bool) -> (tempfile::TempDir, DirectAuthority, Genesis) {
         let dir = tempfile::tempdir().unwrap();
-        let paths = StatePaths {
-            dir: dir.path().to_path_buf(),
-        };
+        let paths = StatePaths::from_dir(dir.path().to_path_buf());
         let g = genesis();
         let auth =
             DirectAuthority::load(&paths, g.network_id, open, g.clone(), "tt".into()).unwrap();

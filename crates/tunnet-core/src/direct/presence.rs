@@ -92,7 +92,7 @@ pub struct PresenceConfig {
     pub ssh_host_key: Option<String>,
     pub agent_version: String,
     pub bootstrap: Vec<EndpointId>,
-    pub state_dir: Option<PathBuf>,
+    pub known_hosts_file: Option<PathBuf>,
     pub dns_suffix: Option<String>,
 }
 
@@ -197,7 +197,7 @@ pub async fn spawn_presence(cfg: PresenceConfig) -> anyhow::Result<PresenceHandl
     let (sender, mut receiver) = cfg.gossip.subscribe(topic, cfg.bootstrap).await?.split();
 
     let recv_table = table.clone();
-    let recv_state_dir = cfg.state_dir.clone();
+    let recv_known_hosts = cfg.known_hosts_file.clone();
     let recv_suffix = cfg.dns_suffix.clone();
     tokio::spawn(async move {
         while let Some(ev) = receiver.next().await {
@@ -217,8 +217,8 @@ pub async fn spawn_presence(cfg: PresenceConfig) -> anyhow::Result<PresenceHandl
                         "gossip presence"
                     );
                     recv_table.upsert(beacon.clone());
-                    if let (Some(dir), Some(suffix)) =
-                        (recv_state_dir.as_ref(), recv_suffix.as_deref())
+                    if let (Some(file), Some(suffix)) =
+                        (recv_known_hosts.as_ref(), recv_suffix.as_deref())
                         && let Some(key) = beacon.ssh_host_key.as_deref().filter(|k| !k.is_empty())
                     {
                         let fqdn = format!("{}.{}", beacon.hostname, suffix);
@@ -227,7 +227,7 @@ pub async fn spawn_presence(cfg: PresenceConfig) -> anyhow::Result<PresenceHandl
                             hosts.insert(0, ip);
                         }
                         if let Err(e) =
-                            crate::known_hosts::upsert_known_hosts_entry(dir, &hosts, key)
+                            crate::known_hosts::upsert_known_hosts_entry(file, &hosts, key)
                         {
                             tracing::debug!(?e, "presence known_hosts upsert skipped");
                         }

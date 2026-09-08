@@ -5,13 +5,7 @@ use uuid::Uuid;
 
 pub fn queue_kick(paths: &StatePaths, network_id: Uuid, peer_id: &str) -> anyhow::Result<()> {
     paths.ensure_network_dirs(network_id)?;
-    let kick_path = paths
-        .dir
-        .join("direct_pending_kick")
-        .join(format!("{network_id}.json"));
-    if let Some(parent) = kick_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let kick_path = paths.pending_kick_file(network_id);
     let mut kicks: Vec<String> = if kick_path.exists() {
         serde_json::from_slice(&std::fs::read(&kick_path)?)?
     } else {

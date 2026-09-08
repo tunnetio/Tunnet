@@ -34,9 +34,9 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
     );
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = tunnet_core::StatePaths::resolve(Some(tmp.path().to_str().expect("utf8")));
-    std::fs::create_dir_all(&paths.dir).ok();
+    let _ = paths.ensure();
     let send = tunnet_core::SendManager::open(
-        paths.dir.join("blobs"),
+        paths.blobs_dir(),
         pool.clone(),
         routes.clone(),
         acl.clone(),

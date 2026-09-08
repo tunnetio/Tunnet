@@ -36,7 +36,7 @@ impl AgentBootstrapOps {
     }
 
     fn state_dir(&self) -> Option<String> {
-        Some(self.paths.dir.to_string_lossy().into_owned())
+        Some(self.paths.root().to_string_lossy().into_owned())
     }
 
     async fn signed_client(&self) -> anyhow::Result<SignedClient> {

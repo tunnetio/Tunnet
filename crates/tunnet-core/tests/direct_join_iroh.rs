@@ -209,9 +209,7 @@ struct Harness {
 
 async fn harness(open: bool) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
-    let paths = StatePaths {
-        dir: tmp.path().to_path_buf(),
-    };
+    let paths = StatePaths::from_dir(tmp.path().to_path_buf());
     let (sk, vk) = generate_coordinator_keypair();
     let disco = MemoryLookup::new();
     let coord = Endpoint::builder(iroh::endpoint::presets::Minimal)

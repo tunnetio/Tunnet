@@ -15,9 +15,7 @@ use tunnet_common::local_api::DirectConnectPendingInfo;
 
 use crate::local_api::LocalApiState;
 use crate::routing::PeerInfo;
-use crate::state::PersistedState;
-
-const CONNECT_PENDING_FILE: &str = "connect_pending.json";
+use crate::state::{PersistedState, StatePaths};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectPending {
@@ -37,18 +35,18 @@ fn save_allowlist(state: &LocalApiState, set: &HashSet<String>) -> anyhow::Resul
     crate::agent_config::save_connect_allowlist(&state.node.paths, set.iter().cloned())
 }
 
-fn load_pending(state: &LocalApiState) -> anyhow::Result<Vec<ConnectPending>> {
-    let p = state.node.paths.dir.join(CONNECT_PENDING_FILE);
+fn load_pending(paths: &StatePaths) -> anyhow::Result<Vec<ConnectPending>> {
+    let p = paths.connect_pending_file();
     if !p.exists() {
         return Ok(vec![]);
     }
     Ok(serde_json::from_slice(&std::fs::read(&p)?)?)
 }
 
-fn save_pending(state: &LocalApiState, list: &[ConnectPending]) -> anyhow::Result<()> {
-    state.node.paths.ensure()?;
+fn save_pending(paths: &StatePaths, list: &[ConnectPending]) -> anyhow::Result<()> {
+    paths.ensure()?;
     std::fs::write(
-        state.node.paths.dir.join(CONNECT_PENDING_FILE),
+        paths.connect_pending_file(),
         serde_json::to_vec_pretty(list)?,
     )?;
     Ok(())
@@ -200,7 +198,7 @@ pub fn allow_contact(state: &LocalApiState, contact_id: &str) -> anyhow::Result<
 
 pub fn list_pending(state: &LocalApiState) -> anyhow::Result<Vec<DirectConnectPendingInfo>> {
     let _ = state.node.persisted.require_direct_network(None)?;
-    let list = load_pending(state)?;
+    let list = load_pending(&state.node.paths)?;
     Ok(list
         .into_iter()
         .map(|p| DirectConnectPendingInfo {
@@ -214,12 +212,12 @@ pub fn list_pending(state: &LocalApiState) -> anyhow::Result<Vec<DirectConnectPe
 
 pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(None)?.clone();
-    let mut list = load_pending(state)?;
+    let mut list = load_pending(&state.node.paths)?;
     let Some(idx) = list.iter().position(|p| p.contact_id == contact_id) else {
         anyhow::bail!("no pending connect from {contact_id}");
     };
     let pending = list.remove(idx);
-    save_pending(state, &list)?;
+    save_pending(&state.node.paths, &list)?;
 
     let peer: EndpointId = pending
         .endpoint_id
@@ -260,13 +258,13 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
 
 pub fn deny_pending(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let _ = state.node.persisted.require_direct_network(None)?;
-    let mut list = load_pending(state)?;
+    let mut list = load_pending(&state.node.paths)?;
     let before = list.len();
     list.retain(|p| p.contact_id != contact_id);
     if list.len() == before {
         anyhow::bail!("no pending connect from {contact_id}");
     }
-    save_pending(state, &list)?;
+    save_pending(&state.node.paths, &list)?;
     Ok(format!("Denied {contact_id}"))
 }
 
@@ -294,7 +292,7 @@ pub async fn rotate_identity(state: &LocalApiState) -> anyhow::Result<String> {
 
 /// Handle an inbound connect request (CONNECT_ALPN). Grant is verified by the caller.
 pub async fn handle_inbound_connect(
-    state_dir: &std::path::Path,
+    paths: &StatePaths,
     remote_hex: &str,
     body: &[u8],
     allowlist: &HashSet<String>,
@@ -332,10 +330,7 @@ pub async fn handle_inbound_connect(
     }
 
     // Queue pending.
-    let paths = crate::state::StatePaths {
-        dir: state_dir.to_path_buf(),
-    };
-    let pending_path = paths.dir.join(CONNECT_PENDING_FILE);
+    let pending_path = paths.connect_pending_file();
     let mut list: Vec<ConnectPending> = if pending_path.exists() {
         serde_json::from_slice(&std::fs::read(&pending_path)?).unwrap_or_default()
     } else {
@@ -355,12 +350,4 @@ pub async fn handle_inbound_connect(
         "status": "pending",
     });
     Ok((false, serde_json::to_vec(&resp)?))
-}
-
-/// Load allowlist from disk for accept path (no full LocalApiState).
-pub fn load_allowlist_from_dir(state_dir: &std::path::Path) -> HashSet<String> {
-    let paths = crate::state::StatePaths {
-        dir: state_dir.to_path_buf(),
-    };
-    crate::agent_config::load_connect_allowlist(&paths)
 }

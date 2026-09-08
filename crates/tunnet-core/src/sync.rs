@@ -111,7 +111,7 @@ pub fn apply_membership(
     org_version: u64,
     self_endpoint_id: &str,
     self_hostname: &str,
-    known_hosts_dir: Option<&std::path::Path>,
+    known_hosts_file: Option<&std::path::Path>,
 ) -> bool {
     // Verify policy signatures BEFORE mutating routes/ACL.
     if let Some(vk) = parse_policy_vk(policy_verifying_key) {
@@ -179,8 +179,8 @@ pub fn apply_membership(
         return false;
     }
 
-    if let Some(dir) = known_hosts_dir
-        && let Err(e) = crate::known_hosts::sync_known_hosts(dir, &peers, &membership.dns.suffix)
+    if let Some(file) = known_hosts_file
+        && let Err(e) = crate::known_hosts::sync_known_hosts(file, &peers, &membership.dns.suffix)
     {
         tracing::debug!(?e, "known_hosts sync skipped");
     }
@@ -341,7 +341,7 @@ pub fn spawn_managed_driver(
                             network_id,
                             &self_endpoint_id,
                             &self_hostname,
-                            Some(paths.dir.as_path()),
+                            Some(&paths.known_hosts_file()),
                             &pools,
                         )
                         .await;
@@ -361,7 +361,7 @@ pub fn spawn_managed_driver(
                                     snap.version,
                                     &self_endpoint_id,
                                     &self_hostname,
-                                    Some(paths.dir.as_path()),
+                                    Some(&paths.known_hosts_file()),
                                 ) {
                                     continue;
                                 }
@@ -489,7 +489,7 @@ pub fn spawn_managed_driver(
                                                 snap.version,
                                                 &self_endpoint_id,
                                                 &self_hostname,
-                                                Some(paths.dir.as_path()),
+                                                Some(&paths.known_hosts_file()),
                                             ) {
                                                 continue;
                                             }
@@ -863,7 +863,7 @@ pub async fn poll_once(
     network_id: Uuid,
     self_endpoint_id: &str,
     self_hostname: &str,
-    known_hosts_dir: Option<&std::path::Path>,
+    known_hosts_file: Option<&std::path::Path>,
     pools: &[crate::iroh_pool::ConnPool],
 ) {
     match client.poll(revisions.load().org.0).await {
@@ -879,7 +879,7 @@ pub async fn poll_once(
                     snap.version,
                     self_endpoint_id,
                     self_hostname,
-                    known_hosts_dir,
+                    known_hosts_file,
                 ) {
                     tracing::debug!(
                         org = snap.version,

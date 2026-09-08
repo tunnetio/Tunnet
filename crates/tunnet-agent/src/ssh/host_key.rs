@@ -1,24 +1,20 @@
 //! SSH host key load-or-create in the agent state directory.
 
-use std::path::{Path, PathBuf};
-
 use anyhow::Context;
 use russh::keys::{Algorithm, PrivateKey};
+use tunnet_core::StatePaths;
 
-pub fn host_key_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("ssh_host_ed25519_key")
-}
-
-/// Load an OpenSSH Ed25519 host key from `state_dir`, or generate and persist one.
-pub fn load_or_create_host_key(state_dir: &Path) -> anyhow::Result<PrivateKey> {
-    let path = host_key_path(state_dir);
+/// Load an OpenSSH Ed25519 host key from the agent state directory, or generate and persist one.
+pub fn load_or_create_host_key(paths: &StatePaths) -> anyhow::Result<PrivateKey> {
+    let path = paths.ssh_host_key_file();
     if path.is_file() {
         let key = PrivateKey::read_openssh_file(&path)
             .with_context(|| format!("read host key {}", path.display()))?;
         return Ok(key);
     }
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("create state dir {}", state_dir.display()))?;
+    paths
+        .ensure()
+        .with_context(|| format!("create state dir {}", paths.root().display()))?;
     let key =
         PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).context("generate host key")?;
     key.write_openssh_file(&path, russh::keys::ssh_key::LineEnding::LF)
@@ -33,7 +29,7 @@ pub fn load_or_create_host_key(state_dir: &Path) -> anyhow::Result<PrivateKey> {
 }
 
 /// OpenSSH public key line for the local host key (`ssh-ed25519 AAAA...`).
-pub fn host_pubkey_openssh(state_dir: &Path) -> anyhow::Result<String> {
-    let key = load_or_create_host_key(state_dir)?;
+pub fn host_pubkey_openssh(paths: &StatePaths) -> anyhow::Result<String> {
+    let key = load_or_create_host_key(paths)?;
     key.public_key().to_openssh().context("encode host pubkey")
 }

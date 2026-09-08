@@ -14,10 +14,10 @@ use crate::ssh_nat::SSH_INTERNAL_PORT;
 
 pub async fn spawn_ssh_listener(
     mesh_ip: Ipv4Addr,
-    state_dir: &std::path::Path,
+    paths: &tunnet_core::StatePaths,
     deps: SshServeDeps,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let host_key = load_or_create_host_key(state_dir)?;
+    let host_key = load_or_create_host_key(paths)?;
     let mut methods = MethodSet::empty();
     methods.push(MethodKind::None);
     methods.push(MethodKind::KeyboardInteractive);

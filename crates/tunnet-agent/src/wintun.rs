@@ -20,7 +20,7 @@ compile_error!("Windows TUN backend is vendored only for x86_64 and aarch64");
 
 pub fn materialize() -> anyhow::Result<PathBuf> {
     let hash = hex::encode(Sha256::digest(WINTUN));
-    let dir = tunnet_core::StatePaths::resolve(None).dir.join("runtime");
+    let dir = tunnet_core::StatePaths::resolve(None).runtime_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let dest = dir.join(format!("wintun-{}.dll", &hash[..16]));
     if dest.is_file()

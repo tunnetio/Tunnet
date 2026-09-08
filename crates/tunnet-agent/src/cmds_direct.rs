@@ -268,7 +268,7 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         address_plan.peer_cidr,
         tier.as_str()
     );
-    println!("State directory: {}", paths.dir.display());
+    println!("State directory: {}", paths.root().display());
     crate::cmds::finish_after_config(state_dir, had_networks).await?;
     println!("Next: `tunnet invite` and share the code.");
     Ok(())
@@ -429,7 +429,7 @@ pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::
         anyhow::bail!("only the coordinator should run upgrade-to-managed first");
     }
 
-    let members_path = paths.dir.join("direct_members_cache.json");
+    let members_path = paths.members_cache_file();
     let members: Vec<MembershipEntry> = if members_path.exists() {
         serde_json::from_slice(&std::fs::read(&members_path)?).unwrap_or_default()
     } else {
@@ -496,7 +496,7 @@ pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::
         "network_name": resp.network_name,
     });
     std::fs::write(
-        paths.dir.join("upgrade_notice.json"),
+        paths.upgrade_notice_file(),
         serde_json::to_vec_pretty(&notice)?,
     )?;
 

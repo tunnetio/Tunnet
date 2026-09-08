@@ -330,11 +330,11 @@ fn bootstrap_identity_from_env(paths: &StatePaths) -> anyhow::Result<()> {
     if !boot.is_dir() {
         return Ok(());
     }
-    std::fs::create_dir_all(&paths.dir)
-        .with_context(|| format!("create state dir {}", paths.dir.display()))?;
+    std::fs::create_dir_all(paths.root())
+        .with_context(|| format!("create state dir {}", paths.root().display()))?;
     for name in ["identity.hex", "state.json"] {
         let src = boot.join(name);
-        let dst = paths.dir.join(name);
+        let dst = paths.root().join(name);
         if src.is_file() {
             std::fs::copy(&src, &dst)
                 .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
@@ -346,8 +346,8 @@ fn bootstrap_identity_from_env(paths: &StatePaths) -> anyhow::Result<()> {
 /// Load identity from operator Secret files (`identity.hex` + `state.json`),
 /// falling back to sealed `load_agent` for local/dev.
 fn load_identity(paths: &StatePaths) -> anyhow::Result<(AgentIdentity, PersistedState)> {
-    let identity_path = paths.dir.join("identity.hex");
-    let state_path = paths.dir.join("state.json");
+    let identity_path = paths.identity_hex_file();
+    let state_path = paths.state_file();
     if identity_path.is_file() && state_path.is_file() {
         let hex = std::fs::read_to_string(&identity_path)
             .with_context(|| format!("read {}", identity_path.display()))?;

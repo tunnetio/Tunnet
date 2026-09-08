@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -301,7 +300,7 @@ impl DocsMembership {
                 hostname: direct.hostname.clone(),
                 auto_accept_firewall: direct.auto_accept_firewall,
                 self_endpoint_id: self_endpoint_id.to_string(),
-                paths: paths.clone_paths(),
+                paths: paths.clone(),
                 firewall,
                 dns: Arc::new(ArcSwap::from_pointee(dns)),
                 seed_peers: seed_peers.clone(),
@@ -812,11 +811,13 @@ impl DocsMembership {
         acl.replace_bundle(policy.clone());
         self.fire_change_hook();
         if let Ok(json) = serde_json::to_vec_pretty(&members) {
-            let _ = std::fs::write(self.inner.paths.dir.join("direct_members_cache.json"), json);
+            let _ = std::fs::write(self.inner.paths.members_cache_file(), json);
         }
-        if let Err(e) =
-            crate::known_hosts::sync_known_hosts(&self.inner.paths.dir, &peers, &dns.suffix)
-        {
+        if let Err(e) = crate::known_hosts::sync_known_hosts(
+            &self.inner.paths.known_hosts_file(),
+            &peers,
+            &dns.suffix,
+        ) {
             tracing::debug!(?e, "known_hosts sync skipped");
         }
     }
@@ -849,12 +850,7 @@ impl DocsMembership {
     }
 
     pub async fn apply_pending_kicks(&self) -> anyhow::Result<()> {
-        let kick_path = self
-            .inner
-            .paths
-            .dir
-            .join("direct_pending_kick")
-            .join(format!("{}.json", self.inner.network_id));
+        let kick_path = self.inner.paths.pending_kick_file(self.inner.network_id);
         if !kick_path.exists() {
             return Ok(());
         }
@@ -1000,10 +996,6 @@ impl DocsMembership {
         if let Err(e) = self.inner.gossip.handle_connection(conn).await {
             tracing::debug!(?e, "gossip accept ended");
         }
-    }
-
-    pub fn blobs_store_path(paths: &StatePaths) -> PathBuf {
-        paths.dir.join("blobs")
     }
 }
 

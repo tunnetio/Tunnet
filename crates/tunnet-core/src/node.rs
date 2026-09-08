@@ -379,7 +379,7 @@ impl CoreNode {
             snapshot.version,
             &my_id_hex,
             &cfg.hostname,
-            Some(paths.dir.as_path()),
+            Some(&paths.known_hosts_file()),
         );
 
         let secret = SecretKey::from_bytes(&identity.secret_bytes);
@@ -431,7 +431,7 @@ impl CoreNode {
         let tunnels = TunnelManager::new(pool.clone());
         #[cfg(feature = "send")]
         let send = SendManager::open(
-            paths.dir.join("blobs"),
+            paths.blobs_dir(),
             pool.clone(),
             routes.clone(),
             acl.clone(),
@@ -603,14 +603,14 @@ impl CoreNode {
         #[cfg(feature = "tunnel")]
         let tunnels = TunnelManager::new(pool.clone());
 
-        let blobs_dir = paths.dir.join("blobs");
+        let blobs_dir = paths.blobs_dir();
         std::fs::create_dir_all(&blobs_dir)?;
         let blobs = iroh_blobs::store::fs::FsStore::load(&blobs_dir)
             .await
             .map_err(|e| anyhow::anyhow!("open shared FsStore: {e}"))?;
 
         let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
-        let docs_dir = paths.dir.join("docs");
+        let docs_dir = paths.docs_root_dir();
         std::fs::create_dir_all(&docs_dir)?;
         let docs_engine = Docs::persistent(docs_dir)
             .spawn(endpoint.clone(), (*blobs).clone(), gossip.clone())

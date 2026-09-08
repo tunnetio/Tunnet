@@ -5,9 +5,11 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Filesystem layout for all agent state. Single boundary between the agent
+/// and disk: every state path is derived here, never constructed ad hoc.
 #[derive(Clone)]
 pub struct StatePaths {
-    pub dir: PathBuf,
+    dir: PathBuf,
 }
 
 impl StatePaths {
@@ -25,6 +27,10 @@ impl StatePaths {
         {
             PathBuf::from("./tunnet-state")
         }
+    }
+
+    pub fn from_dir(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
     pub fn resolve(explicit: Option<&str>) -> Self {
@@ -59,6 +65,10 @@ impl StatePaths {
     pub fn secrets_file(&self) -> PathBuf {
         self.dir.join("state.enc")
     }
+    /// Plain hex identity seed projected from an operator Secret.
+    pub fn identity_hex_file(&self) -> PathBuf {
+        self.dir.join("identity.hex")
+    }
     /// Seal metadata for `state.enc` (tier, wrapped DEK / salt).
     pub fn secrets_meta_file(&self) -> PathBuf {
         self.dir.join("state.enc.meta")
@@ -79,28 +89,78 @@ impl StatePaths {
     pub fn update_staging_dir(&self) -> PathBuf {
         self.update_dir().join("staged")
     }
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.dir.join("blobs")
+    }
+    /// Shared iroh-docs store root (one engine across all networks).
+    pub fn docs_root_dir(&self) -> PathBuf {
+        self.dir.join("docs")
+    }
     /// Per-network iroh-docs store root.
     pub fn docs_dir(&self, network_id: Uuid) -> PathBuf {
-        self.dir.join("docs").join(network_id.to_string())
+        self.docs_root_dir().join(network_id.to_string())
     }
+    /// OpenSSH `known_hosts` mirror written from verified peer host keys.
+    pub fn known_hosts_file(&self) -> PathBuf {
+        self.dir.join("known_hosts")
+    }
+    /// Session recordings captured by the agent recorder.
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.dir.join("recordings")
+    }
+    /// OpenSSH Ed25519 host key for the agent's SSH server.
+    pub fn ssh_host_key_file(&self) -> PathBuf {
+        self.dir.join("ssh_host_ed25519_key")
+    }
+    /// Upgrade notice published for peers after a coordinator upgrade.
+    pub fn upgrade_notice_file(&self) -> PathBuf {
+        self.dir.join("upgrade_notice.json")
+    }
+    /// Private runtime scratch area (e.g. vendored driver payloads).
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.dir.join("runtime")
+    }
+    /// The state root itself, for handing the directory (never a derived
+    /// filename) to subprocesses, display, or external configuration.
+    pub fn root(&self) -> &std::path::Path {
+        &self.dir
+    }
+    /// Local peers mirror cached from verified Direct membership.
+    pub fn members_cache_file(&self) -> PathBuf {
+        self.dir.join("direct_members_cache.json")
+    }
+    /// Pending 2-peer connect requests (`tt_…` contact flow).
+    pub fn connect_pending_file(&self) -> PathBuf {
+        self.dir.join("connect_pending.json")
+    }
+
+    fn firewall_pending_dir(&self) -> PathBuf {
+        self.dir.join("firewall_pending")
+    }
+    fn authority_dir(&self) -> PathBuf {
+        self.dir.join("direct_authority")
+    }
+    fn pending_dir(&self) -> PathBuf {
+        self.dir.join("direct_pending")
+    }
+    fn pending_kick_dir(&self) -> PathBuf {
+        self.dir.join("direct_pending_kick")
+    }
+
     /// Pending coordinator firewall suggestion for a network.
     pub fn firewall_pending_file(&self, network_id: Uuid) -> PathBuf {
-        self.dir
-            .join("firewall_pending")
+        self.firewall_pending_dir()
             .join(format!("{network_id}.json"))
     }
     pub fn authority_file(&self, network_id: Uuid) -> PathBuf {
-        self.dir
-            .join("direct_authority")
-            .join(format!("{network_id}.json"))
-    }
-    pub fn invites_file(&self, network_id: Uuid) -> PathBuf {
-        self.authority_file(network_id)
+        self.authority_dir().join(format!("{network_id}.json"))
     }
     pub fn pending_file(&self, network_id: Uuid) -> PathBuf {
-        self.dir
-            .join("direct_pending")
-            .join(format!("{network_id}.json"))
+        self.pending_dir().join(format!("{network_id}.json"))
+    }
+    /// Disk-backed kick queue for a network, applied when docs membership is ready.
+    pub fn pending_kick_file(&self, network_id: Uuid) -> PathBuf {
+        self.pending_kick_dir().join(format!("{network_id}.json"))
     }
 
     pub fn ensure(&self) -> anyhow::Result<()> {
@@ -113,19 +173,14 @@ impl StatePaths {
         self.ensure()?;
         for sub in [
             self.docs_dir(network_id),
-            self.dir.join("firewall_pending"),
-            self.dir.join("direct_authority"),
-            self.dir.join("direct_pending"),
+            self.firewall_pending_dir(),
+            self.authority_dir(),
+            self.pending_dir(),
+            self.pending_kick_dir(),
         ] {
             std::fs::create_dir_all(&sub).with_context(|| format!("mkdir {}", sub.display()))?;
         }
         Ok(())
-    }
-
-    pub fn clone_paths(&self) -> StatePaths {
-        StatePaths {
-            dir: self.dir.clone(),
-        }
     }
 }
 
@@ -551,5 +606,50 @@ mod tests {
                 .network_name,
             "homelab"
         );
+    }
+
+    #[test]
+    fn per_network_files_stay_under_fixed_dirs() {
+        let id = Uuid::from_u128(0x0d1e_c7a5_4b9e_4a1f_9c2d_5e6f_7081_92a3);
+        let root = PathBuf::from("/tmp/tunnet-state-test");
+        let paths = StatePaths::from_dir(root.clone());
+        for (file, dir) in [
+            (
+                paths.firewall_pending_file(id),
+                root.join("firewall_pending"),
+            ),
+            (paths.authority_file(id), root.join("direct_authority")),
+            (paths.pending_file(id), root.join("direct_pending")),
+            (
+                paths.pending_kick_file(id),
+                root.join("direct_pending_kick"),
+            ),
+            (paths.docs_dir(id), root.join("docs")),
+        ] {
+            assert_eq!(file.parent(), Some(dir.as_path()));
+            assert!(file.starts_with(&root));
+        }
+    }
+
+    #[test]
+    fn network_id_is_a_single_filename_component() {
+        let id = Uuid::nil();
+        let root = PathBuf::from("state");
+        let paths = StatePaths::from_dir(root.clone());
+        for (file, name) in [
+            (paths.firewall_pending_file(id), format!("{id}.json")),
+            (paths.authority_file(id), format!("{id}.json")),
+            (paths.pending_file(id), format!("{id}.json")),
+            (paths.pending_kick_file(id), format!("{id}.json")),
+            (paths.docs_dir(id), id.to_string()),
+        ] {
+            assert_eq!(
+                file.file_name().and_then(|s| s.to_str()),
+                Some(name.as_str())
+            );
+            let components = file.components().count();
+            let dir_components = file.parent().unwrap().components().count();
+            assert_eq!(components, dir_components + 1);
+        }
     }
 }

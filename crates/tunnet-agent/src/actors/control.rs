@@ -276,7 +276,7 @@ impl ControlPlaneActor {
                         snap.version,
                         &self.cfg.transport.endpoint_id,
                         &self.cfg.hostname,
-                        Some(self.cfg.paths.dir.as_path()),
+                        Some(&self.cfg.paths.known_hosts_file()),
                     );
                     if !applied {
                         return;

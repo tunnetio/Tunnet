@@ -480,9 +480,7 @@ mod tests {
 
     fn test_paths() -> (TempDir, StatePaths) {
         let dir = TempDir::new().unwrap();
-        let paths = StatePaths {
-            dir: dir.path().to_path_buf(),
-        };
+        let paths = StatePaths::from_dir(dir.path().to_path_buf());
         (dir, paths)
     }
 
