@@ -42,7 +42,8 @@ pub use agent_config::{TunnetConfig, load_dns, load_firewall};
 pub use cloud_relay_meter::CloudRelayMeter;
 pub use effective_config::{EffectiveAgentConfigState, EffectiveConfigStore};
 pub use secret_store::{
-    AgentSecrets, NetworkSecrets, SealPolicy, SealTier, load_agent, persist_agent,
+    AgentSecrets, NetworkSecrets, SealPolicy, SealTier, load_agent, load_relay_auth, persist_agent,
+    store_relay_auth,
 };
 
 pub use acl::{AclEngine, SelfIdentity};

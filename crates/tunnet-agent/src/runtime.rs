@@ -80,6 +80,38 @@ pub async fn run(
         hosts
     };
 
+    let connectivity = if is_direct {
+        if let Err(errs) = agent_cfg.validate() {
+            anyhow::bail!("invalid tunnet.toml: {}", errs.join("; "));
+        }
+        let credentials = tunnet_core::secret_store::load_relay_auth(&paths).unwrap_or_default();
+        let mut opts = ConnectivityOptions::from_direct_config(
+            &agent_cfg,
+            credentials,
+            args.relay_mode.as_deref(),
+            args.relay_urls.as_deref(),
+        )
+        .context("resolve Direct relay policy")?;
+        if args.no_mdns {
+            opts.enable_mdns = false;
+        }
+        tracing::info!(
+            relay = opts.relay.kind(),
+            mdns = opts.enable_mdns,
+            lan_discovery = opts.enable_lan_discovery,
+            dht = opts.enable_dht,
+            "direct connectivity"
+        );
+        opts
+    } else {
+        if agent_cfg.has_local_direct_relay_settings() {
+            tracing::warn!(
+                "ignoring [network] relay-mode / relay-urls in Managed mode; control-plane snapshot is authoritative"
+            );
+        }
+        ConnectivityOptions::managed_default()
+    };
+
     let (node, _pending_control) = CoreNode::bootstrap(
         identity.clone(),
         persisted,
@@ -91,13 +123,7 @@ pub async fn run(
             advertise_recording_alpn: args.recorder,
             kind: "agent",
             src_posture_ok: Some(src_posture_ok.clone()),
-            connectivity: if is_direct {
-                ConnectivityOptions::direct_default(
-                    agent_cfg.effective_mdns_default() && !args.no_mdns,
-                )
-            } else {
-                ConnectivityOptions::managed_default()
-            },
+            connectivity,
             enable_gossip: !args.disable_gossip || agent_cfg.effective_service_relay(),
             keep_alive: match std::env::var("TUNNET_KEEP_ALIVE").ok().as_deref() {
                 Some("0" | "false" | "off") => false,

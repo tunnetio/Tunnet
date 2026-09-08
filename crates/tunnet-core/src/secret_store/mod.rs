@@ -78,6 +78,10 @@ pub struct AgentSecrets {
     pub networks: BTreeMap<Uuid, NetworkSecrets>,
     #[zeroize(skip)]
     pub auth: Option<CliAuthTokens>,
+    /// Custom Direct relay auth tokens keyed by relay URL. Never written to
+    /// `tunnet.toml` or `state.json`.
+    #[zeroize(skip)]
+    pub relay_auth: BTreeMap<String, String>,
 }
 
 impl AgentSecrets {
@@ -90,6 +94,7 @@ impl AgentSecrets {
             identity_seed: identity.secret_bytes,
             networks: BTreeMap::new(),
             auth: None,
+            relay_auth: BTreeMap::new(),
         }
     }
 }
@@ -102,6 +107,8 @@ struct SensitivePayload {
     networks: BTreeMap<Uuid, NetworkSecrets>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth: Option<CliAuthTokens>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    relay_auth: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -160,6 +167,7 @@ pub fn save_secrets(
         identity_seed_hex: hex::encode(secrets.identity_seed),
         networks: secrets.networks.clone(),
         auth: secrets.auth.clone(),
+        relay_auth: secrets.relay_auth.clone(),
     };
     let plain = serde_json::to_vec(&payload).context("serialize sensitive payload")?;
 
@@ -279,6 +287,7 @@ pub fn load_secrets(paths: &StatePaths) -> anyhow::Result<(AgentSecrets, SealTie
             identity_seed,
             networks: payload.networks,
             auth: payload.auth,
+            relay_auth: payload.relay_auth,
         },
         meta.tier,
     ))
@@ -426,6 +435,44 @@ pub fn clear_auth(paths: &StatePaths) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn load_relay_auth(paths: &StatePaths) -> anyhow::Result<BTreeMap<String, String>> {
+    if !secrets_exist(paths) {
+        return Ok(BTreeMap::new());
+    }
+    let (secrets, _) = load_secrets(paths)?;
+    Ok(secrets.relay_auth.clone())
+}
+
+/// Persist a Direct custom-relay auth token in `state.enc`, keyed by URL.
+pub fn store_relay_auth(paths: &StatePaths, url: &str, token: &str) -> anyhow::Result<()> {
+    let policy = SealPolicy::from_env_and_flag(false);
+    let (mut secrets, _) = if secrets_exist(paths) {
+        load_secrets(paths)?
+    } else {
+        load_or_create_secrets(paths, policy)?
+    };
+    if token.is_empty() {
+        secrets.relay_auth.remove(url);
+    } else {
+        secrets
+            .relay_auth
+            .insert(url.to_string(), token.to_string());
+    }
+    save_secrets(paths, &secrets, policy)?;
+    Ok(())
+}
+
+pub fn clear_relay_auth(paths: &StatePaths) -> anyhow::Result<()> {
+    if !secrets_exist(paths) {
+        return Ok(());
+    }
+    let policy = SealPolicy::from_env_and_flag(false);
+    let (mut secrets, _) = load_secrets(paths)?;
+    secrets.relay_auth.clear();
+    save_secrets(paths, &secrets, policy)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +505,10 @@ mod tests {
                 },
             )]),
             auth: None,
+            relay_auth: BTreeMap::from([(
+                "https://relay.example.com".into(),
+                "relay-secret".into(),
+            )]),
         };
         let policy = SealPolicy {
             allow_encrypt: true,
@@ -477,6 +528,22 @@ mod tests {
         let ns = loaded.networks.get(&nid).unwrap();
         assert_eq!(ns.join_secret, "deadbeef");
         assert_eq!(ns.doc_ticket.as_deref(), Some("ticket"));
+        assert_eq!(
+            loaded
+                .relay_auth
+                .get("https://relay.example.com")
+                .map(String::as_str),
+            Some("relay-secret")
+        );
+        let public = std::fs::read_to_string(paths.state_file())
+            .ok()
+            .unwrap_or_default();
+        assert!(!public.contains("relay-secret"));
+        let toml_path = paths.config_toml_file();
+        if toml_path.exists() {
+            let toml = std::fs::read_to_string(toml_path).unwrap();
+            assert!(!toml.contains("relay-secret"));
+        }
         let _ = policy;
     }
 

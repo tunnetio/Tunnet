@@ -1,6 +1,7 @@
-//! Endpoint connectivity presets for Direct and Managed agents.
+//! Endpoint connectivity: resolved relay policy plus independent discovery flags.
 //!
-//! Selects iroh relay presets, optional Mainline DHT address lookup, and mDNS.
+//! Relay selection is [`EffectiveRelayPolicy`] only. DHT, mDNS, and LAN discovery
+//! are separate and never implied by a connectivity "profile".
 
 use std::sync::Arc;
 
@@ -15,74 +16,98 @@ use tunnet_common::{ConnectivityRelayConfig, ConnectivityRelayFallback};
 
 #[cfg(feature = "direct")]
 use super::mdns::apply_mdns;
+pub use super::relay_policy::{
+    DirectRelayInput, DirectRelayMode, EffectiveRelayPolicy, RelayResolveError,
+    resolve_direct_relay_policy, resolve_managed_relay_policy,
+};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConnectivityProfile {
-    /// [`presets::N0`] + optional mDNS.
-    #[default]
-    N0Public,
-    /// Tunnet-managed agents: custom RelayMap from control plane, or n0 / disabled fallback.
-    TunnetManaged,
-    /// [`presets::N0`] + DHT address lookup + optional mDNS.
-    ServerlessDht,
-    /// [`presets::Minimal`] + mDNS only (no N0 DNS).
-    LanOnly,
-}
-
+/// Endpoint settings after relay policy has already been resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectivityOptions {
-    pub profile: ConnectivityProfile,
+    pub relay: EffectiveRelayPolicy,
+    pub enable_dht: bool,
     pub enable_mdns: bool,
-    /// Custom connectivity relays from the control-plane snapshot (managed).
-    pub custom_relays: Vec<ConnectivityRelayConfig>,
-    /// Control-plane policy when `custom_relays` is empty: n0 public relays or disable.
-    pub relay_fallback: ConnectivityRelayFallback,
+    pub enable_lan_discovery: bool,
 }
 
 impl Default for ConnectivityOptions {
     fn default() -> Self {
         Self {
-            profile: ConnectivityProfile::N0Public,
+            relay: EffectiveRelayPolicy::N0,
+            enable_dht: true,
             enable_mdns: true,
-            custom_relays: Vec::new(),
-            relay_fallback: ConnectivityRelayFallback::N0,
+            enable_lan_discovery: true,
         }
     }
 }
 
 impl ConnectivityOptions {
+    pub fn direct_from_input(
+        input: &DirectRelayInput,
+        enable_dht: bool,
+        enable_mdns: bool,
+        enable_lan_discovery: bool,
+    ) -> Result<Self, RelayResolveError> {
+        Ok(Self {
+            relay: resolve_direct_relay_policy(input)?,
+            enable_dht,
+            enable_mdns,
+            enable_lan_discovery,
+        })
+    }
+
+    /// Shared Direct path for the daemon runtime and `tunnet join`.
+    pub fn from_direct_config(
+        cfg: &crate::TunnetConfig,
+        credentials: std::collections::BTreeMap<String, String>,
+        mode_override: Option<&str>,
+        urls_override: Option<&str>,
+    ) -> Result<Self, RelayResolveError> {
+        let input = cfg
+            .direct_relay_input(credentials)
+            .overlay_process_env()?
+            .overlay_mode_and_urls(mode_override, urls_override)?;
+        Self::direct_from_input(
+            &input,
+            cfg.effective_dht_default(),
+            cfg.effective_mdns_default(),
+            cfg.effective_lan_discovery_default(),
+        )
+    }
+
+    /// Direct defaults: `auto` with no custom relays → N0.
     pub fn direct_default(enable_mdns: bool) -> Self {
         Self {
-            profile: ConnectivityProfile::ServerlessDht,
+            relay: EffectiveRelayPolicy::N0,
+            enable_dht: true,
             enable_mdns,
-            custom_relays: Vec::new(),
-            relay_fallback: ConnectivityRelayFallback::N0,
+            enable_lan_discovery: true,
         }
     }
 
+    /// Fail-closed until the control-plane snapshot is applied.
     pub fn managed_default() -> Self {
         Self {
-            profile: ConnectivityProfile::TunnetManaged,
+            relay: EffectiveRelayPolicy::Disabled,
+            enable_dht: false,
             enable_mdns: false,
-            custom_relays: Vec::new(),
-            // Fail-closed until EndpointSnapshot applies the control-plane policy.
-            relay_fallback: ConnectivityRelayFallback::None,
+            enable_lan_discovery: false,
         }
     }
 
-    /// Apply the control plane's relay list and fallback. The snapshot is authoritative.
-    pub fn with_snapshot_relays(
+    /// Replace relay policy from the control-plane snapshot. Local Direct
+    /// `relay-mode` is ignored.
+    pub fn with_managed_snapshot(
         mut self,
         relays: Vec<ConnectivityRelayConfig>,
         fallback: ConnectivityRelayFallback,
-    ) -> Self {
-        self.custom_relays = relays;
-        self.relay_fallback = fallback;
-        self
+    ) -> Result<Self, RelayResolveError> {
+        self.relay = resolve_managed_relay_policy(&relays, fallback)?;
+        Ok(self)
     }
 }
 
-/// Build an iroh [`RelayMap`] from control-plane relay configs.
+/// Build an iroh [`RelayMap`] from resolved custom relay configs.
 pub fn relay_map_from_configs(
     relays: &[ConnectivityRelayConfig],
 ) -> Result<RelayMap, iroh::RelayUrlParseError> {
@@ -98,76 +123,42 @@ pub fn relay_map_from_configs(
     Ok(map)
 }
 
-#[derive(Debug)]
-enum AppliedRelayMode {
-    Custom(RelayMap),
-    PresetUnchanged,
-    Disabled,
-}
-
-fn applied_relay_mode(opts: &ConnectivityOptions) -> AppliedRelayMode {
-    if !opts.custom_relays.is_empty() {
-        match relay_map_from_configs(&opts.custom_relays) {
-            Ok(map) => return AppliedRelayMode::Custom(map),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "invalid connectivity relay URL; applying fallback"
-                );
-            }
+fn apply_relay_policy(builder: Builder, policy: &EffectiveRelayPolicy) -> Builder {
+    match policy {
+        EffectiveRelayPolicy::N0 => builder,
+        EffectiveRelayPolicy::Custom(relays) => {
+            let map =
+                relay_map_from_configs(relays).expect("resolver already validated relay URLs");
+            builder.relay_mode(RelayMode::Custom(map))
         }
-    }
-
-    match (opts.profile, opts.relay_fallback) {
-        (ConnectivityProfile::LanOnly, _) | (_, ConnectivityRelayFallback::N0) => {
-            AppliedRelayMode::PresetUnchanged
-        }
-        (_, ConnectivityRelayFallback::None) => AppliedRelayMode::Disabled,
+        EffectiveRelayPolicy::Disabled => builder.relay_mode(RelayMode::Disabled),
     }
 }
 
-fn apply_relay_mode(builder: Builder, opts: &ConnectivityOptions) -> Builder {
-    match applied_relay_mode(opts) {
-        AppliedRelayMode::Custom(map) => builder.relay_mode(RelayMode::Custom(map)),
-        AppliedRelayMode::PresetUnchanged => builder,
-        AppliedRelayMode::Disabled => {
-            tracing::info!("iroh relays disabled by control-plane policy");
-            builder.relay_mode(RelayMode::Disabled)
-        }
-    }
-}
-
-/// Start an endpoint builder with the relay preset for this profile.
+/// Start an endpoint builder from the resolved relay policy.
+///
+/// N0 uses the n0 preset (relays + n0 DNS lookup). Custom and Disabled use
+/// [`presets::Minimal`] so n0 DNS discovery is not pulled in as a side effect.
 pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
-    let builder = match opts.profile {
-        ConnectivityProfile::LanOnly => Endpoint::builder(presets::Minimal),
-        ConnectivityProfile::TunnetManaged if !opts.custom_relays.is_empty() => {
-            // Minimal + Custom relay_mode (override below).
+    let builder = match &opts.relay {
+        EffectiveRelayPolicy::N0 => Endpoint::builder(presets::N0),
+        EffectiveRelayPolicy::Custom(_) | EffectiveRelayPolicy::Disabled => {
             Endpoint::builder(presets::Minimal)
         }
-        ConnectivityProfile::TunnetManaged
-            if opts.relay_fallback == ConnectivityRelayFallback::None =>
-        {
-            Endpoint::builder(presets::Minimal)
-        }
-        ConnectivityProfile::N0Public
-        | ConnectivityProfile::TunnetManaged
-        | ConnectivityProfile::ServerlessDht => Endpoint::builder(presets::N0),
     };
-    apply_relay_mode(builder, opts)
+    apply_relay_policy(builder, &opts.relay)
 }
 
-/// Attach address-lookup services to an endpoint builder.
+/// Attach address-lookup services independently of relay policy.
 pub fn apply_connectivity(builder: Builder, opts: &ConnectivityOptions) -> Builder {
     #[cfg(feature = "direct")]
     {
         let mut builder = builder;
-        if matches!(opts.profile, ConnectivityProfile::ServerlessDht) {
+        if opts.enable_dht {
             tracing::info!("Mainline DHT address lookup enabled");
             builder = builder.address_lookup(DhtAddressLookup::builder());
         }
-        let mdns = opts.enable_mdns || matches!(opts.profile, ConnectivityProfile::LanOnly);
-        apply_mdns(builder, mdns)
+        apply_mdns(builder, opts.enable_mdns)
     }
     #[cfg(not(feature = "direct"))]
     {
@@ -176,116 +167,175 @@ pub fn apply_connectivity(builder: Builder, opts: &ConnectivityOptions) -> Build
     }
 }
 
+/// Whether this policy would contact n0 relay/DNS infrastructure via the preset.
+pub fn relay_uses_n0_preset(policy: &EffectiveRelayPolicy) -> bool {
+    policy.uses_n0_infrastructure()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn managed_default_is_tunnet_managed() {
+    fn managed_default_is_disabled_until_snapshot() {
         let opts = ConnectivityOptions::managed_default();
-        assert_eq!(opts.profile, ConnectivityProfile::TunnetManaged);
+        assert_eq!(opts.relay, EffectiveRelayPolicy::Disabled);
         assert!(!opts.enable_mdns);
-        assert!(opts.custom_relays.is_empty());
-        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::None);
+        assert!(!opts.enable_lan_discovery);
+        assert!(!opts.enable_dht);
     }
 
     #[cfg(feature = "direct")]
     #[test]
-    fn direct_default_is_serverless_dht() {
+    fn direct_default_is_n0_with_discovery() {
         let opts = ConnectivityOptions::direct_default(true);
-        assert_eq!(opts.profile, ConnectivityProfile::ServerlessDht);
+        assert_eq!(opts.relay, EffectiveRelayPolicy::N0);
         assert!(opts.enable_mdns);
+        assert!(opts.enable_dht);
+        assert!(opts.enable_lan_discovery);
+        assert!(relay_uses_n0_preset(&opts.relay));
     }
 
     #[cfg(feature = "direct")]
     #[test]
-    fn lan_only_builder_uses_minimal() {
+    fn disabled_plus_lan_discovery_is_valid() {
         let opts = ConnectivityOptions {
-            profile: ConnectivityProfile::LanOnly,
-            enable_mdns: false,
-            custom_relays: Vec::new(),
-            relay_fallback: ConnectivityRelayFallback::None,
+            relay: EffectiveRelayPolicy::Disabled,
+            enable_dht: false,
+            enable_mdns: true,
+            enable_lan_discovery: true,
         };
-        let _builder = endpoint_builder(&opts);
+        assert_eq!(opts.relay, EffectiveRelayPolicy::Disabled);
+        assert!(opts.enable_lan_discovery);
+        assert!(!relay_uses_n0_preset(&opts.relay));
+        let _builder = apply_connectivity(endpoint_builder(&opts), &opts);
     }
 
     #[cfg(feature = "direct")]
     #[test]
-    fn serverless_builder_uses_n0() {
-        let opts = ConnectivityOptions::direct_default(false);
-        let _builder = endpoint_builder(&opts);
-    }
-
-    #[cfg(any(feature = "direct", feature = "managed"))]
-    #[test]
-    fn custom_relays_builder_uses_custom_relay_map() {
-        // Non-empty custom_relays → Minimal preset + RelayMode::Custom(map)
-        // via apply_relay_mode (see endpoint_builder / apply_relay_mode).
-        let opts = ConnectivityOptions::managed_default().with_snapshot_relays(
-            vec![ConnectivityRelayConfig {
+    fn lan_discovery_independent_of_relay_mode() {
+        for relay in [
+            EffectiveRelayPolicy::N0,
+            EffectiveRelayPolicy::Disabled,
+            EffectiveRelayPolicy::Custom(vec![ConnectivityRelayConfig {
                 url: "https://relay.example.com".into(),
-                region: Some("us".into()),
-                auth_token: Some("tok".into()),
+                region: None,
+                auth_token: None,
                 metering: false,
-            }],
-            ConnectivityRelayFallback::None,
-        );
-        assert!(!opts.custom_relays.is_empty());
-        assert_eq!(opts.profile, ConnectivityProfile::TunnetManaged);
-        let _builder = endpoint_builder(&opts);
-        let map = relay_map_from_configs(&opts.custom_relays).expect("parse");
-        assert_eq!(map.len(), 1);
-        let urls: Vec<iroh::RelayUrl> = map.urls();
-        assert!(urls[0].as_str().contains("relay.example.com"));
+            }]),
+        ] {
+            let opts = ConnectivityOptions {
+                relay,
+                enable_dht: true,
+                enable_mdns: false,
+                enable_lan_discovery: true,
+            };
+            assert!(opts.enable_lan_discovery);
+            let _builder = endpoint_builder(&opts);
+        }
     }
 
     #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn custom_relays_with_auth_token_builds_map() {
+    fn custom_relays_builder_uses_custom_map() {
         let relays = vec![ConnectivityRelayConfig {
-            url: "https://relay.example.com./".into(),
-            region: None,
-            auth_token: Some("shared-secret".into()),
+            url: "https://relay.example.com".into(),
+            region: Some("us".into()),
+            auth_token: Some("tok".into()),
             metering: false,
         }];
-        let map = relay_map_from_configs(&relays).expect("parse");
+        let opts = ConnectivityOptions::managed_default()
+            .with_managed_snapshot(relays.clone(), ConnectivityRelayFallback::None)
+            .expect("snapshot");
+        assert!(!opts.relay.uses_n0_infrastructure());
+        let _builder = endpoint_builder(&opts);
+        let map = relay_map_from_configs(opts.relay.custom_relays()).expect("parse");
         assert_eq!(map.len(), 1);
     }
 
     #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn snapshot_none_stays_disabled() {
-        let opts = ConnectivityOptions::managed_default()
-            .with_snapshot_relays(vec![], ConnectivityRelayFallback::None);
-        assert!(opts.custom_relays.is_empty());
-        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::None);
-        assert!(matches!(
-            applied_relay_mode(&opts),
-            AppliedRelayMode::Disabled
-        ));
-        let _builder = endpoint_builder(&opts);
+    fn managed_snapshot_overrides_local_direct_settings() {
+        let local = ConnectivityOptions::direct_from_input(
+            &DirectRelayInput {
+                mode: DirectRelayMode::N0,
+                relay_urls: vec![],
+                credentials: Default::default(),
+            },
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(local.relay, EffectiveRelayPolicy::N0);
+
+        let from_snapshot = local
+            .with_managed_snapshot(vec![], ConnectivityRelayFallback::None)
+            .unwrap();
+        assert_eq!(from_snapshot.relay, EffectiveRelayPolicy::Disabled);
+
+        let custom = ConnectivityOptions::direct_default(true)
+            .with_managed_snapshot(
+                vec![ConnectivityRelayConfig {
+                    url: "https://org-relay.example.com".into(),
+                    region: None,
+                    auth_token: Some("managed-tok".into()),
+                    metering: true,
+                }],
+                ConnectivityRelayFallback::N0,
+            )
+            .unwrap();
+        match custom.relay {
+            EffectiveRelayPolicy::Custom(ref relays) => {
+                assert_eq!(relays[0].url, "https://org-relay.example.com");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!relay_uses_n0_preset(&custom.relay));
     }
 
     #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn snapshot_empty_n0_keeps_n0() {
+    fn snapshot_none_does_not_upgrade_to_n0() {
         let opts = ConnectivityOptions::managed_default()
-            .with_snapshot_relays(vec![], ConnectivityRelayFallback::N0);
-        assert!(opts.custom_relays.is_empty());
-        assert_eq!(opts.relay_fallback, ConnectivityRelayFallback::N0);
-        assert!(matches!(
-            applied_relay_mode(&opts),
-            AppliedRelayMode::PresetUnchanged
-        ));
+            .with_managed_snapshot(vec![], ConnectivityRelayFallback::None)
+            .unwrap();
+        assert_eq!(opts.relay, EffectiveRelayPolicy::Disabled);
+        assert_ne!(opts.relay, EffectiveRelayPolicy::N0);
         let _builder = endpoint_builder(&opts);
     }
 
-    #[cfg(any(feature = "direct", feature = "managed"))]
     #[test]
-    fn with_snapshot_relays_does_not_upgrade_none_to_n0() {
-        let before = ConnectivityRelayFallback::None;
-        let opts = ConnectivityOptions::managed_default().with_snapshot_relays(vec![], before);
-        assert_eq!(opts.relay_fallback, before);
-        assert_ne!(opts.relay_fallback, ConnectivityRelayFallback::N0);
+    fn auth_token_debug_is_redacted() {
+        let relay = ConnectivityRelayConfig {
+            url: "https://relay.example.com".into(),
+            region: None,
+            auth_token: Some("never-log-me".into()),
+            metering: false,
+        };
+        let rendered = format!("{relay:?}");
+        assert!(!rendered.contains("never-log-me"), "{rendered}");
+        let policy = EffectiveRelayPolicy::Custom(vec![relay]);
+        let rendered = format!("{policy:?}");
+        assert!(!rendered.contains("never-log-me"), "{rendered}");
+    }
+
+    #[test]
+    fn from_direct_config_disabled_keeps_lan_discovery() {
+        let mut cfg = crate::TunnetConfig::default();
+        cfg.network.relay_mode = DirectRelayMode::Disabled;
+        cfg.network.lan_discovery = Some(true);
+        cfg.network.mdns = Some(true);
+        let opts = ConnectivityOptions::direct_from_input(
+            &cfg.direct_relay_input(Default::default()),
+            cfg.effective_dht_default(),
+            cfg.effective_mdns_default(),
+            cfg.effective_lan_discovery_default(),
+        )
+        .unwrap();
+        assert_eq!(opts.relay, EffectiveRelayPolicy::Disabled);
+        assert!(opts.enable_lan_discovery);
+        assert!(opts.enable_mdns);
+        assert!(!relay_uses_n0_preset(&opts.relay));
     }
 }

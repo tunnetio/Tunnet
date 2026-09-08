@@ -27,11 +27,13 @@ pub fn persist_agent(
         );
     }
     let auth = secret_store::load_auth(paths).ok().flatten();
+    let relay_auth = secret_store::load_relay_auth(paths).unwrap_or_default();
 
     let secrets = AgentSecrets {
         identity_seed: identity.secret_bytes,
         networks,
         auth,
+        relay_auth,
     };
 
     state.save_public(paths)?;

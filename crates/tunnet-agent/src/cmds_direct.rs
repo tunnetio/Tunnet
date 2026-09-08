@@ -3,15 +3,15 @@ use std::collections::HashSet;
 use anyhow::Context;
 use clap::Args;
 use tunnet_core::direct::{
-    AddressPlan, ConnectivityOptions, ConnectivityProfile, GENESIS_SCHEMA_VERSION, Genesis,
-    JOIN_ALPN, JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant,
-    allocate_peer_ip, apply_connectivity, decode_and_preflight, endpoint_builder,
-    generate_coordinator_keypair, grant_expiry, network_id_from_topic, run_join_client,
-    sign_genesis, sign_grant, sign_member_record, topic_from_name_secret, validate_peer_cidr,
-    verify_admission,
+    AddressPlan, ConnectivityOptions, GENESIS_SCHEMA_VERSION, Genesis, JOIN_ALPN, JoinStatus,
+    MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant, allocate_peer_ip,
+    apply_connectivity, decode_and_preflight, endpoint_builder, generate_coordinator_keypair,
+    grant_expiry, network_id_from_topic, run_join_client, sign_genesis, sign_grant,
+    sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
 };
 use tunnet_core::{
-    AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, load_agent, persist_agent,
+    AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, TunnetConfig, load_agent,
+    persist_agent,
 };
 
 #[derive(Args, Debug)]
@@ -315,12 +315,17 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
 
     let my_id = identity.endpoint_id_hex();
     let secret = iroh::SecretKey::from_bytes(&identity.secret_bytes);
-    let connectivity = ConnectivityOptions {
-        profile: ConnectivityProfile::ServerlessDht,
-        enable_mdns: false,
-        custom_relays: Vec::new(),
-        relay_fallback: tunnet_common::ConnectivityRelayFallback::N0,
-    };
+    let agent_cfg = TunnetConfig::try_load(&paths)?.unwrap_or_default();
+    if let Err(errs) = agent_cfg.validate() {
+        anyhow::bail!("invalid tunnet.toml: {}", errs.join("; "));
+    }
+    let credentials = tunnet_core::secret_store::load_relay_auth(&paths).unwrap_or_default();
+    let connectivity = ConnectivityOptions::from_direct_config(&agent_cfg, credentials, None, None)
+        .context("resolve Direct relay policy")?;
+    tracing::info!(
+        relay = connectivity.relay.kind(),
+        "join using Direct relay policy"
+    );
     let endpoint = apply_connectivity(
         endpoint_builder(&connectivity)
             .secret_key(secret)

@@ -63,6 +63,9 @@ format = "text"
 [network]
 mdns = false
 # lan-discovery = false
+# dht = true
+# relay-mode = "auto"
+# relay-urls = ["https://relay.example.com"]
 # tunnel-mtu = 1280
 # service-relay = true
 
@@ -108,7 +111,7 @@ One block per Direct network. Keyed by network name.
 #### Firewall (`[direct.<name>.firewall]`)
 
 | Key | Description |
-|-----|-------------|
+| ----- | ------------- |
 | `enabled` | Local firewall engine (default `true`) |
 | `version` | Policy version |
 | `rules` | Array of rule objects |
@@ -116,7 +119,7 @@ One block per Direct network. Keyed by network name.
 Each rule:
 
 | Field | Values |
-|-------|--------|
+| ------- | -------- |
 | `direction` | `in` or `out` |
 | `protocol` | `tcp`, `udp`, `icmp`, or `any` |
 | `action` | `allow`, `deny`, or `reject` |
@@ -128,7 +131,7 @@ You can also manage rules with `tunnet firewall`. Edits to TOML take effect afte
 #### DNS (`[direct.<name>.dns]`)
 
 | Key | Default | Description |
-|-----|---------|-------------|
+| ----- | --------- | ------------- |
 | `magic-ip` | `the gateway peer address | PeerDNS listener address on the TUN |
 | `tld` | `tunnet` | DNS suffix for peer hostnames |
 | `upstream` | `1.1.1.1`, `8.8.8.8` | Forwarders for non-mesh queries |
@@ -151,9 +154,12 @@ You can also manage rules with `tunnet firewall`. Edits to TOML take effect afte
 Only keys you set override org remote policy. Omitted keys inherit remote / defaults.
 
 | Key | Default | Description |
-|-----|---------|-------------|
+| ----- | --------- | ------------- |
 | `mdns` | `true` | LAN mDNS address discovery |
 | `lan-discovery` | `true` | LAN peer discovery |
+| `dht` | `true` | Direct Mainline DHT address lookup |
+| `relay-mode` | `auto` | Direct only: `auto`, `n0`, `custom`, or `disabled`. (Managed ignores this and uses the control-plane snapshot) |
+| `relay-urls` | `[]` | Public custom relay URLs for Direct `auto` / `custom`. (Auth tokens are not stored here) |
 | `tunnel-mtu` | `1280` | Preferred tunnel MTU |
 | `service-relay` | `false` | Relay LAN DNS-SD services across the mesh |
 
@@ -162,7 +168,7 @@ Only keys you set override org remote policy. Omitted keys inherit remote / defa
 Automatic binary updates from GitHub Releases. See [tunnet update](/cli/update).
 
 | Key | Default | Description |
-|-----|---------|-------------|
+| ----- | --------- | ------------- |
 | `enabled` | inherit / `false` | When set, overrides org auto-update |
 | `check-interval-hours` | inherit / `6` | When set, overrides org poll interval |
 | `health-window-secs` | `30` | Local-only: revert if new binary is unstable |

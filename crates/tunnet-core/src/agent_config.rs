@@ -13,6 +13,7 @@ use crate::direct::contact::parse_contact_id;
 use crate::direct::firewall::{
     FirewallAction, FirewallConfig, FirewallDirection, FirewallRule, PeerFilter, default_firewall,
 };
+use crate::direct::{DirectRelayInput, DirectRelayMode};
 use crate::state::{PersistedState, StatePaths};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -178,6 +179,19 @@ pub struct NetworkSection {
         rename = "service-relay"
     )]
     pub service_relay: Option<bool>,
+    /// Direct-only relay policy. Ignored in Managed mode (control plane wins).
+    #[serde(
+        default,
+        rename = "relay-mode",
+        skip_serializing_if = "relay_mode_is_auto"
+    )]
+    pub relay_mode: DirectRelayMode,
+    /// Public custom relay URLs for Direct `auto` / `custom`. Tokens live in `state.enc`.
+    #[serde(default, rename = "relay-urls", skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<String>,
+    /// Direct Mainline DHT address lookup. Default true when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dht: Option<bool>,
 }
 
 /// Automatic binary updates - dual with org remote policy.
@@ -253,6 +267,10 @@ fn default_log_level() -> String {
 }
 fn default_log_format() -> String {
     "text".into()
+}
+
+fn relay_mode_is_auto(mode: &DirectRelayMode) -> bool {
+    *mode == DirectRelayMode::Auto
 }
 
 impl TunnetConfig {
@@ -443,6 +461,30 @@ impl TunnetConfig {
             errs.push("network.tunnel-mtu: must be 576-9000".into());
         }
 
+        if self.network.relay_mode == DirectRelayMode::Custom
+            && self
+                .network
+                .relay_urls
+                .iter()
+                .map(|u| u.trim())
+                .filter(|u| !u.is_empty())
+                .count()
+                == 0
+        {
+            errs.push(
+                "network.relay-mode = custom requires at least one network.relay-urls entry".into(),
+            );
+        }
+        for (i, url) in self.network.relay_urls.iter().enumerate() {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            if url.parse::<iroh::RelayUrl>().is_err() {
+                errs.push(format!("network.relay-urls[{i}]: invalid relay URL {url}"));
+            }
+        }
+
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 
@@ -473,6 +515,30 @@ impl TunnetConfig {
 
     pub fn effective_service_relay(&self) -> bool {
         self.network.service_relay.unwrap_or(false)
+    }
+
+    pub fn effective_dht_default(&self) -> bool {
+        self.network.dht.unwrap_or(true)
+    }
+
+    pub fn effective_lan_discovery_default(&self) -> bool {
+        self.network.lan_discovery.unwrap_or(true)
+    }
+
+    /// True when local TOML sets Direct relay knobs that Managed must ignore.
+    pub fn has_local_direct_relay_settings(&self) -> bool {
+        self.network.relay_mode != DirectRelayMode::Auto || !self.network.relay_urls.is_empty()
+    }
+
+    pub fn direct_relay_input(
+        &self,
+        credentials: std::collections::BTreeMap<String, String>,
+    ) -> DirectRelayInput {
+        DirectRelayInput {
+            mode: self.network.relay_mode,
+            relay_urls: self.network.relay_urls.clone(),
+            credentials,
+        }
     }
 }
 
@@ -790,5 +856,46 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_direct_relay_settings() {
+        let cfg: TunnetConfig = parse_toml(
+            r#"
+[network]
+relay-mode = "custom"
+relay-urls = ["https://relay.example.com"]
+lan-discovery = true
+mdns = true
+dht = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.network.relay_mode, DirectRelayMode::Custom);
+        assert_eq!(cfg.network.relay_urls, vec!["https://relay.example.com"]);
+        assert_eq!(cfg.network.lan_discovery, Some(true));
+        assert!(cfg.validate().is_ok());
+        let dumped = toml::to_string(&cfg).unwrap();
+        assert!(!dumped.contains("auth"));
+        assert!(!dumped.contains("token"));
+    }
+
+    #[test]
+    fn custom_relay_mode_without_urls_fails_validate() {
+        let cfg: TunnetConfig = parse_toml(
+            r#"
+[network]
+relay-mode = "custom"
+"#,
+        )
+        .unwrap();
+        let errs = cfg.validate().unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("relay-mode = custom")));
+    }
+
+    #[test]
+    fn omitted_relay_mode_is_auto() {
+        let cfg: TunnetConfig = parse_toml("[network]\nmdns = true\n").unwrap();
+        assert_eq!(cfg.network.relay_mode, DirectRelayMode::Auto);
     }
 }

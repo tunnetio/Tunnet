@@ -34,6 +34,7 @@ pub mod membership;
 pub mod policy_docs;
 #[cfg(feature = "direct")]
 pub mod presence;
+pub mod relay_policy;
 
 pub use addrplan::{
     AddressPlan, AddressPlanError, ConflictCategory, NetworkConflict, allocate_peer_ip,
@@ -53,8 +54,8 @@ pub use auth::{
 pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub use connectivity::{
-    ConnectivityOptions, ConnectivityProfile, apply_connectivity, endpoint_builder,
-    relay_map_from_configs,
+    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_map_from_configs,
+    relay_uses_n0_preset,
 };
 pub use contact::{contact_id_from_endpoint, contact_id_from_hex, is_contact_id, parse_contact_id};
 #[cfg(feature = "direct")]
@@ -93,6 +94,10 @@ pub use policy_docs::{
 pub use presence::{
     PRESENCE_PUBLISH_INTERVAL, PRESENCE_TTL, PresenceBeacon, PresenceConfig, PresenceHandle,
     PresenceTable, build_beacon, sign_beacon, spawn_presence, verify_beacon,
+};
+pub use relay_policy::{
+    DirectRelayInput, DirectRelayMode, EffectiveRelayPolicy, RelayResolveError,
+    resolve_direct_relay_policy, resolve_managed_relay_policy,
 };
 
 /// ALPNs used by Direct membership (iroh-docs + its gossip transport).

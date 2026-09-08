@@ -363,7 +363,7 @@ pub struct NetworkMembershipSnapshot {
 }
 
 /// Connectivity relay entry pushed to agents (mesh DERP / hybrid).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectivityRelayConfig {
     pub url: String,
@@ -373,6 +373,20 @@ pub struct ConnectivityRelayConfig {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub metering: bool,
+}
+
+impl std::fmt::Debug for ConnectivityRelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectivityRelayConfig")
+            .field("url", &self.url)
+            .field("region", &self.region)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("metering", &self.metering)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

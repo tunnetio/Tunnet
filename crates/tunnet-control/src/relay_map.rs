@@ -239,7 +239,7 @@ mod tests {
             connectivity_relay_fallback_for(
                 LicenseTier::Cloud,
                 DeploymentRelayMode::Custom,
-                &[relay.clone()]
+                std::slice::from_ref(&relay)
             ),
             ConnectivityRelayFallback::None
         );
@@ -247,7 +247,7 @@ mod tests {
             connectivity_relay_fallback_for(
                 LicenseTier::Enterprise,
                 DeploymentRelayMode::Custom,
-                &[relay]
+                std::slice::from_ref(&relay)
             ),
             ConnectivityRelayFallback::None
         );

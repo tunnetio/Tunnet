@@ -36,6 +36,10 @@ pub struct RunArgs {
     pub recorder: bool,
     #[arg(long, env = "TUNNET_NO_MDNS")]
     pub no_mdns: bool,
+    #[arg(long, env = "TUNNET_RELAY_MODE")]
+    pub relay_mode: Option<String>,
+    #[arg(long, env = "TUNNET_RELAY_URLS")]
+    pub relay_urls: Option<String>,
     #[arg(long, env = "TUNNET_KEEP_ALIVE")]
     pub keep_alive: bool,
     #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]

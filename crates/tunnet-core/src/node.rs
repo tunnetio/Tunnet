@@ -383,17 +383,15 @@ impl CoreNode {
         );
 
         let secret = SecretKey::from_bytes(&identity.secret_bytes);
-        let connectivity = if matches!(
-            cfg.connectivity.profile,
-            crate::direct::ConnectivityProfile::TunnetManaged
-        ) {
-            cfg.connectivity.clone().with_snapshot_relays(
+        let connectivity = cfg
+            .connectivity
+            .clone()
+            .with_managed_snapshot(
                 snapshot.connectivity_relays.clone(),
                 snapshot.connectivity_relay_fallback,
             )
-        } else {
-            cfg.connectivity.clone()
-        };
+            .context("resolve managed relay policy from control-plane snapshot")?;
+        tracing::info!(relay = connectivity.relay.kind(), "managed relay policy");
         let builder = endpoint_builder(&connectivity)
             .secret_key(secret)
             .alpns(alpns)
