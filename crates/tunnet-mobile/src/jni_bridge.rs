@@ -81,6 +81,21 @@ struct JvmTunProvider {
     service: GlobalRef,
 }
 
+/// Build a `String[]` for the JVM from any iterator of owned strings.
+fn string_array<'a>(
+    env: &mut JNIEnv<'a>,
+    items: impl ExactSizeIterator<Item = String>,
+) -> Result<jni::objects::JObjectArray<'a>> {
+    let len = i32::try_from(items.len()).context("too many elements for a JVM array")?;
+    let empty = env.new_string("")?;
+    let array = env.new_object_array(len, "java/lang/String", &empty)?;
+    for (index, item) in items.enumerate() {
+        let value = env.new_string(&item)?;
+        env.set_object_array_element(&array, index as i32, &value)?;
+    }
+    Ok(array)
+}
+
 impl TunProvider for JvmTunProvider {
     fn establish(&self, request: TunRequest) -> Result<OwnedFd> {
         // The data plane establishes from a tokio worker thread, which the JVM
@@ -90,18 +105,26 @@ impl TunProvider for JvmTunProvider {
             .attach_current_thread()
             .context("attach data-plane thread to the JVM")?;
 
-        let ipv4 = env
-            .new_string(request.ipv4.to_string())
-            .context("marshal tunnel address")?;
+        // Addresses, routes and resolvers cross as string arrays in canonical
+        // text form (`10.9.0.2`, `10.9.0.0/24`). Parsing on the Kotlin side
+        // keeps the JNI signature stable as the lists grow, and avoids
+        // encoding an address family into ints.
+        let addrs = string_array(&mut env, request.addrs.iter().map(|a| a.to_string()))
+            .context("marshal tunnel addresses")?;
+        let routes = string_array(&mut env, request.routes.iter().map(|r| r.to_string()))
+            .context("marshal tunnel routes")?;
+        let dns = string_array(&mut env, request.dns.iter().map(|d| d.to_string()))
+            .context("marshal tunnel resolvers")?;
 
         let fd = env
             .call_method(
                 &self.service,
                 "establishTun",
-                "(Ljava/lang/String;II)I",
+                "([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;I)I",
                 &[
-                    (&ipv4).into(),
-                    jni::objects::JValue::Int(i32::from(request.prefix)),
+                    (&addrs).into(),
+                    (&routes).into(),
+                    (&dns).into(),
                     jni::objects::JValue::Int(i32::from(request.mtu)),
                 ],
             )

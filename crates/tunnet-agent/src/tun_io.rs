@@ -26,34 +26,34 @@ use crate::ssh_nat;
 /// and addressing is applied by `VpnService.Builder`, so those parameters are
 /// forwarded to the app rather than applied here.
 ///
-/// Only a single local address is supported: the JNI `TunRequest` carries one
-/// address, and the extra `/32`s that `build_tun_multi` adds to the device on
-/// other platforms would have to be applied by the JVM side instead. Refuse
-/// rather than silently establishing a tunnel that is missing addresses.
+/// `routes` matters here in a way it does not on other platforms. Desktop
+/// installs per-peer routes into the kernel table itself, but on Android the
+/// framework owns routing and accepts it only at `establish()` time, so the
+/// destinations to capture must be declared up front.
 #[cfg(target_os = "android")]
 pub fn build_tun_multi(
     ifname: &str,
     addrs: &[std::net::Ipv4Addr],
-    prefix: u8,
+    routes: &[ipnet::Ipv4Net],
+    _prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {
     use std::os::fd::IntoRawFd;
 
     use crate::android_tun::{self, TunRequest};
 
-    let (ipv4, extra) = addrs
-        .split_first()
-        .context("at least one local address required")?;
+    anyhow::ensure!(!addrs.is_empty(), "at least one local address required");
     anyhow::ensure!(
-        extra.is_empty(),
-        "Android supports one TUN address, got {}: extend TunRequest and the \
-         VpnService builder before enabling multi-address networks",
-        addrs.len()
+        !routes.is_empty(),
+        "at least one route required: without one the tunnel captures nothing"
     );
 
     let fd = android_tun::establish(TunRequest {
-        ipv4: *ipv4,
-        prefix,
+        addrs: addrs.to_vec(),
+        routes: routes.to_vec(),
+        // PeerDNS binds host loopback, which Android cannot use as a tunnel
+        // resolver. Left empty deliberately; see TunRequest::dns.
+        dns: Vec::new(),
         mtu,
     })?;
     // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
@@ -64,10 +64,13 @@ pub fn build_tun_multi(
     Ok(dev)
 }
 
+/// `routes` is unused here: desktop platforms install peer routes into the
+/// kernel routing table separately, rather than declaring them on the device.
 #[cfg(not(target_os = "android"))]
 pub fn build_tun_multi(
     ifname: &str,
     addrs: &[std::net::Ipv4Addr],
+    _routes: &[ipnet::Ipv4Net],
     prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {

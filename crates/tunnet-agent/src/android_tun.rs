@@ -21,15 +21,32 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
+use ipnet::Ipv4Net;
 
 /// What the app must configure on `VpnService.Builder` before `establish()`.
-#[derive(Debug, Clone, Copy)]
+///
+/// Addresses and routes are separate lists because they are separate facts.
+/// A node holds one `/32` per Direct network it belongs to, while the traffic
+/// that must enter the tunnel is each network's whole peer range. Deriving one
+/// from the other is what broke when addressing moved to exact `/32`s: a route
+/// computed from the address prefix is a host route to the node itself, so no
+/// peer traffic is captured and the tunnel silently carries nothing.
+#[derive(Debug, Clone)]
 pub struct TunRequest {
-    /// Mesh address for this node, from `VpnService.Builder.addAddress`.
-    pub ipv4: Ipv4Addr,
-    /// Prefix length of the mesh CIDR. Direct mode uses /10, so the app should
-    /// route the truncated network (`10.0.0.0/10`), not a host route.
-    pub prefix: u8,
+    /// Mesh addresses for this node, one per joined network, each applied with
+    /// `VpnService.Builder.addAddress(addr, 32)`.
+    pub addrs: Vec<Ipv4Addr>,
+    /// Destinations to capture, from `VpnService.Builder.addRoute`. These are
+    /// the joined networks' peer ranges, not anything derived from `addrs`.
+    pub routes: Vec<Ipv4Net>,
+    /// Resolvers to advertise, from `VpnService.Builder.addDnsServer`.
+    ///
+    /// Only addresses reachable *through the tunnel* belong here. The agent's
+    /// PeerDNS binds host loopback, which is useless to Android: `netd`
+    /// resolves on behalf of each app, so `127.0.0.1` would name that app
+    /// rather than the agent. Until PeerDNS answers on an in-tunnel address
+    /// this stays empty and the phone resolves names outside the mesh.
+    pub dns: Vec<Ipv4Addr>,
     /// Tunnel MTU, from `VpnService.Builder.setMtu`.
     pub mtu: u16,
 }
@@ -61,15 +78,14 @@ pub fn establish(request: TunRequest) -> anyhow::Result<OwnedFd> {
     let Some(provider) = PROVIDER.load_full() else {
         bail!("no TunProvider installed; the VpnService must register one before starting");
     };
+    let summary = format!(
+        "addrs={:?} routes={:?} dns={:?} mtu={}",
+        request.addrs, request.routes, request.dns, request.mtu
+    );
     let fd = provider
         .establish(request)
         .context("VpnService.Builder.establish() failed")?;
-    tracing::info!(
-        ipv4 = %request.ipv4,
-        prefix = request.prefix,
-        mtu = request.mtu,
-        "TUN established by VpnService"
-    );
+    tracing::info!(%summary, "TUN established by VpnService");
     Ok(fd)
 }
 
@@ -101,8 +117,9 @@ mod tests {
 
     fn request() -> TunRequest {
         TunRequest {
-            ipv4: Ipv4Addr::new(10, 1, 2, 3),
-            prefix: 10,
+            addrs: vec![Ipv4Addr::new(10, 1, 2, 3)],
+            routes: vec!["10.1.0.0/16".parse().unwrap()],
+            dns: Vec::new(),
             mtu: 1280,
         }
     }

@@ -235,18 +235,52 @@ class TunnetVpnService : VpnService() {
      * consent was never granted or was revoked); the agent surfaces that as a
      * start failure rather than retrying blindly.
      */
-    fun establishTun(ipv4: String, prefix: Int, mtu: Int): Int {
+    fun establishTun(
+        addrs: Array<String>,
+        routes: Array<String>,
+        dns: Array<String>,
+        mtu: Int,
+    ): Int {
         return try {
+            if (addrs.isEmpty()) {
+                Log.e(TAG, "no tunnel address supplied")
+                return -1
+            }
+            if (routes.isEmpty()) {
+                // Establishing anyway would produce a tunnel that captures no
+                // traffic: connected in the UI, silently carrying nothing.
+                Log.e(TAG, "no routes supplied; refusing to establish a tunnel that captures nothing")
+                return -1
+            }
+
             val builder = Builder()
                 .setSession(getString(R.string.app_name))
-                .addAddress(ipv4, prefix)
-                // Route the mesh CIDR, not the host address: `prefix` describes
-                // the whole mesh (Direct mode uses a /10), so the route must be
-                // the truncated network or peers are unreachable.
-                .addRoute(networkAddress(ipv4, prefix), prefix)
                 .setMtu(mtu)
                 // tun-rs drives the descriptor with non-blocking async I/O.
                 .setBlocking(false)
+
+            // One /32 per joined network. The agent owns exactly these
+            // addresses; anything wider would claim addresses belonging to
+            // peers and blackhole them locally.
+            for (addr in addrs) {
+                builder.addAddress(addr, 32)
+            }
+
+            // Routes are supplied, never derived from the addresses. Each is a
+            // network's peer range in CIDR form, which is the traffic that must
+            // enter the tunnel. Deriving a route from a /32 address yields a
+            // host route to ourselves, so no peer traffic would be captured.
+            for (route in routes) {
+                val (network, prefix) = parseCidr(route) ?: run {
+                    Log.e(TAG, "ignoring unparseable route: $route")
+                    null
+                } ?: continue
+                builder.addRoute(network, prefix)
+            }
+
+            for (server in dns) {
+                builder.addDnsServer(server)
+            }
 
             // Keep our OWN sockets out of the tunnel. They carry the encrypted
             // mesh traffic, so routing them into it would loop: encrypt, into
@@ -271,7 +305,11 @@ class TunnetVpnService : VpnService() {
                 Log.e(TAG, "establish() returned null; VPN consent missing or revoked")
                 return -1
             }
-            Log.i(TAG, "tunnel established: $ipv4/$prefix mtu=$mtu")
+            Log.i(
+                TAG,
+                "tunnel established: addrs=${addrs.joinToString()} " +
+                    "routes=${routes.joinToString()} dns=${dns.joinToString()} mtu=$mtu",
+            )
             pfd.detachFd()
         } catch (e: Exception) {
             Log.e(TAG, "establishTun failed", e)
@@ -280,20 +318,26 @@ class TunnetVpnService : VpnService() {
     }
 
     /**
-     * The network base address of `ipv4/prefix` (10.9.8.7/10 -> 10.0.0.0).
+     * Split `10.9.0.0/24` into its network address and prefix.
      *
-     * `addRoute` rejects an address with host bits set, so the host address the
-     * agent assigned cannot be passed through unchanged.
+     * `addRoute` rejects an address with host bits set, so the network address
+     * is masked here rather than trusted: a range whose text form carries host
+     * bits would otherwise throw at establish() time.
      */
-    private fun networkAddress(ipv4: String, prefix: Int): String {
-        val octets = ipv4.split(".").map { it.toInt() }
-        require(octets.size == 4) { "not an IPv4 address: $ipv4" }
+    private fun parseCidr(cidr: String): Pair<String, Int>? {
+        val parts = cidr.split("/")
+        if (parts.size != 2) return null
+        val prefix = parts[1].toIntOrNull() ?: return null
+        if (prefix !in 0..32) return null
+        val octets = parts[0].split(".").mapNotNull { it.toIntOrNull() }
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return null
         val value = (octets[0] shl 24) or (octets[1] shl 16) or (octets[2] shl 8) or octets[3]
         // `shl 32` is undefined on Int (it shifts by 0), so /0 is special-cased.
         val mask = if (prefix == 0) 0 else (-1 shl (32 - prefix))
         val network = value and mask
-        return "${(network ushr 24) and 0xFF}.${(network ushr 16) and 0xFF}." +
+        val text = "${(network ushr 24) and 0xFF}.${(network ushr 16) and 0xFF}." +
             "${(network ushr 8) and 0xFF}.${network and 0xFF}"
+        return text to prefix
     }
 
     /** The user revoked our VPN permission, or another VPN replaced us. */

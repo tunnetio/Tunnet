@@ -180,21 +180,28 @@ pub async fn run(
         }
     }
 
-    let (local_addrs, mtu, dns_cfg) = if is_direct {
+    let (local_addrs, peer_cidrs, mtu, dns_cfg) = if is_direct {
         let _ = tunnet_core::TunnetConfig::ensure(&node.paths);
         let mut active: Vec<_> = node
             .direct
             .iter()
-            .map(|(network_id, runtime)| (*network_id, runtime.state.self_record.ipv4))
+            .map(|(network_id, runtime)| {
+                (
+                    *network_id,
+                    runtime.state.self_record.ipv4,
+                    runtime.state.genesis.address_plan.peer_cidr,
+                )
+            })
             .collect();
-        active.sort_by_key(|(network_id, _)| *network_id);
-        let addrs: Vec<_> = active.into_iter().map(|(_, address)| address).collect();
+        active.sort_by_key(|(network_id, _, _)| *network_id);
+        let cidrs: Vec<_> = active.iter().map(|(_, _, cidr)| *cidr).collect();
+        let addrs: Vec<_> = active.into_iter().map(|(_, address, _)| address).collect();
         let addrs = if addrs.is_empty() {
             vec![node.self_ipv4]
         } else {
             addrs
         };
-        (addrs, 1280u16, tunnet_core::load_dns(&node.paths))
+        (addrs, cidrs, 1280u16, tunnet_core::load_dns(&node.paths))
     } else {
         let membership_snap = tunnet_core::state::load_snapshot_cache(&node.paths)
             .and_then(|s| {
@@ -204,14 +211,21 @@ pub async fn run(
             })
             .context("cached snapshot missing enrolled network")?;
         let effective_mtu = config_store.load().effective.tunnel_mtu.value.max(576);
-        (vec![membership_snap.assigned_ipv4], effective_mtu, {
-            let mut dns = membership_snap.dns.clone();
-            let eff = config_store.load();
-            dns.suffix = eff.effective.dns_suffix.value.clone();
-            dns.upstream = eff.effective.dns_upstream.value.clone();
-            dns.dnssec = eff.effective.dnssec.value;
-            dns
-        })
+        // Managed enrolment has no Direct address plan; peer reachability is
+        // driven by the coordinator's routes rather than a declared range.
+        (
+            vec![membership_snap.assigned_ipv4],
+            Vec::new(),
+            effective_mtu,
+            {
+                let mut dns = membership_snap.dns.clone();
+                let eff = config_store.load();
+                dns.suffix = eff.effective.dns_suffix.value.clone();
+                dns.upstream = eff.effective.dns_upstream.value.clone();
+                dns.dnssec = eff.effective.dnssec.value;
+                dns
+            },
+        )
     };
 
     // One long-lived osdns manager for the agent lifetime. Owned by the
@@ -241,6 +255,7 @@ pub async fn run(
     let dataplane_cfg = DataPlaneActorConfig {
         ifname: args.ifname.clone(),
         local_addrs,
+        peer_cidrs,
         mtu,
         dns_cfg: dns_cfg.clone(),
         dns: dns_controller.clone(),

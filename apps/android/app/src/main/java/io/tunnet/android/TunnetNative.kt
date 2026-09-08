@@ -33,7 +33,8 @@ object TunnetNative {
     /**
      * Start the agent against [stateDir], reporting itself as [deviceName].
      *
-     * [vpnService] must expose `int establishTun(String ipv4, int prefix, int mtu)`:
+     * [vpnService] must expose
+     * `int establishTun(String[] addrs, String[] routes, String[] dns, int mtu)`:
      * the agent calls back into it whenever the data plane needs a tunnel, since
      * only the framework can open one. Registered before startup because the
      * agent establishes during startup when a network is already joined.

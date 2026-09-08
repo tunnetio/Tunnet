@@ -640,6 +640,7 @@ mod tests {
                 dataplane_config: DataPlaneActorConfig {
                     ifname: "tunnet-test-down".into(),
                     local_addrs: vec!["10.9.0.1".parse().unwrap()],
+                    peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],
                     mtu: 1280,
                     dns_cfg: tunnet_common::DnsConfig::default(),
                     dns: None,
