@@ -79,19 +79,6 @@ impl ControlClient {
         self.metering_enabled.load(Ordering::Relaxed)
     }
 
-    /// Record bytes for an organization (no-op unless cloud deployment metering is on).
-    ///
-    /// Not used by the iroh-relay data plane today (encrypted frames have no org id).
-    /// Agents report `CloudRelayUsage` instead; this remains for optional ops hooks.
-    #[allow(dead_code)]
-    pub fn record_org_bytes(&self, organization_id: &str, bytes: u64) {
-        if !self.metering_enabled() || bytes == 0 || organization_id.is_empty() {
-            return;
-        }
-        let mut guard = self.pending.lock().expect("usage meter poisoned");
-        *guard.entry(organization_id.to_string()).or_insert(0) += bytes;
-    }
-
     pub async fn register(
         &self,
         url: &str,

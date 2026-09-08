@@ -205,7 +205,6 @@ async fn run_serve(args: Args) -> anyhow::Result<()> {
         policy_key,
         service_auth,
         audit,
-        entitlements,
     ));
 
     let database_url = args.database_url.expose_secret().to_string();

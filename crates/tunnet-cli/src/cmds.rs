@@ -94,13 +94,9 @@ pub struct NetcheckArgs {
     pub state_dir: Option<String>,
 }
 
-async fn client(_state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
-    Ok(TunnetClient::connect())
-}
-
 /// Connect to the Local API, or return a clear "daemon not running" error.
-pub async fn ipc_or_err(state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
-    let client = client(state_dir).await?;
+pub async fn ipc_or_err(_state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
+    let client = TunnetClient::connect();
     if !tunnet_client::endpoint_reachable(client.path()).await {
         anyhow::bail!("{}", format_api_error(&ApiErrorCode::DaemonNotRunning, ""));
     }
@@ -136,7 +132,7 @@ pub async fn ensure_daemon_running(
     state_dir: Option<&str>,
     purpose: &str,
 ) -> anyhow::Result<TunnetClient> {
-    let client = client(state_dir).await?;
+    let client = TunnetClient::connect();
     if tunnet_client::endpoint_reachable(client.path()).await {
         return Ok(client);
     }
@@ -1330,12 +1326,6 @@ fn fmt_bytes(n: u64) -> String {
     } else {
         format!("{n}B")
     }
-}
-
-/// Shared helper kept for future serve/tunnel CLI modules.
-#[allow(dead_code)]
-pub async fn ensure_agent(state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
-    ipc_or_err(state_dir).await
 }
 
 pub async fn run_up(state_dir: Option<&str>) -> anyhow::Result<()> {

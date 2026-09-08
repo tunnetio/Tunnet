@@ -104,16 +104,12 @@ pub async fn run_ssh(args: SshArgs) -> anyhow::Result<()> {
     }
 }
 
-async fn api_client(state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
-    crate::cmds::ipc_or_err(state_dir).await
-}
-
 async fn run_sessions(
     limit: u32,
     status: Option<String>,
     state_dir: Option<String>,
 ) -> anyhow::Result<()> {
-    let client = api_client(state_dir.as_deref()).await?;
+    let client = crate::cmds::ipc_or_err(state_dir.as_deref()).await?;
     let resp = client.ssh_sessions(limit, status.as_deref()).await?;
     let sessions = resp.sessions;
     if sessions.is_empty() {
@@ -140,7 +136,7 @@ async fn run_sessions(
 }
 
 async fn run_recordings(limit: u32, state_dir: Option<String>) -> anyhow::Result<()> {
-    let client = api_client(state_dir.as_deref()).await?;
+    let client = crate::cmds::ipc_or_err(state_dir.as_deref()).await?;
     let resp = client.ssh_recordings(limit).await?;
     let recordings = resp.recordings;
     if recordings.is_empty() {
@@ -163,7 +159,7 @@ async fn run_recordings(limit: u32, state_dir: Option<String>) -> anyhow::Result
 }
 
 async fn run_play(session_id: String, state_dir: Option<String>) -> anyhow::Result<()> {
-    let client = api_client(state_dir.as_deref()).await?;
+    let client = crate::cmds::ipc_or_err(state_dir.as_deref()).await?;
     let resp = client.ssh_cast(&session_id).await?;
     let cast = resp.cast_text;
     play_cast(&cast).await
@@ -530,7 +526,7 @@ async fn resolve_host(target: &str) -> Option<String> {
     if target.parse::<std::net::Ipv4Addr>().is_ok() {
         return Some(target.to_string());
     }
-    let client = api_client(None).await.ok()?;
+    let client = crate::cmds::ipc_or_err(None).await.ok()?;
     let peers = all_peers(&client).await.ok()?;
     let needle = target.trim_end_matches(".tunnet");
     for peer in peers {
@@ -564,7 +560,7 @@ fn local_username() -> String {
 
 pub async fn run_ssh_keyscan(args: SshKeyscanArgs) -> anyhow::Result<()> {
     let paths = StatePaths::resolve(args.state_dir.as_deref());
-    let client = api_client(args.state_dir.as_deref()).await?;
+    let client = crate::cmds::ipc_or_err(args.state_dir.as_deref()).await?;
     let peers = all_peers(&client).await?;
     let suffix = "tunnet".to_string();
 

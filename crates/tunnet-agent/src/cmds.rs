@@ -3,13 +3,9 @@
 use anyhow::Context;
 use tunnet_client::{ApiErrorCode, TunnetClient, format_api_error};
 
-async fn client(_state_dir: Option<&str>) -> anyhow::Result<TunnetClient> {
-    Ok(TunnetClient::connect())
-}
-
 /// Connect to the Local API, or return a clear "daemon not running" error.
-pub async fn ipc_or_err(state_dir: Option<&str>) -> anyhow::Result<()> {
-    let client = client(state_dir).await?;
+pub async fn ipc_or_err(_state_dir: Option<&str>) -> anyhow::Result<()> {
+    let client = TunnetClient::connect();
     if !tunnet_client::endpoint_reachable(client.path()).await {
         anyhow::bail!("{}", format_api_error(&ApiErrorCode::DaemonNotRunning, ""));
     }

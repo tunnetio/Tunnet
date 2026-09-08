@@ -7,7 +7,7 @@
 mod client;
 mod transport;
 
-pub use client::{LocalApiClient, TunnetClient};
+pub use client::TunnetClient;
 pub use transport::{default_api_path, endpoint_reachable};
 
 pub use tunnet_common::local_api::{

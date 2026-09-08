@@ -8,7 +8,7 @@ use anyhow::{Context, bail};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use parking_lot::Mutex;
@@ -210,15 +210,4 @@ async fn replay_request(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(new_id) => Json(ReplayResult { id: new_id }).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
-}
-
-/// Helper so CORS is not needed for same-origin; kept for completeness.
-#[allow(dead_code)]
-fn json_headers() -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    h
 }

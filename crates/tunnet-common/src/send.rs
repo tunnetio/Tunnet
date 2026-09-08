@@ -149,6 +149,8 @@ pub struct DirectoryEntry {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -175,27 +177,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn consent_parse() {
-        assert_eq!(
-            SendConsentMode::parse("auto_accept"),
-            Some(SendConsentMode::AutoAccept)
-        );
-        assert_eq!(
-            SendConsentMode::parse("prompt"),
-            Some(SendConsentMode::Prompt)
-        );
-        assert_eq!(SendConsentMode::parse("deny"), Some(SendConsentMode::Deny));
-        assert_eq!(SendConsentMode::parse("nope"), None);
+    #[rstest]
+    #[case::auto_accept("auto_accept", Some(SendConsentMode::AutoAccept))]
+    #[case::prompt("prompt", Some(SendConsentMode::Prompt))]
+    #[case::deny("deny", Some(SendConsentMode::Deny))]
+    #[case::unknown("nope", None)]
+    fn consent_parse(#[case] raw: &str, #[case] expected: Option<SendConsentMode>) {
+        assert_eq!(SendConsentMode::parse(raw), expected);
     }
 
-    #[test]
-    fn consent_decide_shared_tag() {
-        use ConsentDecision::*;
-        assert_eq!(SendConsentMode::Deny.decide(true), Deny);
-        assert_eq!(SendConsentMode::Deny.decide(false), Deny);
-        assert_eq!(SendConsentMode::AutoAccept.decide(false), Accept);
-        assert_eq!(SendConsentMode::Prompt.decide(true), Accept);
-        assert_eq!(SendConsentMode::Prompt.decide(false), Prompt);
+    #[rstest]
+    #[case::deny_always(SendConsentMode::Deny, true, ConsentDecision::Deny)]
+    #[case::deny_no_tag(SendConsentMode::Deny, false, ConsentDecision::Deny)]
+    #[case::auto_accept_no_tag(SendConsentMode::AutoAccept, false, ConsentDecision::Accept)]
+    #[case::prompt_shared_tag(SendConsentMode::Prompt, true, ConsentDecision::Accept)]
+    #[case::prompt_no_tag(SendConsentMode::Prompt, false, ConsentDecision::Prompt)]
+    fn consent_decide_shared_tag(
+        #[case] mode: SendConsentMode,
+        #[case] shared_tag: bool,
+        #[case] expected: ConsentDecision,
+    ) {
+        assert_eq!(mode.decide(shared_tag), expected);
     }
 }

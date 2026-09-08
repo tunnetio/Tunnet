@@ -589,6 +589,8 @@ async fn proxy_tls(
 
 #[cfg(test)]
 mod tests {
+    use rstest::{fixture, rstest};
+
     use super::*;
     use crate::routing::RoutingTable;
     use std::net::Ipv4Addr;
@@ -623,58 +625,34 @@ mod tests {
         table
     }
 
-    #[test]
-    fn allow_peer_all_peers() {
-        let routes = RoutingTable::new();
-        let acl = ServeAcl {
-            access_mode: "all_peers".into(),
-            ..Default::default()
-        };
-        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 12345));
-        assert!(allow_peer(&routes, &acl, peer));
+    #[fixture]
+    fn two_peer_routes() -> RoutingTable {
+        routes_with(&[
+            peer_entry(&"bb".repeat(32), "10.7.0.1"),
+            peer_entry(&"aa".repeat(32), "10.7.0.2"),
+        ])
     }
 
-    #[test]
-    fn allow_peer_machines_filters_by_endpoint() {
-        let desktop = "aa".repeat(32);
-        let ctl = "bb".repeat(32);
-        let routes = routes_with(&[
-            peer_entry(&ctl, "10.7.0.1"),
-            peer_entry(&desktop, "10.7.0.2"),
-        ]);
+    #[rstest]
+    #[case::all_peers_allow("all_peers", vec![], "10.7.0.1", true)]
+    #[case::machines_deny_unlisted("machines", vec!["aa".repeat(32)], "10.7.0.1", false)]
+    #[case::machines_allow_listed("machines", vec!["aa".repeat(32)], "10.7.0.2", true)]
+    #[case::machines_empty_denies("machines", Vec::new(), "10.7.0.1", false)]
+    #[case::unknown_mode_denies("bogus", vec![], "10.7.0.1", false)]
+    fn allow_peer_matrix(
+        two_peer_routes: RoutingTable,
+        #[case] access_mode: &str,
+        #[case] allowed_endpoint_ids: Vec<String>,
+        #[case] ip: &str,
+        #[case] expected: bool,
+    ) {
         let acl = ServeAcl {
-            access_mode: "machines".into(),
-            allowed_endpoint_ids: vec![desktop.clone()],
+            access_mode: access_mode.into(),
+            allowed_endpoint_ids,
             allowed_tags: Vec::new(),
         };
-
-        let from_ctl = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
-        let from_desktop = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 2), 1));
-        assert!(!allow_peer(&routes, &acl, from_ctl));
-        assert!(allow_peer(&routes, &acl, from_desktop));
-    }
-
-    #[test]
-    fn allow_peer_machines_empty_denies_all() {
-        let routes = routes_with(&[peer_entry(&"cc".repeat(32), "10.7.0.1")]);
-        let acl = ServeAcl {
-            access_mode: "machines".into(),
-            allowed_endpoint_ids: Vec::new(),
-            allowed_tags: Vec::new(),
-        };
-        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
-        assert!(!allow_peer(&routes, &acl, peer));
-    }
-
-    #[test]
-    fn allow_peer_unknown_mode_denies() {
-        let routes = RoutingTable::new();
-        let acl = ServeAcl {
-            access_mode: "bogus".into(),
-            ..Default::default()
-        };
-        let peer = SocketAddr::from((Ipv4Addr::new(10, 7, 0, 1), 1));
-        assert!(!allow_peer(&routes, &acl, peer));
+        let peer = SocketAddr::from((ip.parse::<Ipv4Addr>().unwrap(), 1));
+        assert_eq!(allow_peer(&two_peer_routes, &acl, peer), expected);
     }
 
     #[tokio::test]

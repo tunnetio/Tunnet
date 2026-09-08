@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -610,6 +610,3 @@ fn resolve_peer(node: &CoreNode, host: &str) -> Option<Arc<PeerInfo>> {
         .lookup_hostname(host)
         .or_else(|| node.routes.lookup_endpoint(host))
 }
-
-#[allow(dead_code)]
-fn _touch_path(_: &Path) {}

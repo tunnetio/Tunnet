@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 pub struct CustomScriptConfig {
     pub name: String,
     pub path: String,
-    #[serde(alias = "timeoutSecs")]
     pub timeout_secs: u64,
 }
 

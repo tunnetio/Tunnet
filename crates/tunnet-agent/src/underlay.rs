@@ -1,16 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use ipnet::{Ipv4Net, Ipv6Net};
-
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Surfaced for NAT/route callers and future status APIs.
 pub struct UnderlayInfo {
     pub interface_index: u32,
     pub interface_name: String,
     pub gateway: Option<IpAddr>,
-    pub local_ipv4: Vec<Ipv4Net>,
-    pub local_ipv6: Vec<Ipv6Net>,
-    pub mtu: Option<u32>,
     pub dns_servers: Vec<IpAddr>,
 }
 
@@ -37,24 +31,10 @@ impl UnderlayInfo {
                 })
             });
 
-        let local_ipv4 = iface
-            .ipv4
-            .iter()
-            .filter_map(|n| Ipv4Net::new(n.addr(), n.prefix_len()).ok())
-            .collect();
-        let local_ipv6 = iface
-            .ipv6
-            .iter()
-            .filter_map(|n| Ipv6Net::new(n.addr(), n.prefix_len()).ok())
-            .collect();
-
         Some(Self {
             interface_index: iface.index,
             interface_name: iface.name,
             gateway,
-            local_ipv4,
-            local_ipv6,
-            mtu: iface.mtu,
             dns_servers: iface.dns_servers,
         })
     }

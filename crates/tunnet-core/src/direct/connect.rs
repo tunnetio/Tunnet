@@ -376,8 +376,3 @@ pub fn load_allowlist_from_dir(state_dir: &std::path::Path) -> HashSet<String> {
     };
     crate::agent_config::load_connect_allowlist(&paths)
 }
-
-#[allow(dead_code)]
-fn _persist_mode_check(p: &PersistedState) {
-    let _ = p.is_direct();
-}

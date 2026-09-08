@@ -39,9 +39,6 @@ pub struct TunnetClient {
     path: std::path::PathBuf,
 }
 
-/// Back-compat alias for [`TunnetClient`].
-pub type LocalApiClient = TunnetClient;
-
 impl TunnetClient {
     pub fn connect() -> Self {
         Self {

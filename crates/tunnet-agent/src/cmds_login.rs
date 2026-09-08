@@ -183,12 +183,6 @@ pub async fn run_logout(args: LogoutArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn load_tokens(state_dir: Option<&str>) -> anyhow::Result<Option<CliAuthTokens>> {
-    let paths = StatePaths::resolve(state_dir);
-    tunnet_core::secret_store::load_auth(&paths)
-}
-
 async fn poll_for_token(
     http: &reqwest::Client,
     token_endpoint: &str,

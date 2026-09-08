@@ -423,17 +423,6 @@ async fn load_inherited_posture_settings(
     Ok(best)
 }
 
-#[allow(dead_code)]
-pub async fn load_org_posture_settings(
-    pool: &PgPool,
-    organization_id: &str,
-) -> anyhow::Result<PostureEnforcementConfig> {
-    Ok(load_settings_row(pool, organization_id, None)
-        .await?
-        .map(to_enforcement)
-        .unwrap_or_default())
-}
-
 pub async fn request_posture_recheck(hub: &WsHub, endpoint_id: &str) {
     hub.push_to(endpoint_id, ServerMsg::PostureRecheck).await;
 }

@@ -5,9 +5,7 @@ use std::time::{Duration, Instant};
 use iroh::EndpointId;
 use tokio::sync::mpsc;
 use tunnet_common::policy::Selector;
-use tunnet_common::recording::{
-    RecordingMeta, asciinema_header_line, asciinema_output_event, asciinema_resize_event,
-};
+use tunnet_common::recording::{RecordingMeta, asciinema_header_line, asciinema_output_event};
 use tunnet_core::recording::dial_recording;
 use tunnet_core::{AclEngine, ConnPool, RoutingTable};
 
@@ -174,34 +172,6 @@ impl RecordingTee {
                 let text = String::from_utf8_lossy(data);
                 let t = start.elapsed().as_secs_f64();
                 batch.push_str(&asciinema_output_event(t, &text));
-                batch.push('\n');
-                if tx.try_send(batch.into_bytes()).is_err() {
-                    anyhow::bail!("recording channel full or closed");
-                }
-                Ok(())
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn write_resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        match self {
-            Self::Local(w) => w.write_resize(cols, rows),
-            Self::Remote {
-                tx,
-                start,
-                meta,
-                header_sent,
-            } => {
-                let mut batch = String::new();
-                if !*header_sent {
-                    let ts = jiff::Timestamp::now().as_second();
-                    batch.push_str(&asciinema_header_line(meta, ts));
-                    batch.push('\n');
-                    *header_sent = true;
-                }
-                let t = start.elapsed().as_secs_f64();
-                batch.push_str(&asciinema_resize_event(t, cols, rows));
                 batch.push('\n');
                 if tx.try_send(batch.into_bytes()).is_err() {
                     anyhow::bail!("recording channel full or closed");

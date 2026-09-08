@@ -6,7 +6,6 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::json;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 use tunnet_common::{
     EndpointSnapshot, EnrollRequest, EnrollResponse, EnrollStatusRequest, EnrollStatusResponse,
@@ -14,7 +13,7 @@ use tunnet_common::{
 };
 
 use crate::auth::{AuthError, authenticate};
-use crate::state::{AppState, SharedState};
+use crate::state::SharedState;
 use crate::ws::run_ws;
 
 pub async fn serve(state: SharedState) -> anyhow::Result<()> {
@@ -723,6 +722,3 @@ async fn ready_handler(State(state): State<SharedState>) -> impl IntoResponse {
         (StatusCode::SERVICE_UNAVAILABLE, "db down")
     }
 }
-
-#[allow(dead_code)]
-fn _touch(_s: Arc<AppState>) {}

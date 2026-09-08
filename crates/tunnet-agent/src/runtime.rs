@@ -512,7 +512,6 @@ pub async fn run(
         signed: node.signed.clone(),
         hostname: hostname.clone(),
         network_name: network_name.clone(),
-        self_endpoint_id: node.endpoint_id_hex(),
     };
     if ssh_deps.cp_tx.is_none() {
         tracing::warn!(

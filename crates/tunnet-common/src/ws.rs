@@ -2,8 +2,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    EffectiveAgentConfig, EndpointIdHex, EndpointSnapshot, NetworkMembershipSnapshot, RedirectRule,
-    RemoteAgentPolicy, SnapshotDelta,
+    EffectiveAgentConfig, EndpointIdHex, EndpointSnapshot, RedirectRule, RemoteAgentPolicy,
+    SnapshotDelta,
     posture::{CustomScriptConfig, PostureEvalResult},
 };
 
@@ -273,7 +273,3 @@ pub enum ClientMsg {
         reported_at: Timestamp,
     },
 }
-
-// Silence unused import when building with certain feature combos.
-#[allow(dead_code)]
-fn _touch(_: NetworkMembershipSnapshot) {}

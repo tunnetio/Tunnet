@@ -34,7 +34,7 @@ pub use server::spawn_bootstrap as spawn_bootstrap_api;
 #[cfg(feature = "local_api")]
 pub use state::LocalApiState;
 #[cfg(feature = "local_api")]
-pub use transport::{default_api_path, default_ipc_path, endpoint_reachable};
+pub use transport::{default_api_path, endpoint_reachable};
 
 /// Load persisted agent state (for display / network selection).
 #[cfg(feature = "local_api")]

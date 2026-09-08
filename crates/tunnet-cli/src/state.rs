@@ -54,26 +54,11 @@ pub struct DirectState {
     pub network_id: Uuid,
     pub hostname: String,
     pub self_record: DirectMemberRecord,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub genesis: Option<DirectGenesis>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DirectMemberRecord {
     pub ipv4: Ipv4Addr,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct DirectGenesis {
-    pub address_plan: DirectAddressPlan,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-pub struct DirectAddressPlan {
-    pub peer_cidr: String,
 }
 
 impl DirectState {

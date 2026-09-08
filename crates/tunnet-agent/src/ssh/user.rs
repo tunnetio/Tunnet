@@ -8,11 +8,10 @@ use anyhow::bail;
 
 #[derive(Debug, Clone)]
 pub struct UserInfo {
-    #[allow(dead_code)]
     pub username: String,
-    #[allow(dead_code)]
     pub home_dir: PathBuf,
-    #[allow(dead_code)]
+    /// Login shell (read on Unix; constructed for validation on Windows).
+    #[cfg_attr(windows, allow(dead_code))]
     pub shell: PathBuf,
     #[cfg(unix)]
     pub uid: u32,
@@ -36,23 +35,6 @@ pub fn lookup(username: &str) -> anyhow::Result<UserInfo> {
     }
 }
 
-#[allow(dead_code)]
-pub fn current() -> anyhow::Result<UserInfo> {
-    #[cfg(unix)]
-    {
-        let uid = unsafe { libc::getuid() };
-        lookup_unix_by_uid(uid)
-    }
-    #[cfg(windows)]
-    {
-        lookup_windows(&std::env::var("USERNAME").unwrap_or_default())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        bail!("user lookup is not supported on this platform");
-    }
-}
-
 #[cfg(unix)]
 fn lookup_unix(username: &str) -> anyhow::Result<UserInfo> {
     use std::ffi::CString;
@@ -64,17 +46,6 @@ fn lookup_unix(username: &str) -> anyhow::Result<UserInfo> {
         bail!("user `{username}` not found");
     }
     // SAFETY: passwd is non-null and points to a valid passwd from getpwnam.
-    Ok(unsafe { user_from_passwd(&*passwd) })
-}
-
-#[cfg(unix)]
-fn lookup_unix_by_uid(uid: u32) -> anyhow::Result<UserInfo> {
-    // SAFETY: getpwuid is the standard libc lookup; we only read the returned struct.
-    let passwd = unsafe { libc::getpwuid(uid) };
-    if passwd.is_null() {
-        bail!("current user (uid {uid}) not found");
-    }
-    // SAFETY: passwd is non-null and points to a valid passwd from getpwuid.
     Ok(unsafe { user_from_passwd(&*passwd) })
 }
 

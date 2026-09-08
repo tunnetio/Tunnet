@@ -36,8 +36,6 @@ struct Inner {
 
 struct ActiveTunnel {
     info: TunnelInfo,
-    #[allow(dead_code)]
-    redirect_rules: Vec<RedirectRule>,
     inspect: bool,
     stop: Option<oneshot::Sender<()>>,
 }
@@ -105,7 +103,6 @@ impl TunnelManager {
             tunnel_id,
             ActiveTunnel {
                 info: info.clone(),
-                redirect_rules: Vec::new(),
                 inspect: true,
                 stop: Some(stop_tx),
             },
@@ -238,7 +235,6 @@ impl TunnelManager {
             tunnel_id,
             ActiveTunnel {
                 info: info.clone(),
-                redirect_rules,
                 inspect,
                 stop: Some(stop_tx),
             },

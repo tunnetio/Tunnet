@@ -1,5 +1,4 @@
 use ed25519_dalek::{Signer, SigningKey};
-use serde::Deserialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use tunnet_common::policy::{
@@ -309,6 +308,3 @@ fn sign_bundle(
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, sig.to_bytes());
     Ok(bundle)
 }
-
-#[allow(dead_code)]
-fn _touch<'de, T: Deserialize<'de>>() {}

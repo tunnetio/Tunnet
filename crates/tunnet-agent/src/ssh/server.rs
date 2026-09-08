@@ -38,8 +38,6 @@ pub struct SshServeDeps {
     pub signed: Option<SignedClient>,
     pub hostname: String,
     pub network_name: String,
-    #[allow(dead_code)]
-    pub self_endpoint_id: String,
 }
 
 pub struct SshHandler {

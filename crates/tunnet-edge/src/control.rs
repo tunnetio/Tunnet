@@ -81,9 +81,6 @@ fn default_https() -> String {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HeartbeatResponse {
     #[serde(default)]
-    #[allow(dead_code)]
-    ok: bool,
-    #[serde(default)]
     tunnels: Vec<HeartbeatTunnelAuth>,
 }
 
@@ -209,10 +206,7 @@ impl ControlClient {
         }
         match serde_json::from_str(&text) {
             Ok(v) => Ok(v),
-            Err(_) => Ok(HeartbeatResponse {
-                ok: true,
-                tunnels: vec![],
-            }),
+            Err(_) => Ok(HeartbeatResponse { tunnels: vec![] }),
         }
     }
 

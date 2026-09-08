@@ -15,10 +15,6 @@ pub struct TunnelRegistry {
 pub struct TunnelSlot {
     pub tunnel_id: String,
     pub subdomain: String,
-    #[allow(dead_code)]
-    pub local_port: u16,
-    #[allow(dead_code)]
-    pub protocol: String,
     pub transport: Mutex<Option<Arc<dyn AgentTransport>>>,
 }
 

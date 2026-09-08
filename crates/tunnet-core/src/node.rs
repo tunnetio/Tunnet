@@ -50,8 +50,6 @@ use crate::sync::{apply_membership, membership_for_network};
 #[cfg(feature = "tunnel")]
 use crate::tunnel::TunnelManager;
 #[cfg(feature = "direct")]
-use ed25519_dalek::SigningKey;
-#[cfg(feature = "direct")]
 use iroh_docs::protocol::Docs;
 
 /// Per-Direct-network runtime (docs + firewall + state).
@@ -610,8 +608,6 @@ impl CoreNode {
             .await
             .map_err(|e| anyhow::anyhow!("open shared FsStore: {e}"))?;
 
-        warn_legacy_docs_dirs(&paths, &networks);
-
         let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
         let docs_dir = paths.dir.join("docs");
         std::fs::create_dir_all(&docs_dir)?;
@@ -648,7 +644,6 @@ impl CoreNode {
             let network_name = direct.network_name.clone();
             match bootstrap_one_direct_network(
                 BootstrapOneArgs {
-                    identity: &identity,
                     my_id_hex: &my_id_hex,
                     paths: &paths,
                     docs_engine: &docs_engine,
@@ -811,37 +806,7 @@ fn build_alpns(cfg: &CoreNodeConfig, direct: bool, enable_gossip: bool) -> Vec<V
 }
 
 #[cfg(feature = "direct")]
-fn warn_legacy_docs_dirs(paths: &StatePaths, networks: &[DirectState]) {
-    let unified = paths.dir.join("docs");
-    let unified_nonempty = unified.exists()
-        && std::fs::read_dir(&unified)
-            .ok()
-            .and_then(|mut d| d.next())
-            .is_some();
-    if unified_nonempty {
-        return;
-    }
-    for net in networks {
-        let legacy = paths.docs_dir(net.network_id);
-        if legacy.exists()
-            && std::fs::read_dir(&legacy)
-                .ok()
-                .and_then(|mut d| d.next())
-                .is_some()
-        {
-            tracing::warn!(
-                network = %net.network_name,
-                legacy = %legacy.display(),
-                unified = %unified.display(),
-                "per-network docs store detected while unified docs/ is empty; re-join with doc ticket if import fails"
-            );
-        }
-    }
-}
-
-#[cfg(feature = "direct")]
 struct BootstrapOneArgs<'a> {
-    identity: &'a AgentIdentity,
     my_id_hex: &'a str,
     paths: &'a StatePaths,
     docs_engine: &'a Docs,
@@ -887,7 +852,6 @@ async fn bootstrap_one_direct_network(
         ssh_host_key: direct.self_record.ssh_host_key.clone(),
     };
 
-    let endpoint_signing_key = SigningKey::from_bytes(&args.identity.secret_bytes);
     let coordinator_signing_key = direct
         .coordinator_signing_key
         .as_ref()
@@ -944,7 +908,6 @@ async fn bootstrap_one_direct_network(
         direct,
         self_endpoint_id: args.my_id_hex,
         self_entry,
-        endpoint_signing_key,
         coordinator_signing_key,
         coordinator_verifying_key,
         content_key: content_key.clone(),

@@ -191,6 +191,8 @@ impl From<&hickory_resolver::config::ProtocolConfig> for ProtocolKind {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn ns(spec: &str) -> NameServerConfig {
@@ -200,29 +202,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preserves_custom_udp_port() {
-        let n = ns("udp://10.0.0.9:5353");
-        assert_eq!(n.ip, "10.0.0.9".parse::<IpAddr>().unwrap());
-        assert_eq!(connection_summary(&n), vec![(ProtocolKind::Udp, 5353)]);
-    }
-
-    #[test]
-    fn plain_ip_is_udp_and_tcp_53() {
-        let n = ns("1.1.1.1");
-        assert_eq!(
-            connection_summary(&n),
-            vec![(ProtocolKind::Udp, 53), (ProtocolKind::Tcp, 53)]
-        );
-    }
-
-    #[test]
-    fn ip_with_port_applies_to_both() {
-        let n = ns("8.8.8.8:5353");
-        assert_eq!(
-            connection_summary(&n),
-            vec![(ProtocolKind::Udp, 5353), (ProtocolKind::Tcp, 5353)]
-        );
+    #[rstest]
+    #[case::custom_udp_port("udp://10.0.0.9:5353", vec![(ProtocolKind::Udp, 5353)])]
+    #[case::plain_ip_is_udp_and_tcp("1.1.1.1", vec![(ProtocolKind::Udp, 53), (ProtocolKind::Tcp, 53)])]
+    #[case::ip_with_port_applies_to_both("8.8.8.8:5353", vec![(ProtocolKind::Udp, 5353), (ProtocolKind::Tcp, 5353)])]
+    #[case::tls("tls://1.1.1.1:853#cloudflare-dns.com", vec![(ProtocolKind::Tls, 853)])]
+    #[case::https("https://1.1.1.1/dns-query#cloudflare-dns.com", vec![(ProtocolKind::Https, 443)])]
+    #[case::quic("quic://1.1.1.1:853#cloudflare-dns.com", vec![(ProtocolKind::Quic, 853)])]
+    #[case::h3("h3://1.1.1.1:443/dns-query#cloudflare-dns.com", vec![(ProtocolKind::H3, 443)])]
+    #[case::ipv6_bracket("udp://[2001:db8::1]:5353", vec![(ProtocolKind::Udp, 5353)])]
+    fn single_upstream_maps_to_expected_connections(
+        #[case] spec: &str,
+        #[case] expected: Vec<(ProtocolKind, u16)>,
+    ) {
+        assert_eq!(connection_summary(&ns(spec)), expected, "{spec}");
     }
 
     #[test]
@@ -235,23 +228,6 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-    }
-
-    #[test]
-    fn https_and_h3_and_quic() {
-        let https = ns("https://1.1.1.1/dns-query#cloudflare-dns.com");
-        assert_eq!(connection_summary(&https), vec![(ProtocolKind::Https, 443)]);
-        let quic = ns("quic://1.1.1.1:853#cloudflare-dns.com");
-        assert_eq!(connection_summary(&quic), vec![(ProtocolKind::Quic, 853)]);
-        let h3 = ns("h3://1.1.1.1:443/dns-query#cloudflare-dns.com");
-        assert_eq!(connection_summary(&h3), vec![(ProtocolKind::H3, 443)]);
-    }
-
-    #[test]
-    fn ipv6_bracket_port() {
-        let n = ns("udp://[2001:db8::1]:5353");
-        assert_eq!(n.ip, "2001:db8::1".parse::<IpAddr>().unwrap());
-        assert_eq!(connection_summary(&n), vec![(ProtocolKind::Udp, 5353)]);
     }
 
     #[test]

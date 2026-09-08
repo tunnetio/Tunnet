@@ -52,6 +52,8 @@ impl EdgeCtrl {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::EDGE_ALPN as CRATE_EDGE_ALPN;
 
@@ -124,56 +126,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn forward_without_ip_roundtrip() {
+    #[rstest]
+    #[case::without_ip(8080, None)]
+    #[case::with_ip(22, Some("10.21.0.2"))]
+    fn forward_roundtrip(#[case] port: u16, #[case] ip: Option<&str>) {
         let msg = EdgeCtrl::Forward {
-            target_port: 8080,
-            target_ip: None,
+            target_port: port,
+            target_ip: ip.map(str::to_string),
         };
         let bytes = msg.to_line().unwrap();
         let json = std::str::from_utf8(&bytes).unwrap();
         assert!(json.contains("\"type\":\"forward\""));
-        assert!(!json.contains("target_ip"));
+        assert_eq!(json.contains("target_ip"), ip.is_some());
         match roundtrip(&msg) {
             EdgeCtrl::Forward {
                 target_port,
                 target_ip,
             } => {
-                assert_eq!(target_port, 8080);
-                assert!(target_ip.is_none());
+                assert_eq!(target_port, port);
+                assert_eq!(target_ip.as_deref(), ip);
             }
             other => panic!("expected Forward, got {other:?}"),
         }
     }
 
-    #[test]
-    fn forward_with_ip_roundtrip() {
-        let msg = EdgeCtrl::Forward {
-            target_port: 22,
-            target_ip: Some("10.21.0.2".into()),
-        };
-        match roundtrip(&msg) {
-            EdgeCtrl::Forward {
-                target_port,
-                target_ip,
-            } => {
-                assert_eq!(target_port, 22);
-                assert_eq!(target_ip.as_deref(), Some("10.21.0.2"));
-            }
-            other => panic!("expected Forward, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ping_pong_roundtrip() {
-        assert!(matches!(roundtrip(&EdgeCtrl::Ping), EdgeCtrl::Ping));
-        assert!(matches!(roundtrip(&EdgeCtrl::Pong), EdgeCtrl::Pong));
-        let ping_bytes = EdgeCtrl::Ping.to_line().unwrap();
-        let pong_bytes = EdgeCtrl::Pong.to_line().unwrap();
-        let ping_json = std::str::from_utf8(&ping_bytes).unwrap();
-        let pong_json = std::str::from_utf8(&pong_bytes).unwrap();
-        assert!(ping_json.contains("\"type\":\"ping\""));
-        assert!(pong_json.contains("\"type\":\"pong\""));
+    #[rstest]
+    #[case::ping(EdgeCtrl::Ping, "ping")]
+    #[case::pong(EdgeCtrl::Pong, "pong")]
+    fn ping_pong_roundtrip(#[case] msg: EdgeCtrl, #[case] tag: &str) {
+        let bytes = msg.to_line().unwrap();
+        let json = std::str::from_utf8(&bytes).unwrap();
+        assert!(json.contains(&format!("\"type\":\"{tag}\"")));
+        let back = roundtrip(&msg);
+        assert!(matches!(
+            (&back, tag),
+            (EdgeCtrl::Ping, "ping") | (EdgeCtrl::Pong, "pong")
+        ));
     }
 
     #[test]

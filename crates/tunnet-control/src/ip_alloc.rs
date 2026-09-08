@@ -3,15 +3,13 @@
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
-use sqlx::{PgConnection, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::pg_inet::{self, PgIp};
 
 pub struct Allocated {
     pub ip: Ipv4Addr,
-    #[allow(dead_code)]
-    pub prefix: u8,
 }
 
 /// True when `ip` is a usable host address inside `net` (not network/broadcast
@@ -56,10 +54,7 @@ pub async fn allocate<'c>(
     {
         let addr = pg_inet::to_ipv4_addr(ip)?;
         if is_usable_host(&net, addr) {
-            return Ok(Allocated {
-                ip: addr,
-                prefix: net.prefix_len(),
-            });
+            return Ok(Allocated { ip: addr });
         }
         tracing::warn!(
             %addr,
@@ -91,14 +86,8 @@ pub async fn allocate<'c>(
     }
     let ip = chosen.ok_or_else(|| anyhow::anyhow!("network full"))?;
 
-    Ok(Allocated {
-        ip,
-        prefix: net.prefix_len(),
-    })
+    Ok(Allocated { ip })
 }
-
-#[allow(dead_code)]
-pub async fn _keep_unused_ref(_c: &mut PgConnection) {}
 
 #[cfg(test)]
 mod tests {

@@ -203,7 +203,7 @@ kube = { version = "4.2.0", default-features = false, features = [
 k8s-openapi = { version = "0.28.0", features = ["v1_36"] }
 schemars = "1.2.2"
 futures = "0.3"
-rstest = "0.26.1"
+rstest = "0.27.0"
 
 [profile.release]
 opt-level = 3

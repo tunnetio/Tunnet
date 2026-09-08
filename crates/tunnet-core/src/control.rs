@@ -137,11 +137,17 @@ pub struct UnauthedClient {
 
 #[cfg(test)]
 mod endpoint_tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn unauthed_client_rejects_a_loopback_control_plane() {
-        assert!(UnauthedClient::new("http://127.0.0.1:8080".into()).is_err());
+    #[rstest]
+    #[case::loopback("http://127.0.0.1:8080")]
+    #[case::link_local("http://169.254.169.254")]
+    #[case::credentials("https://token@example.com")]
+    #[case::redirectable_query("https://example.com?next=/internal")]
+    fn control_plane_clients_reject_unsafe_endpoints(#[case] url: &str) {
+        assert!(UnauthedClient::new(url.into()).is_err());
     }
 
     #[test]
@@ -156,12 +162,6 @@ mod endpoint_tests {
     }
 
     #[test]
-    fn endpoint_rejects_credentials_and_redirectable_url_parts() {
-        assert!(UnauthedClient::new("https://token@example.com".into()).is_err());
-        assert!(UnauthedClient::new("https://example.com?next=/internal".into()).is_err());
-    }
-
-    #[test]
     fn private_endpoint_opt_in_is_explicit() {
         assert!(
             ServiceEndpoint::parse_with_private_endpoints_allowed("http://127.0.0.1:8080", true,)
@@ -169,25 +169,35 @@ mod endpoint_tests {
         );
     }
 
-    #[test]
-    fn private_address_detection_covers_ssrf_targets() {
-        for address in [
+    #[rstest]
+    fn private_address_detection_covers_ssrf_targets(
+        #[values(
+            /// private range
             "10.0.0.1",
+            /// loopback
             "127.0.0.1",
+            /// link-local (cloud metadata)
             "169.254.169.254",
+            /// documentation range
             "192.0.2.1",
+            /// private range
             "10.21.0.1",
+            /// ipv6 loopback
             "[::1]",
+            /// ipv6 unique-local
             "[fc00::1]",
+            /// ipv6 link-local
             "[fe80::1]",
-            "[::ffff:127.0.0.1]",
-        ] {
-            let address = address
-                .trim_matches(['[', ']'])
-                .parse()
-                .expect("test address is valid");
-            assert!(is_private_or_local(address), "{address}");
-        }
+            /// ipv4-mapped loopback
+            "[::ffff:127.0.0.1]"
+        )]
+        address: &str,
+    ) {
+        let address = address
+            .trim_matches(['[', ']'])
+            .parse()
+            .expect("test address is valid");
+        assert!(is_private_or_local(address), "{address}");
     }
 }
 

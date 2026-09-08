@@ -441,24 +441,31 @@ pub async fn resolve_enroll_expires_in(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::resolve_expires_in_input;
 
-    #[test]
-    fn device_ttl_accepts_positive_fixed_whole_seconds() {
-        assert_eq!(
-            resolve_expires_in_input(Some("2 weeks 3 days")),
-            Ok(Some(1_468_800))
-        );
-        assert_eq!(resolve_expires_in_input(Some("never")), Ok(None));
+    #[rstest]
+    #[case::weeks_and_days("2 weeks 3 days", Some(1_468_800))]
+    #[case::never("never", None)]
+    fn device_ttl_accepts_valid_inputs(#[case] input: &str, #[case] expected: Option<i64>) {
+        assert_eq!(resolve_expires_in_input(Some(input)), Ok(expected));
     }
 
-    #[test]
-    fn device_ttl_rejects_calendar_fractional_and_non_positive_values() {
-        for invalid in ["1 month", "1.5 seconds", "0 seconds", "-2 hours"] {
-            assert!(
-                resolve_expires_in_input(Some(invalid)).is_err(),
-                "{invalid}"
-            );
-        }
+    #[rstest]
+    fn device_ttl_rejects_invalid_inputs(
+        #[values(
+            /// calendar unit
+            "1 month",
+            /// fractional value
+            "1.5 seconds",
+            /// zero duration
+            "0 seconds",
+            /// negative duration
+            "-2 hours"
+        )]
+        input: &str,
+    ) {
+        assert!(resolve_expires_in_input(Some(input)).is_err(), "{input}");
     }
 }

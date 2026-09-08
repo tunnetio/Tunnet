@@ -25,11 +25,6 @@ pub fn default_api_path() -> PathBuf {
     }
 }
 
-/// Alias for callers still using the old name.
-pub fn default_ipc_path() -> PathBuf {
-    default_api_path()
-}
-
 /// Prefer system runtime dir when present (systemd `RuntimeDirectory=tunnet`), else `/tmp`.
 #[cfg(unix)]
 pub fn unix_api_candidates() -> Vec<PathBuf> {

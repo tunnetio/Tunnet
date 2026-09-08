@@ -179,8 +179,6 @@ async fn handle_agent(
     let slot = Arc::new(TunnelSlot {
         tunnel_id: tunnel_id.clone(),
         subdomain: subdomain.clone(),
-        local_port,
-        protocol,
         transport: parking_lot::Mutex::new(Some(transport)),
     });
     registry.insert(slot.clone());

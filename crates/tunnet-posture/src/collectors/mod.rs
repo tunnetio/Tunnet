@@ -29,7 +29,6 @@ pub use secure_boot::SecureBootCollector;
 pub use tpm::TpmCollector;
 
 use std::process::Stdio;
-use std::time::Duration;
 use tokio::process::Command;
 
 /// Run a shell command and return stdout as a trimmed string.
@@ -41,32 +40,6 @@ pub(crate) async fn run_command(program: &str, args: &[&str]) -> Option<String> 
         .output()
         .await
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Run a command with a timeout.
-#[allow(dead_code)]
-pub(crate) async fn run_command_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<String> {
-    let child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .ok()?
-        .ok()?;
-
     if !output.status.success() {
         return None;
     }

@@ -8,9 +8,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
-use tunnet_common::recording::{
-    RecordingMeta, asciinema_header_line, asciinema_output_event, asciinema_resize_event,
-};
+use tunnet_common::recording::{RecordingMeta, asciinema_header_line, asciinema_output_event};
 
 pub struct RecordingStore {
     dir: PathBuf,
@@ -31,22 +29,6 @@ pub struct FinalizedCast {
     pub path: PathBuf,
     pub byte_size: u64,
     pub sha256_hex: String,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct RecordingIndexEntry {
-    pub session_id: String,
-    pub peer_endpoint: String,
-    pub peer_hostname: Option<String>,
-    pub user: String,
-    pub machine: String,
-    pub network: String,
-    pub path: String,
-    pub byte_size: u64,
-    pub sha256_hex: String,
-    pub duration_ms: u64,
-    pub started_at: jiff::Timestamp,
 }
 
 impl RecordingStore {
@@ -138,82 +120,6 @@ impl RecordingStore {
         )?;
         Ok(())
     }
-
-    #[allow(dead_code)]
-    pub fn list(&self, limit: usize) -> anyhow::Result<Vec<RecordingIndexEntry>> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = db.prepare(
-            "SELECT session_id, peer_endpoint, peer_hostname, user_name, machine, network,
-                    path, byte_size, sha256_hex, duration_ms, started_at
-             FROM recordings ORDER BY started_at DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(RecordingIndexEntry {
-                session_id: row.get(0)?,
-                peer_endpoint: row.get(1)?,
-                peer_hostname: row.get(2)?,
-                user: row.get(3)?,
-                machine: row.get(4)?,
-                network: row.get(5)?,
-                path: row.get(6)?,
-                byte_size: row.get::<_, i64>(7)? as u64,
-                sha256_hex: row.get(8)?,
-                duration_ms: row.get::<_, i64>(9)? as u64,
-                started_at: jiff::Timestamp::from_second(row.get(10)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
-    }
-
-    #[allow(dead_code)]
-    pub fn get(&self, session_id: &str) -> anyhow::Result<Option<RecordingIndexEntry>> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = db.prepare(
-            "SELECT session_id, peer_endpoint, peer_hostname, user_name, machine, network,
-                    path, byte_size, sha256_hex, duration_ms, started_at
-             FROM recordings WHERE session_id = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![session_id], |row| {
-            Ok(RecordingIndexEntry {
-                session_id: row.get(0)?,
-                peer_endpoint: row.get(1)?,
-                peer_hostname: row.get(2)?,
-                user: row.get(3)?,
-                machine: row.get(4)?,
-                network: row.get(5)?,
-                path: row.get(6)?,
-                byte_size: row.get::<_, i64>(7)? as u64,
-                sha256_hex: row.get(8)?,
-                duration_ms: row.get::<_, i64>(9)? as u64,
-                started_at: jiff::Timestamp::from_second(row.get(10)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-            })
-        })?;
-        Ok(rows.next().transpose()?)
-    }
-
-    #[allow(dead_code)]
-    pub fn read_cast(&self, session_id: &str) -> anyhow::Result<Option<String>> {
-        let Some(entry) = self.get(session_id)? else {
-            return Ok(None);
-        };
-        Ok(Some(fs::read_to_string(&entry.path)?))
-    }
 }
 
 impl ActiveCastWriter {
@@ -232,13 +138,6 @@ impl ActiveCastWriter {
         let text = String::from_utf8_lossy(data);
         let t = self.start.elapsed().as_secs_f64();
         let line = asciinema_output_event(t, &text);
-        self.write_line(&line)
-    }
-
-    pub fn write_resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        self.write_header()?;
-        let t = self.start.elapsed().as_secs_f64();
-        let line = asciinema_resize_event(t, cols, rows);
         self.write_line(&line)
     }
 
