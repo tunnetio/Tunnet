@@ -175,6 +175,25 @@ impl ApiListener {
         }
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn bind_test(marker: PathBuf, name: &str) -> anyhow::Result<(Self, PathBuf)> {
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&marker, name)?;
+        let first = create_server_pipe(name, true)?;
+        Ok((
+            Self {
+                windows: WindowsListener {
+                    pending: tokio::sync::Mutex::new(Some(first)),
+                    marker: marker.clone(),
+                },
+                path: marker.clone(),
+            },
+            marker,
+        ))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

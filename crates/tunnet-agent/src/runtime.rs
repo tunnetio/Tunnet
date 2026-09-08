@@ -242,6 +242,7 @@ pub async fn run(
             poll_secs: args.poll_secs,
             // Late-bound by the supervisor after the dataplane tree starts.
             route_actor: None,
+            dataplane_actor: None,
             posture_actor: None,
             ssh_registry: None,
         })
@@ -359,32 +360,36 @@ pub async fn run(
             api_state.emit(tunnet_common::local_api::LocalEvent::ControlConnected);
         }
     }
-    let _api_task = spawn_local_api(api_state.clone())
+    let api_server = spawn_local_api(api_state.clone())
         .await
         .context("start Local Management API")?;
-    if let Some(tx) = on_ready.take() {
-        let _ = tx.send(());
-    }
-
-    #[cfg(unix)]
-    crate::sd_notify::ready("running");
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
     // A Direct address conflict degrades bring-up instead of reporting healthy.
-    match tokio::time::timeout(
+    let dataplane_ready = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         dataplane_ref.ask(crate::actors::dataplane::BringUp),
     )
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => true,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "dataplane degraded at startup");
+            false
         }
         Err(e) => {
             tracing::warn!(error = %e, "dataplane bring-up timed out; degraded");
+            false
         }
+    };
+    if dataplane_ready {
+        api_state.emit(tunnet_common::local_api::LocalEvent::DaemonReady);
+        if let Some(tx) = on_ready.take() {
+            let _ = tx.send(());
+        }
+        #[cfg(unix)]
+        crate::sd_notify::ready("running");
     }
     {
         let dataplane_bg = dataplane_ref.clone();
@@ -621,7 +626,7 @@ pub async fn run(
         let upgrade = crate::upgrade::UpgradeGuard::install()?;
         let reason = upgrade.wait().await;
         tracing::info!(?reason, "shutdown signal; draining");
-        drain(supervisor, ssh_handle, dns_controller, &node).await;
+        drain(supervisor, ssh_handle, dns_controller, api_server, &node).await;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -633,7 +638,7 @@ pub async fn run(
             tokio::signal::ctrl_c().await?;
             tracing::info!("ctrl-c, shutting down");
         }
-        drain(supervisor, ssh_handle, dns_controller, &node).await;
+        drain(supervisor, ssh_handle, dns_controller, api_server, &node).await;
         Ok(())
     }
 }
@@ -651,12 +656,13 @@ async fn drain(
     supervisor: kameo::actor::ActorRef<AgentSupervisor>,
     ssh_handle: Option<tokio::task::JoinHandle<()>>,
     dns_controller: Option<Arc<DnsController>>,
+    api_server: tunnet_core::local_api::LocalApiServer,
     node: &CoreNode,
 ) {
     use crate::actors::supervisor::ShutdownAgent;
 
-    // 1. Stop accepting new lifecycle/control mutations (Local API tasks end
-    //    with the process; in-flight handlers drain via timeouts).
+    // 1. Stop accepting new lifecycle/control mutations and drain clients.
+    api_server.shutdown().await;
     // 2. Actor tree: control → presence/posture/update → dataplane → ssh.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _ = supervisor.tell(ShutdownAgent).send().await;

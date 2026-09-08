@@ -8,7 +8,6 @@ use std::time::Duration;
 
 #[cfg(any(feature = "managed", feature = "direct"))]
 use anyhow::Context;
-use arc_swap::ArcSwap;
 use iroh::Endpoint;
 #[cfg(any(feature = "managed", feature = "direct"))]
 use iroh::SecretKey;
@@ -119,7 +118,8 @@ pub struct CoreNode {
     pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
     pub acl: AclEngine,
-    pub version: Arc<ArcSwap<u64>>,
+    #[cfg(feature = "managed")]
+    pub revisions: Arc<crate::sync::ManagedRevisions>,
     pub self_ipv4: std::net::Ipv4Addr,
     pub paths: StatePaths,
     #[cfg(feature = "serve")]
@@ -151,6 +151,15 @@ pub struct CoreNode {
 }
 
 impl CoreNode {
+    pub fn snapshot_version(&self) -> u64 {
+        #[cfg(feature = "managed")]
+        if matches!(self.persisted, PersistedState::Managed(_)) {
+            return self.revisions.load().org.0;
+        }
+
+        0
+    }
+
     #[cfg(feature = "direct")]
     pub fn firewall_for(&self, network_id: Uuid) -> Option<&crate::direct::FirewallEngine> {
         self.direct.get(&network_id).map(|r| &r.firewall)
@@ -331,7 +340,10 @@ impl CoreNode {
 
         let membership = membership_for_network(&snapshot, managed.network_id)?.clone();
         let routes = RoutingTable::new();
-        let version = Arc::new(ArcSwap::from_pointee(snapshot.version));
+        let revisions = Arc::new(crate::sync::ManagedRevisions::new(
+            snapshot.version,
+            membership.version,
+        ));
         let acl = if let Some(flag) = cfg.src_posture_ok.clone() {
             AclEngine::with_posture_flag(
                 SelfIdentity {
@@ -362,7 +374,7 @@ impl CoreNode {
             snapshot.policy_verifying_key.as_deref(),
             &routes,
             &acl,
-            &version,
+            &revisions,
             snapshot.version,
             &my_id_hex,
             &cfg.hostname,
@@ -462,7 +474,7 @@ impl CoreNode {
                 effective_config,
                 routes,
                 acl,
-                version,
+                revisions,
                 self_ipv4: membership.assigned_ipv4,
                 paths,
                 #[cfg(feature = "serve")]
@@ -541,7 +553,8 @@ impl CoreNode {
         let self_ipv4 = primary.self_record.ipv4;
 
         let routes = RoutingTable::new();
-        let version = Arc::new(ArcSwap::from_pointee(1u64));
+        #[cfg(feature = "managed")]
+        let revisions = Arc::new(crate::sync::ManagedRevisions::new(0, 0));
         // ACL/self identity uses primary network name; per-network policy applied via docs.
         let fw0 = crate::agent_config::load_firewall_for(&paths, &primary.network_name);
         let policy0 = firewall_to_policy(&fw0, &my_id_hex, self_ipv4);
@@ -724,7 +737,8 @@ impl CoreNode {
             effective_config,
             routes,
             acl,
-            version,
+            #[cfg(feature = "managed")]
+            revisions,
             self_ipv4,
             paths,
             #[cfg(feature = "serve")]

@@ -82,15 +82,29 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
         management_url: args.management_url,
         dashboard_url: args.dashboard_url,
     };
-    let resp = match client.enroll(&body).await {
-        Ok(resp) => resp,
-        Err(e) if crate::cmds::is_api_connection_closed(&e) => {
-            return crate::cmds::recover_bootstrap_result(state_dir, "enrolled", e).await;
-        }
-        Err(e) => return Err(e),
-    };
+    let resp = client.enroll(&body).await?;
     println!("{}", resp.message);
+    wait_for_managed_network_ready(90).await?;
     Ok(())
+}
+
+async fn wait_for_managed_network_ready(secs: u64) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let client = TunnetClient::connect();
+    let mut last_error = None;
+    while tokio::time::Instant::now() < deadline {
+        match client.node().await {
+            Ok(node) if node.data_plane_up && !node.networks.is_empty() => return Ok(()),
+            Ok(_) => {}
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("daemon did not make the enrolled network ready")))
+    .context(format!(
+        "enrolled state did not become network-ready within {secs}s"
+    ))
 }
 
 pub async fn run_reset(args: ResetArgs, state_dir: Option<&str>) -> anyhow::Result<()> {

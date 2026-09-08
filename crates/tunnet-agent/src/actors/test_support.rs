@@ -15,7 +15,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         .await
         .expect("bind test endpoint");
     let routes = tunnet_core::RoutingTable::new();
-    let version = Arc::new(arc_swap::ArcSwap::from_pointee(1u64));
+    let revisions = Arc::new(tunnet_core::sync::ManagedRevisions::new(1, 1));
     let acl = tunnet_core::AclEngine::new(
         tunnet_core::SelfIdentity {
             endpoint_hex: identity.endpoint_id_hex(),
@@ -53,7 +53,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         effective_config: tunnet_core::EffectiveConfigStore::new(),
         routes: routes.clone(),
         acl,
-        version,
+        revisions,
         self_ipv4: "10.9.0.1".parse().unwrap(),
         paths,
         serves: tunnet_core::ServeManager::new("10.9.0.1".parse().unwrap(), routes),

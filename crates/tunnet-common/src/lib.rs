@@ -390,6 +390,7 @@ pub struct EndpointSnapshot {
     pub ipv6_enabled: bool,
     pub tenant_ipv6: Option<Ipv6Addr>,
     pub memberships: Vec<NetworkMembershipSnapshot>,
+    pub network_revisions: HashMap<Uuid, u64>,
     pub ipv6_peers: Vec<Ipv6PeerEntry>,
     pub org_policy: policy::PolicyBundle,
     /// Hex-encoded Ed25519 verifying key for `PolicyBundle.signature`.

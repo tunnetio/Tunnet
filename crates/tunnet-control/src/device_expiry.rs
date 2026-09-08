@@ -196,17 +196,23 @@ async fn soft_expire_device(
     .fetch_all(&mut *tx)
     .await?;
 
+    let mut network_versions = Vec::with_capacity(memberships.len());
     for (network_id,) in &memberships {
-        sqlx::query("UPDATE networks SET version = version + 1 WHERE id = $1")
-            .bind(network_id)
-            .execute(&mut *tx)
-            .await?;
+        let version: i64 = sqlx::query_scalar(
+            "UPDATE networks SET version = version + 1 WHERE id = $1 RETURNING version",
+        )
+        .bind(network_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        network_versions.push((*network_id, version as u64));
     }
 
-    sqlx::query("UPDATE organization SET snapshot_version = snapshot_version + 1 WHERE id = $1")
-        .bind(organization_id)
-        .execute(&mut *tx)
-        .await?;
+    let org_revision: i64 = sqlx::query_scalar(
+        "UPDATE organization SET snapshot_version = snapshot_version + 1 WHERE id = $1 RETURNING snapshot_version",
+    )
+    .bind(organization_id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -220,6 +226,19 @@ async fn soft_expire_device(
         None,
     );
 
+    for (network_id, network_revision) in &network_versions {
+        ws_hub
+            .push_to(
+                endpoint_id,
+                tunnet_common::ws::ServerMsg::MembershipRevoked {
+                    network_id: *network_id,
+                    org_revision: org_revision as u64,
+                    network_revision: *network_revision,
+                    reason: "membership expired".into(),
+                },
+            )
+            .await;
+    }
     ws_hub
         .disconnect(
             endpoint_id,
@@ -227,13 +246,9 @@ async fn soft_expire_device(
         )
         .await;
 
-    for (network_id,) in memberships {
-        let version: i64 = sqlx::query_scalar("SELECT version FROM networks WHERE id = $1")
-            .bind(network_id)
-            .fetch_one(pool)
-            .await?;
+    for (network_id, version) in network_versions {
         ws_hub
-            .notify_peer_left(network_id, endpoint_id, version as u64)
+            .notify_peer_left(network_id, endpoint_id, version)
             .await;
     }
     pg_notify::emit_org_changed(pool, organization_id).await?;
@@ -248,13 +263,6 @@ async fn hard_delete_device(
     endpoint_id: &str,
     organization_id: &str,
 ) -> anyhow::Result<bool> {
-    ws_hub
-        .disconnect(
-            endpoint_id,
-            "machine deleted due to inactivity; re-enroll to reconnect",
-        )
-        .await;
-
     let mut tx = pool.begin().await?;
 
     let memberships: Vec<(Uuid,)> =
@@ -263,6 +271,7 @@ async fn hard_delete_device(
             .fetch_all(&mut *tx)
             .await?;
 
+    let mut network_versions = Vec::with_capacity(memberships.len());
     for (network_id,) in &memberships {
         sqlx::query("DELETE FROM network_memberships WHERE endpoint_id = $1 AND network_id = $2")
             .bind(endpoint_id)
@@ -270,10 +279,13 @@ async fn hard_delete_device(
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query("UPDATE networks SET version = version + 1 WHERE id = $1")
-            .bind(network_id)
-            .execute(&mut *tx)
-            .await?;
+        let version: i64 = sqlx::query_scalar(
+            "UPDATE networks SET version = version + 1 WHERE id = $1 RETURNING version",
+        )
+        .bind(network_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        network_versions.push((*network_id, version as u64));
     }
 
     let deleted = sqlx::query("DELETE FROM devices WHERE endpoint_id = $1")
@@ -286,10 +298,12 @@ async fn hard_delete_device(
         return Ok(false);
     }
 
-    sqlx::query("UPDATE organization SET snapshot_version = snapshot_version + 1 WHERE id = $1")
-        .bind(organization_id)
-        .execute(&mut *tx)
-        .await?;
+    let org_revision: i64 = sqlx::query_scalar(
+        "UPDATE organization SET snapshot_version = snapshot_version + 1 WHERE id = $1 RETURNING snapshot_version",
+    )
+    .bind(organization_id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
@@ -303,13 +317,29 @@ async fn hard_delete_device(
         None,
     );
 
-    for (network_id,) in memberships {
-        let version: i64 = sqlx::query_scalar("SELECT version FROM networks WHERE id = $1")
-            .bind(network_id)
-            .fetch_one(pool)
-            .await?;
+    for (network_id, network_revision) in &network_versions {
         ws_hub
-            .notify_peer_left(network_id, endpoint_id, version as u64)
+            .push_to(
+                endpoint_id,
+                tunnet_common::ws::ServerMsg::MembershipRevoked {
+                    network_id: *network_id,
+                    org_revision: org_revision as u64,
+                    network_revision: *network_revision,
+                    reason: "membership removed".into(),
+                },
+            )
+            .await;
+    }
+    ws_hub
+        .disconnect(
+            endpoint_id,
+            "machine deleted due to inactivity; re-enroll to reconnect",
+        )
+        .await;
+
+    for (network_id, version) in network_versions {
+        ws_hub
+            .notify_peer_left(network_id, endpoint_id, version)
             .await;
     }
     pg_notify::emit_org_changed(pool, organization_id).await?;

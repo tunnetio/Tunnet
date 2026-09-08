@@ -21,18 +21,12 @@ use super::transport::{ApiListener, ApiStream};
 /// Spawn the Local Management API listener (full mesh runtime).
 ///
 /// Binds before returning so callers can treat the API as ready.
-pub async fn spawn(state: Arc<LocalApiState>) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let emit_state = state.clone();
-    let handle =
-        spawn_listener(move |peer| router::app(state.clone()).layer(Extension(peer))).await?;
-    emit_state.emit(LocalEvent::DaemonReady);
-    Ok(handle)
+pub async fn spawn(state: Arc<LocalApiState>) -> anyhow::Result<LocalApiServer> {
+    spawn_listener(move |peer| router::app(state.clone()).layer(Extension(peer))).await
 }
 
 /// Spawn a bootstrap-only API (idle agent waiting for create / enroll / join).
-pub async fn spawn_bootstrap(
-    state: BootstrapApiState,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+pub async fn spawn_bootstrap(state: BootstrapApiState) -> anyhow::Result<LocalApiServer> {
     let events = state.events.clone();
     let handle = spawn_listener(move |peer| {
         bootstrap_router::bootstrap_app(state.clone()).layer(Extension(peer))
@@ -42,21 +36,51 @@ pub async fn spawn_bootstrap(
     Ok(handle)
 }
 
-async fn spawn_listener<F>(make_app: F) -> anyhow::Result<tokio::task::JoinHandle<()>>
+pub struct LocalApiServer {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LocalApiServer {
+    pub async fn shutdown(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+}
+
+async fn spawn_listener<F>(make_app: F) -> anyhow::Result<LocalApiServer>
 where
     F: Fn(super::auth::PeerIdentity) -> Router + Send + Sync + 'static,
 {
     let (listener, path) = ApiListener::bind()
         .await
         .context("bind Local Management API listener")?;
+    Ok(spawn_bound_listener(listener, path, make_app))
+}
+
+fn spawn_bound_listener<F>(
+    listener: ApiListener,
+    path: std::path::PathBuf,
+    make_app: F,
+) -> LocalApiServer
+where
+    F: Fn(super::auth::PeerIdentity) -> Router + Send + Sync + 'static,
+{
     tracing::info!(path = %path.display(), "Local Management API ready");
     let make_app = Arc::new(make_app);
-    Ok(tokio::spawn(async move {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                _ = run_cancel.cancelled() => break,
+                accepted = listener.accept() => accepted,
+            };
+            match accepted {
                 Ok(stream) => {
                     let make_app = make_app.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(e) = serve_connection(stream, make_app.as_ref()).await {
                             tracing::debug!(?e, "Local API client session ended");
                         }
@@ -64,11 +88,20 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(?e, "Local API accept failed");
-                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
         }
-    }))
+        if tokio::time::timeout(Duration::from_secs(5), async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        }
+    });
+    LocalApiServer { cancel, task }
 }
 
 async fn serve_connection<F>(stream: ApiStream, make_app: &F) -> anyhow::Result<()>
@@ -142,3 +175,21 @@ impl std::fmt::Display for InfallibleWrap {
 }
 
 impl std::error::Error for InfallibleWrap {}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_releases_listener_before_returning() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("api.pipe");
+        let pipe = format!(r"\\.\pipe\tunnet-test-{}", uuid::Uuid::new_v4());
+        let (listener, path) = ApiListener::bind_test(marker.clone(), &pipe).unwrap();
+        let first = spawn_bound_listener(listener, path, |_| Router::new());
+        first.shutdown().await;
+        let (listener, path) = ApiListener::bind_test(marker, &pipe).unwrap();
+        let second = spawn_bound_listener(listener, path, |_| Router::new());
+        second.shutdown().await;
+    }
+}

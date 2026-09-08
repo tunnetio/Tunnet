@@ -580,7 +580,7 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
         api_version: API_VERSION,
         data_plane_up: state.data_plane.is_up(),
         uptime_secs: state.uptime_secs(),
-        snapshot_version: **state.node.version.load(),
+        snapshot_version: state.node.snapshot_version(),
         networks,
         on_demand: Some(OnDemandStatusInfo {
             reconnect_attempts: od.reconnect_attempts,
@@ -804,8 +804,8 @@ pub(crate) async fn build_netcheck(state: &LocalApiState) -> NetcheckInfo {
 
     checks.push(NetcheckItem {
         name: "snapshot".into(),
-        pass: **state.node.version.load() > 0,
-        detail: format!("version {}", **state.node.version.load()),
+        pass: state.node.snapshot_version() > 0,
+        detail: format!("version {}", state.node.snapshot_version()),
     });
 
     let ok = checks.iter().all(|c| c.pass);

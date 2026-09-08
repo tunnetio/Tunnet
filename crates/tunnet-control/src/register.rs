@@ -437,6 +437,7 @@ fn empty_pending_snapshot() -> tunnet_common::EndpointSnapshot {
         ipv6_enabled: false,
         tenant_ipv6: None,
         memberships: vec![],
+        network_revisions: std::collections::HashMap::new(),
         ipv6_peers: vec![],
         org_policy: tunnet_common::policy::PolicyBundle::default(),
         policy_verifying_key: None,

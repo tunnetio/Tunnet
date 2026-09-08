@@ -230,12 +230,15 @@ impl Actor for AgentSupervisor {
         // Wire late-bound subsystem refs into the control actor. Refs stay
         // valid across supervised restarts (restart is in place).
         if let Some(control) = &control_actor {
-            use super::control::{SetPostureActor, SetRouteActor};
+            use super::control::{SetDataPlaneActor, SetPostureActor, SetRouteActor};
             let mut route_ref = None;
+            let mut dataplane_ref = None;
             if let Ok(children) = dataplane_sup.ask(GetDataPlaneChildren).await {
                 route_ref = children.route_actor;
+                dataplane_ref = children.dataplane_actor;
             }
             let _ = control.tell(SetRouteActor(route_ref)).send().await;
+            let _ = control.tell(SetDataPlaneActor(dataplane_ref)).send().await;
             let _ = control
                 .tell(SetPostureActor(posture_actor.clone()))
                 .send()

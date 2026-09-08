@@ -26,6 +26,8 @@ pub use bootstrap_router::BootstrapApiState;
 #[cfg(feature = "local_api")]
 pub use dataplane::{DataPlaneControl, DataPlaneStatusSnapshot};
 #[cfg(feature = "local_api")]
+pub use server::LocalApiServer;
+#[cfg(feature = "local_api")]
 pub use server::spawn as spawn_local_api;
 #[cfg(feature = "local_api")]
 pub use server::spawn_bootstrap as spawn_bootstrap_api;

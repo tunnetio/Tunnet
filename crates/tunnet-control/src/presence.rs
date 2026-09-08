@@ -3,11 +3,9 @@
 use std::net::IpAddr;
 
 use sqlx::PgPool;
-use tunnet_common::PeerEntry;
 use uuid::Uuid;
 
 use crate::pg_inet;
-use crate::ws_hub::WsHub;
 
 pub const PRESENCE_CHANNEL: &str = "tunnet:device_presence";
 
@@ -98,95 +96,10 @@ async fn insert_presence_event(
     Ok(())
 }
 
-async fn bump_network_version(pool: &PgPool, network_id: Uuid) -> anyhow::Result<u64> {
-    let version: i64 = sqlx::query_scalar(
-        "UPDATE networks SET version = version + 1 WHERE id = $1 RETURNING version",
-    )
-    .bind(network_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(version as u64)
-}
-
-/// Load a single active peer entry for delta broadcasts.
-pub async fn load_peer_entry(
-    pool: &PgPool,
-    network_id: Uuid,
-    endpoint_id: &str,
-) -> anyhow::Result<Option<PeerEntry>> {
-    let row: Option<(String, String, pg_inet::PgIp, Option<String>)> = sqlx::query_as(
-        "SELECT e.endpoint_id, \
-            COALESCE(NULLIF(e.metadata->>'hostname', ''), left(e.endpoint_id, 8)) AS hostname, \
-            nm.assigned_ip::inet, \
-            NULLIF(e.metadata->>'sshHostKey', '') AS ssh_host_key \
-         FROM network_memberships nm \
-         JOIN devices e ON e.endpoint_id = nm.endpoint_id \
-         WHERE nm.network_id = $1 AND nm.status = 'active' AND nm.endpoint_id = $2 \
-           AND e.expired_at IS NULL",
-    )
-    .bind(network_id)
-    .bind(endpoint_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some((eid, host, assigned_ip, ssh_host_key)) = row else {
-        return Ok(None);
-    };
-    let ip = match pg_inet::to_ipv4_addr(assigned_ip) {
-        Ok(ip) => ip,
-        Err(_) => return Ok(None),
-    };
-    let tag_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT tag FROM device_tags WHERE endpoint_id = $1")
-            .bind(&eid)
-            .fetch_all(pool)
-            .await?;
-    Ok(Some(PeerEntry {
-        ip,
-        endpoint_id: eid,
-        hostname: host,
-        tags: tag_rows.into_iter().map(|(t,)| t).collect(),
-        ssh_host_key,
-    }))
-}
-
-/// Push a peer-joined delta to other WS agents (avoids full snapshot storm).
-pub async fn notify_peer_joined(
-    pool: &PgPool,
-    ws_hub: &WsHub,
-    network_id: Uuid,
-    endpoint_id: &str,
-) -> anyhow::Result<()> {
-    let Some(peer) = load_peer_entry(pool, network_id, endpoint_id).await? else {
-        return Ok(());
-    };
-    let version = bump_network_version(pool, network_id).await?;
-    ws_hub
-        .notify_peer_joined(network_id, endpoint_id, peer, version)
-        .await;
-    Ok(())
-}
-
-/// Push a peer-left delta when membership is actually removed (not mere presence).
-#[allow(dead_code)] // public helper for membership revocation paths
-pub async fn notify_peer_left(
-    pool: &PgPool,
-    ws_hub: &WsHub,
-    network_id: Uuid,
-    endpoint_id: &str,
-) -> anyhow::Result<()> {
-    let version = bump_network_version(pool, network_id).await?;
-    ws_hub
-        .notify_peer_left(network_id, endpoint_id, version)
-        .await;
-    Ok(())
-}
-
 pub async fn mark_agent_connected(
     pool: &PgPool,
     endpoint_id: &str,
     public_ip: Option<IpAddr>,
-    ws_hub: Option<&WsHub>,
 ) -> anyhow::Result<()> {
     let Some(device) = load_device(pool, endpoint_id).await? else {
         return Ok(());
@@ -216,13 +129,6 @@ pub async fn mark_agent_connected(
     .await?;
 
     emit_presence_changed(pool, &device.organization_id, endpoint_id).await?;
-    // Peer membership is unchanged by presence; push a cheap Delta so peers refresh
-    // metadata (hostname / ssh keys) without a full Snapshot storm.
-    if let Some(hub) = ws_hub
-        && let Err(e) = notify_peer_joined(pool, hub, device.network_id, endpoint_id).await
-    {
-        tracing::warn!(?e, %endpoint_id, "peer-joined delta on connect failed");
-    }
     tracing::info!(%endpoint_id, ?public_ip, "agent connected");
     Ok(())
 }

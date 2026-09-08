@@ -88,41 +88,6 @@ impl WsHub {
         tx.send(msg).await.is_ok()
     }
 
-    /// Broadcast a peer-joined delta to other agents on the network (skips `joined_endpoint_id`).
-    pub async fn notify_peer_joined(
-        &self,
-        network_id: Uuid,
-        joined_endpoint_id: &str,
-        peer: tunnet_common::PeerEntry,
-        version: u64,
-    ) {
-        let Some(set) = self.inner.by_network.get(&network_id) else {
-            return;
-        };
-        let ids: Vec<String> = set
-            .iter()
-            .filter(|e| e.as_str() != joined_endpoint_id)
-            .map(|e| e.clone())
-            .collect();
-        drop(set);
-
-        tracing::info!(
-            %network_id,
-            peer = %joined_endpoint_id,
-            agents = ids.len(),
-            "pushing peer-joined delta"
-        );
-
-        let msg = ServerMsg::Delta(tunnet_common::SnapshotDelta {
-            added: vec![peer],
-            removed: vec![],
-            version,
-        });
-        for endpoint_id in ids {
-            self.push_to(&endpoint_id, msg.clone()).await;
-        }
-    }
-
     /// Broadcast a peer-left delta to other agents on the network.
     pub async fn notify_peer_left(&self, network_id: Uuid, left_endpoint_id: &str, version: u64) {
         let Some(set) = self.inner.by_network.get(&network_id) else {

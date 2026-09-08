@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     EffectiveAgentConfig, EndpointIdHex, EndpointSnapshot, NetworkMembershipSnapshot, RedirectRule,
     RemoteAgentPolicy, SnapshotDelta,
-    policy::PolicyBundle,
     posture::{CustomScriptConfig, PostureEvalResult},
 };
 
@@ -13,7 +12,12 @@ use crate::{
 pub enum ServerMsg {
     Snapshot(Box<EndpointSnapshot>),
     Delta(SnapshotDelta),
-    Policy(PolicyBundle),
+    MembershipRevoked {
+        network_id: uuid::Uuid,
+        org_revision: u64,
+        network_revision: u64,
+        reason: String,
+    },
     ForceReenroll {
         reason: String,
     },

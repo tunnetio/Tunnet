@@ -158,6 +158,11 @@ impl AclEngine {
         self.fragments.lock().clear();
     }
 
+    #[cfg(all(test, feature = "managed"))]
+    pub(crate) fn policy_version(&self) -> u64 {
+        self.bundle.load().version
+    }
+
     pub fn flush_conntrack(&self) {
         self.conntrack.clear();
     }

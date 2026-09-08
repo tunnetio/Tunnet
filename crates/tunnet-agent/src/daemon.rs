@@ -138,9 +138,7 @@ pub async fn run_with_shutdown(
         None
     };
     if let Some(handle) = bootstrap_api {
-        handle.abort();
-        // Let the pipe / socket release before the full API rebinds.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.shutdown().await;
     }
 
     if let Some(token) = &shutdown
@@ -188,7 +186,7 @@ fn has_network_state(paths: &StatePaths) -> bool {
 async fn start_idle_bootstrap(
     paths: &StatePaths,
     on_ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<tunnet_core::local_api::LocalApiServer> {
     use std::sync::Arc;
 
     use tunnet_core::local_api::{BootstrapApiState, spawn_bootstrap_api};
@@ -226,9 +224,6 @@ async fn wait_for_network_state(
         }
         let has_secrets = paths.secrets_file().is_file();
         if has_secrets && let Ok(Some(_)) = PersistedState::try_load(paths) {
-            // Allow in-flight create/enroll HTTP responses to finish before we
-            // tear down the bootstrap API listener.
-            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
             return Ok(());
         }
         if !logged {

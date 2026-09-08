@@ -164,7 +164,10 @@ mod tests {
     use super::*;
     use crate::acl::{AclEngine, SelfIdentity};
     use std::net::Ipv4Addr;
-    use tunnet_common::policy::{DefaultAction, IcmpPolicy, PolicyBundle};
+    use tunnet_common::policy::{
+        Action, DefaultAction, FlowContext, FlowEndpoint, IcmpPolicy, PolicyBundle, PolicyRule,
+        Protocol, RuleScope, Selector,
+    };
 
     fn deny_bundle() -> PolicyBundle {
         PolicyBundle {
@@ -216,6 +219,73 @@ mod tests {
         let auth = TransportAuth::managed(&routes);
         assert!(auth.allows(&peer));
         assert!(!auth.allows(&"cc".repeat(32)));
+    }
+
+    #[test]
+    fn icmp_allow_with_deny_all_keeps_member_transport_authorized() {
+        let routes = RoutingTable::new();
+        let peer = "bb".repeat(32);
+        let self_id = "aa".repeat(32);
+        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
+        routes.replace(
+            &[tunnet_common::PeerEntry {
+                ip: peer_ip,
+                endpoint_id: peer.clone(),
+                hostname: "peer".into(),
+                tags: vec![],
+                ssh_host_key: None,
+            }],
+            &[],
+            &[],
+            &[],
+            &tunnet_common::DeviceProfile::default(),
+            &tunnet_common::DnsConfig::default(),
+            "net",
+            uuid::Uuid::nil(),
+            &self_id,
+            1,
+        );
+        let bundle = PolicyBundle {
+            rules: vec![PolicyRule {
+                src: Selector::Any,
+                dst: Selector::Any,
+                action: Action::Deny,
+                ports: vec![],
+                protocol: None,
+                priority: 0,
+                order_index: 0,
+                scope: RuleScope::Network,
+                enabled: true,
+                slug: Some("deny-all".into()),
+                src_posture: vec![],
+            }],
+            default_action: DefaultAction::Allow,
+            icmp_policy: IcmpPolicy::Allow,
+            ..PolicyBundle::default()
+        };
+        let acl = AclEngine::new(
+            SelfIdentity {
+                endpoint_hex: self_id.clone(),
+                ip: self_ip,
+                tags: vec![],
+                network: "net".into(),
+            },
+            routes.clone(),
+            bundle,
+        );
+        let auth = TransportAuth::managed(&routes);
+        assert!(auth.allows(&peer));
+        assert!(acl.allow_flow(
+            &FlowContext {
+                src: FlowEndpoint::member(self_id, vec![], "net".into(), Some(self_ip)),
+                dst: FlowEndpoint::member(peer.clone(), vec![], "net".into(), Some(peer_ip)),
+                protocol: Protocol::Icmp,
+                dst_port: None,
+                src_posture_ok: true,
+            },
+            &peer,
+        ));
     }
 
     #[test]

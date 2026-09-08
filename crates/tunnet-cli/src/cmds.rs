@@ -121,39 +121,6 @@ pub async fn wait_until_daemon(state_dir: Option<&str>, secs: u64) -> anyhow::Re
         .context("daemon not ready; check `tunnet service status` / `tunnet status`")
 }
 
-/// True when the Local API dropped the connection mid-request (common when the
-/// daemon reloads after create/join/enroll).
-pub fn is_api_connection_closed(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("connection closed")
-        || msg.contains("connection reset")
-        || msg.contains("broken pipe")
-        || msg.contains("unexpected eof")
-}
-
-/// After a mid-reload disconnect, wait for the daemon and treat success if state exists.
-pub async fn recover_bootstrap_result(
-    state_dir: Option<&str>,
-    verb: &str,
-    original: anyhow::Error,
-) -> anyhow::Result<()> {
-    if let Err(e) = wait_until_daemon(state_dir, 30).await {
-        return Err(original.context(format!(
-            "Local API closed during {verb}; daemon did not come back: {e:#}"
-        )));
-    }
-    let paths = StatePaths::resolve(state_dir);
-    match PersistedState::try_load(&paths)? {
-        Some(_) => {
-            println!("Network {verb} (daemon reloaded).");
-            Ok(())
-        }
-        None => Err(original.context(format!(
-            "Local API closed during {verb}, and no network state was found afterward"
-        ))),
-    }
-}
-
 fn read_yes_no() -> anyhow::Result<bool> {
     use std::io::{Write, stdin, stdout};
     stdout().flush()?;

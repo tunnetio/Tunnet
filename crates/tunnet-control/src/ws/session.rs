@@ -19,13 +19,8 @@ pub async fn run_ws(
 ) {
     tracing::info!(%endpoint_id, %organization_id, ?public_ip, "ws connected");
 
-    if let Err(e) = crate::presence::mark_agent_connected(
-        &state.pool,
-        &endpoint_id,
-        public_ip,
-        Some(&state.ws_hub),
-    )
-    .await
+    if let Err(e) =
+        crate::presence::mark_agent_connected(&state.pool, &endpoint_id, public_ip).await
     {
         tracing::warn!(?e, %endpoint_id, "failed to mark agent connected");
     }

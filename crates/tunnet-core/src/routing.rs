@@ -87,6 +87,20 @@ impl Default for RoutingTable {
 }
 
 impl RoutingTable {
+    pub fn clear_managed(&self, network_id: uuid::Uuid, self_endpoint_id: &str) {
+        self.replace(
+            &[],
+            &[],
+            &[],
+            &[],
+            &tunnet_common::DeviceProfile::default(),
+            &tunnet_common::DnsConfig::default(),
+            "",
+            network_id,
+            self_endpoint_id,
+            self.version(),
+        );
+    }
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(Tables {

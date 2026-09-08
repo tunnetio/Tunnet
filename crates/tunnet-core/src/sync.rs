@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use arc_swap::ArcSwap;
 use ed25519_dalek::VerifyingKey;
+use parking_lot::Mutex;
 use tunnet_common::policy::{PolicyBundle, merge_policy_bundles, verify_policy_bundle_signature};
 use tunnet_common::ws::{ClientMsg, ServerMsg};
 use tunnet_common::{EndpointSnapshot, NetworkMembershipSnapshot};
@@ -13,6 +13,73 @@ use crate::acl::AclEngine;
 use crate::control::SignedClient;
 use crate::routing::RoutingTable;
 use crate::state::{StatePaths, save_snapshot_cache};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgRevision(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkRevision(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedRevisionSnapshot {
+    pub org: OrgRevision,
+    pub network: NetworkRevision,
+}
+
+#[derive(Debug)]
+pub struct ManagedRevisions {
+    applied: Mutex<ManagedRevisionSnapshot>,
+}
+
+impl ManagedRevisions {
+    pub fn new(org: u64, network: u64) -> Self {
+        Self {
+            applied: Mutex::new(ManagedRevisionSnapshot {
+                org: OrgRevision(org),
+                network: NetworkRevision(network),
+            }),
+        }
+    }
+
+    pub fn load(&self) -> ManagedRevisionSnapshot {
+        *self.applied.lock()
+    }
+
+    pub fn accept_absence(&self, org: u64, network: u64) -> bool {
+        let mut current = self.applied.lock();
+        if org < current.org.0 || network < current.network.0 {
+            return false;
+        }
+        current.org = OrgRevision(org);
+        current.network = NetworkRevision(network);
+        true
+    }
+
+    fn apply_snapshot(
+        &self,
+        org: OrgRevision,
+        network: NetworkRevision,
+        apply: impl FnOnce(),
+    ) -> bool {
+        let mut current = self.applied.lock();
+        if org.0 < current.org.0 || network.0 < current.network.0 {
+            return false;
+        }
+        apply();
+        *current = ManagedRevisionSnapshot { org, network };
+        true
+    }
+
+    fn apply_delta(&self, network: NetworkRevision, apply: impl FnOnce()) -> bool {
+        let mut current = self.applied.lock();
+        if network.0 < current.network.0 {
+            return false;
+        }
+        apply();
+        current.network = network;
+        true
+    }
+}
 
 pub fn membership_for_network(
     snap: &EndpointSnapshot,
@@ -40,12 +107,12 @@ pub fn apply_membership(
     policy_verifying_key: Option<&str>,
     routes: &RoutingTable,
     acl: &AclEngine,
-    version: &Arc<ArcSwap<u64>>,
+    revisions: &Arc<ManagedRevisions>,
     org_version: u64,
     self_endpoint_id: &str,
     self_hostname: &str,
     known_hosts_dir: Option<&std::path::Path>,
-) {
+) -> bool {
     // Verify policy signatures BEFORE mutating routes/ACL.
     if let Some(vk) = parse_policy_vk(policy_verifying_key) {
         if let Err(e) = verify_policy_bundle_signature(&membership.policy, &vk) {
@@ -53,14 +120,14 @@ pub fn apply_membership(
                 ?e,
                 "network policy signature invalid; keeping previous routes+ACL"
             );
-            return;
+            return false;
         }
         if let Err(e) = verify_policy_bundle_signature(org_policy, &vk) {
             tracing::warn!(
                 ?e,
                 "org policy signature invalid; keeping previous routes+ACL"
             );
-            return;
+            return false;
         }
     } else if !membership.policy.signature.is_empty() || !org_policy.signature.is_empty() {
         tracing::debug!(
@@ -87,53 +154,58 @@ pub fn apply_membership(
         });
     }
 
-    routes.replace(
-        &peers,
-        &membership.subnet_routes,
-        &membership.hostname_routes,
-        &membership.exit_nodes,
-        &membership.device_profile,
-        &membership.dns,
-        &membership.network_name,
-        membership.network_id,
-        self_endpoint_id,
-        membership.version,
-    );
-
     let merged = merge_policy_bundles(org_policy, &membership.policy);
-    acl.replace_bundle(merged);
-    acl.replace_self_tags(membership.self_tags.clone());
-    version.store(Arc::new(org_version));
+    let applied = revisions.apply_snapshot(
+        OrgRevision(org_version),
+        NetworkRevision(membership.version),
+        || {
+            routes.replace(
+                &peers,
+                &membership.subnet_routes,
+                &membership.hostname_routes,
+                &membership.exit_nodes,
+                &membership.device_profile,
+                &membership.dns,
+                &membership.network_name,
+                membership.network_id,
+                self_endpoint_id,
+                membership.version,
+            );
+            acl.replace_bundle(merged);
+            acl.replace_self_tags(membership.self_tags.clone());
+        },
+    );
+    if !applied {
+        return false;
+    }
 
     if let Some(dir) = known_hosts_dir
         && let Err(e) = crate::known_hosts::sync_known_hosts(dir, &peers, &membership.dns.suffix)
     {
         tracing::debug!(?e, "known_hosts sync skipped");
     }
+    true
 }
 
 /// Apply a peer-only SnapshotDelta (no policy / route table replace).
 pub fn apply_delta(
     routes: &RoutingTable,
-    version: &Arc<ArcSwap<u64>>,
+    revisions: &Arc<ManagedRevisions>,
     delta: &tunnet_common::SnapshotDelta,
     self_endpoint_id: &str,
     network_id: Uuid,
     network_name: &str,
-) {
-    routes.apply_peer_delta(
-        network_id,
-        &delta.added,
-        &delta.removed,
-        delta.version,
-        self_endpoint_id,
-        network_name,
-    );
-    version.store(Arc::new(delta.version));
-}
-
-pub struct SyncHandles {
-    pub version: Arc<ArcSwap<u64>>,
+) -> bool {
+    revisions.apply_delta(NetworkRevision(delta.version), || {
+        routes.apply_peer_delta(
+            network_id,
+            &delta.added,
+            &delta.removed,
+            delta.version,
+            self_endpoint_id,
+            network_name,
+        );
+    })
 }
 
 /// Explicit owner-spawned managed control driver (no hidden tasks).
@@ -144,7 +216,7 @@ pub struct SyncHandles {
 pub struct ManagedDriverCtx {
     pub routes: RoutingTable,
     pub acl: AclEngine,
-    pub version: Arc<ArcSwap<u64>>,
+    pub revisions: Arc<ManagedRevisions>,
     pub paths: StatePaths,
     pub network_id: Uuid,
     pub self_endpoint_id: String,
@@ -177,7 +249,7 @@ impl ManagedDriverCtx {
         Self {
             routes: node.routes.clone(),
             acl: node.acl.clone(),
-            version: node.version.clone(),
+            revisions: node.revisions.clone(),
             paths: node.paths.clone(),
             network_id,
             self_endpoint_id: node.endpoint_id_hex(),
@@ -206,7 +278,7 @@ pub fn spawn_managed_driver(
         let ManagedDriverCtx {
             routes,
             acl,
-            version,
+            revisions,
             paths,
             network_id,
             self_endpoint_id,
@@ -243,7 +315,7 @@ pub fn spawn_managed_driver(
             .send(ClientMsg::Hello {
                 endpoint_id: "self".into(),
                 agent_version: agent_version.into(),
-                known_version: **version.load(),
+                known_version: revisions.load().org.0,
             })
             .await;
         let pools: Vec<crate::iroh_pool::ConnPool> =
@@ -263,7 +335,7 @@ pub fn spawn_managed_driver(
                     if let Some(client) = &poll_client {
                         poll_once(
                             client,
-                            &version,
+                            &revisions,
                             &routes,
                             &acl,
                             network_id,
@@ -278,27 +350,29 @@ pub fn spawn_managed_driver(
                 Some(msg) = server_rx.recv() => {
                     match msg {
                         ServerMsg::Snapshot(snap) => {
-                            if let Some(pool) = tunnel_pool.as_ref() {
-                                pool.set_cloud_relay_urls(
-                                    snap.connectivity_relays
-                                        .iter()
-                                        .filter(|r| r.metering)
-                                        .map(|r| r.url.clone()),
-                                );
-                            }
                             if let Ok(m) = membership_for_network(&snap, network_id) {
-                                apply_membership(
+                                if !apply_membership(
                                     m,
                                     &snap.org_policy,
                                     snap.policy_verifying_key.as_deref(),
                                     &routes,
                                     &acl,
-                                    &version,
+                                    &revisions,
                                     snap.version,
                                     &self_endpoint_id,
                                     &self_hostname,
                                     Some(paths.dir.as_path()),
-                                );
+                                ) {
+                                    continue;
+                                }
+                                if let Some(pool) = tunnel_pool.as_ref() {
+                                    pool.set_cloud_relay_urls(
+                                        snap.connectivity_relays
+                                            .iter()
+                                            .filter(|r| r.metering)
+                                            .map(|r| r.url.clone()),
+                                    );
+                                }
                                 for p in &pools {
                                     p.reconcile().await;
                                 }
@@ -326,7 +400,18 @@ pub fn spawn_managed_driver(
                                         })
                                         .await;
                                 }
-                            } else if let Some(store) = &effective_config {
+                            } else if snap
+                                .network_revisions
+                                .get(&network_id)
+                                .is_some_and(|network| revisions.accept_absence(snap.version, *network))
+                            {
+                                routes.clear_managed(network_id, &self_endpoint_id);
+                                for p in &pools {
+                                    p.reconcile().await;
+                                    p.close_all().await;
+                                }
+                                save_snapshot_cache(&paths, &snap).ok();
+                                if let Some(store) = &effective_config {
                                 let local = crate::TunnetConfig::try_load(&paths)
                                     .ok()
                                     .flatten()
@@ -339,6 +424,7 @@ pub fn spawn_managed_driver(
                                         reported_at: jiff::Timestamp::now(),
                                     })
                                     .await;
+                                }
                             }
                         }
                         ServerMsg::Delta(delta) => {
@@ -349,19 +435,37 @@ pub fn spawn_managed_driver(
                                 "delta received"
                             );
                             let network_name = routes.network_name();
-                            apply_delta(
+                            if !apply_delta(
                                 &routes,
-                                &version,
+                            &revisions,
                                 &delta,
                                 &self_endpoint_id,
                                 network_id,
                                 &network_name,
-                            );
+                            ) {
+                                continue;
+                            }
                             for p in &pools {
                                 p.reconcile().await;
                             }
                         }
-                        ServerMsg::Policy(bundle) => acl.replace_bundle(bundle),
+                        ServerMsg::MembershipRevoked {
+                            network_id: revoked_network_id,
+                            org_revision,
+                            network_revision,
+                            reason,
+                        } => {
+                            if revoked_network_id == network_id
+                                && revisions.accept_absence(org_revision, network_revision)
+                            {
+                                routes.clear_managed(network_id, &self_endpoint_id);
+                                for pool in &pools {
+                                    pool.reconcile().await;
+                                    pool.close_all().await;
+                                }
+                                tracing::warn!(%network_id, %reason, "managed membership revoked");
+                            }
+                        }
                         ServerMsg::ForceReenroll { reason } => {
                             tracing::error!(%reason, "control plane requested re-enrollment");
                             break;
@@ -369,24 +473,26 @@ pub fn spawn_managed_driver(
                         ServerMsg::Ping { nonce } => {
                             let _ = client_tx.send(ClientMsg::Pong { nonce }).await;
                             if let Some(client) = &poll_client {
-                                match client.poll(**version.load()).await {
+                                match client.poll(revisions.load().org.0).await {
                                     Ok(snap) => {
                                         if let Ok(m) = membership_for_network(&snap, network_id)
-                                            && (snap.version != **version.load()
-                                                || m.version != routes.version())
+                                            && (snap.version != revisions.load().org.0
+                                                || m.version != revisions.load().network.0)
                                         {
-                                            apply_membership(
+                                            if !apply_membership(
                                                 m,
                                                 &snap.org_policy,
                                                 snap.policy_verifying_key.as_deref(),
                                                 &routes,
                                                 &acl,
-                                                &version,
+                                                &revisions,
                                                 snap.version,
                                                 &self_endpoint_id,
                                                 &self_hostname,
                                                 Some(paths.dir.as_path()),
-                                            );
+                                            ) {
+                                                continue;
+                                            }
                                             for p in &pools {
                                                 p.reconcile().await;
                                             }
@@ -751,7 +857,7 @@ pub fn spawn_managed_driver(
 #[allow(clippy::too_many_arguments)]
 pub async fn poll_once(
     client: &SignedClient,
-    version: &Arc<ArcSwap<u64>>,
+    revisions: &Arc<ManagedRevisions>,
     routes: &RoutingTable,
     acl: &AclEngine,
     network_id: Uuid,
@@ -760,29 +866,30 @@ pub async fn poll_once(
     known_hosts_dir: Option<&std::path::Path>,
     pools: &[crate::iroh_pool::ConnPool],
 ) {
-    match client.poll(**version.load()).await {
+    match client.poll(revisions.load().org.0).await {
         Ok(snap) => {
-            if snap.version < **version.load() {
-                tracing::debug!(
-                    v = snap.version,
-                    current = **version.load(),
-                    "ignoring stale poll snapshot"
-                );
-                return;
-            }
             if let Ok(m) = membership_for_network(&snap, network_id) {
-                apply_membership(
+                if !apply_membership(
                     m,
                     &snap.org_policy,
                     snap.policy_verifying_key.as_deref(),
                     routes,
                     acl,
-                    version,
+                    revisions,
                     snap.version,
                     self_endpoint_id,
                     self_hostname,
                     known_hosts_dir,
-                );
+                ) {
+                    tracing::debug!(
+                        org = snap.version,
+                        network = m.version,
+                        current_org = revisions.load().org.0,
+                        current_network = revisions.load().network.0,
+                        "ignoring stale poll snapshot"
+                    );
+                    return;
+                }
                 for p in pools {
                     p.reconcile().await;
                 }
@@ -793,6 +900,16 @@ pub async fn poll_once(
                     hostname_routes = m.hostname_routes.len(),
                     "snapshot via poll"
                 );
+            } else if snap
+                .network_revisions
+                .get(&network_id)
+                .is_some_and(|network| revisions.accept_absence(snap.version, *network))
+            {
+                routes.clear_managed(network_id, self_endpoint_id);
+                for pool in pools {
+                    pool.reconcile().await;
+                    pool.close_all().await;
+                }
             }
         }
         Err(e) => {
@@ -805,9 +922,174 @@ pub async fn poll_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_swap::ArcSwap;
     use std::sync::Arc;
     use tunnet_common::SnapshotDelta;
+
+    fn membership(version: u64, policy: PolicyBundle) -> NetworkMembershipSnapshot {
+        NetworkMembershipSnapshot {
+            network_id: Uuid::nil(),
+            network_name: "office".into(),
+            assigned_ipv4: "10.7.0.1".parse().unwrap(),
+            prefix: 24,
+            mtu: 1280,
+            ipv4_peers: vec![tunnet_common::PeerEntry {
+                ip: "10.7.0.2".parse().unwrap(),
+                endpoint_id: "b".repeat(64),
+                hostname: "peer".into(),
+                tags: vec![],
+                ssh_host_key: None,
+            }],
+            subnet_routes: vec![],
+            hostname_routes: vec![],
+            dns: tunnet_common::DnsConfig::default(),
+            exit_nodes: vec![],
+            device_profile: tunnet_common::DeviceProfile::default(),
+            active_serves: vec![],
+            tunnel_config: vec![],
+            self_tags: vec![],
+            self_hostname: "self".into(),
+            policy,
+            gossip_bootstrap: vec![],
+            gossip_topic_hex: String::new(),
+            agent_policy: tunnet_common::RemoteAgentPolicy::default(),
+            version,
+        }
+    }
+
+    #[test]
+    fn network_revision_never_overwrites_org_revision() {
+        let revisions = ManagedRevisions::new(7, 100);
+        assert!(revisions.apply_delta(NetworkRevision(101), || {}));
+        assert_eq!(revisions.load().org, OrgRevision(7));
+        assert_eq!(revisions.load().network, NetworkRevision(101));
+        assert!(revisions.apply_snapshot(OrgRevision(8), NetworkRevision(102), || {}));
+        assert_eq!(revisions.load().org, OrgRevision(8));
+    }
+
+    #[test]
+    fn policy_create_update_delete_apply_without_restart() {
+        use tunnet_common::policy::{DefaultAction, IcmpPolicy};
+
+        let routes = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let acl = AclEngine::new(
+            crate::acl::SelfIdentity {
+                endpoint_hex: self_id.clone(),
+                ip: "10.7.0.1".parse().unwrap(),
+                tags: vec![],
+                network: "office".into(),
+            },
+            routes.clone(),
+            PolicyBundle::default(),
+        );
+        let revisions = Arc::new(ManagedRevisions::new(7, 100));
+        for (network_revision, default_action) in [
+            (101, DefaultAction::Deny),
+            (102, DefaultAction::Allow),
+            (103, DefaultAction::Allow),
+        ] {
+            let policy = PolicyBundle {
+                version: network_revision,
+                default_action,
+                icmp_policy: IcmpPolicy::Allow,
+                ..PolicyBundle::default()
+            };
+            assert!(apply_membership(
+                &membership(network_revision, policy),
+                &PolicyBundle::default(),
+                None,
+                &routes,
+                &acl,
+                &revisions,
+                8,
+                &self_id,
+                "self",
+                None,
+            ));
+            assert_eq!(acl.policy_version(), network_revision);
+        }
+        assert_eq!(revisions.load().org, OrgRevision(8));
+        assert_eq!(revisions.load().network, NetworkRevision(103));
+    }
+
+    #[test]
+    fn authoritative_membership_removal_revokes_transport_immediately() {
+        let routes = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let peer = "b".repeat(64);
+        let acl = AclEngine::new(
+            crate::acl::SelfIdentity {
+                endpoint_hex: self_id.clone(),
+                ip: "10.7.0.1".parse().unwrap(),
+                tags: vec![],
+                network: "office".into(),
+            },
+            routes.clone(),
+            PolicyBundle::default(),
+        );
+        let revisions = Arc::new(ManagedRevisions::new(1, 1));
+        assert!(apply_membership(
+            &membership(2, PolicyBundle::default()),
+            &PolicyBundle::default(),
+            None,
+            &routes,
+            &acl,
+            &revisions,
+            2,
+            &self_id,
+            "self",
+            None,
+        ));
+        let auth = crate::transport_auth::TransportAuth::managed(&routes);
+        assert!(auth.allows(&peer));
+        assert!(revisions.accept_absence(3, 3));
+        routes.clear_managed(Uuid::nil(), &self_id);
+        assert!(!auth.allows(&peer));
+    }
+
+    #[test]
+    fn stale_completion_cannot_mutate_live_state() {
+        let revisions = ManagedRevisions::new(1, 1);
+        let applied = std::sync::atomic::AtomicU64::new(0);
+        assert!(
+            revisions.apply_snapshot(OrgRevision(3), NetworkRevision(30), || {
+                applied.store(30, std::sync::atomic::Ordering::SeqCst);
+            })
+        );
+        assert!(
+            !revisions.apply_snapshot(OrgRevision(2), NetworkRevision(20), || {
+                applied.store(20, std::sync::atomic::Ordering::SeqCst);
+            })
+        );
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 30);
+    }
+
+    #[test]
+    fn concurrent_out_of_order_results_remain_monotonic() {
+        let revisions = Arc::new(ManagedRevisions::new(1, 1));
+        let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let newer = {
+            let revisions = revisions.clone();
+            let applied = applied.clone();
+            std::thread::spawn(move || {
+                revisions.apply_snapshot(OrgRevision(3), NetworkRevision(30), || {
+                    applied.store(30, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        assert!(newer.join().unwrap());
+        let older = {
+            let revisions = revisions.clone();
+            let applied = applied.clone();
+            std::thread::spawn(move || {
+                revisions.apply_snapshot(OrgRevision(2), NetworkRevision(20), || {
+                    applied.store(20, std::sync::atomic::Ordering::SeqCst);
+                })
+            })
+        };
+        assert!(!older.join().unwrap());
+        assert_eq!(applied.load(std::sync::atomic::Ordering::SeqCst), 30);
+    }
 
     #[test]
     fn apply_delta_bumps_version() {
@@ -827,7 +1109,7 @@ mod tests {
             &self_id,
             1,
         );
-        let version = Arc::new(ArcSwap::from_pointee(1u64));
+        let revisions = Arc::new(ManagedRevisions::new(1, 1));
         let delta = SnapshotDelta {
             added: vec![tunnet_common::PeerEntry {
                 ip: "10.7.0.5".parse().unwrap(),
@@ -839,8 +1121,9 @@ mod tests {
             removed: vec![],
             version: 42,
         };
-        apply_delta(&routes, &version, &delta, &self_id, nid, "office");
-        assert_eq!(**version.load(), 42);
+        apply_delta(&routes, &revisions, &delta, &self_id, nid, "office");
+        assert_eq!(revisions.load().org, OrgRevision(1));
+        assert_eq!(revisions.load().network, NetworkRevision(42));
         assert_eq!(routes.version(), 42);
         assert!(routes.lookup_endpoint(&peer_a).is_some());
     }

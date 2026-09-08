@@ -70,6 +70,17 @@ pub async fn build_endpoint_snapshot(
     .fetch_all(pool)
     .await?;
 
+    let network_revision_rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT nm.network_id, n.version FROM network_memberships nm \
+         JOIN networks n ON n.id = nm.network_id WHERE nm.endpoint_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_all(pool)
+    .await?;
+    let network_revisions = network_revision_rows
+        .into_iter()
+        .map(|(network_id, version)| (network_id, version as u64))
+        .collect();
     let mut memberships = Vec::with_capacity(membership_rows.len());
     for (network_id, network_name, assigned_ip, mtu, network_version, self_hostname) in
         membership_rows
@@ -162,6 +173,7 @@ pub async fn build_endpoint_snapshot(
         ipv6_enabled,
         tenant_ipv6,
         memberships,
+        network_revisions,
         ipv6_peers,
         org_policy,
         policy_verifying_key: Some(hex::encode(policy_key.verifying_key().to_bytes())),

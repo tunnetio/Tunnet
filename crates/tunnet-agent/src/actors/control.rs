@@ -10,7 +10,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use ed25519_dalek::SigningKey;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -20,10 +19,11 @@ use tunnet_core::ws_client::{ControlPlaneLink, ControlTransport};
 use tunnet_core::{CoreNode, StatePaths};
 use uuid::Uuid;
 
+use super::dataplane::{BringDown, DataPlaneActor};
 use super::posture::{
     ApplyPostureConfig, ApplyRemoteAgentPolicy, PostureActor, PostureStatusChanged, Recheck,
 };
-use super::routes::{ApplyDesiredRoutes, RouteActor};
+use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
 use super::ssh_registry::SshRegistryActor;
 use crate::system_routes::desired_from_membership;
 
@@ -39,6 +39,7 @@ pub struct ControlPlaneActorArgs {
     pub poll_secs: u64,
     /// Late-bound by the supervisor (`SetRouteActor`); `None` until wired.
     pub route_actor: Option<ActorRef<RouteActor>>,
+    pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
     pub posture_actor: Option<ActorRef<PostureActor>>,
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
 }
@@ -51,6 +52,7 @@ pub struct TransportConfig {
 }
 
 pub struct ControlPlaneActor {
+    self_ref: ActorRef<ControlPlaneActor>,
     cfg: ControlPlaneActorArgs,
     client_tx: tokio::sync::mpsc::Sender<ClientMsg>,
     link: ControlPlaneLink,
@@ -59,7 +61,7 @@ pub struct ControlPlaneActor {
     forwarder: Option<super::OwnedTask>,
     heartbeat: Option<super::OwnedTask>,
     poller: Option<super::OwnedTask>,
-    version: Arc<ArcSwap<u64>>,
+    revisions: Arc<tunnet_core::sync::ManagedRevisions>,
 }
 
 impl Actor for ControlPlaneActor {
@@ -191,7 +193,7 @@ impl Actor for ControlPlaneActor {
             },
         );
 
-        let version = args.node.version.clone();
+        let revisions = args.node.revisions.clone();
         // Route serve/send reports through this transport (overwrites the dead
         // bootstrap senders; bootstrap spawns no transport task).
         args.node.serves.set_client_tx(client_tx.clone());
@@ -201,11 +203,12 @@ impl Actor for ControlPlaneActor {
             .send(ClientMsg::Hello {
                 endpoint_id: "self".into(),
                 agent_version: args.agent_version.to_string(),
-                known_version: **version.load(),
+                known_version: revisions.load().org.0,
             })
             .await;
 
         Ok(Self {
+            self_ref: actor_ref,
             cfg: args,
             client_tx,
             link,
@@ -214,7 +217,7 @@ impl Actor for ControlPlaneActor {
             forwarder: Some(forwarder),
             heartbeat: Some(heartbeat),
             poller: Some(poller),
-            version,
+            revisions,
         })
     }
 
@@ -261,31 +264,32 @@ impl ControlPlaneActor {
         let node = self.cfg.node.clone();
         match msg {
             ServerMsg::Snapshot(snap) => {
-                node.tunnel_pool.set_cloud_relay_urls(
-                    snap.connectivity_relays
-                        .iter()
-                        .filter(|r| r.metering)
-                        .map(|r| r.url.clone()),
-                );
                 if let Ok(m) = tunnet_core::sync::membership_for_network(&snap, self.cfg.network_id)
                 {
-                    tunnet_core::sync::apply_membership(
+                    let applied = tunnet_core::sync::apply_membership(
                         m,
                         &snap.org_policy,
                         snap.policy_verifying_key.as_deref(),
                         &node.routes,
                         &node.acl,
-                        &self.version,
+                        &self.revisions,
                         snap.version,
                         &self.cfg.transport.endpoint_id,
                         &self.cfg.hostname,
                         Some(self.cfg.paths.dir.as_path()),
                     );
+                    if !applied {
+                        return;
+                    }
+                    node.tunnel_pool.set_cloud_relay_urls(
+                        snap.connectivity_relays
+                            .iter()
+                            .filter(|r| r.metering)
+                            .map(|r| r.url.clone()),
+                    );
                     node.pool.reconcile().await;
                     node.tunnel_pool.reconcile().await;
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
-                    // The snapshot version travels with the work so a lagging
-                    // task can never overwrite newer desired routes.
                     let desired = membership_desired(
                         &node,
                         &m.device_profile,
@@ -298,92 +302,97 @@ impl ControlPlaneActor {
                             .collect::<Vec<_>>(),
                         m.device_profile.exit_node_endpoint_id.is_some(),
                     );
-                    let snapshot_version = snap.version;
-                    let route_actor = self.cfg.route_actor.clone();
+                    let network_version = m.version;
                     let client_tx = self.client_tx.clone();
                     let policy = m.agent_policy.clone();
                     let paths = self.cfg.paths.clone();
                     let store = node.effective_config.clone();
-                    let posture_actor = self.cfg.posture_actor.clone();
-                    tokio::spawn(async move {
-                        match route_actor {
-                            Some(route_actor) => {
-                                if let Ok(res) = tokio::time::timeout(
-                                    Duration::from_secs(15),
-                                    route_actor.ask(ApplyDesiredRoutes {
-                                        desired,
-                                        version: crate::actors::ControlVersion::Snapshot(
-                                            snapshot_version,
-                                        ),
-                                    }),
-                                )
-                                .await
-                                    && let Err(e) = res
-                                {
-                                    tracing::warn!(error = %e, "route apply via control plane failed");
-                                }
-                            }
-                            None => {
-                                tracing::debug!("route actor not wired yet; skipping route apply");
-                            }
-                        }
-                        // Remote policy merge off the mailbox. Versioned like
-                        // routes: a lagging snapshot must not overwrite the
-                        // merge from a newer one.
-                        if let Some(posture) = posture_actor {
-                            let _ = posture
-                                .tell(ApplyRemoteAgentPolicy {
-                                    policy,
-                                    paths,
-                                    store,
+                    match self.cfg.route_actor.clone() {
+                        Some(route_actor) => {
+                            if let Ok(res) = tokio::time::timeout(
+                                Duration::from_secs(15),
+                                route_actor.ask(ApplyDesiredRoutes {
+                                    desired,
                                     version: crate::actors::ControlVersion::Snapshot(
-                                        snapshot_version,
+                                        network_version,
                                     ),
-                                })
-                                .send()
-                                .await;
-                        } else {
-                            let local = tunnet_core::TunnetConfig::try_load(&paths)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let effective = store.apply_remote(&local, policy);
-                            let _ = client_tx
-                                .send(ClientMsg::EffectiveConfigReport {
-                                    config: effective,
-                                    reported_at: jiff::Timestamp::now(),
-                                })
-                                .await;
+                                }),
+                            )
+                            .await
+                                && let Err(e) = res
+                            {
+                                tracing::warn!(error = %e, "route apply via control plane failed");
+                            }
                         }
-                    });
+                        None => {
+                            tracing::debug!("route actor not wired yet; skipping route apply");
+                        }
+                    }
+                    if let Some(posture) = self.cfg.posture_actor.clone() {
+                        let _ = posture
+                            .tell(ApplyRemoteAgentPolicy {
+                                policy,
+                                paths,
+                                store,
+                                version: crate::actors::ControlVersion::Snapshot(network_version),
+                            })
+                            .send()
+                            .await;
+                    } else {
+                        let local = tunnet_core::TunnetConfig::try_load(&paths)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                        let effective = store.apply_remote(&local, policy);
+                        let _ = client_tx
+                            .send(ClientMsg::EffectiveConfigReport {
+                                config: effective,
+                                reported_at: jiff::Timestamp::now(),
+                            })
+                            .await;
+                    }
+                    if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                        let _ = dataplane_actor.ask(super::dataplane::BringUp).await;
+                    }
                     tunnet_core::state::save_snapshot_cache(&self.cfg.paths, &snap).ok();
                     tracing::info!(
                         v = m.version,
                         peers = m.ipv4_peers.len(),
                         "snapshot from ws"
                     );
-                } else if let Some(posture) = &self.cfg.posture_actor {
-                    let _ = posture
-                        .tell(ApplyRemoteAgentPolicy {
-                            policy: snap.agent_policy.clone(),
-                            paths: self.cfg.paths.clone(),
-                            store: node.effective_config.clone(),
-                            version: crate::actors::ControlVersion::Snapshot(snap.version),
-                        })
-                        .send()
-                        .await;
+                } else if snap
+                    .network_revisions
+                    .get(&self.cfg.network_id)
+                    .is_some_and(|network| self.revisions.accept_absence(snap.version, *network))
+                {
+                    node.routes
+                        .clear_managed(self.cfg.network_id, &self.cfg.transport.endpoint_id);
+                    node.pool.reconcile().await;
+                    node.tunnel_pool.reconcile().await;
+                    node.pool.close_all().await;
+                    node.tunnel_pool.close_all().await;
+                    if let Some(route_actor) = &self.cfg.route_actor {
+                        let _ = route_actor.ask(ClearRoutes).await;
+                    }
+                    if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                        let _ = dataplane_actor.ask(BringDown).await;
+                    }
+                    tunnet_core::state::save_snapshot_cache(&self.cfg.paths, &snap).ok();
+                    tracing::warn!(network_id = %self.cfg.network_id, "managed membership is no longer active");
                 }
             }
             ServerMsg::Delta(delta) => {
                 let network_name = node.routes.network_name();
-                tunnet_core::sync::apply_delta(
+                if !tunnet_core::sync::apply_delta(
                     &node.routes,
-                    &self.version,
+                    &self.revisions,
                     &delta,
                     &self.cfg.transport.endpoint_id,
                     self.cfg.network_id,
                     &network_name,
-                );
+                ) {
+                    return;
+                }
                 node.pool.reconcile().await;
                 node.tunnel_pool.reconcile().await;
                 tracing::info!(
@@ -393,36 +402,45 @@ impl ControlPlaneActor {
                     "delta received"
                 );
             }
-            ServerMsg::Policy(bundle) => node.acl.replace_bundle(bundle),
+            ServerMsg::MembershipRevoked {
+                network_id,
+                org_revision,
+                network_revision,
+                reason,
+            } => {
+                if network_id != self.cfg.network_id
+                    || !self
+                        .revisions
+                        .accept_absence(org_revision, network_revision)
+                {
+                    return;
+                }
+                node.routes
+                    .clear_managed(network_id, &self.cfg.transport.endpoint_id);
+                node.pool.reconcile().await;
+                node.tunnel_pool.reconcile().await;
+                node.pool.close_all().await;
+                node.tunnel_pool.close_all().await;
+                if let Some(route_actor) = &self.cfg.route_actor {
+                    let _ = route_actor.ask(ClearRoutes).await;
+                }
+                if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                    let _ = dataplane_actor.ask(BringDown).await;
+                }
+                tracing::warn!(%network_id, %reason, "managed membership revoked");
+            }
             ServerMsg::ForceReenroll { reason } => {
                 tracing::error!(%reason, "control plane requested re-enrollment");
             }
             ServerMsg::Ping { nonce } => {
                 self.send_client(ClientMsg::Pong { nonce });
-                // Ping wake-up poll off the mailbox. Shares `poll_once` with
-                // the periodic driver (stale-guarded, single implementation).
+                // Fetch off the mailbox; the result returns through PollCompleted.
                 if let Some(signed) = node.signed.clone() {
-                    let routes = node.routes.clone();
-                    let acl = node.acl.clone();
-                    let pools = vec![node.pool.clone(), node.tunnel_pool.clone()];
-                    let version = self.version.clone();
-                    let nid = self.cfg.network_id;
-                    let eid = self.cfg.transport.endpoint_id.clone();
-                    let hostname = self.cfg.hostname.clone();
-                    let dir = self.cfg.paths.dir.clone();
+                    let actor = self.self_ref.clone();
+                    let known = self.revisions.load().org.0;
                     tokio::spawn(async move {
-                        tunnet_core::sync::poll_once(
-                            &signed,
-                            &version,
-                            &routes,
-                            &acl,
-                            nid,
-                            &eid,
-                            &hostname,
-                            Some(dir.as_path()),
-                            &pools,
-                        )
-                        .await;
+                        let result = signed.poll(known).await;
+                        let _ = actor.tell(PollCompleted(result)).send().await;
                     });
                 }
             }
@@ -727,7 +745,7 @@ struct InboundServerMsg(ServerMsg);
 impl Message<InboundServerMsg> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, msg: InboundServerMsg, _ctx: &mut Context<Self, Self::Reply>) {
-        // Short dispatch only; long work is spawned off the mailbox.
+        // The actor serializes every live-state mutation.
         self.handle_server(msg.0).await;
     }
 }
@@ -755,29 +773,32 @@ struct PollNow;
 
 impl Message<PollNow> for ControlPlaneActor {
     type Reply = ();
-    async fn handle(&mut self, _msg: PollNow, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, _msg: PollNow, ctx: &mut Context<Self, Self::Reply>) {
         if let Some(signed) = self.cfg.node.signed.clone() {
-            let node = self.cfg.node.clone();
-            let version = self.version.clone();
-            let network_id = self.cfg.network_id;
-            let endpoint_id = self.cfg.transport.endpoint_id.clone();
-            let hostname = self.cfg.hostname.clone();
-            let dir = self.cfg.paths.dir.clone();
+            let actor = ctx.actor_ref().clone();
+            let known = self.revisions.load().org.0;
             tokio::spawn(async move {
-                let pools = vec![node.pool.clone(), node.tunnel_pool.clone()];
-                tunnet_core::sync::poll_once(
-                    &signed,
-                    &version,
-                    &node.routes,
-                    &node.acl,
-                    network_id,
-                    &endpoint_id,
-                    &hostname,
-                    Some(dir.as_path()),
-                    &pools,
-                )
-                .await;
+                let result = signed.poll(known).await;
+                let _ = actor.tell(PollCompleted(result)).send().await;
             });
+        }
+    }
+}
+
+struct PollCompleted(anyhow::Result<tunnet_common::EndpointSnapshot>);
+
+impl Message<PollCompleted> for ControlPlaneActor {
+    type Reply = ();
+    async fn handle(&mut self, msg: PollCompleted, _ctx: &mut Context<Self, Self::Reply>) {
+        match msg.0 {
+            Ok(snapshot) => {
+                self.handle_server(ServerMsg::Snapshot(Box::new(snapshot)))
+                    .await
+            }
+            Err(error) => {
+                self.cfg.node.acl.mark_stale();
+                tracing::warn!(?error, "poll failed");
+            }
         }
     }
 }
@@ -859,6 +880,15 @@ impl Message<SetRouteActor> for ControlPlaneActor {
     }
 }
 
+pub struct SetDataPlaneActor(pub Option<ActorRef<DataPlaneActor>>);
+
+impl Message<SetDataPlaneActor> for ControlPlaneActor {
+    type Reply = ();
+    async fn handle(&mut self, msg: SetDataPlaneActor, _ctx: &mut Context<Self, Self::Reply>) {
+        self.cfg.dataplane_actor = msg.0;
+    }
+}
+
 /// Late-bind the posture actor.
 pub struct SetPostureActor(pub Option<ActorRef<PostureActor>>);
 
@@ -912,6 +942,7 @@ mod tests {
             paths,
             poll_secs: 30,
             route_actor: Some(route),
+            dataplane_actor: None,
             posture_actor: None,
             ssh_registry: Some(ssh),
         }
