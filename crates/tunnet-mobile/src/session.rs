@@ -73,6 +73,12 @@ fn run_args() -> RunArgs {
         disable_gossip: false,
         recorder: false,
         no_mdns: false,
+        // No override, matching the CLI default: relay policy is persisted
+        // configuration, so pinning it here would silently outrank whatever the
+        // user set. `Auto` is also the right behaviour for a phone, which moves
+        // between networks and needs relay selection to follow.
+        relay_mode: None,
+        relay_urls: None,
         // The product promise is "connected until switched off", so peers must
         // not be allowed to idle out while the device sleeps.
         keep_alive: true,
