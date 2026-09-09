@@ -177,20 +177,44 @@ class MainActivity : ComponentActivity() {
                 connect()
                 return@launch
             }
-            val result = withContext(Dispatchers.IO) {
-                TunnetNative.join(inviteCode, Build.MODEL ?: "android")
-            }
-            when (result) {
-                is TunnetNative.Result.Ok -> refresh()
-                is TunnetNative.Result.Err -> TunnetState.setError(result.message)
+            // The agent stays Running for the whole join, so this flag is the
+            // only thing that moves on screen between the tap and membership
+            // arriving. Cleared in `finally` so a failed or throwing join does
+            // not leave the UI spinning forever.
+            TunnetState.setJoining(true)
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    TunnetNative.join(inviteCode, Build.MODEL ?: "android")
+                }
+                when (result) {
+                    // Keep the indicator up until membership is actually
+                    // visible. The agent acknowledges the join before its
+                    // status lists the network, so a single refresh here
+                    // returns an empty list and the screen flashes
+                    // "Not joined", which reads as failure.
+                    is TunnetNative.Result.Ok -> awaitMembership()
+                    is TunnetNative.Result.Err -> TunnetState.setError(result.message)
+                }
+            } finally {
+                TunnetState.setJoining(false)
             }
         }
     }
 
     /** Pull fresh status; the agent is the truth for everything shown. */
     private fun refresh() {
-        lifecycleScope.launch {
-            withContext(Dispatchers.IO) {
+        lifecycleScope.launch { refreshNow() }
+    }
+
+    /**
+     * Pull status and wait for it, so a caller can sequence against the result.
+     *
+     * [refresh] fires and forgets, which is right for polling but wrong after a
+     * join: clearing `joining` before the new status arrived left one frame
+     * reading "Not joined", which looks like the join failed.
+     */
+    private suspend fun refreshNow() {
+        withContext(Dispatchers.IO) {
                 when (val status = TunnetNative.status()) {
                     is TunnetNative.Result.Ok -> {
                         val data = status.data
@@ -217,6 +241,24 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+    }
+
+    /**
+     * Refresh until the agent reports membership, or the budget runs out.
+     *
+     * Joining is acknowledged before it is observable: the agent returns from
+     * `join` once the coordinator has admitted it, while membership reaches
+     * local status a moment later. Measured at roughly 2-3s on a phone. The
+     * budget bounds the wait so a genuinely stuck join still resolves to the
+     * normal "not joined" screen instead of spinning forever.
+     */
+    private suspend fun awaitMembership(budgetMillis: Long = 15_000) {
+        val deadline = System.currentTimeMillis() + budgetMillis
+        while (true) {
+            refreshNow()
+            if (TunnetState.status.value.joined) return
+            if (System.currentTimeMillis() >= deadline) return
+            delay(250)
         }
     }
 
@@ -300,13 +342,19 @@ private fun StatusCard(status: TunnetStatus) {
                         // Running but not joined is not "connecting": there is
                         // nothing to connect to until a network is joined, and
                         // claiming progress that will never arrive is a lie.
+                        // Progress that is really happening, unlike the idle
+                        // "Running but not joined" case below.
+                        status.joining -> "Joining"
                         status.stage == Stage.Running && !status.joined -> "Not joined"
                         status.stage == Stage.Running -> "Connecting"
                         else -> "Disconnected"
                     },
                     style = MaterialTheme.typography.headlineSmall,
                 )
-                if (status.stage == Stage.Starting || status.stage == Stage.Stopping) {
+                if (status.joining ||
+                    status.stage == Stage.Starting ||
+                    status.stage == Stage.Stopping
+                ) {
                     Spacer(Modifier.fillMaxWidth(0.05f))
                     CircularProgressIndicator(Modifier.height(20.dp))
                 }
@@ -371,10 +419,18 @@ private fun JoinCard(status: TunnetStatus, onJoin: (String) -> Unit) {
             }
             Button(
                 onClick = { onJoin(invite.trim()) },
-                enabled = invite.isNotBlank() && status.stage != Stage.Starting,
+                enabled = invite.isNotBlank() &&
+                    status.stage != Stage.Starting &&
+                    !status.joining,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (status.stage == Stage.Stopped) "Start and join" else "Join")
+                Text(
+                    when {
+                        status.joining -> "Joining…"
+                        status.stage == Stage.Stopped -> "Start and join"
+                        else -> "Join"
+                    },
+                )
             }
         }
     }

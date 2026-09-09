@@ -38,6 +38,17 @@ data class TunnetStatus(
     val stage: Stage = Stage.Stopped,
     /** True once the agent reports a live data plane, i.e. traffic is flowing. */
     val dataPlaneUp: Boolean = false,
+    /**
+     * A join is in flight against an already-running agent.
+     *
+     * [Stage] cannot express this: the agent is `Running` throughout, so
+     * without a separate flag the screen does not move between the tap and
+     * membership arriving. That is a couple of seconds of redeeming the
+     * invite, syncing membership and establishing the tunnel, which looked
+     * frozen. The `Stopped` path does not need it, because starting the agent
+     * already reports [Stage.Starting].
+     */
+    val joining: Boolean = false,
     val endpointId: String = "",
     val hostname: String = "",
     val networks: List<Network> = emptyList(),
@@ -86,6 +97,8 @@ object TunnetState {
     }
 
     fun setStage(stage: Stage) = update { it.copy(stage = stage) }
+
+    fun setJoining(joining: Boolean) = update { it.copy(joining = joining) }
 
     fun setError(message: String?) = update { it.copy(error = message) }
 

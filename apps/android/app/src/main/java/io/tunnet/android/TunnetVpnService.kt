@@ -144,12 +144,28 @@ class TunnetVpnService : VpnService() {
     private fun redeemPendingInvite() {
         val invite = TunnetState.takePendingInvite() ?: return
         Log.i(TAG, "redeeming pending invite")
-        when (val result = TunnetNative.join(invite, Build.MODEL ?: "android")) {
-            is TunnetNative.Result.Ok -> Log.i(TAG, "joined network")
-            is TunnetNative.Result.Err -> {
-                Log.e(TAG, "join failed: ${result.message}")
-                TunnetState.setError(result.message)
+        // The agent is already Running by this point, so `Stage` no longer
+        // conveys progress; without this the screen reads "Not joined" while
+        // the join is actually in flight.
+        TunnetState.setJoining(true)
+        try {
+            when (val result = TunnetNative.join(invite, Build.MODEL ?: "android")) {
+                is TunnetNative.Result.Ok -> {
+                    Log.i(TAG, "joined network")
+                    // Publish the joined status BEFORE the flag drops. The
+                    // caller refreshes too, but that happens after this
+                    // function returns, leaving a window where `joining` is
+                    // false and membership has not landed: the screen reads
+                    // "Not joined" for a second, which looks like failure.
+                    refreshStatus()
+                }
+                is TunnetNative.Result.Err -> {
+                    Log.e(TAG, "join failed: ${result.message}")
+                    TunnetState.setError(result.message)
+                }
             }
+        } finally {
+            TunnetState.setJoining(false)
         }
     }
 
