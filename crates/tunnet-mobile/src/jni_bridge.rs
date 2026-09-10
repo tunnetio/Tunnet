@@ -223,7 +223,7 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStart(
         init_logging();
 
         let state_dir = read_string(&mut env, &state_dir)?;
-        let device_name = read_string(&mut env, &device_name)?;
+        let device_name = crate::session::sanitize_hostname(&read_string(&mut env, &device_name)?);
 
         let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
@@ -310,7 +310,7 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeJoin(
 ) -> jstring {
     let result = (|| -> Result<serde_json::Value> {
         let invite_code = read_string(&mut env, &invite_code)?;
-        let hostname = read_string(&mut env, &hostname)?;
+        let hostname = crate::session::sanitize_hostname(&read_string(&mut env, &hostname)?);
         if invite_code.trim().is_empty() {
             bail!("invite code is empty");
         }

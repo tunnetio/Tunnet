@@ -236,3 +236,68 @@ mod tests {
         );
     }
 }
+
+/// Make a device name usable as a Tunnet hostname.
+///
+/// Android hands us `Build.MODEL`, which routinely contains spaces ("Pixel
+/// 8a"), while the agent rejects a hostname containing a space, a dot or a
+/// slash, or longer than 63 characters. Passing the raw model through wrote a
+/// `tunnet.toml` the agent then refused to load, so joining appeared to work
+/// and the agent died on the next start with `invalid hostname`.
+///
+/// Substituting rather than rejecting keeps the device recognisable in a peer
+/// list, which is the only thing this name is for.
+pub(crate) fn sanitize_hostname(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| match c {
+            ' ' | '.' | '/' => '-',
+            c => c,
+        })
+        .collect();
+    // Truncate on a character boundary, not a byte index: a multi-byte name
+    // would otherwise panic or produce invalid UTF-8.
+    let truncated: String = cleaned.chars().take(63).collect();
+    let trimmed = truncated.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "android".to_string()
+    } else {
+        trimmed
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::sanitize_hostname;
+
+    /// The agent rejects a hostname containing ' ', '.' or '/', or longer than
+    /// 63 characters, so these are the cases that previously produced a
+    /// `tunnet.toml` the agent refused to load.
+    #[test]
+    fn rejected_characters_are_substituted() {
+        assert_eq!(sanitize_hostname("Pixel 8a"), "Pixel-8a");
+        assert_eq!(sanitize_hostname("moto g(60)"), "moto-g(60)");
+        assert_eq!(sanitize_hostname("a.b/c d"), "a-b-c-d");
+    }
+
+    #[test]
+    fn length_is_capped_on_a_character_boundary() {
+        let long = "é".repeat(80);
+        let out = sanitize_hostname(&long);
+        assert_eq!(out.chars().count(), 63);
+        assert!(out.len() <= 63 * 2);
+    }
+
+    #[test]
+    fn empty_or_punctuation_only_falls_back() {
+        assert_eq!(sanitize_hostname(""), "android");
+        assert_eq!(sanitize_hostname("   "), "android");
+        assert_eq!(sanitize_hostname("..."), "android");
+    }
+
+    #[test]
+    fn an_already_valid_name_is_unchanged() {
+        assert_eq!(sanitize_hostname("nono"), "nono");
+    }
+}
