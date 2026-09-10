@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 tunnet-agent.workspace = true
 tunnet-client.workspace = true
 tunnet-common.workspace = true
+tunnet-core.workspace = true
 
 anyhow.workspace = true
 serde.workspace = true

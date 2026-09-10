@@ -6,7 +6,6 @@
 //! Android-only and cannot be tested off-device).
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -22,49 +21,26 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Filename of the Local API socket inside the app's private directory.
 const API_SOCKET: &str = "tunnetd.sock";
 
-static API_PATH_ONCE: Once = Once::new();
-static HOSTNAME_ONCE: Once = Once::new();
-
 /// Point the Local API at the app's private directory.
 ///
 /// The default bind paths (`/run/tunnet`, `/tmp`) do not exist or are not
-/// writable on Android, and the agent has no argument for this, so the
-/// environment is the only channel. Done once, as early as possible.
+/// writable on Android. This used to go through `TUNNET_API_PATH`, which meant
+/// `std::env::set_var`: unsound here, because a JVM is already multi-threaded
+/// before any of our code runs and `setenv` races every concurrent `getenv` in
+/// the process, including ones inside libc. `tunnet-core` now takes the path
+/// programmatically, so no environment write is needed.
 ///
-/// Mutating the environment is process-global and racy against concurrent
-/// getenv in other threads; a JVM is already multi-threaded by the time we run,
-/// so this is deliberately confined to a single write of a single variable
-/// before the agent (and therefore any reader of it) starts.
+/// First call wins, matching the previous `Once`: the agent binds this socket,
+/// so moving it afterwards would strand the client.
 fn set_api_path(api_path: &Path) {
-    API_PATH_ONCE.call_once(|| {
-        // SAFETY: single write, before the agent or client read it, and never
-        // repeated (Once). No other Tunnet thread touches the environment.
-        unsafe { std::env::set_var("TUNNET_API_PATH", api_path) };
-    });
-}
-
-/// Report the device's own name to the mesh.
-///
-/// The agent reads `HOSTNAME` for the name it presents to peers; without it
-/// every phone appears as the built-in default ("tunnet-agent"), which is
-/// useless in a peer list where the point is telling devices apart. Same
-/// single-write discipline as [`set_api_path`].
-fn set_hostname(hostname: &str) {
-    let hostname = hostname.trim();
-    if hostname.is_empty() {
-        return;
-    }
-    HOSTNAME_ONCE.call_once(|| {
-        // SAFETY: single write, before the agent reads it, never repeated.
-        unsafe { std::env::set_var("HOSTNAME", hostname) };
-    });
+    tunnet_core::local_api::transport::set_api_path_override(api_path);
 }
 
 /// Arguments the embedded agent runs with.
 ///
 /// Deliberately not the desktop defaults: a phone has no SSH recorder to offer
 /// and must hold the mesh open while the screen is off.
-fn run_args() -> RunArgs {
+fn run_args(hostname: &str) -> RunArgs {
     RunArgs {
         // Cosmetic on Android: the framework names the interface itself.
         ifname: "tunnet0".to_string(),
@@ -83,6 +59,9 @@ fn run_args() -> RunArgs {
         // not be allowed to idle out while the device sleeps.
         keep_alive: true,
         no_encrypt_state: false,
+        // Explicit rather than via `HOSTNAME`: see `set_api_path` on why the
+        // environment is not usable as a configuration channel here.
+        hostname: Some(hostname.to_string()).filter(|h| !h.trim().is_empty()),
     }
 }
 
@@ -108,7 +87,6 @@ impl AgentSession {
 
         let api_path = state_dir.join(API_SOCKET);
         set_api_path(&api_path);
-        set_hostname(hostname);
 
         tunnet_agent::install_crypto_provider();
 
@@ -121,18 +99,18 @@ impl AgentSession {
         let shutdown = CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
+        // Built here, not inside the task: the caller's `hostname` is borrowed
+        // and must not escape into a `'static` future.
+        let args = run_args(hostname);
+
         {
             let shutdown = shutdown.clone();
             let state_dir = state_dir.clone();
             runtime.spawn(async move {
                 let dir = state_dir.to_string_lossy().into_owned();
-                if let Err(e) = daemon::run_with_shutdown(
-                    run_args(),
-                    Some(&dir),
-                    Some(shutdown),
-                    Some(ready_tx),
-                )
-                .await
+                if let Err(e) =
+                    daemon::run_with_shutdown(args, Some(&dir), Some(shutdown), Some(ready_tx))
+                        .await
                 {
                     tracing::error!(error = ?e, "embedded agent exited with an error");
                 }
@@ -200,7 +178,7 @@ mod tests {
 
     #[test]
     fn run_args_hold_the_mesh_open_and_skip_the_recorder() {
-        let args = run_args();
+        let args = run_args("");
         assert!(args.keep_alive, "a phone must stay reachable while asleep");
         assert!(!args.recorder, "no SSH session recorder on a phone");
     }

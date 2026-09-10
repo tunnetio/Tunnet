@@ -2,11 +2,39 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Process-wide override for the API endpoint, set programmatically.
+///
+/// Exists for embedders that cannot use the environment. Setting `TUNNET_API_PATH`
+/// requires `std::env::set_var`, which is `unsafe` and genuinely unsound in a
+/// process that is already multi-threaded: `setenv` races every concurrent
+/// `getenv` in the process, including ones inside libc, not merely Tunnet's own
+/// threads. Android hosts the agent inside an app whose JVM has many threads
+/// running before any of our code executes, so the environment is not available
+/// to us as a configuration channel.
+static API_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Pin the Local Management API endpoint for this process.
+///
+/// First call wins, so a late caller cannot move the endpoint out from under a
+/// server that already bound it. Returns whether this call set the value.
+pub fn set_api_path_override(path: impl Into<PathBuf>) -> bool {
+    API_PATH_OVERRIDE.set(path.into()).is_ok()
+}
+
+/// The programmatic override, then the environment, then platform defaults.
+fn api_path_override() -> Option<PathBuf> {
+    if let Some(path) = API_PATH_OVERRIDE.get() {
+        return Some(path.clone());
+    }
+    std::env::var("TUNNET_API_PATH").ok().map(PathBuf::from)
+}
 
 /// Resolve the fixed Local Management API endpoint path / pipe marker.
 pub fn default_api_path() -> PathBuf {
-    if let Ok(override_path) = std::env::var("TUNNET_API_PATH") {
-        return PathBuf::from(override_path);
+    if let Some(override_path) = api_path_override() {
+        return override_path;
     }
     #[cfg(unix)]
     {
@@ -35,8 +63,8 @@ pub fn unix_api_candidates() -> Vec<PathBuf> {
         }
     };
 
-    if let Ok(override_path) = std::env::var("TUNNET_API_PATH") {
-        push(PathBuf::from(override_path));
+    if let Some(override_path) = api_path_override() {
+        push(override_path);
     }
     if let Ok(dir) = std::env::var("TUNNET_RUNTIME_DIR") {
         push(PathBuf::from(dir).join("tunnetd.sock"));
@@ -67,8 +95,8 @@ fn apply_unix_api_permissions(path: &Path) {
 /// Path used when *binding* the listener (single socket).
 #[cfg(unix)]
 fn unix_bind_path() -> PathBuf {
-    if let Ok(override_path) = std::env::var("TUNNET_API_PATH") {
-        return PathBuf::from(override_path);
+    if let Some(override_path) = api_path_override() {
+        return override_path;
     }
     if let Ok(dir) = std::env::var("TUNNET_RUNTIME_DIR") {
         return PathBuf::from(dir).join("tunnetd.sock");

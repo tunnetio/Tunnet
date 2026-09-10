@@ -46,9 +46,13 @@ pub async fn run(
     let metrics = AgentMetrics::new().context("metrics")?;
     let started_at = Instant::now();
 
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "tunnet-agent".into());
+    let hostname = args
+        .hostname
+        .clone()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "tunnet-agent".into());
 
     let is_direct = persisted.is_direct();
     let network_id = persisted.primary_network_id().unwrap_or(Uuid::nil());
