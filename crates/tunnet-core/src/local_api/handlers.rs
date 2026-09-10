@@ -405,6 +405,16 @@ fn iroh_relay_status(endpoint: &iroh::Endpoint) -> String {
         "connected".into()
     } else if statuses.is_empty() {
         "disabled".into()
+    } else if let Some((url, reason)) = statuses.iter().find_map(|s| {
+        s.auth_denied_reason()
+            .map(|reason| (s.url().to_string(), reason.to_string()))
+    }) {
+        tracing::warn!(%url, %reason, "relay denied authentication");
+        if reason.is_empty() {
+            "auth_denied".into()
+        } else {
+            format!("auth_denied: {reason}")
+        }
     } else {
         "disconnected".into()
     }

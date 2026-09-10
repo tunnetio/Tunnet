@@ -172,6 +172,21 @@ pub fn relay_uses_n0_preset(policy: &EffectiveRelayPolicy) -> bool {
     policy.uses_n0_infrastructure()
 }
 
+/// Relay auth denial observed via `home_relay_status`
+///
+/// Returns `(relay_url, reason)` for the first home relay reporting
+/// [`iroh::endpoint::RelayStatus::auth_denied_reason`]. Unlike transient
+/// failures this won't resolve by retrying with the same credentials, so
+/// callers should surface it rather than wait for `Endpoint::online`.
+pub fn relay_auth_denied_detail(endpoint: &Endpoint) -> Option<(String, String)> {
+    use iroh::Watcher;
+    let mut watcher = endpoint.home_relay_status();
+    watcher.get().iter().find_map(|s| {
+        s.auth_denied_reason()
+            .map(|reason| (s.url().to_string(), reason.to_string()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

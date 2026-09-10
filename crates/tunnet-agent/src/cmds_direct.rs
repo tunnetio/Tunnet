@@ -6,8 +6,8 @@ use tunnet_core::direct::{
     AddressPlan, ConnectivityOptions, GENESIS_SCHEMA_VERSION, Genesis, JOIN_ALPN, JoinStatus,
     MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant, allocate_peer_ip,
     apply_connectivity, decode_and_preflight, endpoint_builder, generate_coordinator_keypair,
-    grant_expiry, network_id_from_topic, run_join_client, sign_genesis, sign_grant,
-    sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
+    grant_expiry, network_id_from_topic, relay_auth_denied_detail, run_join_client, sign_genesis,
+    sign_grant, sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
 };
 use tunnet_core::{
     AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, TunnetConfig, load_agent,
@@ -339,7 +339,14 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
     let join_result = async {
         match tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await {
             Ok(()) => tracing::info!("join endpoint online"),
-            Err(_) => tracing::warn!("relay not ready yet; attempting join connect anyway"),
+            Err(_) => match relay_auth_denied_detail(&endpoint) {
+                Some((url, reason)) => tracing::error!(
+                    %url,
+                    %reason,
+                    "relay denied authentication (check relay auth token); attempting join connect anyway"
+                ),
+                None => tracing::warn!("relay not ready yet; attempting join connect anyway"),
+            },
         }
 
         let coord: iroh::EndpointId = invite

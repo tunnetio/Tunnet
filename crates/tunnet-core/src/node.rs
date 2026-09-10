@@ -31,7 +31,9 @@ use crate::direct::{
     verify_genesis, verify_member_record, verifying_key_from_hex,
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
-use crate::direct::{ConnectivityOptions, apply_connectivity, endpoint_builder};
+use crate::direct::{
+    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_auth_denied_detail,
+};
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
 use crate::routing::RoutingTable;
@@ -409,7 +411,14 @@ impl CoreNode {
             tokio::spawn(async move {
                 match tokio::time::timeout(Duration::from_secs(10), ep.online()).await {
                     Ok(()) => tracing::info!("endpoint online"),
-                    Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+                    Err(_) => match relay_auth_denied_detail(&ep) {
+                        Some((url, reason)) => tracing::error!(
+                            %url,
+                            %reason,
+                            "relay denied authentication (check relay auth token); continuing without relay"
+                        ),
+                        None => tracing::warn!("timed out waiting for relay; continuing"),
+                    },
                 }
             });
         }
@@ -588,7 +597,14 @@ impl CoreNode {
             tokio::spawn(async move {
                 match tokio::time::timeout(Duration::from_secs(10), ep.online()).await {
                     Ok(()) => tracing::info!("direct endpoint online"),
-                    Err(_) => tracing::warn!("timed out waiting for relay; continuing"),
+                    Err(_) => match relay_auth_denied_detail(&ep) {
+                        Some((url, reason)) => tracing::error!(
+                            %url,
+                            %reason,
+                            "relay denied authentication (check relay auth token); continuing without relay"
+                        ),
+                        None => tracing::warn!("timed out waiting for relay; continuing"),
+                    },
                 }
             });
         }

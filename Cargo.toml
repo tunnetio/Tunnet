@@ -144,8 +144,8 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 
 # Networking
-iroh = { version = "1.1.0" }
-iroh-relay = { version = "1.1.0", default-features = false, features = [
+iroh = { version = "1.2.0" }
+iroh-relay = { version = "1.2.0", default-features = false, features = [
   "server",
 ] }
 iroh-gossip = "0.101"

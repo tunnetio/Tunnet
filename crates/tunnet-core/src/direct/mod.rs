@@ -54,8 +54,8 @@ pub use auth::{
 pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub use connectivity::{
-    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_map_from_configs,
-    relay_uses_n0_preset,
+    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_auth_denied_detail,
+    relay_map_from_configs, relay_uses_n0_preset,
 };
 pub use contact::{contact_id_from_endpoint, contact_id_from_hex, is_contact_id, parse_contact_id};
 #[cfg(feature = "direct")]
