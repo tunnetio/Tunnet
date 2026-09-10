@@ -81,6 +81,11 @@ impl AgentSession {
     /// Blocking, and slow on first run. Callers on Android must not invoke this
     /// from the main thread.
     pub fn start(state_dir: impl Into<PathBuf>, hostname: &str) -> Result<Self> {
+        // Sanitised here rather than by the caller, so no embedder can pass a
+        // name the agent will reject: an invalid hostname is written into
+        // `tunnet.toml` and only fails on the *next* start, long after the call
+        // that caused it.
+        let hostname = sanitize_hostname(hostname);
         let state_dir = state_dir.into();
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
@@ -101,7 +106,7 @@ impl AgentSession {
 
         // Built here, not inside the task: the caller's `hostname` is borrowed
         // and must not escape into a `'static` future.
-        let args = run_args(hostname);
+        let args = run_args(&hostname);
 
         {
             let shutdown = shutdown.clone();

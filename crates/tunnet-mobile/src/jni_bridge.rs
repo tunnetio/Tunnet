@@ -223,7 +223,7 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStart(
         init_logging();
 
         let state_dir = read_string(&mut env, &state_dir)?;
-        let device_name = crate::session::sanitize_hostname(&read_string(&mut env, &device_name)?);
+        let device_name = read_string(&mut env, &device_name)?;
 
         let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
