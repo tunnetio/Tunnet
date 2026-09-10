@@ -207,6 +207,20 @@ class TunnetVpnService : VpnService() {
         if (status !is TunnetNative.Result.Ok) {
             if (status is TunnetNative.Result.Err) {
                 TunnetState.setError(status.message)
+                // The agent can die after startup (a failed bootstrap-to-runtime
+                // transition right after a join, for one). The session object
+                // survives it, so without this the UI sits on "connected" while
+                // every call fails, which is the most misleading state we can
+                // show. The native layer reports this distinctly rather than as
+                // a generic socket error.
+                if (status.message.contains("agent is not running")) {
+                    Log.e(TAG, "agent died: ${'$'}{status.message}")
+                    agentStarted = false
+                    TunnetState.update {
+                        it.copy(stage = Stage.Stopped, dataPlaneUp = false, joining = false)
+                    }
+                    stopSelf()
+                }
             }
             return
         }

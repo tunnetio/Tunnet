@@ -46,27 +46,45 @@ static INIT_ANDROID_CONTEXT: Once = Once::new();
 
 fn init_android_context(env: &mut JNIEnv, service: &JObject) -> Result<()> {
     let vm = env.get_java_vm().context("obtain JavaVM")?;
-    // A strong global ref: the registered context object must stay alive as long
-    // as the process, and a local ref would be freed on return.
-    let service_ref = env
-        .new_global_ref(service)
-        .context("pin VpnService reference")?;
+
+    // Register the *application* context, not the Service.
+    //
+    // ndk-context keeps the pointer for the process lifetime, but a Service is
+    // not process-lived: `stopAgent` calls `stopSelf()`, and the next connect
+    // constructs a new `TunnetVpnService`. Registering the Service would pin
+    // the first instance forever and, worse, leave consumers (notably
+    // rustls-platform-verifier, which fetches it lazily during the join) holding
+    // a context belonging to a destroyed Service after any stop/start cycle.
+    // The application context outlives every Service, so pinning it is both
+    // bounded and always valid.
+    let app_context = env
+        .call_method(
+            service,
+            "getApplicationContext",
+            "()Landroid/content/Context;",
+            &[],
+        )
+        .and_then(|v| v.l())
+        .context("obtain application context")?;
+    let app_ref = env
+        .new_global_ref(&app_context)
+        .context("pin application context")?;
+
     INIT_ANDROID_CONTEXT.call_once(|| {
         // SAFETY: the JavaVM pointer is valid for the process lifetime, and the
-        // context object is held by `service_ref` for the same lifetime, so the
+        // context object is held by `app_ref` for the same lifetime, so the
         // pointers stay valid for however long ndk-context holds them. Called
         // exactly once, satisfying the crate's own contract.
         unsafe {
             ndk_context::initialize_android_context(
                 vm.get_java_vm_pointer().cast(),
-                service_ref.as_obj().as_raw().cast(),
+                app_ref.as_obj().as_raw().cast(),
             );
         }
-        // Leaking the ref is deliberate: ndk-context needs the context for the
-        // rest of the process, so it must never be freed. The same object is
-        // pinned again for the TunProvider below, so this is one deliberate
-        // lifetime extension, not a leak per start.
-        std::mem::forget(service_ref);
+        // Deliberate: ndk-context needs the context for the rest of the
+        // process, so it must never be freed. One application context, once,
+        // rather than one Service per start.
+        std::mem::forget(app_ref);
     });
     Ok(())
 }
@@ -297,6 +315,13 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStatus(
     _class: JClass,
 ) -> jstring {
     let result = with_session(|session| {
+        // An agent that died after startup leaves this session in place, so a
+        // failed query here is ambiguous: transient, or a corpse. Report the
+        // agent's own exit error when there is one, so the app can leave
+        // "connected" instead of decorating it with a socket error forever.
+        if let Some(cause) = session.exit_error() {
+            bail!("agent is not running: {cause}");
+        }
         let node = session
             .block_on(session.client().node())
             .context("query node status")?;

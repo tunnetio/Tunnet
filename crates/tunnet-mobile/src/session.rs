@@ -6,6 +6,7 @@
 //! Android-only and cannot be tested off-device).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -68,6 +69,9 @@ fn run_args(hostname: &str) -> RunArgs {
 /// A running embedded agent plus a client for its Local API.
 pub struct AgentSession {
     runtime: Runtime,
+    /// Set when the agent's own task returns an error, at any point after
+    /// startup. `stop()` is not the only way an agent ends.
+    exit_error: Arc<Mutex<Option<String>>>,
     shutdown: CancellationToken,
     client: TunnetClient,
     state_dir: PathBuf,
@@ -104,6 +108,13 @@ impl AgentSession {
         let shutdown = CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
+        // The agent's own error is the only actionable text there is ("invalid
+        // tunnet.toml: invalid hostname", "cached snapshot missing enrolled
+        // network"). Logging it and reporting a symptom sends the cause to
+        // logcat, which a phone user cannot read. Kept here so both the start
+        // path and later status calls can report it.
+        let exit_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         // Built here, not inside the task: the caller's `hostname` is borrowed
         // and must not escape into a `'static` future.
         let args = run_args(&hostname);
@@ -111,6 +122,7 @@ impl AgentSession {
         {
             let shutdown = shutdown.clone();
             let state_dir = state_dir.clone();
+            let exit_error = exit_error.clone();
             runtime.spawn(async move {
                 let dir = state_dir.to_string_lossy().into_owned();
                 if let Err(e) =
@@ -118,6 +130,7 @@ impl AgentSession {
                         .await
                 {
                     tracing::error!(error = ?e, "embedded agent exited with an error");
+                    *exit_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!("{e:#}"));
                 }
             });
         }
@@ -133,7 +146,12 @@ impl AgentSession {
                 // until every task including in-flight spawn_blocking finishes,
                 // which on Android runs on the service's worker thread.
                 runtime.shutdown_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
-                bail!("agent stopped before its Local API became ready");
+                let cause = exit_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "no error reported".to_string());
+                bail!("agent stopped before its Local API became ready: {cause}");
             }
             Err(_) => {
                 shutdown.cancel();
@@ -150,6 +168,7 @@ impl AgentSession {
             runtime,
             shutdown,
             state_dir,
+            exit_error,
         })
     }
 
@@ -164,6 +183,19 @@ impl AgentSession {
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    /// The error the agent exited with, if it has exited.
+    ///
+    /// `run_with_shutdown` can fail at any point after readiness, notably when
+    /// the bootstrap-to-runtime transition fails just after a join. Nothing
+    /// else notices: the session object survives, so the app would sit on
+    /// "connected" while every call fails against a socket nobody is serving.
+    pub fn exit_error(&self) -> Option<String> {
+        self.exit_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Signal shutdown and drop the runtime.
