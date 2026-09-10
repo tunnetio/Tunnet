@@ -100,6 +100,21 @@ object TunnetState {
 
     fun setJoining(joining: Boolean) = update { it.copy(joining = joining) }
 
+    /**
+     * Undo an optimistic [Stage.Starting] for a start that will never happen.
+     *
+     * The UI moves to `Starting` on the tap, before VPN consent is granted, so
+     * that the screen reacts immediately. If consent is refused, nothing will
+     * ever report `Running` or `Stopped`, so the stage has to be put back here
+     * or the spinner runs forever. A parked invite is dropped for the same
+     * reason: no service will start to redeem it, and keeping it would join on
+     * some unrelated later connect.
+     */
+    fun abandonStart(reason: String) {
+        pendingInvite = null
+        update { it.copy(stage = Stage.Stopped, joining = false, error = reason) }
+    }
+
     fun setError(message: String?) = update { it.copy(error = message) }
 
     /** Reset to stopped, keeping nothing stale from the previous session. */

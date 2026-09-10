@@ -73,7 +73,12 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnService()
         } else {
-            TunnetState.setError("VPN permission is required to connect")
+            // `connect()` optimistically moved to Starting before asking, so a
+            // refusal has to undo that or the UI spins on "Starting" forever
+            // for something that will never arrive. Any invite parked for the
+            // service to redeem goes too: nothing will start to consume it, and
+            // leaving it would silently join on some later connect.
+            TunnetState.abandonStart("VPN permission is required to connect")
         }
     }
 
