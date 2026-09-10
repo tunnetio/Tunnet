@@ -129,10 +129,15 @@ impl AgentSession {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 shutdown.cancel();
+                // Bounded, like stop(): dropping a multi-thread Runtime blocks
+                // until every task including in-flight spawn_blocking finishes,
+                // which on Android runs on the service's worker thread.
+                runtime.shutdown_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
                 bail!("agent stopped before its Local API became ready");
             }
             Err(_) => {
                 shutdown.cancel();
+                runtime.shutdown_timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
                 bail!(
                     "agent did not become ready within {}s",
                     READY_TIMEOUT.as_secs()
@@ -239,9 +244,17 @@ pub(crate) fn sanitize_hostname(raw: &str) -> String {
             c => c,
         })
         .collect();
-    // Truncate on a character boundary, not a byte index: a multi-byte name
-    // would otherwise panic or produce invalid UTF-8.
-    let truncated: String = cleaned.chars().take(63).collect();
+    // The agent's limit is 63 *bytes* (`h.len() > 63`), so counting characters
+    // is not enough: 63 multi-byte characters is up to 252 bytes and would be
+    // rejected exactly as the raw name was. Take whole characters while they
+    // fit the byte budget, so the result is valid UTF-8 and within the limit.
+    let mut truncated = String::new();
+    for c in cleaned.chars() {
+        if truncated.len() + c.len_utf8() > 63 {
+            break;
+        }
+        truncated.push(c);
+    }
     let trimmed = truncated.trim_matches('-').to_string();
     if trimmed.is_empty() {
         "android".to_string()
@@ -264,12 +277,17 @@ mod hostname_tests {
         assert_eq!(sanitize_hostname("a.b/c d"), "a-b-c-d");
     }
 
+    /// The agent counts bytes, so a multi-byte name must be capped by bytes.
+    /// Capping by characters produced a name up to 252 bytes long, which the
+    /// agent rejects for precisely the reason this function exists.
     #[test]
-    fn length_is_capped_on_a_character_boundary() {
-        let long = "é".repeat(80);
-        let out = sanitize_hostname(&long);
-        assert_eq!(out.chars().count(), 63);
-        assert!(out.len() <= 63 * 2);
+    fn length_is_capped_in_bytes_on_a_character_boundary() {
+        for name in ["é".repeat(80), "a".repeat(80), "日本語".repeat(40)] {
+            let out = sanitize_hostname(&name);
+            assert!(out.len() <= 63, "{out:?} is {} bytes", out.len());
+            // Still valid UTF-8 with no partial character.
+            assert!(out.chars().all(|c| !c.is_control()));
+        }
     }
 
     #[test]

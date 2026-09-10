@@ -11221,6 +11221,7 @@ dependencies = [
  "tunnet-agent",
  "tunnet-client",
  "tunnet-common",
+ "tunnet-core",
 ]
 
 [[package]]

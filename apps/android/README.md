@@ -6,7 +6,7 @@ Connects the phone to a Tunnet mesh and keeps it connected, like the desktop age
 
 - **The full agent runs in-process.** Android cannot host a daemon, so `tunnetd`'s runtime is linked into the app as `libtunnet_mobile.so` (`crates/tunnet-mobile`, wrapping `crates/tunnet-agent` as a library). Desktop and mobile therefore share one runtime rather than a mobile fork of it.
 - **Kotlin at the OS edge only.** `TunnetVpnService` owns the tunnel and the notification; `MainActivity` paints state. Neither holds mesh logic: every fact on screen (identity, peers, whether the data plane is up) comes from the agent through the same Local Management API the CLI and desktop app use.
-- **The agent asks the app for a tunnel, not the reverse.** Only the framework can open a TUN, but only the agent knows the mesh address, so neither can go first. The agent calls `TunnetVpnService.establishTun(ipv4, prefix, mtu)` whenever its data plane comes up, and the app answers with a descriptor from `VpnService.Builder.establish()`. This also covers reconnects: each cycle establishes a fresh session, where a cached descriptor would point at a revoked tunnel and drop writes silently.
+- **The agent asks the app for a tunnel, not the reverse.** Only the framework can open a TUN, but only the agent knows the mesh address, so neither can go first. The agent calls `TunnetVpnService.establishTun(addrs, routes, dns, mtu)` whenever its data plane comes up, passing the addresses to assign, the routes to capture and the resolvers to advertise as three separate lists rather than one address the app has to interpret, and the app answers with a descriptor from `VpnService.Builder.establish()`. This also covers reconnects: each cycle establishes a fresh session, where a cached descriptor would point at a revoked tunnel and drop writes silently.
 - **Cross-compiled as a normal Gradle step.** `cargoBuildAgent` runs `cargo build` per ABI with the NDK's clang and stages each `.so` into `jniLibs`, wired into `preBuild`. No cargo-ndk. `./gradlew :app:assembleDebug` just works.
 
 ## Build
@@ -14,6 +14,8 @@ Connects the phone to a Tunnet mesh and keeps it connected, like the desktop age
 ```sh
 rustup target add aarch64-linux-android x86_64-linux-android
 export ANDROID_HOME=/path/to/android-sdk      # or set sdk.dir in local.properties
+# Also required: JDK 17, and an NDK under $ANDROID_HOME/ndk (API 26 capable).
+# rustup targets are per-toolchain, so re-run the target add after a bump.
 cd apps/android
 ./gradlew :app:assembleDebug
 ```
@@ -27,7 +29,7 @@ The APK lands at `app/build/outputs/apk/debug/app-debug.apk`, signed with AGP's 
 ## Use
 
 1. On a machine already in the mesh: `tunnet invite <network>`.
-2. Open the app, paste the code, tap **Start and join**. That grants VPN consent, starts the agent, joins, and brings the tunnel up in one step.
+2. Open the app and grant the VPN prompt. The app connects on open, so the agent is already running by the time you paste; the button then reads **Join** rather than **Start and join**, which is the refused-consent or explicitly-disconnected path.
 3. The mesh IP and peers appear once membership syncs.
 
 Afterwards the app reconnects on its own: the service is `START_STICKY`, and it can be set as an always-on VPN in Android's settings.
@@ -50,7 +52,8 @@ Installing a release-signed APK over a debug one requires uninstalling first: sa
 
 ## Known limits (v1)
 
-- **APK is ~84 MB**, because the packaged agent still carries SSH, the session recorder, bundled SQLite and the updater, none of which a phone reaches. Trimming needs feature gates in `tunnet-agent`, which `tunnet-core` already has.
+- **APK is ~108 MB** (both ABIs; roughly 46 MB of that is the arm64 agent alone), because the packaged agent still carries SSH, the session recorder, bundled SQLite and the updater, none of which a phone reaches. Trimming needs feature gates in `tunnet-agent`, which `tunnet-core` already has.
+- **No DNS.** The resolver list handed to `VpnService.Builder` is empty: PeerDNS binds host loopback, which Android cannot use, since port 53 is privileged for an unprivileged app and `netd` resolves per app, so `127.0.0.1` would name the app rather than the agent. Peers are reachable by address, not by name.
 - **Direct mode only.** Managed enrolment is not surfaced.
 - **IPv4 only**, matching the agent's data plane. IPv6 is left outside the tunnel rather than blackholed.
-- Peer list refreshes on resume, not from the agent's `/v1/events` stream.
+- Peer list is polled (2s in the UI, 3s in the service), not driven by the agent's `/v1/events` stream.

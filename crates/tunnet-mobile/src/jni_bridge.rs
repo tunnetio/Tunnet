@@ -210,7 +210,8 @@ fn json_of<T: serde::Serialize>(value: T) -> Result<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 /// Start the embedded agent. `service` must implement
-/// `int establishTun(String ipv4, int prefix, int mtu)`.
+/// `int establishTun(String[] addrs, String[] routes, String[] dns, int mtu)`,
+/// matching the JNI descriptor used below.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStart(
     mut env: JNIEnv,
@@ -268,16 +269,22 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStop(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let session = {
+    // The lock is held across stop(), not just across take(). Releasing it
+    // first leaves a window where `nativeStart` sees `None` and starts a second
+    // agent against the same state dir while the first is still draining: two
+    // endpoints on one identity, two writers on the same sealed state, and a
+    // second bind of the socket the first still holds.
+    let stopped = {
         let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        guard.take()
+        android_tun::clear_provider();
+        match guard.take() {
+            Some(session) => {
+                session.stop();
+                true
+            }
+            None => false,
+        }
     };
-    android_tun::clear_provider();
-
-    let stopped = session.is_some();
-    if let Some(session) = session {
-        session.stop();
-    }
 
     let payload = ok_json(serde_json::json!({ "stopped": stopped }));
     to_jstring(&mut env, payload)

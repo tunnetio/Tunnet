@@ -65,6 +65,11 @@ class TunnetVpnService : VpnService() {
      * feels responsive. Guarding on it made the service mistake the UI's
      * optimism for its own progress and skip starting the agent entirely.
      */
+    // Written on `worker` and read on the main thread in onStartCommand, so
+    // it needs to be visible across both. `TunnetState.pendingInvite` next door
+    // is @Volatile for the same reason. A stale `true` would make startAgent
+    // return early and never start the agent at all.
+    @Volatile
     private var agentStarted = false
 
     /** Held while connected so mDNS peer discovery can receive multicast. */

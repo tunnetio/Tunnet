@@ -38,7 +38,7 @@ pub fn build_tun_multi(
     _prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {
-    use std::os::fd::IntoRawFd;
+    use std::os::fd::AsRawFd;
 
     use crate::android_tun::{self, TunRequest};
 
@@ -57,9 +57,18 @@ pub fn build_tun_multi(
         mtu,
     })?;
     // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
-    // into_raw_fd() gives up our close so the device becomes sole owner.
-    let dev = unsafe { AsyncDevice::from_fd(fd.into_raw_fd()) }
-        .context("adopt VpnService TUN descriptor")?;
+    // Borrow for the call and only give up ownership once it succeeded: on
+    // failure `fd` still owns the descriptor and closes on drop, where
+    // `into_raw_fd()` up front would leak it and leave the framework tunnel
+    // established with nothing reading it.
+    let raw = fd.as_raw_fd();
+    let dev = match unsafe { AsyncDevice::from_fd(raw) } {
+        Ok(dev) => {
+            std::mem::forget(fd);
+            dev
+        }
+        Err(e) => return Err(e).context("adopt VpnService TUN descriptor"),
+    };
     tracing::debug!(ifname, "TUN device adopted");
     Ok(dev)
 }

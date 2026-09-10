@@ -34,11 +34,41 @@ for abi in "${required_abis[@]}"; do
   fi
 done
 
-# The JNI entry points must survive the release profile's `strip = "symbols"`.
-# A stripped export is an UnsatisfiedLinkError at runtime, not a build error.
-if command -v llvm-nm >/dev/null 2>&1 || [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
-  echo "note: verify JNI exports with:"
-  echo "  llvm-nm -D --defined-only target/aarch64-linux-android/release/$lib | grep Java_io_tunnet"
+# The library must actually export the JNI entry points. A missing export is an
+# UnsatisfiedLinkError on first use, not a build error, and the ABI check above
+# would still pass because the file is present.
+#
+# Note this does NOT guard against `strip = "symbols"` in the release profile,
+# despite what an earlier version of this comment claimed: stripping removes
+# debug and local symbols, while JNI exports live in `.dynsym` and are required
+# for linking, so they survive. What it does catch is the export never being
+# built: a crate-type change, a renamed package (the symbol encodes the Java
+# package), or a visibility change.
+#
+# Asserting rather than printing a suggested command: a hint that a reader might
+# run is indistinguishable from a passing check once this runs in CI.
+nm=""
+if command -v llvm-nm >/dev/null 2>&1; then
+  nm="llvm-nm"
+elif [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
+  candidate="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+  [[ -x "$candidate" ]] && nm="$candidate"
+fi
+
+if [[ -z "$nm" ]]; then
+  echo "note: llvm-nm not found, JNI exports NOT verified (set ANDROID_NDK_HOME to check)"
+else
+  workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' EXIT
+  for abi in "${required_abis[@]}"; do
+    unzip -o -q "$apk" "lib/$abi/$lib" -d "$workdir"
+    if "$nm" -D --defined-only "$workdir/lib/$abi/$lib" 2>/dev/null | grep -q "Java_io_tunnet"; then
+      echo "ok: $abi exports Java_io_tunnet_*"
+    else
+      echo "FAIL: $abi exports no Java_io_tunnet_*; wrong crate-type, renamed package, or hidden visibility" >&2
+      missing=1
+    fi
+  done
 fi
 
 if [[ $missing -ne 0 ]]; then
