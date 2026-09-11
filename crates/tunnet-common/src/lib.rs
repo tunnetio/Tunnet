@@ -25,7 +25,7 @@ use uuid::Uuid;
 pub type EndpointIdHex = String;
 
 /// ALPN identifier for our tunnel protocol (mesh datagrams).
-pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/1";
+pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/2";
 
 /// ALPN for agent ↔ public edge reverse tunnels.
 pub const EDGE_ALPN: &[u8] = b"tunnet/edge/1";
@@ -404,7 +404,10 @@ pub struct EndpointSnapshot {
     pub ipv6_enabled: bool,
     pub tenant_ipv6: Option<Ipv6Addr>,
     pub memberships: Vec<NetworkMembershipSnapshot>,
+    /// Absent on older control planes; treat as empty (no per-network revision map).
+    #[serde(default)]
     pub network_revisions: HashMap<Uuid, u64>,
+    #[serde(default)]
     pub ipv6_peers: Vec<Ipv6PeerEntry>,
     pub org_policy: policy::PolicyBundle,
     /// Hex-encoded Ed25519 verifying key for `PolicyBundle.signature`.
@@ -477,4 +480,25 @@ pub fn mdns_relay_topic_hex(id: &uuid::Uuid) -> String {
     hasher.update(id.as_bytes());
     hasher.update(b"mdns-relay");
     hex::encode(hasher.finalize().as_bytes())
+}
+
+#[cfg(test)]
+mod snapshot_compat_tests {
+    use super::*;
+
+    #[test]
+    fn register_snapshot_without_network_revisions_deserializes() {
+        let json = r#"{
+            "ipv6_enabled": false,
+            "tenant_ipv6": null,
+            "memberships": [],
+            "org_policy": {"rules": [], "version": 0},
+            "version": 1
+        }"#;
+        let snap: EndpointSnapshot =
+            serde_json::from_str(json).expect("older control register body");
+        assert!(snap.network_revisions.is_empty());
+        assert!(snap.ipv6_peers.is_empty());
+        assert_eq!(snap.version, 1);
+    }
 }

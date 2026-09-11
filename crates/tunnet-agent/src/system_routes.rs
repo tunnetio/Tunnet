@@ -431,6 +431,14 @@ impl RouteEngine {
     }
 
     pub(crate) async fn reconcile(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
+        let mut desired = desired.clone();
+        if usable_if_index(desired.tun_if_index).is_none() {
+            desired.tun_if_index = resolve_if_index(&desired.ifname).or_else(|| {
+                self.last_desired
+                    .as_ref()
+                    .and_then(|prev| usable_if_index(prev.tun_if_index))
+            });
+        }
         self.last_desired = Some(desired.clone());
         #[cfg(target_os = "android")]
         {
@@ -444,7 +452,7 @@ impl RouteEngine {
             Ok(())
         }
         #[cfg(not(target_os = "android"))]
-        self.reconcile_native(desired).await
+        self.reconcile_native(&desired).await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -455,9 +463,8 @@ impl RouteEngine {
             .as_ref()
             .map(|u| (u.interface_index, u.interface_name.as_str()));
 
-        let tun_index = desired
-            .tun_if_index
-            .or_else(|| resolve_if_index(&desired.ifname));
+        let tun_index =
+            usable_if_index(desired.tun_if_index).or_else(|| resolve_if_index(&desired.ifname));
         let Some(tun_index) = tun_index else {
             return Err(RouteError::InvalidInterface {
                 route: desired.ifname.clone(),
@@ -633,11 +640,39 @@ impl RouteEngine {
     }
 }
 
+/// `if_nametoindex` and some TUN backends return 0 for "not found".
+/// Treating that as a real index makes every kernel route with
+/// `if_index == 0` look TUN-owned and fails Linux bring-up.
+fn usable_if_index(index: Option<u32>) -> Option<u32> {
+    index.filter(|i| *i != 0)
+}
+
 fn resolve_if_index(name: &str) -> Option<u32> {
     netdev::get_interfaces()
         .into_iter()
-        .find(|iface| iface.name == name)
+        .find(|iface| interface_named(iface, name))
         .map(|iface| iface.index)
+        .filter(|i| *i != 0)
+}
+
+fn resolve_if_index_by_ipv4(ip: Ipv4Addr) -> Option<u32> {
+    netdev::get_interfaces()
+        .into_iter()
+        .find(|iface| iface.ipv4_addrs().contains(&ip))
+        .map(|iface| iface.index)
+        .filter(|i| *i != 0)
+}
+
+fn resolve_tun_index(name: &str, assigned: Ipv4Addr) -> Option<u32> {
+    resolve_if_index(name).or_else(|| resolve_if_index_by_ipv4(assigned))
+}
+
+fn interface_named(iface: &netdev::Interface, name: &str) -> bool {
+    iface.name.eq_ignore_ascii_case(name)
+        || iface
+            .friendly_name
+            .as_deref()
+            .is_some_and(|friendly| friendly.eq_ignore_ascii_case(name))
 }
 
 /// Build a [`DesiredRoutes`] from high-level membership inputs (pure, testable).
@@ -645,7 +680,7 @@ fn resolve_if_index(name: &str) -> Option<u32> {
 pub fn desired_from_membership(
     ifname: &str,
     profile: &DeviceProfile,
-    _assigned_ipv4: Ipv4Addr,
+    assigned_ipv4: Ipv4Addr,
     _prefix: u8,
     remote_subnets: &[Ipv4Net],
     has_exit: bool,
@@ -653,14 +688,27 @@ pub fn desired_from_membership(
 ) -> DesiredRoutes {
     DesiredRoutes {
         ifname: ifname.to_string(),
-        tun_if_index: resolve_if_index(ifname),
+        tun_if_index: resolve_tun_index(ifname, assigned_ipv4),
         profile: profile.clone(),
         remote_subnets: remote_subnets.to_vec(),
-        peer_routes: vec![],
+        peer_routes: Vec::new(),
         has_exit,
         underlay_hosts: underlay_hosts.to_vec(),
         underlay: None,
     }
+}
+
+/// Exact `/32` overlay destinations for mesh peers. Allocation CIDRs stay
+/// out of the OS table; only live peer hosts are routed into the TUN.
+pub fn overlay_peer_host_routes(
+    peers: impl IntoIterator<Item = Ipv4Addr>,
+    skip: &[Ipv4Addr],
+) -> Vec<Ipv4Net> {
+    peers
+        .into_iter()
+        .filter(|ip| !skip.contains(ip))
+        .map(Ipv4Net::from)
+        .collect()
 }
 
 pub fn desired_direct(
@@ -1148,5 +1196,25 @@ mod tests {
             cidr: Ipv4Net::from("1.2.3.4".parse::<Ipv4Addr>().unwrap()),
             gw: gw(),
         }));
+    }
+
+    #[test]
+    fn overlay_peer_host_routes_skips_self() {
+        let self_ip: Ipv4Addr = "10.7.0.1".parse().unwrap();
+        let peer: Ipv4Addr = "10.7.0.2".parse().unwrap();
+        let routes = overlay_peer_host_routes([self_ip, peer], &[self_ip]);
+        assert_eq!(routes, vec![Ipv4Net::from(peer)]);
+    }
+
+    #[tokio::test]
+    async fn zero_tun_index_is_not_a_real_interface() {
+        let mut d = mesh_desired();
+        d.tun_if_index = Some(0);
+        d.ifname = "tunnet-if-that-must-not-exist".into();
+        let mut r = reconciler(MockBackend {
+            state: Arc::new(Mutex::new(MockState::default())),
+        });
+        let err = r.reconcile(&d).await.unwrap_err();
+        assert!(matches!(err, RouteError::InvalidInterface { .. }));
     }
 }

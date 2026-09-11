@@ -25,7 +25,7 @@ use super::posture::{
 };
 use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
 use super::ssh_registry::SshRegistryActor;
-use crate::system_routes::desired_from_membership;
+use crate::system_routes::{desired_from_membership, overlay_peer_host_routes};
 
 #[derive(Clone)]
 pub struct ControlPlaneActorArgs {
@@ -42,6 +42,7 @@ pub struct ControlPlaneActorArgs {
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
     pub posture_actor: Option<ActorRef<PostureActor>>,
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
+    pub ifname: String,
 }
 
 #[derive(Clone)]
@@ -281,17 +282,22 @@ impl ControlPlaneActor {
                     if !applied {
                         return;
                     }
-                    node.tunnel_pool.set_cloud_relay_urls(
+                    node.tunnel.set_cloud_relay_urls(
                         snap.connectivity_relays
                             .iter()
                             .filter(|r| r.metering)
                             .map(|r| r.url.clone()),
                     );
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
+                    if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                        let _ = dataplane_actor
+                            .ask(super::dataplane::ReconcileDirectState)
+                            .await;
+                    }
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
                     let desired = membership_desired(
                         &node,
+                        &self.cfg.ifname,
                         &m.device_profile,
                         m.assigned_ipv4,
                         m.prefix,
@@ -368,9 +374,7 @@ impl ControlPlaneActor {
                     node.routes
                         .clear_managed(self.cfg.network_id, &self.cfg.transport.endpoint_id);
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
                     node.pool.close_all().await;
-                    node.tunnel_pool.close_all().await;
                     if let Some(route_actor) = &self.cfg.route_actor {
                         let _ = route_actor.ask(ClearRoutes).await;
                     }
@@ -394,7 +398,11 @@ impl ControlPlaneActor {
                     return;
                 }
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
+                if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                    let _ = dataplane_actor
+                        .ask(super::dataplane::ReconcileDirectState)
+                        .await;
+                }
                 tracing::info!(
                     v = delta.version,
                     added = delta.added.len(),
@@ -418,9 +426,7 @@ impl ControlPlaneActor {
                 node.routes
                     .clear_managed(network_id, &self.cfg.transport.endpoint_id);
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
                 node.pool.close_all().await;
-                node.tunnel_pool.close_all().await;
                 if let Some(route_actor) = &self.cfg.route_actor {
                     let _ = route_actor.ask(ClearRoutes).await;
                 }
@@ -716,24 +722,25 @@ impl ControlPlaneActor {
 
 fn membership_desired(
     node: &CoreNode,
+    ifname: &str,
     profile: &tunnet_common::DeviceProfile,
     assigned: std::net::Ipv4Addr,
     prefix: u8,
     remote_subnets: &[ipnet::Ipv4Net],
     has_exit: bool,
 ) -> crate::system_routes::DesiredRoutes {
-    // ifname resolved fromControlPlaneActor cfg at call site; use tunnet0 default here
-    // and let RouteActor resolve the real index via DesiredRoutes.tun_if_index.
-    let _ = node;
-    desired_from_membership(
-        "tunnet0",
+    let mut desired = desired_from_membership(
+        ifname,
         profile,
         assigned,
         prefix,
         remote_subnets,
         has_exit,
         &[],
-    )
+    );
+    desired.peer_routes =
+        overlay_peer_host_routes(node.routes.peers().iter().map(|p| p.ip), &[assigned]);
+    desired
 }
 
 // ---------------------------------------------------------------------------
@@ -755,13 +762,13 @@ struct SendHeartbeat;
 impl Message<SendHeartbeat> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, _msg: SendHeartbeat, _ctx: &mut Context<Self, Self::Reply>) {
-        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel_pool.heartbeat_counters();
+        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel.heartbeat_counters();
         self.send_client(ClientMsg::Heartbeat {
             active_conns,
             bytes_tx,
             bytes_rx,
         });
-        let bytes = self.cfg.node.tunnel_pool.cloud_relay_meter().take();
+        let bytes = self.cfg.node.tunnel.cloud_relay_meter().take();
         if bytes > 0 {
             self.send_client(ClientMsg::CloudRelayUsage { bytes });
         }
@@ -945,6 +952,7 @@ mod tests {
             dataplane_actor: None,
             posture_actor: None,
             ssh_registry: Some(ssh),
+            ifname: "tunnet0".into(),
         }
     }
 
