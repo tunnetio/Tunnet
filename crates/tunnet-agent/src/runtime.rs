@@ -30,7 +30,6 @@ use crate::actors::supervisor::{
 };
 use crate::actors::update::{UpdateActorArgs, UpdateState};
 use crate::daemon::RunArgs;
-use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::recorder::RecordingStore;
 use crate::system_dns::DnsController;
@@ -313,9 +312,6 @@ pub async fn run(
 
     // Single event bus shared by the actors, the updater, and the Local API.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    // Ingress reader registry: shared by the dialer pump, the accept router,
-    // and the DataPlaneActor (which aborts readers on BringDown).
-    let ingress = IngressRegistry::new();
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
     let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(UpdateState::Idle));
     let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
@@ -330,7 +326,6 @@ pub async fn run(
                 events: events_tx.clone(),
                 published: published.clone(),
                 status: status_snapshot.clone(),
-                ingress: ingress.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
@@ -464,30 +459,6 @@ pub async fn run(
     }
 
     let stream_handler = tunnet_core::stream_handler(node.routes.clone(), node.acl.clone());
-    let dgram_pool = node.tunnel_pool.clone();
-
-    let firewalls: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.firewall.clone()))
-        .collect();
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-
-    crate::dgram_pump::install_dialer_datagram_pump(
-        &dgram_pool,
-        published.clone(),
-        node.routes.clone(),
-        node.acl.clone(),
-        firewalls.clone(),
-        spoofs.clone(),
-        metrics.clone(),
-        node.direct_auth.clone(),
-        ingress.clone(),
-    );
 
     let docs_map: HashMap<_, _> = node
         .direct
@@ -498,15 +469,12 @@ pub async fn run(
     // Direct membership sync drives pool invalidation by event, never by timer.
     for docs in docs_map.values() {
         let stream_pool = node.pool.clone();
-        let dgram_pool = node.tunnel_pool.clone();
         let dataplane = dataplane_ref.clone();
         docs.set_change_hook(Arc::new(move || {
             let stream_pool = stream_pool.clone();
-            let dgram_pool = dgram_pool.clone();
             let dataplane = dataplane.clone();
             tokio::spawn(async move {
                 stream_pool.reconcile().await;
-                dgram_pool.reconcile().await;
                 if let Err(error) = dataplane
                     .ask(crate::actors::dataplane::ReconcileDirectState)
                     .await
@@ -621,7 +589,6 @@ pub async fn run(
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
         acl: node.acl.clone(),
-        metrics: metrics.clone(),
         tun: published.clone(),
         stream_handler,
         cp_tx: node.serves.client_tx(),
@@ -634,12 +601,8 @@ pub async fn run(
         auth_server_ctx,
         paths: node.paths.clone(),
         join_authorities,
-        firewalls,
-        spoofs,
-        dgram_pool: dgram_pool.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
-        ingress: ingress.clone(),
         events: api_state.events.clone(),
     });
 

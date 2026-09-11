@@ -25,7 +25,7 @@ use uuid::Uuid;
 pub type EndpointIdHex = String;
 
 /// ALPN identifier for our tunnel protocol (mesh datagrams).
-pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/1";
+pub const TUNNEL_ALPN: &[u8] = b"tunnet/tunnel/2";
 
 /// ALPN for agent ↔ public edge reverse tunnels.
 pub const EDGE_ALPN: &[u8] = b"tunnet/edge/1";

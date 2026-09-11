@@ -115,8 +115,8 @@ pub struct CoreNode {
     pub endpoint: Endpoint,
     /// Stream pool (`TUNNEL_STREAM_ALPN`).
     pub pool: ConnPool,
-    /// Datagram tunnel pool (`TUNNEL_ALPN`), shares keep-alive policy with [`Self::pool`].
-    pub tunnel_pool: ConnPool,
+    /// Mesh DATAGRAM dataplane telemetry / keep-alive (not a connection pool).
+    pub tunnel: crate::TunnelMesh,
     /// Live effective agent config (local TOML + remote org policy).
     pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
@@ -426,9 +426,16 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        let tunnel = crate::TunnelMesh::new(pool.cloud_relay_meter(), cfg.keep_alive);
         pool.set_transport_auth(crate::transport_auth::TransportAuth::managed(&routes));
         pool.set_cloud_relay_urls(
+            snapshot
+                .connectivity_relays
+                .iter()
+                .filter(|r| r.metering)
+                .map(|r| r.url.clone()),
+        );
+        tunnel.set_cloud_relay_urls(
             snapshot
                 .connectivity_relays
                 .iter()
@@ -478,7 +485,7 @@ impl CoreNode {
                 persisted: PersistedState::Managed(managed),
                 endpoint,
                 pool,
-                tunnel_pool,
+                tunnel,
                 effective_config,
                 routes,
                 acl,
@@ -612,7 +619,7 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(self_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        let tunnel = crate::TunnelMesh::new(pool.cloud_relay_meter(), cfg.keep_alive);
         pool.set_transport_auth(crate::transport_auth::TransportAuth::direct(&auth));
         let effective_config = cfg.effective_config.clone().unwrap_or_default();
         pool.set_keep_alive(cfg.keep_alive);
@@ -746,7 +753,7 @@ impl CoreNode {
             },
             endpoint,
             pool,
-            tunnel_pool,
+            tunnel,
             effective_config,
             routes,
             acl,

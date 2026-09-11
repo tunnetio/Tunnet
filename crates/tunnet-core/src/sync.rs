@@ -231,7 +231,7 @@ pub struct ManagedDriverCtx {
     pub tunnels: Option<crate::tunnel::TunnelManager>,
     #[cfg(feature = "send")]
     pub send: Option<crate::send::SendManager>,
-    pub tunnel_pool: Option<crate::iroh_pool::ConnPool>,
+    pub tunnel: Option<crate::TunnelMesh>,
     pub pool: Option<crate::iroh_pool::ConnPool>,
     pub effective_config: Option<crate::EffectiveConfigStore>,
 }
@@ -263,7 +263,7 @@ impl ManagedDriverCtx {
             tunnels: Some(node.tunnels.clone()),
             #[cfg(feature = "send")]
             send: Some(node.send.clone()),
-            tunnel_pool: Some(node.tunnel_pool.clone()),
+            tunnel: Some(node.tunnel.clone()),
             pool: Some(node.pool.clone()),
             effective_config: Some(node.effective_config.clone()),
         }
@@ -292,7 +292,7 @@ pub fn spawn_managed_driver(
             tunnels,
             #[cfg(feature = "send")]
             send,
-            tunnel_pool,
+            tunnel,
             pool,
             effective_config,
         } = ctx;
@@ -318,8 +318,7 @@ pub fn spawn_managed_driver(
                 known_version: revisions.load().org.0,
             })
             .await;
-        let pools: Vec<crate::iroh_pool::ConnPool> =
-            pool.into_iter().chain(tunnel_pool.clone()).collect();
+        let pools: Vec<crate::iroh_pool::ConnPool> = pool.into_iter().collect();
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -365,8 +364,8 @@ pub fn spawn_managed_driver(
                                 ) {
                                     continue;
                                 }
-                                if let Some(pool) = tunnel_pool.as_ref() {
-                                    pool.set_cloud_relay_urls(
+                                if let Some(mesh) = tunnel.as_ref() {
+                                    mesh.set_cloud_relay_urls(
                                         snap.connectivity_relays
                                             .iter()
                                             .filter(|r| r.metering)
@@ -824,7 +823,7 @@ pub fn spawn_managed_driver(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    let (active_conns, bytes_tx, bytes_rx) = tunnel_pool
+                    let (active_conns, bytes_tx, bytes_rx) = tunnel
                         .as_ref()
                         .map(|p| p.heartbeat_counters())
                         .unwrap_or((0, 0, 0));
@@ -833,8 +832,8 @@ pub fn spawn_managed_driver(
                         bytes_tx,
                         bytes_rx,
                     }).await;
-                    if let Some(pool) = tunnel_pool.as_ref() {
-                        let bytes = pool.cloud_relay_meter().take();
+                    if let Some(mesh) = tunnel.as_ref() {
+                        let bytes = mesh.cloud_relay_meter().take();
                         if bytes > 0 {
                             let _ = client_tx.send(ClientMsg::CloudRelayUsage { bytes }).await;
                         }

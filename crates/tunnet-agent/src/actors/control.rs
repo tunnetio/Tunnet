@@ -281,14 +281,18 @@ impl ControlPlaneActor {
                     if !applied {
                         return;
                     }
-                    node.tunnel_pool.set_cloud_relay_urls(
+                    node.tunnel.set_cloud_relay_urls(
                         snap.connectivity_relays
                             .iter()
                             .filter(|r| r.metering)
                             .map(|r| r.url.clone()),
                     );
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
+                    if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                        let _ = dataplane_actor
+                            .ask(super::dataplane::ReconcileDirectState)
+                            .await;
+                    }
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
                     let desired = membership_desired(
                         &node,
@@ -368,9 +372,7 @@ impl ControlPlaneActor {
                     node.routes
                         .clear_managed(self.cfg.network_id, &self.cfg.transport.endpoint_id);
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
                     node.pool.close_all().await;
-                    node.tunnel_pool.close_all().await;
                     if let Some(route_actor) = &self.cfg.route_actor {
                         let _ = route_actor.ask(ClearRoutes).await;
                     }
@@ -394,7 +396,11 @@ impl ControlPlaneActor {
                     return;
                 }
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
+                if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
+                    let _ = dataplane_actor
+                        .ask(super::dataplane::ReconcileDirectState)
+                        .await;
+                }
                 tracing::info!(
                     v = delta.version,
                     added = delta.added.len(),
@@ -418,9 +424,7 @@ impl ControlPlaneActor {
                 node.routes
                     .clear_managed(network_id, &self.cfg.transport.endpoint_id);
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
                 node.pool.close_all().await;
-                node.tunnel_pool.close_all().await;
                 if let Some(route_actor) = &self.cfg.route_actor {
                     let _ = route_actor.ask(ClearRoutes).await;
                 }
@@ -755,13 +759,13 @@ struct SendHeartbeat;
 impl Message<SendHeartbeat> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, _msg: SendHeartbeat, _ctx: &mut Context<Self, Self::Reply>) {
-        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel_pool.heartbeat_counters();
+        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel.heartbeat_counters();
         self.send_client(ClientMsg::Heartbeat {
             active_conns,
             bytes_tx,
             bytes_rx,
         });
-        let bytes = self.cfg.node.tunnel_pool.cloud_relay_meter().take();
+        let bytes = self.cfg.node.tunnel.cloud_relay_meter().take();
         if bytes > 0 {
             self.send_client(ClientMsg::CloudRelayUsage { bytes });
         }
