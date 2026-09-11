@@ -77,8 +77,10 @@ pub fn build_tun_multi(
         .name(ifname)
         .ipv4(first, prefix, None)
         .mtu(mtu);
-    #[cfg(target_os = "linux")]
-    let builder = builder.offload(true);
+    // Linux offload (IFF_VNET_HDR + recv_multiple) is not enabled here.
+    // tun-rs can leave VNET_HDR set after TUNSETOFFLOAD fails while
+    // reporting vnet_hdr=false, and a virtio parse error used to panic the
+    // dataplane actor. Use the same recv/send path as the previous TUN I/O.
     #[cfg(windows)]
     let builder = {
         let path = crate::wintun::materialize()?;
@@ -109,15 +111,11 @@ pub struct ReaderDeps {
 }
 
 pub async fn run_reader(deps: ReaderDeps) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        run_reader_linux(deps).await
-    }
     #[cfg(all(windows, not(target_os = "android")))]
     {
         run_reader_windows(deps).await
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(not(all(windows, not(target_os = "android"))))]
     {
         run_reader_generic(deps).await
     }
@@ -204,7 +202,7 @@ fn require_ipv4<'a>(metrics: &AgentMetrics, pkt: Packet<'a>, inbound: bool) -> O
     Some(pkt)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(all(windows, not(target_os = "android"))))]
 async fn run_reader_generic(deps: ReaderDeps) -> anyhow::Result<()> {
     let mut buf = vec![0u8; (deps.mtu as usize).max(1280) + 256];
     loop {
@@ -268,34 +266,6 @@ where
     n
 }
 
-#[cfg(target_os = "linux")]
-async fn run_reader_linux(deps: ReaderDeps) -> anyhow::Result<()> {
-    use tun_rs::{IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
-
-    let cap = (deps.mtu as usize).max(1280);
-    let mut original = vec![0u8; VIRTIO_NET_HDR_LEN + 65535];
-    let mut bufs: Vec<RecvSlot> = (0..IDEAL_BATCH_SIZE)
-        .map(|_| RecvSlot::with_capacity(cap))
-        .collect();
-    let mut sizes = vec![0usize; IDEAL_BATCH_SIZE];
-    loop {
-        tokio::select! {
-            biased;
-            _ = deps.cancel.cancelled() => return Ok(()),
-            res = deps.tun.recv_multiple(&mut original, &mut bufs, &mut sizes, 0) => {
-                let num = res?;
-                for i in 0..num {
-                    let n = sizes[i];
-                    if n == 0 {
-                        continue;
-                    }
-                    handle_outbound(&deps, &mut bufs[i].as_mut()[..n]);
-                }
-            }
-        }
-    }
-}
-
 /// Linux `recv_multiple` slot: `AsRef`/`AsMut` always expose full capacity.
 #[cfg(any(test, target_os = "linux"))]
 pub struct RecvSlot {
@@ -327,23 +297,14 @@ impl AsMut<[u8]> for RecvSlot {
 
 pub async fn run_writer(
     tun: Arc<AsyncDevice>,
-    rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<Bytes>,
     mesh: tunnet_core::TunnelMesh,
     metrics: AgentMetrics,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        run_writer_linux(tun, rx, mesh, metrics, cancel).await
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let mut rx = rx;
-        run_writer_generic(tun, &mut rx, mesh, metrics, cancel).await
-    }
+    run_writer_generic(tun, &mut rx, mesh, metrics, cancel).await
 }
 
-#[cfg(not(target_os = "linux"))]
 async fn run_writer_generic(
     tun: Arc<AsyncDevice>,
     rx: &mut mpsc::Receiver<Bytes>,
@@ -366,7 +327,6 @@ async fn run_writer_generic(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
 async fn write_one(
     tun: &AsyncDevice,
     pkt: &[u8],
@@ -395,45 +355,6 @@ async fn write_one(
         Err(e) => {
             metrics.dropped_inc("tun_send_failed");
             Err(e.into())
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-async fn run_writer_linux(
-    tun: Arc<AsyncDevice>,
-    mut rx: mpsc::Receiver<Bytes>,
-    mesh: tunnet_core::TunnelMesh,
-    metrics: AgentMetrics,
-    cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    use tun_rs::{GROTable, IDEAL_BATCH_SIZE, VIRTIO_NET_HDR_LEN};
-
-    let mut gro = GROTable::new();
-    let mut staged: Vec<Vec<u8>> = Vec::with_capacity(IDEAL_BATCH_SIZE);
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(()),
-            pkt = rx.recv() => {
-                let Some(pkt) = pkt else { return Ok(()) };
-                staged.clear();
-                staged.push(stage_virtio(&pkt));
-                while staged.len() < IDEAL_BATCH_SIZE {
-                    match rx.try_recv() {
-                        Ok(more) => staged.push(stage_virtio(&more)),
-                        Err(_) => break,
-                    }
-                }
-                let bytes: u64 = staged.iter().map(|s| (s.len() - VIRTIO_NET_HDR_LEN) as u64).sum();
-                match tun.send_multiple(&mut gro, &mut staged, VIRTIO_NET_HDR_LEN).await {
-                    Ok(_) => mesh.record_tun_tx(bytes),
-                    Err(e) => {
-                        metrics.dropped_inc("tun_send_failed");
-                        return Err(e.into());
-                    }
-                }
-            }
         }
     }
 }

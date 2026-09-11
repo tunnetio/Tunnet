@@ -127,7 +127,13 @@ impl TunnelHub {
             if self.deps.local_id == peer {
                 continue;
             }
-            let Some(info) = self.deps.routes.lookup_endpoint(&format!("{peer}")) else {
+            let Some(info) = self
+                .deps
+                .routes
+                .peers()
+                .into_iter()
+                .find(|p| p.endpoint == peer)
+            else {
                 continue;
             };
             if !self.deps.mesh.keep_alive_for(peer, Some(&info.hostname)) {
@@ -488,7 +494,9 @@ fn start_dial(
         deps.mesh.inc_dials_suppressed();
         return DialStart::Denied;
     }
-    if deps.routes.lookup_endpoint(&hex).is_none() {
+    if deps.routes.lookup_endpoint(&hex).is_none()
+        && !deps.routes.peers().iter().any(|p| p.endpoint == peer)
+    {
         deps.mesh.inc_dials_suppressed();
         return DialStart::Denied;
     }

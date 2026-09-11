@@ -477,15 +477,22 @@ impl Message<BringUpSelf> for DataPlaneActor {
     }
 }
 
-/// The owned outbound loop ended without generation cancellation. Abnormal:
-/// supervision must restart us (fresh generation is published on BringUp).
+/// The owned TUN I/O loop ended without generation cancellation.
 struct OutboundExited;
 
 impl Message<OutboundExited> for DataPlaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
-        panic!("outbound TUN loop unexpectedly terminated");
+    async fn handle(&mut self, _msg: OutboundExited, ctx: &mut Context<Self, Self::Reply>) {
+        tracing::error!("TUN I/O loop exited; reconstructing data plane");
+        self.teardown().await;
+        let weak = ctx.actor_ref().downgrade();
+        if let Err(e) = self.do_bring_up(weak).await {
+            tracing::error!(
+                error = %e,
+                "dataplane reconstruction after TUN I/O failure failed"
+            );
+        }
     }
 }
 
