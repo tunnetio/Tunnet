@@ -25,7 +25,7 @@ use super::posture::{
 };
 use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
 use super::ssh_registry::SshRegistryActor;
-use crate::system_routes::desired_from_membership;
+use crate::system_routes::{desired_from_membership, overlay_peer_host_routes};
 
 #[derive(Clone)]
 pub struct ControlPlaneActorArgs {
@@ -42,6 +42,7 @@ pub struct ControlPlaneActorArgs {
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
     pub posture_actor: Option<ActorRef<PostureActor>>,
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
+    pub ifname: String,
 }
 
 #[derive(Clone)]
@@ -296,6 +297,7 @@ impl ControlPlaneActor {
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
                     let desired = membership_desired(
                         &node,
+                        &self.cfg.ifname,
                         &m.device_profile,
                         m.assigned_ipv4,
                         m.prefix,
@@ -720,24 +722,25 @@ impl ControlPlaneActor {
 
 fn membership_desired(
     node: &CoreNode,
+    ifname: &str,
     profile: &tunnet_common::DeviceProfile,
     assigned: std::net::Ipv4Addr,
     prefix: u8,
     remote_subnets: &[ipnet::Ipv4Net],
     has_exit: bool,
 ) -> crate::system_routes::DesiredRoutes {
-    // ifname resolved fromControlPlaneActor cfg at call site; use tunnet0 default here
-    // and let RouteActor resolve the real index via DesiredRoutes.tun_if_index.
-    let _ = node;
-    desired_from_membership(
-        "tunnet0",
+    let mut desired = desired_from_membership(
+        ifname,
         profile,
         assigned,
         prefix,
         remote_subnets,
         has_exit,
         &[],
-    )
+    );
+    desired.peer_routes =
+        overlay_peer_host_routes(node.routes.peers().iter().map(|p| p.ip), &[assigned]);
+    desired
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +952,7 @@ mod tests {
             dataplane_actor: None,
             posture_actor: None,
             ssh_registry: Some(ssh),
+            ifname: "tunnet0".into(),
         }
     }
 

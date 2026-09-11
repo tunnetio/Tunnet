@@ -289,6 +289,7 @@ pub async fn run(
             dataplane_actor: None,
             posture_actor: None,
             ssh_registry: None,
+            ifname: args.ifname.clone(),
         })
     };
     let posture_cfg = if is_direct {

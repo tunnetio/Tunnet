@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::routes::{ApplyDesiredRoutes, ClearRoutes, GetKernelRoutes, RouteActor};
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
-use crate::system_routes::desired_from_membership;
+use crate::system_routes::{desired_from_membership, overlay_peer_host_routes};
 
 // ---------------------------------------------------------------------------
 // Published hot-path view
@@ -205,7 +205,13 @@ impl DataPlaneActor {
                 &self.cfg.underlay_hosts,
             )
         };
-        if let Some(index) = self.tun_if_index {
+        if !self.cfg.is_direct {
+            desired.peer_routes = overlay_peer_host_routes(
+                self.node.routes.peers().iter().map(|p| p.ip),
+                &self.cfg.local_addrs,
+            );
+        }
+        if let Some(index) = self.tun_if_index.filter(|i| *i != 0) {
             desired.tun_if_index = Some(index);
         }
         desired
@@ -235,12 +241,15 @@ impl DataPlaneActor {
         }
         if let Some(reader) = self.reader.take() {
             reader.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader).await;
         }
         if let Some(writer) = self.writer.take() {
             writer.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), writer).await;
         }
         if let Some(dns_task) = self.dns_task.take() {
             dns_task.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), dns_task).await;
         }
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -273,7 +282,7 @@ impl DataPlaneActor {
                 conflicts.len()
             )));
         }
-        if self.cfg.dns.is_some() {
+        if self.cfg.dns.is_some() && self.dns_task.is_none() {
             self.dns_task = Some(
                 tunnet_core::dns::start(
                     tunnet_core::dns::bind_addr(),
@@ -306,9 +315,13 @@ impl DataPlaneActor {
             .map_err(|e| DataPlaneError::Tun(format!("{e:#}")))?,
         );
         match tun.if_index() {
-            Ok(index) => {
+            Ok(index) if index != 0 => {
                 tracing::info!(index, ifname = %self.cfg.ifname, "TUN interface index");
                 self.tun_if_index = Some(index);
+            }
+            Ok(_) => {
+                tracing::warn!(ifname = %self.cfg.ifname, "TUN if_index reported 0; resolving by name");
+                self.tun_if_index = None;
             }
             Err(e) => {
                 tracing::warn!(error = %e, ifname = %self.cfg.ifname, "TUN if_index unavailable");
@@ -348,7 +361,9 @@ impl DataPlaneActor {
 
         // Reconcile routes via RouteActor (one-way ask, bounded timeout).
         // Direct uses exact /32 peer routes; Managed uses subnet snapshots.
-        self.reconcile_routes().await?;
+        if let Err(e) = self.reconcile_routes().await {
+            tracing::warn!(error = %e, "OS route reconcile failed; overlay is up, host routes may be missing");
+        }
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
 
         let firewalls: std::collections::HashMap<_, _> = self
@@ -521,6 +536,11 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
             hub.reconcile();
         }
         if !self.cfg.is_direct {
+            if self.up
+                && let Err(e) = self.reconcile_routes().await
+            {
+                tracing::warn!(error = %e, "managed route refresh failed");
+            }
             return Ok(());
         }
         if self
