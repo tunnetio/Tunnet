@@ -2,6 +2,8 @@
 
 #[cfg(any(target_os = "macos", windows))]
 use anyhow::Context;
+// Only the machine-id readers bail; the portable arm returns a constant.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use anyhow::bail;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;

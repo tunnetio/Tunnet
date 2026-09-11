@@ -1,8 +1,16 @@
 //! Desired-state OS route reconciliation via native routing APIs
+//!
+//! On Android `VpnService.Builder` owns the routing table: `RouteEngine::new`
+//! returns `FrameworkOwnedBackend` and `reconcile` returns before the native
+//! path, so this layer is compiled but unreachable there alone. Scoped, so the
+//! platforms that do use it keep dead-code detection.
+#![cfg_attr(target_os = "android", allow(dead_code))]
 
 use std::collections::BTreeSet;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+#[cfg(not(target_os = "android"))]
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
