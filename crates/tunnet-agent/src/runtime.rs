@@ -425,11 +425,11 @@ pub async fn run(
     };
     if dataplane_ready {
         api_state.emit(tunnet_common::local_api::LocalEvent::DaemonReady);
-        if let Some(tx) = on_ready.take() {
-            let _ = tx.send(());
-        }
         #[cfg(unix)]
         crate::sd_notify::ready("running");
+    }
+    if let Some(tx) = on_ready.take() {
+        let _ = tx.send(());
     }
     {
         let dataplane_bg = dataplane_ref.clone();

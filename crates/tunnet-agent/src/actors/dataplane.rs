@@ -112,6 +112,7 @@ pub struct DataPlaneActor {
     hub: Option<crate::dataplane::TunnelHub>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
     dns_task: Option<tokio::task::JoinHandle<()>>,
+    tun_if_index: Option<u32>,
 }
 
 impl Actor for DataPlaneActor {
@@ -136,6 +137,7 @@ impl Actor for DataPlaneActor {
             hub: None,
             generation_cancel: None,
             dns_task: None,
+            tun_if_index: None,
         };
         if auto_up {
             // Reconstruct service after (re)start from durable state.
@@ -177,7 +179,7 @@ impl DataPlaneActor {
     }
 
     fn desired_routes(&self) -> crate::system_routes::DesiredRoutes {
-        if self.cfg.is_direct {
+        let mut desired = if self.cfg.is_direct {
             let peer_ips: Vec<Ipv4Addr> = self.node.routes.peers().iter().map(|p| p.ip).collect();
             crate::system_routes::desired_direct(
                 &self.cfg.ifname,
@@ -202,7 +204,11 @@ impl DataPlaneActor {
                 has_exit,
                 &self.cfg.underlay_hosts,
             )
+        };
+        if let Some(index) = self.tun_if_index {
+            desired.tun_if_index = Some(index);
         }
+        desired
     }
 
     async fn reconcile_routes(&self) -> Result<(), DataPlaneError> {
@@ -220,6 +226,7 @@ impl DataPlaneActor {
 
     async fn teardown(&mut self) {
         self.published.store(None);
+        self.tun_if_index = None;
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
@@ -298,6 +305,16 @@ impl DataPlaneActor {
             )
             .map_err(|e| DataPlaneError::Tun(format!("{e:#}")))?,
         );
+        match tun.if_index() {
+            Ok(index) => {
+                tracing::info!(index, ifname = %self.cfg.ifname, "TUN interface index");
+                self.tun_if_index = Some(index);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ifname = %self.cfg.ifname, "TUN if_index unavailable");
+                self.tun_if_index = None;
+            }
+        }
         crate::system_firewall::configure(&self.cfg.ifname);
 
         let generation = self.generation.wrapping_add(1);

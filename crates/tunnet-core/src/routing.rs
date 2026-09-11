@@ -142,6 +142,17 @@ impl RoutingTable {
             .map(|(_, p)| p.clone())
     }
 
+    /// Ingress anti-spoof: a mesh IP must belong to this endpoint; any other
+    /// source is allowed only when this endpoint is the subnet/exit route for it
+    /// in the same network.
+    pub fn inbound_source_ok(&self, network_id: Uuid, src: Ipv4Addr, endpoint: EndpointId) -> bool {
+        if let Some(owner) = self.lookup_network_ip(network_id, &src) {
+            return owner.endpoint == endpoint;
+        }
+        self.lookup_ip(&src)
+            .is_some_and(|via| via.endpoint == endpoint && via.network_id == network_id)
+    }
+
     /// Direct peer IP, subnet LPM, then selected exit node for internet.
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
         // Multicast and broadcast are never routable across the mesh.
@@ -1234,5 +1245,49 @@ mod tests {
                 .endpoint_hex,
             exit
         );
+    }
+
+    #[test]
+    fn inbound_source_allows_exit_return_path_not_foreign_mesh_ip() {
+        let (table, exit) = exit_node_table();
+        let exit_id = EndpointId::from_str(&exit).unwrap();
+        let other = EndpointId::from_str(&"c".repeat(64)).unwrap();
+        let net = Uuid::nil();
+        assert!(table.inbound_source_ok(net, "10.7.0.5".parse().unwrap(), exit_id));
+        assert!(table.inbound_source_ok(net, "8.8.8.8".parse().unwrap(), exit_id));
+        assert!(!table.inbound_source_ok(net, "8.8.8.8".parse().unwrap(), other));
+        assert!(!table.inbound_source_ok(net, "10.7.0.5".parse().unwrap(), other));
+    }
+
+    #[test]
+    fn inbound_source_allows_subnet_router_lan_return() {
+        let table = RoutingTable::new();
+        let self_id = "a".repeat(64);
+        let gateway = "b".repeat(64);
+        table.replace(
+            &[peer(&gateway, "10.7.0.5", "gw")],
+            &[SubnetRoute {
+                cidr: Ipv4Net::from_str("10.0.0.0/24").unwrap(),
+                via_endpoint_id: gateway.clone(),
+                via_ip: "10.7.0.5".parse().unwrap(),
+            }],
+            &[],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            Uuid::nil(),
+            &self_id,
+            1,
+        );
+        let gw = EndpointId::from_str(&gateway).unwrap();
+        let net = Uuid::nil();
+        assert!(table.inbound_source_ok(net, "10.7.0.5".parse().unwrap(), gw));
+        assert!(table.inbound_source_ok(net, "10.0.0.100".parse().unwrap(), gw));
+        assert!(!table.inbound_source_ok(
+            net,
+            "10.0.0.100".parse().unwrap(),
+            EndpointId::from_str(&"c".repeat(64)).unwrap()
+        ));
     }
 }

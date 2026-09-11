@@ -20,6 +20,9 @@ pub const SEGMENT_HEADER_LEN: usize = 1 + 16 + 4 + 2 + 2 + 2;
 pub const REASSEMBLY_TTL: Duration = Duration::from_millis(500);
 pub const REASSEMBLY_MAX_ENTRIES: usize = 16;
 pub const REASSEMBLY_MAX_BYTES: usize = 64 * 1024;
+/// Overlay segments are MTU-sized chunks, not 1-byte slices. 64 is well above
+/// `ceil(typical_mtu / min_quic_payload)` and caps `vec![None; count]` abuse.
+pub const MAX_OVERLAY_SEGMENTS: u16 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame<'a> {
@@ -71,7 +74,13 @@ pub fn decode(buf: &[u8]) -> Result<Frame<'_>, FrameError> {
             let count = u16::from_be_bytes(buf[23..25].try_into().unwrap());
             let total_len = u16::from_be_bytes(buf[25..27].try_into().unwrap());
             let payload = &buf[SEGMENT_HEADER_LEN..];
-            if count == 0 || index >= count || total_len == 0 || payload.is_empty() {
+            if count == 0
+                || index >= count
+                || total_len == 0
+                || payload.is_empty()
+                || count as u32 > total_len as u32
+                || count > MAX_OVERLAY_SEGMENTS
+            {
                 return Err(FrameError::BadSegment);
             }
             Ok(Frame::Segment {
@@ -146,7 +155,7 @@ pub fn encode_logical(
     }
     let total_len = packet.len() as u16;
     let count = packet.len().div_ceil(chunk);
-    if count == 0 || count > u16::MAX as usize {
+    if count == 0 || count > MAX_OVERLAY_SEGMENTS as usize {
         return None;
     }
     let count = count as u16;
@@ -220,6 +229,9 @@ impl Reassembly {
             || total_len == 0
             || total_len as usize > self.max_packet
             || payload.is_empty()
+            || count as u32 > total_len as u32
+            || count > MAX_OVERLAY_SEGMENTS
+            || count as usize > self.max_packet
         {
             return Err(ReassemblyError::Malformed);
         }
@@ -518,6 +530,39 @@ mod tests {
             .insert(net(), 1, 0, 1, 200, &[1; 10], Instant::now())
             .unwrap_err();
         assert_eq!(err, ReassemblyError::Malformed);
+    }
+
+    #[test]
+    fn segment_count_capped_by_total_len_and_mtu() {
+        let mut reasm = Reassembly::new(1280);
+        let now = Instant::now();
+        assert_eq!(
+            decode(&encode_segment(net(), 1, 0, 65535, 1, &[1])).unwrap_err(),
+            FrameError::BadSegment
+        );
+        assert_eq!(
+            reasm.insert(net(), 1, 0, 65535, 1, &[1], now).unwrap_err(),
+            ReassemblyError::Malformed
+        );
+        assert_eq!(
+            reasm
+                .insert(net(), 2, 0, 2000, 2000, &[1], now)
+                .unwrap_err(),
+            ReassemblyError::Malformed
+        );
+        assert_eq!(reasm.len(), 0);
+        assert_eq!(
+            decode(&encode_segment(
+                net(),
+                3,
+                0,
+                MAX_OVERLAY_SEGMENTS + 1,
+                80,
+                &[1]
+            ))
+            .unwrap_err(),
+            FrameError::BadSegment
+        );
     }
 
     #[test]

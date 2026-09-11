@@ -9,7 +9,7 @@ pub use tun::{TUN_WRITE_QUEUE, build_tun_multi, run_reader, run_writer};
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -81,13 +81,26 @@ pub fn spawn_generation(spawn: GenerationSpawn) -> GenerationTasks {
     );
     hub.reconcile();
 
+    let unexpected = Arc::new(Mutex::new(Some(on_unexpected_end)));
+    let fire_unexpected = {
+        let unexpected = unexpected.clone();
+        let token = cancel.clone();
+        move || {
+            if token.is_cancelled() {
+                return;
+            }
+            if let Some(cb) = unexpected.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                cb();
+            }
+        }
+    };
+
     let reader_cancel = cancel.clone();
     let reader_hub = hub.clone();
     let reader_tun = tun.clone();
     let reader_metrics = metrics.clone();
     let reader_mesh = mesh.clone();
-    let unexpected = on_unexpected_end;
-    let unexpected_cancel = cancel.clone();
+    let fire_reader = fire_unexpected.clone();
     let reader = tokio::spawn(async move {
         let result = run_reader(tun::ReaderDeps {
             tun: reader_tun,
@@ -102,18 +115,32 @@ pub fn spawn_generation(spawn: GenerationSpawn) -> GenerationTasks {
             cancel: reader_cancel.clone(),
         })
         .await;
-        if let Err(e) = result {
-            tracing::error!(?e, "TUN reader exited");
-            if !unexpected_cancel.is_cancelled() {
-                unexpected();
+        match result {
+            Ok(()) if reader_cancel.is_cancelled() => {}
+            Ok(()) => {
+                tracing::error!("TUN reader exited");
+                fire_reader();
+            }
+            Err(e) => {
+                tracing::error!(?e, "TUN reader exited");
+                fire_reader();
             }
         }
     });
 
     let writer_cancel = cancel;
+    let fire_writer = fire_unexpected;
     let writer = tokio::spawn(async move {
-        if let Err(e) = run_writer(tun, tun_rx, mesh, metrics, writer_cancel).await {
-            tracing::error!(?e, "TUN writer exited");
+        match run_writer(tun, tun_rx, mesh, metrics, writer_cancel.clone()).await {
+            Ok(()) if writer_cancel.is_cancelled() => {}
+            Ok(()) => {
+                tracing::error!("TUN writer exited");
+                fire_writer();
+            }
+            Err(e) => {
+                tracing::error!(?e, "TUN writer exited");
+                fire_writer();
+            }
         }
     });
 

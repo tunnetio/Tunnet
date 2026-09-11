@@ -256,7 +256,7 @@ impl DnsController {
             return;
         }
         if let Err(e) = self.manager.flush_cache() {
-            tracing::warn!(error = %e, "osdns DNS cache flush failed");
+            tracing::debug!(error = %e, "osdns DNS cache flush skipped");
         }
     }
 }

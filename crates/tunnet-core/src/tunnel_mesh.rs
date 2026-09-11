@@ -26,7 +26,7 @@ struct Inner {
     keep_alive_peers: DashMap<EndpointId, ()>,
     cloud_relay_meter: CloudRelayMeter,
     cloud_relay_urls: RwLock<HashSet<String>>,
-    peer_cloud_relay: DashMap<EndpointId, AtomicBool>,
+    peer_cloud_relay: DashMap<EndpointId, RelayFlag>,
     snapshots: DashMap<EndpointId, PeerSnap>,
     active_conns: AtomicU32,
     bytes_tx: AtomicU64,
@@ -56,7 +56,13 @@ struct Inner {
     tun_tx_bytes: AtomicU64,
 }
 
+struct RelayFlag {
+    owner: u64,
+    metered: AtomicBool,
+}
+
 struct PeerSnap {
+    owner: u64,
     state: String,
     keep_alive: bool,
     last_activity: Instant,
@@ -115,30 +121,41 @@ impl TunnelMesh {
         let normalized: HashSet<String> =
             urls.into_iter().map(|u| normalize_relay_url(&u)).collect();
         *self.inner.cloud_relay_urls.write() = normalized;
-        self.inner.peer_cloud_relay.clear();
     }
 
     pub fn cloud_relay_urls(&self) -> HashSet<String> {
         self.inner.cloud_relay_urls.read().clone()
     }
 
-    pub fn set_peer_cloud_relay(&self, peer: EndpointId, metered: bool) {
-        self.inner
-            .peer_cloud_relay
-            .entry(peer)
-            .or_insert_with(|| AtomicBool::new(false))
-            .store(metered, Ordering::Relaxed);
+    pub fn set_peer_cloud_relay(&self, peer: EndpointId, owner: u64, metered: bool) {
+        match self.inner.peer_cloud_relay.entry(peer) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                if owner < e.get().owner {
+                    return;
+                }
+                e.get_mut().owner = owner;
+                e.get().metered.store(metered, Ordering::Relaxed);
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(RelayFlag {
+                    owner,
+                    metered: AtomicBool::new(metered),
+                });
+            }
+        }
     }
 
-    pub fn clear_peer_cloud_relay(&self, peer: EndpointId) {
-        self.inner.peer_cloud_relay.remove(&peer);
+    pub fn clear_peer_cloud_relay(&self, peer: EndpointId, owner: u64) {
+        self.inner
+            .peer_cloud_relay
+            .remove_if(&peer, |_, flag| flag.owner == owner);
     }
 
     pub fn peer_is_cloud_relay(&self, peer: EndpointId) -> bool {
         self.inner
             .peer_cloud_relay
             .get(&peer)
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+            .is_some_and(|f| f.metered.load(Ordering::Relaxed))
     }
 
     pub fn set_keep_alive(&self, enabled: bool) {
@@ -240,11 +257,20 @@ impl TunnelMesh {
     pub fn set_peer_state(
         &self,
         peer: EndpointId,
+        owner: u64,
         state: &str,
         live: bool,
         path: &str,
         keep_alive: bool,
     ) {
+        if let Some(s) = self.inner.snapshots.get(&peer) {
+            if owner < s.owner {
+                return;
+            }
+            if owner != s.owner && !live {
+                return;
+            }
+        }
         let prev_live = self.inner.snapshots.get(&peer).is_some_and(|s| s.live);
         match (prev_live, live) {
             (false, true) => {
@@ -259,6 +285,7 @@ impl TunnelMesh {
             .snapshots
             .entry(peer)
             .and_modify(|s| {
+                s.owner = owner;
                 s.state = state.into();
                 s.live = live;
                 s.path = path.into();
@@ -266,6 +293,7 @@ impl TunnelMesh {
                 s.last_activity = Instant::now();
             })
             .or_insert_with(|| PeerSnap {
+                owner,
                 state: state.into(),
                 keep_alive,
                 last_activity: Instant::now(),
@@ -363,16 +391,17 @@ impl TunnelMesh {
         self.inner.tun_tx_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn clear_peer(&self, peer: EndpointId) {
-        if self
+    pub fn clear_peer(&self, peer: EndpointId, owner: u64) {
+        let removed = self
             .inner
             .snapshots
-            .remove(&peer)
-            .is_some_and(|(_, s)| s.live)
-        {
+            .remove_if(&peer, |_, s| s.owner == owner);
+        if removed.is_some_and(|(_, s)| s.live) {
             self.inner.active_conns.fetch_sub(1, Ordering::Relaxed);
         }
-        self.inner.peer_cloud_relay.remove(&peer);
+        self.inner
+            .peer_cloud_relay
+            .remove_if(&peer, |_, flag| flag.owner == owner);
     }
 }
 
@@ -399,9 +428,28 @@ mod tests {
     fn live_connection_counter() {
         let mesh = TunnelMesh::new(CloudRelayMeter::new(), true);
         let peer = iroh::SecretKey::generate().public();
-        mesh.set_peer_state(peer, "connected", true, "direct", true);
+        mesh.set_peer_state(peer, 1, "connected", true, "direct", true);
         assert_eq!(mesh.heartbeat_counters().0, 1);
-        mesh.set_peer_state(peer, "idle", false, "unknown", true);
+        mesh.set_peer_state(peer, 1, "idle", false, "unknown", true);
+        assert_eq!(mesh.heartbeat_counters().0, 0);
+    }
+
+    #[test]
+    fn stale_owner_cannot_clear_newer_peer_state() {
+        let mesh = TunnelMesh::new(CloudRelayMeter::new(), true);
+        let peer = iroh::SecretKey::generate().public();
+        mesh.set_peer_state(peer, 1, "connected", true, "direct", true);
+        mesh.set_peer_cloud_relay(peer, 1, true);
+        mesh.set_peer_state(peer, 2, "connected", true, "relay", true);
+        mesh.set_peer_cloud_relay(peer, 2, false);
+        mesh.set_peer_state(peer, 1, "idle", false, "unknown", true);
+        mesh.clear_peer(peer, 1);
+        mesh.clear_peer_cloud_relay(peer, 1);
+        assert!(mesh.has_live(peer));
+        assert!(!mesh.peer_is_cloud_relay(peer));
+        assert_eq!(mesh.heartbeat_counters().0, 1);
+        mesh.clear_peer(peer, 2);
+        assert!(!mesh.has_live(peer));
         assert_eq!(mesh.heartbeat_counters().0, 0);
     }
 }

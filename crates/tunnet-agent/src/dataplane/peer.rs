@@ -2,12 +2,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures_util::StreamExt;
-use iroh::endpoint::{Connection, PathEvent, SendDatagramError, Side};
+use iroh::endpoint::{Connection, SendDatagramError, Side};
 use iroh::{Endpoint, EndpointId, TransportAddr};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -15,9 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tunnet_common::TUNNEL_ALPN;
 use tunnet_common::packet;
 use tunnet_common::policy::Direction;
-use tunnet_core::direct::{
-    AuthCache, EvalResult, FirewallEngine, PacketDirection, SpoofTracker, source_matches_peer,
-};
+use tunnet_core::direct::{AuthCache, EvalResult, FirewallEngine, PacketDirection, SpoofTracker};
 use tunnet_core::iroh_pool::DEFAULT_IDLE_SECS;
 use tunnet_core::tunnel_mesh::{TunnelMesh, normalize_relay_url};
 use tunnet_core::{AclEngine, RoutingTable, TransportAuth};
@@ -33,6 +31,9 @@ pub const PEER_QUEUE_CAP: usize = 32;
 pub const ACCEPT_QUEUE_CAP: usize = 4;
 pub const PACKET_MAX_AGE: Duration = Duration::from_secs(1);
 pub const DIAL_COOLDOWN: Duration = Duration::from_millis(500);
+const OUTBOUND_DRAIN_BUDGET: usize = 8;
+
+static NEXT_WORKER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct OutboundPacket {
@@ -57,10 +58,20 @@ pub struct PeerDeps {
     pub mtu: u16,
 }
 
+#[derive(Clone)]
 struct PeerHandle {
+    worker_id: u64,
     packets: mpsc::Sender<OutboundPacket>,
     accepted: mpsc::Sender<Connection>,
     stop: CancellationToken,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialStart {
+    InFlight,
+    Started,
+    Cooldown,
+    Denied,
 }
 
 #[derive(Clone)]
@@ -108,7 +119,7 @@ impl TunnelHub {
                 true
             } else {
                 handle.stop.cancel();
-                self.deps.mesh.clear_peer(*peer);
+                self.deps.mesh.clear_peer(*peer, handle.worker_id);
                 false
             }
         });
@@ -138,36 +149,29 @@ impl TunnelHub {
     }
 
     fn worker(&self, peer: EndpointId) -> PeerHandle {
-        if let Some(existing) = self.workers.get(&peer) {
-            return PeerHandle {
-                packets: existing.packets.clone(),
-                accepted: existing.accepted.clone(),
-                stop: existing.stop.clone(),
-            };
+        match self.workers.entry(peer) {
+            dashmap::mapref::entry::Entry::Occupied(e) => e.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let worker_id = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+                let (packets_tx, packets_rx) = mpsc::channel(PEER_QUEUE_CAP);
+                let (accepted_tx, accepted_rx) = mpsc::channel(ACCEPT_QUEUE_CAP);
+                let stop = self.cancel.child_token();
+                let handle = PeerHandle {
+                    worker_id,
+                    packets: packets_tx,
+                    accepted: accepted_tx,
+                    stop: stop.clone(),
+                };
+                e.insert(handle.clone());
+                let deps = self.deps.clone();
+                let workers = self.workers.clone();
+                tokio::spawn(async move {
+                    run_peer(worker_id, peer, deps, stop, packets_rx, accepted_rx).await;
+                    workers.remove_if(&peer, |_, h| h.worker_id == worker_id);
+                });
+                handle
+            }
         }
-        let (packets_tx, packets_rx) = mpsc::channel(PEER_QUEUE_CAP);
-        let (accepted_tx, accepted_rx) = mpsc::channel(ACCEPT_QUEUE_CAP);
-        let stop = self.cancel.child_token();
-        let handle = PeerHandle {
-            packets: packets_tx.clone(),
-            accepted: accepted_tx.clone(),
-            stop: stop.clone(),
-        };
-        self.workers.insert(
-            peer,
-            PeerHandle {
-                packets: packets_tx,
-                accepted: accepted_tx,
-                stop: stop.clone(),
-            },
-        );
-        let deps = self.deps.clone();
-        let workers = self.workers.clone();
-        tokio::spawn(async move {
-            run_peer(peer, deps, stop, packets_rx, accepted_rx).await;
-            workers.remove(&peer);
-        });
-        handle
     }
 }
 
@@ -177,6 +181,7 @@ struct Live {
 }
 
 async fn run_peer(
+    worker_id: u64,
     peer: EndpointId,
     deps: Arc<PeerDeps>,
     cancel: CancellationToken,
@@ -190,29 +195,30 @@ async fn run_peer(
     let mut dial: Option<JoinHandle<Result<Connection, iroh::endpoint::ConnectError>>> = None;
     let mut cooldown_until: Option<Instant> = None;
     let mut hold: Option<OutboundPacket> = None;
+    let mut retry_at: Option<Instant> = None;
     let mut last_activity = Instant::now();
     let mut idle_tick = tokio::time::interval(Duration::from_secs(5));
     idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    publish_state(&deps, peer, "idle", false, "unknown");
+    publish_state(worker_id, &deps, peer, "idle", false, "unknown");
 
     loop {
         if cancel.is_cancelled() {
             break;
         }
-        if live.is_none() && dial.is_none() {
-            maybe_start_keep_alive_dial(&deps, peer, &mut dial, cooldown_until);
+        if live.is_none() && dial.is_none() && hold.is_none() {
+            maybe_start_keep_alive_dial(&deps, peer, &mut dial, cooldown_until, worker_id);
         }
 
         tokio::select! {
-            biased;
             _ = cancel.cancelled() => break,
             conn = accepted.recv() => {
                 let Some(conn) = conn else { break };
-                install_conn(peer, &deps, &mut live, &mut reassembly, conn);
+                install_conn(worker_id, peer, &deps, &mut live, &mut reassembly, conn);
                 last_activity = Instant::now();
-                flush_hold(peer, &deps, &mut live, &mut hold, &mut packet_id, &mut last_activity);
-                drain_outbound(peer, &deps, &mut live, &mut packets, &mut packet_id, &mut last_activity);
+                retry_at = None;
+                flush_hold(worker_id, peer, &deps, &mut live, &mut reassembly, &mut hold, &mut packet_id, &mut last_activity);
+                drain_outbound(worker_id, peer, &deps, &mut live, &mut reassembly, &mut packets, &mut packet_id, &mut last_activity);
             }
             pkt = packets.recv(), if hold.is_none() => {
                 let Some(pkt) = pkt else { break };
@@ -222,41 +228,67 @@ async fn run_peer(
                         deps.mesh.inc_stale();
                         deps.metrics.dropped_inc("packet_stale");
                     } else {
-                        start_dial(&deps, peer, &mut dial, cooldown_until);
+                        let outcome = start_dial(&deps, peer, &mut dial, cooldown_until);
+                        if outcome == DialStart::Started {
+                            publish_state(worker_id, &deps, peer, "dialing", false, "unknown");
+                        }
+                        retry_at = hold_after_dial(outcome, cooldown_until, pkt.enqueued_at);
                         hold = Some(pkt);
                     }
                 } else {
-                    send_logical(peer, &deps, &mut live, pkt, &mut packet_id);
-                    drain_outbound(peer, &deps, &mut live, &mut packets, &mut packet_id, &mut last_activity);
+                    send_logical(worker_id, peer, &deps, &mut live, &mut reassembly, pkt, &mut packet_id);
+                    drain_outbound(worker_id, peer, &deps, &mut live, &mut reassembly, &mut packets, &mut packet_id, &mut last_activity);
                 }
             }
             result = await_dial(&mut dial) => {
                 match result {
                     Some(Ok(conn)) => {
                         deps.mesh.inc_dial_success();
-                        install_conn(peer, &deps, &mut live, &mut reassembly, conn);
+                        install_conn(worker_id, peer, &deps, &mut live, &mut reassembly, conn);
                         last_activity = Instant::now();
-                        flush_hold(peer, &deps, &mut live, &mut hold, &mut packet_id, &mut last_activity);
-                        drain_outbound(peer, &deps, &mut live, &mut packets, &mut packet_id, &mut last_activity);
+                        retry_at = None;
+                        flush_hold(worker_id, peer, &deps, &mut live, &mut reassembly, &mut hold, &mut packet_id, &mut last_activity);
+                        drain_outbound(worker_id, peer, &deps, &mut live, &mut reassembly, &mut packets, &mut packet_id, &mut last_activity);
                     }
                     Some(Err(_)) => {
                         deps.mesh.inc_dial_fail();
-                        cooldown_until = Some(Instant::now() + DIAL_COOLDOWN);
-                        drop_hold(&deps, &mut hold);
+                        let until = Instant::now() + DIAL_COOLDOWN;
+                        cooldown_until = Some(until);
                         drop_queued(&deps, &mut packets);
-                        publish_state(&deps, peer, "backoff", false, "unknown");
+                        if hold.as_ref().is_some_and(|p| p.enqueued_at.elapsed() > PACKET_MAX_AGE) {
+                            drop_hold(&deps, &mut hold);
+                            retry_at = None;
+                        } else if hold.is_some() {
+                            retry_at = Some(until);
+                        }
+                        publish_state(worker_id, &deps, peer, "backoff", false, "unknown");
                     }
                     None => {}
                 }
             }
+            _ = sleep_until_opt(retry_at), if retry_at.is_some() && live.is_none() => {
+                retry_at = None;
+                let Some(pkt) = hold.as_ref() else { continue };
+                if pkt.enqueued_at.elapsed() > PACKET_MAX_AGE {
+                    drop_hold(&deps, &mut hold);
+                    continue;
+                }
+                let enqueued_at = pkt.enqueued_at;
+                let outcome = start_dial(&deps, peer, &mut dial, cooldown_until);
+                if outcome == DialStart::Started {
+                    publish_state(worker_id, &deps, peer, "dialing", false, "unknown");
+                }
+                retry_at = hold_after_dial(outcome, cooldown_until, enqueued_at);
+            }
             dg = recv_datagram(live.as_ref()) => {
                 match dg {
                     Recv::Closed => {
-                        clear_live(peer, &deps, &mut live, &mut reassembly);
+                        clear_live(worker_id, peer, &deps, &mut live, &mut reassembly);
                     }
                     Recv::Datagram(buf) => {
                         last_activity = Instant::now();
                         handle_inbound(
+                            worker_id,
                             peer,
                             &hex,
                             &deps,
@@ -265,10 +297,16 @@ async fn run_peer(
                             &mut packet_id,
                             buf,
                         );
+                        if let Some(cur) = live.as_ref() {
+                            refresh_path_telemetry(worker_id, &deps, peer, &cur.conn);
+                        }
                     }
                 }
             }
             _ = idle_tick.tick() => {
+                if let Some(cur) = live.as_ref() {
+                    refresh_path_telemetry(worker_id, &deps, peer, &cur.conn);
+                }
                 let ka = keep_alive(&deps, peer);
                 if !ka
                     && live.is_some()
@@ -277,8 +315,7 @@ async fn run_peer(
                     if let Some(cur) = live.take() {
                         cur.conn.close(0u32.into(), b"idle");
                     }
-                    reassembly.clear();
-                    publish_state(&deps, peer, "idle", false, "unknown");
+                    clear_live(worker_id, peer, &deps, &mut live, &mut reassembly);
                 }
             }
         }
@@ -290,7 +327,30 @@ async fn run_peer(
     if let Some(cur) = live.take() {
         cur.conn.close(0u32.into(), b"dataplane_down");
     }
-    forget_peer(&deps, peer);
+    forget_peer(worker_id, &deps, peer);
+}
+
+fn hold_after_dial(
+    outcome: DialStart,
+    cooldown_until: Option<Instant>,
+    enqueued_at: Instant,
+) -> Option<Instant> {
+    match outcome {
+        DialStart::Started | DialStart::InFlight => None,
+        DialStart::Cooldown => cooldown_until,
+        DialStart::Denied => Some(enqueued_at + PACKET_MAX_AGE),
+    }
+}
+
+async fn sleep_until_opt(until: Option<Instant>) {
+    let Some(until) = until else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let now = Instant::now();
+    if until > now {
+        tokio::time::sleep(until - now).await;
+    }
 }
 
 enum Recv {
@@ -329,22 +389,33 @@ fn keep_alive(deps: &PeerDeps, peer: EndpointId) -> bool {
     deps.mesh.keep_alive_for(peer, hostname.as_deref())
 }
 
-fn publish_state(deps: &PeerDeps, peer: EndpointId, state: &str, live: bool, path: &str) {
+fn publish_state(
+    worker_id: u64,
+    deps: &PeerDeps,
+    peer: EndpointId,
+    state: &str,
+    live: bool,
+    path: &str,
+) {
     let was = deps.mesh.has_live(peer);
     deps.mesh
-        .set_peer_state(peer, state, live, path, keep_alive(deps, peer));
-    match (was, live) {
+        .set_peer_state(peer, worker_id, state, live, path, keep_alive(deps, peer));
+    match (was, deps.mesh.has_live(peer)) {
         (false, true) => deps.metrics.active_conns_inc(),
         (true, false) => deps.metrics.active_conns_dec(),
         _ => {}
     }
 }
 
-fn forget_peer(deps: &PeerDeps, peer: EndpointId) {
+fn forget_peer(worker_id: u64, deps: &PeerDeps, peer: EndpointId) {
     if deps.mesh.has_live(peer) {
-        deps.metrics.active_conns_dec();
+        deps.mesh.clear_peer(peer, worker_id);
+        if !deps.mesh.has_live(peer) {
+            deps.metrics.active_conns_dec();
+        }
+    } else {
+        deps.mesh.clear_peer(peer, worker_id);
     }
-    deps.mesh.clear_peer(peer);
 }
 
 fn we_are_preferred_initiator(local: EndpointId, remote: EndpointId) -> bool {
@@ -387,6 +458,7 @@ fn maybe_start_keep_alive_dial(
     peer: EndpointId,
     dial: &mut Option<JoinHandle<Result<Connection, iroh::endpoint::ConnectError>>>,
     cooldown_until: Option<Instant>,
+    worker_id: u64,
 ) {
     if !keep_alive(deps, peer) {
         return;
@@ -394,7 +466,9 @@ fn maybe_start_keep_alive_dial(
     if !we_are_preferred_initiator(deps.local_id, peer) {
         return;
     }
-    start_dial(deps, peer, dial, cooldown_until);
+    if start_dial(deps, peer, dial, cooldown_until) == DialStart::Started {
+        publish_state(worker_id, deps, peer, "dialing", false, "unknown");
+    }
 }
 
 fn start_dial(
@@ -402,28 +476,28 @@ fn start_dial(
     peer: EndpointId,
     dial: &mut Option<JoinHandle<Result<Connection, iroh::endpoint::ConnectError>>>,
     cooldown_until: Option<Instant>,
-) {
+) -> DialStart {
     if dial.is_some() {
-        return;
+        return DialStart::InFlight;
     }
     if cooldown_until.is_some_and(|t| Instant::now() < t) {
-        return;
+        return DialStart::Cooldown;
     }
     let hex = format!("{peer}");
     if !gate_allows(deps, &hex) {
         deps.mesh.inc_dials_suppressed();
-        return;
+        return DialStart::Denied;
     }
     if deps.routes.lookup_endpoint(&hex).is_none() {
         deps.mesh.inc_dials_suppressed();
-        return;
+        return DialStart::Denied;
     }
     deps.mesh.inc_dial_attempt();
-    publish_state(deps, peer, "dialing", false, "unknown");
     let endpoint = deps.endpoint.clone();
     *dial = Some(tokio::spawn(async move {
         endpoint.connect(peer, TUNNEL_ALPN).await
     }));
+    DialStart::Started
 }
 
 fn drop_hold(deps: &PeerDeps, hold: &mut Option<OutboundPacket>) {
@@ -433,10 +507,13 @@ fn drop_hold(deps: &PeerDeps, hold: &mut Option<OutboundPacket>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flush_hold(
+    worker_id: u64,
     peer: EndpointId,
     deps: &PeerDeps,
     live: &mut Option<Live>,
+    reassembly: &mut Reassembly,
     hold: &mut Option<OutboundPacket>,
     packet_id: &mut u32,
     last_activity: &mut Instant,
@@ -450,7 +527,7 @@ fn flush_hold(
         return;
     }
     *last_activity = Instant::now();
-    send_logical(peer, deps, live, pkt, packet_id);
+    send_logical(worker_id, peer, deps, live, reassembly, pkt, packet_id);
 }
 
 fn drop_queued(deps: &PeerDeps, packets: &mut mpsc::Receiver<OutboundPacket>) {
@@ -460,22 +537,28 @@ fn drop_queued(deps: &PeerDeps, packets: &mut mpsc::Receiver<OutboundPacket>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_outbound(
+    worker_id: u64,
     peer: EndpointId,
     deps: &PeerDeps,
     live: &mut Option<Live>,
+    reassembly: &mut Reassembly,
     packets: &mut mpsc::Receiver<OutboundPacket>,
     packet_id: &mut u32,
     last_activity: &mut Instant,
 ) {
-    while let Ok(pkt) = packets.try_recv() {
+    for _ in 0..OUTBOUND_DRAIN_BUDGET {
+        let Ok(pkt) = packets.try_recv() else {
+            break;
+        };
         if pkt.enqueued_at.elapsed() > PACKET_MAX_AGE {
             deps.mesh.inc_stale();
             deps.metrics.dropped_inc("packet_stale");
             continue;
         }
         *last_activity = Instant::now();
-        send_logical(peer, deps, live, pkt, packet_id);
+        send_logical(worker_id, peer, deps, live, reassembly, pkt, packet_id);
         if live.is_none() {
             break;
         }
@@ -483,6 +566,7 @@ fn drain_outbound(
 }
 
 fn clear_live(
+    worker_id: u64,
     peer: EndpointId,
     deps: &PeerDeps,
     live: &mut Option<Live>,
@@ -490,10 +574,21 @@ fn clear_live(
 ) {
     *live = None;
     reassembly.clear();
-    publish_state(deps, peer, "idle", false, "unknown");
+    deps.mesh.clear_peer_cloud_relay(peer, worker_id);
+    publish_state(worker_id, deps, peer, "idle", false, "unknown");
+}
+
+fn refresh_path_telemetry(worker_id: u64, deps: &PeerDeps, peer: EndpointId, conn: &Connection) {
+    let urls = deps.mesh.cloud_relay_urls();
+    let metered = selected_path_is_cloud_relay(conn, &urls);
+    deps.mesh.set_peer_cloud_relay(peer, worker_id, metered);
+    if conn.close_reason().is_none() {
+        publish_state(worker_id, deps, peer, "connected", true, path_label(conn));
+    }
 }
 
 fn install_conn(
+    worker_id: u64,
     peer: EndpointId,
     deps: &PeerDeps,
     live: &mut Option<Live>,
@@ -514,35 +609,13 @@ fn install_conn(
     }
     reassembly.clear();
     let stable_id = incoming.stable_id();
-    spawn_meter_watch(deps.mesh.clone(), peer, incoming.clone());
+    refresh_path_telemetry(worker_id, deps, peer, &incoming);
     let path = path_label(&incoming);
     *live = Some(Live {
         conn: incoming,
         stable_id,
     });
-    publish_state(deps, peer, "connected", true, path);
-}
-
-fn spawn_meter_watch(mesh: TunnelMesh, peer: EndpointId, conn: Connection) {
-    tokio::spawn(async move {
-        let refresh = |conn: &Connection| {
-            let urls = mesh.cloud_relay_urls();
-            let metered = selected_path_is_cloud_relay(conn, &urls);
-            mesh.set_peer_cloud_relay(peer, metered);
-        };
-        refresh(&conn);
-        let mut events = conn.path_events();
-        while let Some(ev) = events.next().await {
-            match ev {
-                PathEvent::Selected { .. }
-                | PathEvent::Lagged { .. }
-                | PathEvent::Opened { .. }
-                | PathEvent::Closed { .. } => refresh(&conn),
-                _ => {}
-            }
-        }
-        mesh.clear_peer_cloud_relay(peer);
-    });
+    publish_state(worker_id, deps, peer, "connected", true, path);
 }
 
 fn selected_path_is_cloud_relay(
@@ -563,9 +636,11 @@ fn selected_path_is_cloud_relay(
 }
 
 fn send_logical(
+    worker_id: u64,
     peer: EndpointId,
     deps: &PeerDeps,
     live: &mut Option<Live>,
+    reassembly: &mut Reassembly,
     pkt: OutboundPacket,
     packet_id: &mut u32,
 ) {
@@ -575,7 +650,7 @@ fn send_logical(
         return;
     };
     if live_conn.conn.close_reason().is_some() {
-        *live = None;
+        clear_live(worker_id, peer, deps, live, reassembly);
         deps.mesh.inc_stale();
         deps.metrics.dropped_inc("packet_stale");
         return;
@@ -612,7 +687,7 @@ fn send_logical(
             Err(SendDatagramError::ConnectionLost(_)) => {
                 let dead_id = live_conn.stable_id;
                 if live.as_ref().is_some_and(|l| l.stable_id == dead_id) {
-                    *live = None;
+                    clear_live(worker_id, peer, deps, live, reassembly);
                 }
                 return;
             }
@@ -626,11 +701,16 @@ fn send_logical(
             deps.mesh.record_tx(peer, pkt.bytes.len() as u64);
             deps.metrics.packets_inc("out");
             deps.metrics.bytes_add("out", pkt.bytes.len() as u64);
+            if let Some(cur) = live.as_ref() {
+                refresh_path_telemetry(worker_id, deps, peer, &cur.conn);
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_inbound(
+    worker_id: u64,
     peer: EndpointId,
     hex: &str,
     deps: &PeerDeps,
@@ -646,6 +726,21 @@ fn handle_inbound(
             deps.metrics.dropped_inc("overlay_malformed");
             return;
         }
+    };
+    let network_id = match &frame {
+        Frame::Single { network_id, .. } | Frame::Segment { network_id, .. } => *network_id,
+    };
+    if let Some(auth) = &deps.direct_auth
+        && !auth.contains_network(hex, network_id)
+    {
+        deps.mesh.inc_blocked();
+        deps.metrics.dropped_inc("unknown_network");
+        return;
+    }
+    let Some(peer_info) = deps.routes.lookup_endpoint_in(network_id, hex) else {
+        deps.mesh.inc_blocked();
+        deps.metrics.dropped_inc("unknown_network");
+        return;
     };
     let (network_id, packet) = match frame {
         Frame::Single { network_id, packet } => (network_id, Bytes::copy_from_slice(packet)),
@@ -687,18 +782,6 @@ fn handle_inbound(
             }
         }
     };
-    if let Some(auth) = &deps.direct_auth
-        && !auth.contains_network(hex, network_id)
-    {
-        deps.mesh.inc_blocked();
-        deps.metrics.dropped_inc("unknown_network");
-        return;
-    }
-    let Some(peer_info) = deps.routes.lookup_endpoint_in(network_id, hex) else {
-        deps.mesh.inc_blocked();
-        deps.metrics.dropped_inc("unknown_network");
-        return;
-    };
     let mut owned = packet.to_vec();
     let pkt = match packet::parse(&owned) {
         Ok(p) => p,
@@ -712,7 +795,10 @@ fn handle_inbound(
         return;
     }
     let src = pkt.ip.v4_src().unwrap();
-    if !source_matches_peer(src, peer_info.ip) {
+    if !deps
+        .routes
+        .inbound_source_ok(network_id, src, peer_info.endpoint)
+    {
         deps.metrics.dropped_inc("antispoof");
         if let Some(tracker) = deps.spoofs.get(&network_id)
             && tracker.record(hex)
@@ -748,9 +834,11 @@ fn handle_inbound(
                 deps.metrics.dropped_inc("fw_reject_in");
                 if !reply.is_empty() {
                     send_logical(
+                        worker_id,
                         peer,
                         deps,
                         live,
+                        reassembly,
                         OutboundPacket {
                             network_id,
                             bytes: reply,
@@ -818,5 +906,21 @@ mod tests {
     #[test]
     fn queue_cap_is_small() {
         assert_eq!(PEER_QUEUE_CAP, 32);
+    }
+
+    #[test]
+    fn hold_retry_follows_dial_outcome() {
+        let now = Instant::now();
+        assert_eq!(hold_after_dial(DialStart::Started, None, now), None);
+        assert_eq!(hold_after_dial(DialStart::InFlight, None, now), None);
+        let until = now + DIAL_COOLDOWN;
+        assert_eq!(
+            hold_after_dial(DialStart::Cooldown, Some(until), now),
+            Some(until)
+        );
+        assert_eq!(
+            hold_after_dial(DialStart::Denied, None, now),
+            Some(now + PACKET_MAX_AGE)
+        );
     }
 }

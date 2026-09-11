@@ -431,6 +431,14 @@ impl RouteEngine {
     }
 
     pub(crate) async fn reconcile(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
+        let mut desired = desired.clone();
+        if desired.tun_if_index.is_none() {
+            desired.tun_if_index = resolve_if_index(&desired.ifname).or_else(|| {
+                self.last_desired
+                    .as_ref()
+                    .and_then(|prev| prev.tun_if_index)
+            });
+        }
         self.last_desired = Some(desired.clone());
         #[cfg(target_os = "android")]
         {
@@ -444,7 +452,7 @@ impl RouteEngine {
             Ok(())
         }
         #[cfg(not(target_os = "android"))]
-        self.reconcile_native(desired).await
+        self.reconcile_native(&desired).await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -636,8 +644,27 @@ impl RouteEngine {
 fn resolve_if_index(name: &str) -> Option<u32> {
     netdev::get_interfaces()
         .into_iter()
-        .find(|iface| iface.name == name)
+        .find(|iface| interface_named(iface, name))
         .map(|iface| iface.index)
+}
+
+fn resolve_if_index_by_ipv4(ip: Ipv4Addr) -> Option<u32> {
+    netdev::get_interfaces()
+        .into_iter()
+        .find(|iface| iface.ipv4_addrs().contains(&ip))
+        .map(|iface| iface.index)
+}
+
+fn resolve_tun_index(name: &str, assigned: Ipv4Addr) -> Option<u32> {
+    resolve_if_index(name).or_else(|| resolve_if_index_by_ipv4(assigned))
+}
+
+fn interface_named(iface: &netdev::Interface, name: &str) -> bool {
+    iface.name.eq_ignore_ascii_case(name)
+        || iface
+            .friendly_name
+            .as_deref()
+            .is_some_and(|friendly| friendly.eq_ignore_ascii_case(name))
 }
 
 /// Build a [`DesiredRoutes`] from high-level membership inputs (pure, testable).
@@ -645,7 +672,7 @@ fn resolve_if_index(name: &str) -> Option<u32> {
 pub fn desired_from_membership(
     ifname: &str,
     profile: &DeviceProfile,
-    _assigned_ipv4: Ipv4Addr,
+    assigned_ipv4: Ipv4Addr,
     _prefix: u8,
     remote_subnets: &[Ipv4Net],
     has_exit: bool,
@@ -653,7 +680,7 @@ pub fn desired_from_membership(
 ) -> DesiredRoutes {
     DesiredRoutes {
         ifname: ifname.to_string(),
-        tun_if_index: resolve_if_index(ifname),
+        tun_if_index: resolve_tun_index(ifname, assigned_ipv4),
         profile: profile.clone(),
         remote_subnets: remote_subnets.to_vec(),
         peer_routes: vec![],
