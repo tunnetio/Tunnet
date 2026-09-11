@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 use iroh::endpoint::Connection;
-use tun_rs::{AsyncDevice, DeviceBuilder};
+use tun_rs::AsyncDevice;
+#[cfg(not(target_os = "android"))]
+use tun_rs::DeviceBuilder;
 use tunnet_common::packet::{self, Packet};
 use tunnet_common::policy::Direction;
 use tunnet_core::direct::{
@@ -18,9 +20,66 @@ use crate::metrics::AgentMetrics;
 use crate::qos::{self, OutboundScheduler};
 use crate::ssh_nat;
 
+/// Ask the app's `VpnService` to establish a tunnel, then adopt its descriptor.
+///
+/// The interface name is meaningless on Android (the framework names it `tunN`)
+/// and addressing is applied by `VpnService.Builder`, so those parameters are
+/// forwarded to the app rather than applied here.
+///
+/// `routes` matters here in a way it does not on other platforms. Desktop
+/// installs per-peer routes into the kernel table itself, but on Android the
+/// framework owns routing and accepts it only at `establish()` time, so the
+/// destinations to capture must be declared up front.
+#[cfg(target_os = "android")]
 pub fn build_tun_multi(
     ifname: &str,
     addrs: &[std::net::Ipv4Addr],
+    routes: &[ipnet::Ipv4Net],
+    _prefix: u8,
+    mtu: u16,
+) -> anyhow::Result<AsyncDevice> {
+    use std::os::fd::AsRawFd;
+
+    use crate::android_tun::{self, TunRequest};
+
+    anyhow::ensure!(!addrs.is_empty(), "at least one local address required");
+    anyhow::ensure!(
+        !routes.is_empty(),
+        "at least one route required: without one the tunnel captures nothing"
+    );
+
+    let fd = android_tun::establish(TunRequest {
+        addrs: addrs.to_vec(),
+        routes: routes.to_vec(),
+        // PeerDNS binds host loopback, which Android cannot use as a tunnel
+        // resolver. Left empty deliberately; see TunRequest::dns.
+        dns: Vec::new(),
+        mtu,
+    })?;
+    // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
+    // Borrow for the call and only give up ownership once it succeeded: on
+    // failure `fd` still owns the descriptor and closes on drop, where
+    // `into_raw_fd()` up front would leak it and leave the framework tunnel
+    // established with nothing reading it.
+    let raw = fd.as_raw_fd();
+    let dev = match unsafe { AsyncDevice::from_fd(raw) } {
+        Ok(dev) => {
+            std::mem::forget(fd);
+            dev
+        }
+        Err(e) => return Err(e).context("adopt VpnService TUN descriptor"),
+    };
+    tracing::debug!(ifname, "TUN device adopted");
+    Ok(dev)
+}
+
+/// `routes` is unused here: desktop platforms install peer routes into the
+/// kernel routing table separately, rather than declaring them on the device.
+#[cfg(not(target_os = "android"))]
+pub fn build_tun_multi(
+    ifname: &str,
+    addrs: &[std::net::Ipv4Addr],
+    _routes: &[ipnet::Ipv4Net],
     prefix: u8,
     mtu: u16,
 ) -> anyhow::Result<AsyncDevice> {

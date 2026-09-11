@@ -44,6 +44,14 @@ pub struct RunArgs {
     pub keep_alive: bool,
     #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
+    /// Name this node presents to peers.
+    ///
+    /// Falls back to `HOSTNAME`/`COMPUTERNAME` when unset, which is what the
+    /// CLI relies on. Embedders that cannot use the environment pass it here
+    /// instead: writing to the environment needs `std::env::set_var`, which is
+    /// unsound in an already-multi-threaded process such as an Android app.
+    #[arg(skip)]
+    pub hostname: Option<String>,
 }
 
 pub fn init_logging(cli: &DaemonCli) -> Option<tracing_appender::non_blocking::WorkerGuard> {

@@ -1,5 +1,10 @@
 node_modules
 /target
+
+# Android: machine-specific SDK path, and Gradle build state.
+local.properties
+.gradle/
+apps/android/**/build/
 .env
 .DS_Store
 dist

@@ -54,6 +54,9 @@ pub fn new_published_plane() -> PublishedPlane {
 pub struct DataPlaneActorConfig {
     pub ifname: String,
     pub local_addrs: Vec<Ipv4Addr>,
+    /// Peer ranges of the joined networks. Android must declare the traffic it
+    /// captures when the tunnel is established; desktop routes peers itself.
+    pub peer_cidrs: Vec<ipnet::Ipv4Net>,
     pub mtu: u16,
     pub dns_cfg: DnsConfig,
     pub dns: Option<Arc<DnsController>>,
@@ -293,6 +296,7 @@ impl DataPlaneActor {
             crate::tun_io::build_tun_multi(
                 &self.cfg.ifname,
                 &self.cfg.local_addrs,
+                &self.cfg.peer_cidrs,
                 32,
                 self.cfg.mtu,
             )
@@ -621,6 +625,7 @@ mod tests {
             config: DataPlaneActorConfig {
                 ifname: "tunnet-test-down".into(),
                 local_addrs: vec!["10.9.0.1".parse().unwrap()],
+                peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],
                 mtu: 1280,
                 dns_cfg: tunnet_common::DnsConfig::default(),
                 dns: None,
@@ -768,6 +773,7 @@ mod tests {
             dataplane_config: DataPlaneActorConfig {
                 ifname: "tunnet-test-down".into(),
                 local_addrs: vec!["10.9.0.1".parse().unwrap()],
+                peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],
                 mtu: 1280,
                 dns_cfg: tunnet_common::DnsConfig::default(),
                 dns: None,
