@@ -117,13 +117,31 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "using NDK $NDK"
 
+      # `-D warnings` here, matching the host Clippy job. Without it the Android
+      # build accumulated 19 warnings that nothing failed on, because the host
+      # jobs compile a different cfg set and never see this target's dead code.
       - name: Cross-compile the agent (arm64 only; a x86_64-only break surfaces in the Gradle leg)
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android26-clang"
           export CC_aarch64_linux_android="$BIN/aarch64-linux-android26-clang"
           export AR_aarch64_linux_android="$BIN/llvm-ar"
           cargo build -p tunnet-mobile --target aarch64-linux-android --release
+
+      # The JNI bridge is `cfg(target_os = "android")`, so the host Clippy job
+      # compiles none of it: the least reviewable code in the tree was also the
+      # least linted.
+      - name: Clippy (Android target)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android26-clang"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          cargo clippy -p tunnet-mobile -p tunnet-agent --target aarch64-linux-android -- -D warnings
 
       - name: Assemble the APK
         working-directory: apps/android

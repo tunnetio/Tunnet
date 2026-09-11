@@ -3,6 +3,18 @@
 //! This crate has no dependency on `tunnet-core` or `iroh`. State directories
 //! use fixed system paths (`/var/lib/tunnet`, `%ProgramData%\tunnet`).
 
+// Targets with no service manager (Android embeds this crate) reach only the
+// "not supported on this OS" arm: the body bails, so what follows is
+// unreachable, its parameters go unused, and the `paths` helpers that install
+// would have called are never reached. That is the intended shape rather than
+// neglect, so it is named here once instead of leaving warnings on every
+// Android build. Scoped so the platforms that do install a service keep the
+// full checks.
+#![cfg_attr(
+    not(any(windows, target_os = "linux", target_os = "macos")),
+    allow(dead_code, unreachable_code, unused_variables)
+)]
+
 mod api_ready;
 mod paths;
 
