@@ -1,3 +1,10 @@
+//! Underlay discovery: the physical interface, gateway and resolvers beneath
+//! the tunnel.
+//!
+//! Android reads only `discover()` for reporting; the gateway and interface
+//! index exist for native route reconciliation, which the framework owns
+//! there. Scoped so dead code still surfaces on the platforms that use them.
+#![cfg_attr(target_os = "android", allow(dead_code))]
 use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug, Clone, Default)]

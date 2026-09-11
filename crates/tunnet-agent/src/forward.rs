@@ -1,5 +1,8 @@
 //! IP forwarding + NAT (MASQUERADE) for exit-node / subnet gateways.
 
+// Every caller is inside a `cfg(target_os = "linux")` block: nftables and
+// iptables are the only NAT backends here, so other targets never shell out.
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -200,6 +203,8 @@ fn install_masquerade(uplink: &str) -> bool {
 }
 
 fn remove_masquerade(uplink: &str, used_nft: bool) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (uplink, used_nft);
     #[cfg(target_os = "linux")]
     {
         if used_nft {
