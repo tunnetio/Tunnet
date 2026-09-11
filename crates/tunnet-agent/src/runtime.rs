@@ -408,33 +408,29 @@ pub async fn run(
     let api_server = spawn_local_api(api_state.clone())
         .await
         .context("start Local Management API")?;
+    if let Some(tx) = on_ready.take() {
+        let _ = tx.send(());
+    }
+    #[cfg(unix)]
+    crate::sd_notify::ready("running");
+    api_state.emit(tunnet_common::local_api::LocalEvent::DaemonReady);
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
     // A Direct address conflict degrades bring-up instead of reporting healthy.
-    let dataplane_ready = match tokio::time::timeout(
+    match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         dataplane_ref.ask(crate::actors::dataplane::BringUp),
     )
     .await
     {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => {}
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "dataplane degraded at startup");
-            false
         }
         Err(e) => {
             tracing::warn!(error = %e, "dataplane bring-up timed out; degraded");
-            false
         }
-    };
-    if dataplane_ready {
-        api_state.emit(tunnet_common::local_api::LocalEvent::DaemonReady);
-        if let Some(tx) = on_ready.take() {
-            let _ = tx.send(());
-        }
-        #[cfg(unix)]
-        crate::sd_notify::ready("running");
     }
     {
         let dataplane_bg = dataplane_ref.clone();
