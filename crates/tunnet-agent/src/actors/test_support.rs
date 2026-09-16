@@ -27,11 +27,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         tunnet_common::policy::PolicyBundle::default(),
     );
     let pool = tunnet_core::ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-    let tunnel_pool = tunnet_core::ConnPool::with_shared_policy(
-        endpoint.clone(),
-        tunnet_common::TUNNEL_ALPN,
-        &pool,
-    );
+    let tunnel = tunnet_core::TunnelMesh::new(pool.cloud_relay_meter(), true);
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = tunnet_core::StatePaths::resolve(Some(tmp.path().to_str().expect("utf8")));
     let _ = paths.ensure();
@@ -49,7 +45,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         persisted: tunnet_core::PersistedState::Direct { networks: vec![] },
         endpoint,
         pool: pool.clone(),
-        tunnel_pool,
+        tunnel,
         effective_config: tunnet_core::EffectiveConfigStore::new(),
         routes: routes.clone(),
         acl,

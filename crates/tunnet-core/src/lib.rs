@@ -33,8 +33,10 @@ pub mod stream_proxy;
 #[cfg(feature = "managed")]
 pub mod sync;
 pub mod transport_auth;
+pub mod transport_profile;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;
+pub mod tunnel_mesh;
 #[cfg(feature = "managed")]
 pub mod ws_client;
 
@@ -68,5 +70,7 @@ pub use stream::{
 };
 pub use stream_proxy::stream_handler;
 pub use transport_auth::{TransportAuth, TransportHook};
+pub use transport_profile::{DATAGRAM_RECEIVE_BUFFER, DATAGRAM_SEND_BUFFER, tunnet_quic_transport};
 #[cfg(feature = "tunnel")]
 pub use tunnel::TunnelManager;
+pub use tunnel_mesh::TunnelMesh;

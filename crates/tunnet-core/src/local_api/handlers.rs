@@ -138,6 +138,7 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
 
     if let Some(net) = cfg.direct.get(&network) {
         state.node.pool.set_keep_alive(net.keep_alive);
+        state.node.tunnel.set_keep_alive(net.keep_alive);
     }
 
     Ok(format!(
@@ -424,7 +425,7 @@ pub(crate) fn peer_summaries(
     state: &LocalApiState,
     network_id: Option<uuid::Uuid>,
 ) -> Vec<PeerSummary> {
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.tunnel;
     let self_id = state.node.endpoint_id_hex();
     state
         .node
@@ -479,7 +480,7 @@ pub(crate) fn build_network_summary(
     let peers = peer_summaries(state, Some(network_id));
     let peers_total = peers.len();
     let peers_online = peers.iter().filter(|p| p.online.unwrap_or(false)).count();
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.tunnel;
     let (expires_at, expires_in_secs) = expiry_fields(state);
     let control = control_plane_status(state);
 
@@ -548,7 +549,7 @@ pub(crate) fn build_network_summary(
 }
 
 pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
-    let pool = &state.node.tunnel_pool;
+    let pool = &state.node.tunnel;
     let od = pool.on_demand_stats();
     let control = control_plane_status(state);
     let networks: Vec<NetworkSummary> = match &state.node.persisted {
@@ -1544,14 +1545,18 @@ pub(crate) fn direct_keep_alive(
     let _ = state.node.persisted.require_direct_network(None)?;
     if enable {
         state.node.pool.add_keep_alive_host(hostname);
+        state.node.tunnel.add_keep_alive_host(hostname);
         if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
             state.node.pool.set_peer_keep_alive(peer.endpoint, true);
+            state.node.tunnel.set_peer_keep_alive(peer.endpoint, true);
         }
         Ok(format!("Keep-alive enabled for {hostname}"))
     } else {
         state.node.pool.remove_keep_alive_host(hostname);
+        state.node.tunnel.remove_keep_alive_host(hostname);
         if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
             state.node.pool.set_peer_keep_alive(peer.endpoint, false);
+            state.node.tunnel.set_peer_keep_alive(peer.endpoint, false);
         }
         Ok(format!("Keep-alive disabled for {hostname}"))
     }

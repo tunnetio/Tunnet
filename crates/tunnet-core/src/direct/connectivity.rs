@@ -147,6 +147,7 @@ pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
         }
     };
     apply_relay_policy(builder, &opts.relay)
+        .transport_config(crate::transport_profile::tunnet_quic_transport())
 }
 
 /// Attach address-lookup services independently of relay policy.

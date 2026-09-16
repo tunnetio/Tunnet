@@ -1,6 +1,8 @@
-//! Ingress anti-spoofing: mesh IP must match the peer that sent the datagram.
+//! Ingress anti-spoofing for assigned mesh IPs.
 //!
-//! Hot-path only: header compare + O(1) route lookup. No allocations on allow.
+//! [`source_matches_peer`] is exact equality for a peer's own overlay address.
+//! Return traffic through a subnet router or exit node is checked separately
+//! via [`crate::routing::RoutingTable::inbound_source_ok`].
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -11,7 +11,6 @@ use arc_swap::ArcSwapOption;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
-use tun_rs::AsyncDevice;
 use tunnet_common::DnsConfig;
 use tunnet_common::local_api::LocalEvent;
 use tunnet_core::CoreNode;
@@ -21,7 +20,7 @@ use uuid::Uuid;
 use super::routes::{ApplyDesiredRoutes, ClearRoutes, GetKernelRoutes, RouteActor};
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
-use crate::system_routes::desired_from_membership;
+use crate::system_routes::{desired_from_membership, overlay_peer_host_routes};
 
 // ---------------------------------------------------------------------------
 // Published hot-path view
@@ -29,15 +28,11 @@ use crate::system_routes::desired_from_membership;
 
 /// Immutable generation published by `DataPlaneActor`.
 ///
-/// Readers load once, retain `device`, and exit when `cancel` fires.
-/// A new TUN publishes a fresh generation; an old reader can never observe a
-/// new device because it holds the old `Arc` + old token only.
+/// Accept and workers load this once. `cancel` ends the generation; a new TUN
+/// publishes a fresh `Arc`.
 pub struct PublishedDataPlane {
-    /// Monotonic generation: readers pin the generation loaded at start and
-    /// never observe a newer device.
-    pub generation: u64,
-    pub device: Arc<AsyncDevice>,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub hub: crate::dataplane::TunnelHub,
 }
 
 pub type PublishedPlane = Arc<ArcSwapOption<PublishedDataPlane>>;
@@ -87,9 +82,6 @@ pub struct DataPlaneActorArgs {
     pub route_actor: ActorRef<RouteActor>,
     pub published: PublishedPlane,
     pub status: DataPlaneStatusSnapshot,
-    /// Ingress reader registry: aborted on BringDown alongside generation
-    /// cancellation (defense in depth; readers also observe the token).
-    pub ingress: crate::ingress::IngressRegistry,
     /// Start in up state (initial plane already published by bootstrap).
     pub initially_up: bool,
     pub initial_generation: u64,
@@ -113,12 +105,14 @@ pub struct DataPlaneActor {
     route_actor: ActorRef<RouteActor>,
     published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
-    ingress: crate::ingress::IngressRegistry,
     up: bool,
     generation: u64,
-    outbound: Option<tokio::task::JoinHandle<()>>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<tokio::task::JoinHandle<()>>,
+    hub: Option<crate::dataplane::TunnelHub>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
     dns_task: Option<tokio::task::JoinHandle<()>>,
+    tun_if_index: Option<u32>,
 }
 
 impl Actor for DataPlaneActor {
@@ -138,10 +132,12 @@ impl Actor for DataPlaneActor {
             route_actor: args.route_actor,
             published: args.published,
             status: args.status,
-            ingress: args.ingress,
-            outbound: None,
+            reader: None,
+            writer: None,
+            hub: None,
             generation_cancel: None,
             dns_task: None,
+            tun_if_index: None,
         };
         if auto_up {
             // Reconstruct service after (re)start from durable state.
@@ -183,7 +179,7 @@ impl DataPlaneActor {
     }
 
     fn desired_routes(&self) -> crate::system_routes::DesiredRoutes {
-        if self.cfg.is_direct {
+        let mut desired = if self.cfg.is_direct {
             let peer_ips: Vec<Ipv4Addr> = self.node.routes.peers().iter().map(|p| p.ip).collect();
             crate::system_routes::desired_direct(
                 &self.cfg.ifname,
@@ -208,7 +204,17 @@ impl DataPlaneActor {
                 has_exit,
                 &self.cfg.underlay_hosts,
             )
+        };
+        if !self.cfg.is_direct {
+            desired.peer_routes = overlay_peer_host_routes(
+                self.node.routes.peers().iter().map(|p| p.ip),
+                &self.cfg.local_addrs,
+            );
         }
+        if let Some(index) = self.tun_if_index.filter(|i| *i != 0) {
+            desired.tun_if_index = Some(index);
+        }
+        desired
     }
 
     async fn reconcile_routes(&self) -> Result<(), DataPlaneError> {
@@ -225,20 +231,26 @@ impl DataPlaneActor {
     }
 
     async fn teardown(&mut self) {
-        // Withdraw published generation first so new readers stop.
         self.published.store(None);
+        self.tun_if_index = None;
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
-        if let Some(outbound) = self.outbound.take() {
-            outbound.abort();
+        if let Some(hub) = self.hub.take() {
+            hub.close_all();
+        }
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), reader).await;
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), writer).await;
         }
         if let Some(dns_task) = self.dns_task.take() {
             dns_task.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), dns_task).await;
         }
-        // Close tunnel connections so old ingress readers exit.
-        self.node.tunnel_pool.close_all().await;
-        // Best-effort route/DNS cleanup; never fail shutdown.
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             self.route_actor.ask(ClearRoutes),
@@ -270,7 +282,7 @@ impl DataPlaneActor {
                 conflicts.len()
             )));
         }
-        if self.cfg.dns.is_some() {
+        if self.cfg.dns.is_some() && self.dns_task.is_none() {
             self.dns_task = Some(
                 tunnet_core::dns::start(
                     tunnet_core::dns::bind_addr(),
@@ -293,7 +305,7 @@ impl DataPlaneActor {
         self_ref: kameo::actor::WeakActorRef<Self>,
     ) -> Result<(), DataPlaneError> {
         let tun = Arc::new(
-            crate::tun_io::build_tun_multi(
+            crate::dataplane::build_tun_multi(
                 &self.cfg.ifname,
                 &self.cfg.local_addrs,
                 &self.cfg.peer_cidrs,
@@ -302,16 +314,25 @@ impl DataPlaneActor {
             )
             .map_err(|e| DataPlaneError::Tun(format!("{e:#}")))?,
         );
+        match tun.if_index() {
+            Ok(index) if index != 0 => {
+                tracing::info!(index, ifname = %self.cfg.ifname, "TUN interface index");
+                self.tun_if_index = Some(index);
+            }
+            Ok(_) => {
+                tracing::warn!(ifname = %self.cfg.ifname, "TUN if_index reported 0; resolving by name");
+                self.tun_if_index = None;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, ifname = %self.cfg.ifname, "TUN if_index unavailable");
+                self.tun_if_index = None;
+            }
+        }
         crate::system_firewall::configure(&self.cfg.ifname);
 
         let generation = self.generation.wrapping_add(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.published.store(Some(Arc::new(PublishedDataPlane {
-            generation,
-            device: tun.clone(),
-            cancel: cancel.clone(),
-        })));
-        self.generation_cancel = Some(cancel);
+        self.generation_cancel = Some(cancel.clone());
 
         // OS DNS work stays off the actor executor thread. Probe the
         // host-local endpoint before switching OS DNS toward it.
@@ -340,7 +361,9 @@ impl DataPlaneActor {
 
         // Reconcile routes via RouteActor (one-way ask, bounded timeout).
         // Direct uses exact /32 peer routes; Managed uses subnet snapshots.
-        self.reconcile_routes().await?;
+        if let Err(e) = self.reconcile_routes().await {
+            tracing::warn!(error = %e, "OS route reconcile failed; overlay is up, host routes may be missing");
+        }
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
 
         let firewalls: std::collections::HashMap<_, _> = self
@@ -349,22 +372,28 @@ impl DataPlaneActor {
             .iter()
             .map(|(id, rt)| (*id, rt.firewall.clone()))
             .collect();
-        // The outbound loop's unexpected end is abnormal: report it so
-        // supervision restarts us. Shutdown ends it via abort (the
-        // generation token is already cancelled then, so no report fires).
-        let exit_gen = self
-            .generation_cancel
-            .clone()
-            .expect("generation token published above");
+        let spoofs: std::collections::HashMap<_, _> = self
+            .node
+            .direct
+            .iter()
+            .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
+            .collect();
+        let exit_gen = cancel.clone();
         let exit_weak = self_ref.clone();
-        let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
-            tun,
+        let tasks = crate::dataplane::spawn_generation(crate::dataplane::GenerationSpawn {
+            tun: tun.clone(),
+            cancel: cancel.clone(),
             routes: self.node.routes.clone(),
-            pool: self.node.tunnel_pool.clone(),
             acl: self.node.acl.clone(),
             firewalls,
+            spoofs,
+            direct_auth: self.node.direct_auth.clone(),
+            transport_auth: self.node.pool.transport_auth(),
             metrics: self.metrics.clone(),
+            mesh: self.node.tunnel.clone(),
             mtu: self.cfg.mtu,
+            endpoint: self.node.endpoint.clone(),
+            local_id: self.node.endpoint.id(),
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
                     && let Some(actor) = exit_weak.upgrade()
@@ -373,7 +402,13 @@ impl DataPlaneActor {
                 }
             }),
         });
-        self.outbound = Some(outbound);
+        self.published.store(Some(Arc::new(PublishedDataPlane {
+            cancel,
+            hub: tasks.hub.clone(),
+        })));
+        self.hub = Some(tasks.hub);
+        self.reader = Some(tasks.reader);
+        self.writer = Some(tasks.writer);
         self.generation = generation;
         self.up = true;
         self.status.set_up(true);
@@ -386,10 +421,6 @@ impl DataPlaneActor {
         if !self.up && self.published.load().is_none() && self.dns_task.is_none() {
             return Ok(());
         }
-        // Stop ingress readers first (registry abort), then withdraw the
-        // generation (token cancellation) in teardown. Both are idempotent;
-        // readers also self-remove from the registry on exit.
-        self.ingress.abort_all();
         self.teardown().await;
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });
         tracing::info!("data plane down");
@@ -461,15 +492,22 @@ impl Message<BringUpSelf> for DataPlaneActor {
     }
 }
 
-/// The owned outbound loop ended without generation cancellation. Abnormal:
-/// supervision must restart us (fresh generation is published on BringUp).
+/// The owned TUN I/O loop ended without generation cancellation.
 struct OutboundExited;
 
 impl Message<OutboundExited> for DataPlaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
-        panic!("outbound TUN loop unexpectedly terminated");
+    async fn handle(&mut self, _msg: OutboundExited, ctx: &mut Context<Self, Self::Reply>) {
+        tracing::error!("TUN I/O loop exited; reconstructing data plane");
+        self.teardown().await;
+        let weak = ctx.actor_ref().downgrade();
+        if let Err(e) = self.do_bring_up(weak).await {
+            tracing::error!(
+                error = %e,
+                "dataplane reconstruction after TUN I/O failure failed"
+            );
+        }
     }
 }
 
@@ -481,9 +519,7 @@ impl Message<BringDown> for DataPlaneActor {
         _msg: BringDown,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Ingress readers stop via the generation token (they hold that exact
-        // generation's cancellation) plus pool close; the registry self-cleans
-        // finished readers.
+        // Ingress readers stop via the generation token.
         self.do_bring_down().await
     }
 }
@@ -496,7 +532,15 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
         _msg: ReconcileDirectState,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if let Some(hub) = &self.hub {
+            hub.reconcile();
+        }
         if !self.cfg.is_direct {
+            if self.up
+                && let Err(e) = self.reconcile_routes().await
+            {
+                tracing::warn!(error = %e, "managed route refresh failed");
+            }
             return Ok(());
         }
         if self
@@ -640,7 +684,6 @@ mod tests {
             route_actor: route,
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
-            ingress: crate::ingress::IngressRegistry::new(),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.
@@ -787,7 +830,6 @@ mod tests {
             events: events_tx,
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
-            ingress: crate::ingress::IngressRegistry::new(),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.

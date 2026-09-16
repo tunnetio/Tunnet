@@ -4,13 +4,11 @@
 //! closed after [`DEFAULT_IDLE_SECS`] and reopened when traffic resumes.
 //! Managed mode defaults to keep-alive (connections stay open).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
-use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use iroh::TransportAddr;
@@ -27,8 +25,6 @@ use crate::transport_auth::{TransportAuth, is_authorization_close};
 
 pub const DEFAULT_IDLE_SECS: u64 = 120;
 pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_BUFFER_PACKETS: usize = 64;
-pub const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const BACKOFF_BASE: Duration = Duration::from_millis(200);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 const REMOTE_RETRY_BASE_SECS: u64 = 10;
@@ -112,8 +108,6 @@ struct PeerSlot {
     state: PeerConnState,
     last_activity: Instant,
     peer_keep_alive: bool,
-    buffer: VecDeque<Bytes>,
-    buffer_bytes: usize,
     /// Shared dial in flight: first waiter dials, others subscribe and await the result.
     dial_waiters: Option<DialWaiters>,
 }
@@ -126,8 +120,6 @@ impl PeerSlot {
             state: PeerConnState::Idle,
             last_activity: Instant::now(),
             peer_keep_alive: false,
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
             dial_waiters: None,
         }
     }
@@ -136,27 +128,8 @@ impl PeerSlot {
         self.last_activity = Instant::now();
     }
 
-    fn push_buf(&mut self, packet: Bytes) -> bool {
-        if self.buffer.len() >= MAX_BUFFER_PACKETS
-            || self.buffer_bytes + packet.len() > MAX_BUFFER_BYTES
-        {
-            return false;
-        }
-        self.buffer_bytes += packet.len();
-        self.buffer.push_back(packet);
-        true
-    }
-
-    fn take_buf(&mut self) -> Vec<Bytes> {
-        self.buffer_bytes = 0;
-        self.buffer.drain(..).collect()
-    }
-
     fn drop_buf(&mut self) -> usize {
-        let n = self.buffer.len();
-        self.buffer.clear();
-        self.buffer_bytes = 0;
-        n
+        0
     }
 
     fn live_conn(&self) -> Option<Connection> {
@@ -273,13 +246,6 @@ enum LiveUse {
     Absent,
 }
 
-/// Invoked when this pool dials a live tunnel connection.
-///
-/// The dialer must read datagrams on that connection (the accept path only
-/// reads accepted sockets). Without this hook, reverse-path IP traffic on a
-/// keep-alive/dialed connection is never delivered to the local TUN.
-pub type TunnelConnHook = Arc<dyn Fn(EndpointId, Connection) + Send + Sync>;
-
 fn normalize_relay_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
@@ -388,7 +354,6 @@ pub struct ConnPool {
     metrics: Arc<PoolMetrics>,
     bytes_in: Arc<DashMap<EndpointId, AtomicU64>>,
     bytes_out: Arc<DashMap<EndpointId, AtomicU64>>,
-    tunnel_hook: Arc<Mutex<Option<TunnelConnHook>>>,
     cloud_relay_meter: CloudRelayMeter,
     cloud_relay_urls: Arc<RwLock<HashSet<String>>>,
     peer_cloud_relay: Arc<DashMap<EndpointId, AtomicBool>>,
@@ -421,7 +386,6 @@ impl ConnPool {
             metrics: Arc::new(PoolMetrics::default()),
             bytes_in: Arc::new(DashMap::new()),
             bytes_out: Arc::new(DashMap::new()),
-            tunnel_hook: Arc::new(Mutex::new(None)),
             cloud_relay_meter: CloudRelayMeter::new(),
             cloud_relay_urls: Arc::new(RwLock::new(HashSet::new())),
             peer_cloud_relay: Arc::new(DashMap::new()),
@@ -431,33 +395,6 @@ impl ConnPool {
         pool
     }
 
-    /// Create a pool that shares keep-alive / idle policy with `other` (different ALPN).
-    ///
-    /// Does **not** spawn an idle sweeper - only [`Self::new`] owns the sweeper for a
-    /// given policy Arc.
-    pub fn with_shared_policy(endpoint: Endpoint, alpn: &'static [u8], other: &ConnPool) -> Self {
-        Self {
-            endpoint,
-            alpn,
-            entries: Arc::new(DashMap::new()),
-            extra: Arc::new(DashMap::new()),
-            policy: other.policy.clone(),
-            metrics: other.metrics.clone(),
-            bytes_in: other.bytes_in.clone(),
-            bytes_out: other.bytes_out.clone(),
-            tunnel_hook: Arc::new(Mutex::new(None)),
-            cloud_relay_meter: other.cloud_relay_meter.clone(),
-            cloud_relay_urls: other.cloud_relay_urls.clone(),
-            peer_cloud_relay: other.peer_cloud_relay.clone(),
-            gate: other.gate.clone(),
-        }
-    }
-
-    /// Register a hook invoked whenever this pool dials a tunnel connection.
-    pub fn set_tunnel_hook(&self, hook: TunnelConnHook) {
-        *self.tunnel_hook.lock() = Some(hook);
-    }
-
     pub fn cloud_relay_meter(&self) -> CloudRelayMeter {
         self.cloud_relay_meter.clone()
     }
@@ -465,6 +402,10 @@ impl ConnPool {
     /// Install the membership gate guarding outbound dials (default + extra ALPNs).
     pub fn set_transport_auth(&self, auth: TransportAuth) {
         *self.gate.write() = Some(auth);
+    }
+
+    pub fn transport_auth(&self) -> Option<TransportAuth> {
+        self.gate.read().clone()
     }
 
     fn gate_allows(&self, peer_hex: &str) -> bool {
@@ -580,15 +521,8 @@ impl ConnPool {
         }
     }
 
-    /// Record a transient failure with backoff. Returns the backoff deadline
-    /// so the caller can wake queued work when it passes.
-    fn mark_backoff(
-        &self,
-        slot: &mut impl ConnSlot,
-        step: u32,
-        peer: EndpointId,
-        err: &Arc<str>,
-    ) -> Instant {
+    /// Record a transient failure with backoff.
+    fn mark_backoff(&self, slot: &mut impl ConnSlot, step: u32, peer: EndpointId, err: &Arc<str>) {
         self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
         let wait = backoff_delay(step);
         let until = Instant::now() + wait;
@@ -600,7 +534,6 @@ impl ConnPool {
             let _ = tx.send(Err(err.clone()));
         }
         tracing::debug!(%peer, wait_ms = wait.as_millis(), reason = %err, "dial failed; backing off");
-        until
     }
 
     /// Record a deterministic local denial (pool gate or endpoint hook, same
@@ -682,31 +615,7 @@ impl ConnPool {
         true
     }
 
-    /// Wake queued work once a transient backoff expires. Fires at most once
-    /// per episode and only dials when packets actually waited; anything else
-    /// is a no-op. Queued datagrams must never strand silently.
-    fn spawn_backoff_wakeup(
-        &self,
-        slot: &Arc<AsyncMutex<PeerSlot>>,
-        peer: EndpointId,
-        until: Instant,
-    ) {
-        let pool = self.clone();
-        let slot = slot.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
-            let queued = {
-                let guard = slot.lock().await;
-                matches!(guard.state, PeerConnState::Backoff { until: u, .. } if u == until)
-                    && !guard.buffer.is_empty()
-            };
-            if queued {
-                let _ = pool.get(peer).await;
-            }
-        });
-    }
-
-    /// Drop connection + buffer for peers the gate now rejects; clear stale
+    /// Drop connection for peers the gate now rejects; clear stale
     /// blocks the gate now admits. Call on every membership change so
     /// authorization changes propagate by event. The pool additionally
     /// revalidates live connections on generation change at point of use, so
@@ -835,11 +744,7 @@ impl ConnPool {
         });
     }
 
-    fn fire_tunnel_hook(&self, peer: EndpointId, conn: Connection) {
-        let hook = self.tunnel_hook.lock().clone();
-        if let Some(hook) = hook {
-            hook(peer, conn.clone());
-        }
+    fn on_live_conn(&self, peer: EndpointId, conn: Connection) {
         self.spawn_cloud_relay_path_watch(peer, conn);
     }
 
@@ -885,7 +790,7 @@ impl ConnPool {
         };
         guard.touch();
         drop(guard);
-        self.fire_tunnel_hook(peer, conn);
+        self.on_live_conn(peer, conn);
         true
     }
 
@@ -1128,7 +1033,7 @@ impl ConnPool {
                 }
                 let generation = self.gate_generation();
                 let local = self.endpoint.id();
-                let (canonical, buffered, fire_hook) = {
+                let canonical = {
                     let mut guard = slot.lock().await;
                     if let Some(existing) = guard.live_conn() {
                         let existing_by_us = guard.opened_by_us;
@@ -1146,17 +1051,15 @@ impl ConnPool {
                             if let Some(tx) = guard.dial_waiters.take() {
                                 let _ = tx.send(Ok(conn.clone()));
                             }
-                            let buffered = guard.take_buf();
-                            (conn, buffered, true)
+                            conn
                         } else {
                             let existing = existing.clone();
                             if let Some(tx) = guard.dial_waiters.take() {
                                 let _ = tx.send(Ok(existing.clone()));
                             }
-                            let buffered = guard.take_buf();
                             drop(guard);
                             conn.close(0u32.into(), b"tie_break");
-                            (existing, buffered, true)
+                            existing
                         }
                     } else {
                         guard.conn = Some(conn.clone());
@@ -1168,19 +1071,10 @@ impl ConnPool {
                         if let Some(tx) = guard.dial_waiters.take() {
                             let _ = tx.send(Ok(conn.clone()));
                         }
-                        let buffered = guard.take_buf();
-                        (conn, buffered, true)
+                        conn
                     }
                 };
-
-                for pkt in buffered {
-                    if let Err(e) = send_datagram(&canonical, pkt).await {
-                        tracing::debug!(%peer, ?e, "flush buffered datagram failed");
-                    }
-                }
-                if fire_hook {
-                    self.fire_tunnel_hook(peer, canonical.clone());
-                }
+                self.on_live_conn(peer, canonical.clone());
                 Ok(canonical)
             }
             Err((DialFailure::LocalDenied, err)) => {
@@ -1203,16 +1097,7 @@ impl ConnPool {
             }
             Err((DialFailure::Transient, err)) => {
                 let mut guard = slot.lock().await;
-                let dropped = guard.drop_buf();
-                self.metrics
-                    .packets_dropped_timeout
-                    .fetch_add(dropped as u64, Ordering::Relaxed);
-                let until = self.mark_backoff(&mut *guard, backoff_step, peer, &err);
-                drop(guard);
-                // Always armed: packets buffered later during the backoff are
-                // covered too. The task no-ops unless this exact episode still
-                // holds queued work at expiry.
-                self.spawn_backoff_wakeup(&slot, peer, until);
+                self.mark_backoff(&mut *guard, backoff_step, peer, &err);
                 anyhow::bail!("{err}")
             }
         }
@@ -1382,92 +1267,6 @@ impl ConnPool {
         }
     }
 
-    /// Send a packet, buffering + dialing when the peer is idle. Locally
-    /// blocked peers fail immediately without buffering; backoff and remote
-    /// cooldowns absorb packets into the bounded buffer while a dial is
-    /// scheduled or in flight.
-    pub async fn send_or_buffer(&self, peer: EndpointId, packet: Bytes) -> anyhow::Result<()> {
-        let slot = self.slot(peer);
-        let now = Instant::now();
-        {
-            let mut guard = slot.lock().await;
-            match self.locked_live(&mut *guard, peer) {
-                LiveUse::Use(c) => {
-                    drop(guard);
-                    return send_datagram(&c, packet).await;
-                }
-                LiveUse::Revoked => {
-                    self.metrics
-                        .packets_dropped_blocked
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(not_authorized(peer));
-                }
-                LiveUse::Absent => {}
-            }
-            if let Some(dead) = guard.conn.take()
-                && self.note_dead_conn(&mut guard.state, &dead, peer)
-            {
-                self.metrics
-                    .packets_dropped_blocked
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(not_authorized_remote(peer));
-            }
-
-            let peer_hex = format!("{peer}");
-            match self.readiness(&mut guard.state, peer, &peer_hex, now) {
-                Readiness::Deny { shed } => {
-                    if shed {
-                        let dropped = guard.drop_buf();
-                        self.metrics
-                            .packets_dropped_blocked
-                            .fetch_add(dropped as u64, Ordering::Relaxed);
-                    }
-                    self.metrics
-                        .packets_dropped_blocked
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(not_authorized(peer));
-                }
-                Readiness::Wait => {
-                    if !guard.push_buf(packet) {
-                        self.metrics
-                            .packets_dropped_timeout
-                            .fetch_add(1, Ordering::Relaxed);
-                        anyhow::bail!("on-demand buffer full for {peer}");
-                    }
-                    self.metrics
-                        .packets_buffered
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Ok(());
-                }
-                Readiness::Dial => {}
-            }
-
-            if !guard.push_buf(packet) {
-                self.metrics
-                    .packets_dropped_timeout
-                    .fetch_add(1, Ordering::Relaxed);
-                anyhow::bail!("on-demand buffer full for {peer}");
-            }
-            self.metrics
-                .packets_buffered
-                .fetch_add(1, Ordering::Relaxed);
-            if guard.dial_waiters.is_some() {
-                return Ok(());
-            }
-            // Leave Rejected/Backoff states intact so the dialer snapshots the
-            // rejection context and backoff step for consecutive episodes.
-            if !matches!(
-                guard.state,
-                PeerConnState::Rejected { .. } | PeerConnState::Backoff { .. }
-            ) {
-                guard.state = PeerConnState::Dialing;
-            }
-        }
-
-        let _ = self.get(peer).await?;
-        Ok(())
-    }
-
     pub fn touch_peer(&self, peer: EndpointId) {
         if let Some(slot) = self.entries.get(&peer)
             && let Ok(mut g) = slot.try_lock()
@@ -1601,30 +1400,6 @@ impl ConnPool {
             },
         }
     }
-}
-
-/// Send a datagram, waiting for buffer space when congested instead of dropping.
-///
-/// Drops packets larger than the connection's current `max_datagram_size`.
-pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
-    if let Some(max) = conn.max_datagram_size()
-        && packet.len() > max
-    {
-        anyhow::bail!(
-            "datagram_too_large: packet {} > max_datagram_size {}",
-            packet.len(),
-            max
-        );
-    }
-    if conn.datagram_send_buffer_space() == 0 {
-        conn.send_datagram_wait(packet)
-            .await
-            .context("send_datagram_wait (datagram buffer full or connection closed)")?;
-        return Ok(());
-    }
-    conn.send_datagram(packet)
-        .context("send_datagram (packet too big or unsupported)")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1827,15 +1602,11 @@ mod tests {
         let peer = SecretKey::generate().public();
 
         for _ in 0..100 {
-            let _ = pool.send_or_buffer(peer, Bytes::from_static(b"pkt")).await;
-        }
-        for _ in 0..20 {
             let _ = pool.get(peer).await;
         }
         let stats = pool.on_demand_stats();
         assert_eq!(stats.reconnect_attempts, 0, "blocked peer must never dial");
         assert!(stats.dials_suppressed > 0);
-        assert!(stats.packets_dropped_blocked >= 100);
         assert_eq!(pool.peer_snapshot(peer).state, "blocked");
     }
 
@@ -1922,15 +1693,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoke_peer_drops_buffer_and_pins_blocked() {
+    async fn revoke_peer_pins_blocked() {
         let ep = bind_endpoint().await;
         let pool = ConnPool::new(ep, TEST_ALPN);
         let peer = SecretKey::generate().public();
 
-        pool.slot(peer)
-            .lock()
-            .await
-            .push_buf(Bytes::from_static(b"stale"));
         pool.revoke_peer(peer).await;
 
         // Pin the denial at the same generation so no dial can follow.
@@ -1938,7 +1705,6 @@ mod tests {
         let _ = pool.get(peer).await;
         let stats = pool.on_demand_stats();
         assert_eq!(stats.reconnect_attempts, 0);
-        assert!(stats.packets_dropped_blocked >= 1);
         assert_eq!(pool.peer_snapshot(peer).state, "blocked");
     }
 
@@ -1963,7 +1729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_backoff_redials_on_packet() {
+    async fn expired_backoff_redials_on_get() {
         let ep = bind_endpoint().await;
         let pool = ConnPool::new(ep, TEST_ALPN);
         let peer = SecretKey::generate().public();
@@ -1976,39 +1742,14 @@ mod tests {
                 step: 0,
             };
         }
-        let sender = tokio::spawn({
+        let caller = tokio::spawn({
             let pool = pool.clone();
-            async move { pool.send_or_buffer(peer, Bytes::from_static(b"pkt")).await }
+            async move { pool.get(peer).await.map(|_| ()) }
         });
-        // The expired backoff must wake on traffic instead of stranding it.
         wait_for_attempts(&pool, 1).await;
-        let _ = sender.await.expect("task");
+        let _ = caller.await.expect("task");
         assert_eq!(pool.on_demand_stats().reconnect_attempts, 1);
         assert_eq!(pool.peer_snapshot(peer).state, "backoff");
-    }
-
-    #[tokio::test]
-    async fn backoff_wakeup_flushes_queued_work() {
-        let ep = bind_endpoint().await;
-        let pool = ConnPool::new(ep, TEST_ALPN);
-        let peer = SecretKey::generate().public();
-
-        // First packet: buffers, dials, fails transiently, enters backoff.
-        let first = tokio::spawn({
-            let pool = pool.clone();
-            async move {
-                let _ = pool.send_or_buffer(peer, Bytes::from_static(b"one")).await;
-            }
-        });
-        first.await.expect("task");
-        assert_eq!(pool.peer_snapshot(peer).state, "backoff");
-
-        // Packet during backoff: absorbed, no dial.
-        let _ = pool.send_or_buffer(peer, Bytes::from_static(b"two")).await;
-        assert_eq!(pool.on_demand_stats().reconnect_attempts, 1);
-
-        // Backoff expiry must redial for the queued work without new traffic.
-        wait_for_attempts(&pool, 2).await;
     }
 
     #[tokio::test]
@@ -2109,7 +1850,7 @@ mod tests {
             .expect("connects");
         assert!(t.pool.has_live(t.id_b));
 
-        // Revoke locally without reconcile: the next packet must still close.
+        // Revoke locally without reconcile: the next stream get must still close.
         t.routes_a.replace(
             &[],
             &[],
@@ -2122,12 +1863,7 @@ mod tests {
             &"aa".repeat(32),
             2,
         );
-        assert!(
-            t.pool
-                .send_or_buffer(t.id_b, Bytes::from_static(b"pkt"))
-                .await
-                .is_err()
-        );
+        assert!(t.pool.get(t.id_b).await.is_err());
         assert!(!t.pool.has_live(t.id_b));
         assert_eq!(t.pool.on_demand_stats().reconnect_attempts, 1);
         assert_eq!(t.pool.peer_snapshot(t.id_b).state, "blocked");
