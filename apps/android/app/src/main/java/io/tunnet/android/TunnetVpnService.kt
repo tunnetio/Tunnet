@@ -95,10 +95,7 @@ class TunnetVpnService : VpnService() {
     }
 
     private fun startAgent() {
-        if (agentStarted) {
-            Log.i(TAG, "agent already starting or running")
-            return
-        }
+        if (agentStarted) return
         agentStarted = true
         TunnetState.setStage(Stage.Starting)
         TunnetState.setError(null)
@@ -148,7 +145,6 @@ class TunnetVpnService : VpnService() {
      */
     private fun redeemPendingInvite() {
         val invite = TunnetState.takePendingInvite() ?: return
-        Log.i(TAG, "redeeming pending invite")
         // The agent is already Running by this point, so `Stage` no longer
         // conveys progress; without this the screen reads "Not joined" while
         // the join is actually in flight.
@@ -208,13 +204,11 @@ class TunnetVpnService : VpnService() {
             if (status is TunnetNative.Result.Err) {
                 TunnetState.setError(status.message)
                 // The agent can die after startup (a failed bootstrap-to-runtime
-                // transition right after a join, for one). The session object
-                // survives it, so without this the UI sits on "connected" while
-                // every call fails, which is the most misleading state we can
-                // show. The native layer reports this distinctly rather than as
-                // a generic socket error.
+                // transition right after a join). The session object survives it,
+                // so without this the UI sits on "connected" while every call
+                // fails, which is the most misleading state we can show.
                 if (status.message.contains("agent is not running")) {
-                    Log.e(TAG, "agent died: ${'$'}{status.message}")
+                    Log.e(TAG, "agent died: ${status.message}")
                     agentStarted = false
                     TunnetState.update {
                         it.copy(stage = Stage.Stopped, dataPlaneUp = false, joining = false)
@@ -317,15 +311,10 @@ class TunnetVpnService : VpnService() {
                 builder.addDnsServer(server)
             }
 
-            // Keep our OWN sockets out of the tunnel. They carry the encrypted
-            // mesh traffic, so routing them into it would loop: encrypt, into
-            // the TUN, read back, encrypt again. Excluding by UID is what makes
-            // this work without per-socket protect() plumbing into iroh.
-            //
-            // Note this also means the app itself cannot reach mesh IPs. Nothing
-            // in the UI needs to: the agent is reached over a unix socket, and
-            // ping/file transfer run over iroh streams rather than through the
-            // TUN.
+            // Keep our OWN sockets out of the tunnel: they carry the encrypted
+            // mesh traffic, so routing them in would loop. Excluding by UID
+            // avoids per-socket protect() plumbing into iroh. It also means the
+            // app cannot reach mesh IPs, which nothing in the UI needs.
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (e: android.content.pm.PackageManager.NameNotFoundException) {

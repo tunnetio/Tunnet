@@ -27,14 +27,14 @@
     "cli": "bun ./packages/cli/src/cli.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.12",
-    "@types/bun": "^1.4.1",
-    "lefthook": "^2.1.12",
+    "@biomejs/biome": "2.5.13",
+    "@types/bun": "^1.4.2",
+    "lefthook": "^2.1.14",
     "portless": "^0.15.6",
     "vitepress": "^2.0.0-alpha.20"
   },
   "dependencies": {
-    "ip-address": "^10.7.0",
-    "zod": "^4.5.4"
+    "ip-address": "^10.7.2",
+    "zod": "^4.6.5"
   }
 }

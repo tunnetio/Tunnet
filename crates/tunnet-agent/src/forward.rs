@@ -1,5 +1,7 @@
 //! IP forwarding + NAT (MASQUERADE) for exit-node / subnet gateways.
 
+// Every NAT backend shells out; Android is the only target with no backend arm.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -200,6 +202,8 @@ fn install_masquerade(uplink: &str) -> bool {
 }
 
 fn remove_masquerade(uplink: &str, used_nft: bool) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (uplink, used_nft);
     #[cfg(target_os = "linux")]
     {
         if used_nft {

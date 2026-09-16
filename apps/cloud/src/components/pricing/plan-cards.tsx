@@ -22,16 +22,14 @@ function priceLabel(plan: Plan): string {
 function cadenceLabel(plan: Plan): string | null {
   if (plan.pricing === "custom") return null;
   if (plan.pricing === "free") return "forever";
-  return plan.cadence;
+  if (plan.pricing === "per_seat") return "/ user / mo";
+  return "/ mo";
 }
 
-function priceDetail(plan: Plan): string | null {
-  if (plan.pricing === "flat") return "Flat · 1 user";
-  if (plan.pricing === "per_seat") {
-    return `Per seat · ${plan.limits.minSeats ?? 2}+ users`;
-  }
-  if (plan.pricing === "free") return "No card required";
-  return null;
+function planCta(plan: Plan): string {
+  if (plan.id === "enterprise") return "Talk to sales";
+  if (plan.pricing === "per_seat") return "Start trial";
+  return "Start for free";
 }
 
 function PlanCard({ plan }: { plan: Plan }): ReactNode {
@@ -44,7 +42,7 @@ function PlanCard({ plan }: { plan: Plan }): ReactNode {
         "border bg-[var(--l1-panel)]/40 shadow-[var(--l1-shadow-panel)]",
         "transition-[border-color,background-color,transform] duration-300",
         plan.highlight
-          ? "border-[oklch(0.75_0.115_58/0.45)] bg-gradient-to-b from-[var(--l1-copper-soft)]/70 to-[var(--l1-panel)]/50"
+          ? "border-[var(--l1-fg)] bg-gradient-to-b from-[var(--l1-bg-2)] to-[var(--l1-panel)]/50"
           : "border-[var(--l1-steel)] hover:border-[var(--l1-steel-strong)] hover:bg-[var(--l1-panel)]/55",
       )}
     >
@@ -58,34 +56,28 @@ function PlanCard({ plan }: { plan: Plan }): ReactNode {
       <header className="flex items-start justify-between gap-3">
         <span className="l1-label text-[var(--l1-muted)]">{plan.name}</span>
         {plan.highlight ? (
-          <span className="rounded-[6px] border border-[oklch(0.75_0.115_58/0.35)] bg-[var(--l1-copper-soft)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--l1-copper)]">
+          <span className="rounded-full bg-[var(--l1-fg)] px-2.5 py-1 text-[10px] font-semibold tracking-[0.12em] text-[var(--l1-on-fg)] uppercase">
             Popular
           </span>
         ) : plan.trialDays ? (
-          <span className="l1-label !text-[10px] text-[var(--l1-muted-2)]">
-            {plan.trialDays}d trial
+          <span className="text-[12px] text-[var(--l1-muted-2)]">
+            {plan.trialDays}-day trial
           </span>
         ) : null}
       </header>
 
-      <div className="mt-6 flex items-baseline gap-2">
-        <span className="l1-readout text-[3rem] leading-none font-semibold tracking-tight l1-engraved text-[var(--l1-fg)] sm:text-[3.25rem]">
+      <div className="mt-8 flex items-end gap-2">
+        <span className="text-[clamp(3.5rem,5vw,4.5rem)] leading-[0.85] font-semibold tracking-[-0.06em] text-[var(--l1-fg)]">
           {priceLabel(plan)}
         </span>
         {cadenceLabel(plan) ? (
-          <span className="l1-label !text-[10px] pb-1 text-[var(--l1-muted-2)]">
+          <span className="mb-1.5 text-[15px] font-medium text-[var(--l1-muted)]">
             {cadenceLabel(plan)}
           </span>
         ) : null}
       </div>
 
-      {priceDetail(plan) ? (
-        <p className="mt-2 text-[12.5px] text-[var(--l1-muted-2)]">
-          {priceDetail(plan)}
-        </p>
-      ) : null}
-
-      <p className="mt-4 text-[15px] leading-snug text-[var(--l1-muted)]">
+      <p className="mt-5 text-[15px] leading-snug text-[var(--l1-muted)]">
         {plan.pitch}
       </p>
 
@@ -110,9 +102,14 @@ function PlanCard({ plan }: { plan: Plan }): ReactNode {
           plan.highlight ? "l1-btn--copper" : "l1-btn--steel",
         )}
       >
-        {plan.cta}
+        {planCta(plan)}
         <ArrowRightIcon className="size-4" />
       </a>
+      {plan.pricing === "free" ? (
+        <p className="mt-2 text-center text-[12px] text-[var(--l1-muted-2)]">
+          No credit card
+        </p>
+      ) : null}
     </article>
   );
 }
@@ -125,7 +122,7 @@ function EnterpriseBand({ plan }: { plan: Plan }): ReactNode {
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            "radial-gradient(ellipse 50% 80% at 100% 50%, oklch(0.6_0.115_50/0.12), transparent 60%), linear-gradient(90deg, transparent, oklch(1_0_0/0.02))",
+            "radial-gradient(ellipse 50% 80% at 100% 50%, oklch(0.2 0.01 260 / 0.06), transparent 60%)",
         }}
       />
       <div className="relative grid gap-8 p-7 sm:p-9 lg:grid-cols-[1.1fr_0.9fr] lg:items-center lg:gap-12">
@@ -153,9 +150,7 @@ function EnterpriseBand({ plan }: { plan: Plan }): ReactNode {
             ))}
           </ul>
           <a
-            href="https://cal.com/tunnet/demo"
-            target="_blank"
-            rel="noreferrer"
+            href="mailto:sales@tunnet.io"
             className="l1-btn l1-btn--steel w-full shrink-0 sm:w-auto lg:w-full"
           >
             {plan.cta}

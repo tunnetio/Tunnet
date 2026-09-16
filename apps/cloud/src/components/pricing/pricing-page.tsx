@@ -17,9 +17,9 @@ export function PricingPage(): ReactNode {
   }, []);
 
   return (
-    <div className="marketing-root relative min-h-svh overflow-x-hidden bg-[var(--l1-bg)] text-[var(--l1-fg)]">
-      <MarketingNav variant="pricing" />
-      <main>
+    <div className="marketing-root relative min-h-svh bg-[var(--l1-bg)] text-[var(--l1-fg)]">
+      <MarketingNav />
+      <main className="overflow-x-hidden">
         <PricingHero />
         <PlanCards />
         <Calculator />

@@ -26,7 +26,7 @@ export function PricingHero(): ReactNode {
           className="absolute inset-x-0 top-0 h-[640px]"
           style={{
             background:
-              "radial-gradient(ellipse 62% 58% at 50% 0%, oklch(0.6_0.115_50/0.16), transparent 62%)",
+              "radial-gradient(ellipse 62% 58% at 50% 0%, oklch(0.2 0.01 260 / 0.05), transparent 62%)",
           }}
         />
         <div className="p-perf absolute inset-x-0 top-0 h-[420px] opacity-50" />

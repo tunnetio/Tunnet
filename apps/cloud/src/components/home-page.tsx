@@ -4,15 +4,13 @@ import { MarketingFooter } from "#/components/footer";
 import { initSmoothScroll } from "#/components/motion/smooth-scroll";
 import { MarketingNav } from "#/components/nav";
 import { AudienceQuotesSection } from "#/components/sections/audience-quotes";
-import { CommandsTimelineSection } from "#/components/sections/commands-timeline";
-import { EdgeGlobeSection } from "#/components/sections/edge-globe";
+import { CapabilityBand } from "#/components/sections/capability-band";
+import { ControlPlaneSection } from "#/components/sections/control-plane";
 import { FaqSection } from "#/components/sections/faq";
-import { FinalCtaSection } from "#/components/sections/final-cta";
-import { HeroSection } from "#/components/sections/hero";
+import { IdentityPathsSection } from "#/components/sections/identity-paths";
 import { OpenSourceSection } from "#/components/sections/open-source";
-import { PrimitivesSection } from "#/components/sections/primitives";
-import { SecuritySection } from "#/components/sections/security";
-import { TrustMarquee } from "#/components/sections/trust-marquee";
+import { PlatformRow } from "#/components/sections/platform-row";
+import { ProductStage } from "#/components/sections/product-stage";
 import { TwoModesSection } from "#/components/sections/two-modes";
 
 export function HomePage(): ReactNode {
@@ -22,20 +20,18 @@ export function HomePage(): ReactNode {
   }, []);
 
   return (
-    <div className="marketing-root relative min-h-svh overflow-x-hidden bg-[var(--l1-bg)] text-[var(--l1-fg)]">
+    <div className="marketing-root relative min-h-svh bg-[var(--l1-bg)] text-[var(--l1-fg)]">
       <MarketingNav />
-      <main>
-        <HeroSection />
-        <TrustMarquee />
-        <PrimitivesSection />
+      <main className="overflow-x-hidden">
+        <ProductStage />
+        <PlatformRow />
+        <ControlPlaneSection />
+        <IdentityPathsSection />
+        <CapabilityBand />
         <TwoModesSection />
-        <EdgeGlobeSection />
-        <SecuritySection />
-        <CommandsTimelineSection />
         <OpenSourceSection />
         <AudienceQuotesSection />
         <FaqSection />
-        <FinalCtaSection />
       </main>
       <MarketingFooter />
     </div>

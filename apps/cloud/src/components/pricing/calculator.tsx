@@ -1,5 +1,12 @@
+"use client";
+
 import { useGSAP } from "@gsap/react";
-import { MinusIcon, PlusIcon } from "lucide-react";
+import {
+  AdaptiveStepper,
+  AdaptiveStepperDecrement,
+  AdaptiveStepperIncrement,
+  AdaptiveStepperValue,
+} from "@tunnet/ui/components/motion/adaptive-stepper";
 import { type ReactNode, useMemo, useRef, useState } from "react";
 import {
   registerMarketingMotion,
@@ -28,41 +35,26 @@ const BUSINESS = requirePlan("business");
 
 const MAX_RESOURCES = 1000;
 
-function Stepper({
+function SeatStepper({
   value,
   onChange,
-  min = 1,
-  max = 500,
 }: {
   value: number;
   onChange: (v: number) => void;
-  min?: number;
-  max?: number;
 }) {
   return (
-    <div className="flex items-center gap-2">
-      <button
-        type="button"
-        onClick={() => onChange(Math.max(min, value - 1))}
-        className="grid size-9 place-items-center rounded-lg border border-[var(--l1-steel-strong)] bg-[var(--l1-panel)] text-[var(--l1-fg-dim)] transition-colors hover:border-[oklch(0.75_0.115_58/0.5)] hover:text-[var(--l1-copper)] disabled:opacity-40"
-        aria-label="Decrease seats"
-        disabled={value <= min}
-      >
-        <MinusIcon className="size-4" />
-      </button>
-      <span className="l1-readout grid min-w-[72px] place-items-center rounded-lg border border-[var(--l1-steel)] bg-[var(--l1-bezel)] px-3 py-2 text-[17px] font-semibold text-[var(--l1-fg)]">
-        {value}
-      </span>
-      <button
-        type="button"
-        onClick={() => onChange(Math.min(max, value + 1))}
-        className="grid size-9 place-items-center rounded-lg border border-[var(--l1-steel-strong)] bg-[var(--l1-panel)] text-[var(--l1-fg-dim)] transition-colors hover:border-[oklch(0.75_0.115_58/0.5)] hover:text-[var(--l1-copper)] disabled:opacity-40"
-        aria-label="Increase seats"
-        disabled={value >= max}
-      >
-        <PlusIcon className="size-4" />
-      </button>
-    </div>
+    <AdaptiveStepper
+      value={value}
+      onValueChange={onChange}
+      min={1}
+      max={500}
+      aria-label="Seats"
+      className="text-[var(--l1-fg)]"
+    >
+      <AdaptiveStepperDecrement />
+      <AdaptiveStepperValue />
+      <AdaptiveStepperIncrement />
+    </AdaptiveStepper>
   );
 }
 
@@ -130,7 +122,7 @@ export function Calculator(): ReactNode {
                     </span>
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-4">
-                    <Stepper value={seats} onChange={setSeats} min={1} />
+                    <SeatStepper value={seats} onChange={setSeats} />
                     <span className="l1-readout text-right text-[12px] text-[var(--l1-muted)]">
                       Team min {minimumSeats(TEAM.id)} · Business min{" "}
                       {minimumSeats(BUSINESS.id)}
@@ -171,8 +163,8 @@ export function Calculator(): ReactNode {
                   <span className="l1-label !text-[9.5px] text-[var(--l1-muted-2)]">
                     FITS
                   </span>
-                  <span className="inline-flex items-center gap-1.5 rounded-full border border-[oklch(0.75_0.115_58/0.45)] bg-[var(--l1-copper-soft)] px-2.5 py-1">
-                    <span className="l1-readout text-[var(--l1-copper)]">
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--l1-steel)] bg-[var(--l1-bg-2)] px-2.5 py-1">
+                    <span className="l1-readout text-[var(--l1-fg)]">
                       {fit.name}
                     </span>
                   </span>
@@ -231,7 +223,7 @@ function CostRow({
     <div
       className={
         highlighted
-          ? "rounded-xl border border-[oklch(0.75_0.115_58/0.5)] bg-[var(--l1-copper-soft)]/70 p-4"
+          ? "rounded-xl border border-[var(--l1-steel-strong)] bg-[var(--l1-bg-2)] p-4"
           : "rounded-xl border border-[var(--l1-steel)] bg-[var(--l1-panel)]/50 p-4"
       }
     >

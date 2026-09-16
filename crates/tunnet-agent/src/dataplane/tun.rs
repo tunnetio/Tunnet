@@ -267,12 +267,12 @@ where
 }
 
 /// Linux `recv_multiple` slot: `AsRef`/`AsMut` always expose full capacity.
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 pub struct RecvSlot {
     buf: Vec<u8>,
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 impl RecvSlot {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
@@ -281,14 +281,14 @@ impl RecvSlot {
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 impl AsRef<[u8]> for RecvSlot {
     fn as_ref(&self) -> &[u8] {
         &self.buf
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 impl AsMut<[u8]> for RecvSlot {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.buf
@@ -359,7 +359,7 @@ async fn write_one(
     }
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(test)]
 pub fn stage_virtio(pkt: &[u8]) -> Vec<u8> {
     #[cfg(target_os = "linux")]
     {

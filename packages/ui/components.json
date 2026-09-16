@@ -26,6 +26,7 @@
     "@react-bits": "https://reactbits.dev/r/{name}.json",
     "@componentry": "https://componentry.fun/r/{name}.json",
     "@unlumen-ui": "https://ui.unlumen.com/r/{name}.json",
-    "@beui": "https://beui.dev/r/{name}.json"
+    "@beui": "https://beui.dev/r/{name}.json",
+    "@aceternity": "https://ui.aceternity.com/registry/{name}.json"
   }
 }

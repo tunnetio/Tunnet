@@ -25,7 +25,7 @@ export function CopyButton({
         }
       }}
       className={cn(
-        "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-[var(--l1-steel-strong)] bg-[var(--l1-panel)] px-2.5 text-[11.5px] font-medium text-[var(--l1-muted)] transition-colors hover:border-[oklch(0.75_0.115_58/0.45)] hover:text-[var(--l1-fg)]",
+        "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-[var(--l1-steel-strong)] bg-[var(--l1-panel)] px-2.5 text-[11.5px] font-medium text-[var(--l1-muted)] transition-colors hover:border-[var(--l1-fg)] hover:text-[var(--l1-fg)]",
         className,
       )}
       aria-label={copied ? "Copied" : label}

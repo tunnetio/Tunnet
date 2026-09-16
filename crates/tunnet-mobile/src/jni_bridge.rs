@@ -27,10 +27,6 @@ use crate::session::AgentSession;
 /// session is the honest model; a second `start` is a bug, not a use case.
 static SESSION: Mutex<Option<AgentSession>> = Mutex::new(None);
 
-// ---------------------------------------------------------------------------
-// Android platform context
-// ---------------------------------------------------------------------------
-
 /// Register the JVM `Context` with `ndk-context`, exactly once per process.
 ///
 /// Rust code in the tree resolves TLS through the platform verifier on Android
@@ -47,16 +43,11 @@ static INIT_ANDROID_CONTEXT: Once = Once::new();
 fn init_android_context(env: &mut JNIEnv, service: &JObject) -> Result<()> {
     let vm = env.get_java_vm().context("obtain JavaVM")?;
 
-    // Register the *application* context, not the Service.
-    //
-    // ndk-context keeps the pointer for the process lifetime, but a Service is
-    // not process-lived: `stopAgent` calls `stopSelf()`, and the next connect
-    // constructs a new `TunnetVpnService`. Registering the Service would pin
-    // the first instance forever and, worse, leave consumers (notably
-    // rustls-platform-verifier, which fetches it lazily during the join) holding
-    // a context belonging to a destroyed Service after any stop/start cycle.
-    // The application context outlives every Service, so pinning it is both
-    // bounded and always valid.
+    // The *application* context, not the Service: ndk-context keeps the pointer
+    // for the process lifetime, but `stopAgent` calls `stopSelf()` and the next
+    // connect builds a new Service. Pinning the Service would leave consumers
+    // (notably rustls-platform-verifier, which fetches it lazily mid-join)
+    // holding a context belonging to a destroyed Service after any stop/start.
     let app_context = env
         .call_method(
             service,
@@ -82,16 +73,11 @@ fn init_android_context(env: &mut JNIEnv, service: &JObject) -> Result<()> {
             );
         }
         // Deliberate: ndk-context needs the context for the rest of the
-        // process, so it must never be freed. One application context, once,
-        // rather than one Service per start.
+        // process, so it must never be freed.
         std::mem::forget(app_ref);
     });
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tunnel establishment: agent -> app
-// ---------------------------------------------------------------------------
 
 /// Bridges [`TunProvider`] to `TunnetVpnService.establishTun`.
 struct JvmTunProvider {
@@ -170,10 +156,6 @@ impl TunProvider for JvmTunProvider {
     }
 }
 
-// ---------------------------------------------------------------------------
-// JSON envelopes
-// ---------------------------------------------------------------------------
-
 fn ok_json(data: serde_json::Value) -> String {
     serde_json::json!({ "ok": true, "data": data }).to_string()
 }
@@ -222,10 +204,6 @@ fn with_session<T>(f: impl FnOnce(&AgentSession) -> Result<T>) -> Result<T> {
 fn json_of<T: serde::Serialize>(value: T) -> Result<serde_json::Value> {
     serde_json::to_value(value).context("serialize response")
 }
-
-// ---------------------------------------------------------------------------
-// Exports
-// ---------------------------------------------------------------------------
 
 /// Start the embedded agent. `service` must implement
 /// `int establishTun(String[] addrs, String[] routes, String[] dns, int mtu)`,
@@ -422,10 +400,6 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeDown(
     let payload = envelope(result);
     to_jstring(&mut env, payload)
 }
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
 
 /// Route `tracing` into logcat once, so `adb logcat -s tunnet` shows agent logs.
 fn init_logging() {

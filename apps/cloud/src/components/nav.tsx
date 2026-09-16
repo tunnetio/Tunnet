@@ -1,4 +1,13 @@
 import { Link } from "@tanstack/react-router";
+import { ThemeToggle } from "@tunnet/ui/components/motion/theme-toggle";
+import {
+  MobileNav,
+  MobileNavHeader,
+  MobileNavMenu,
+  MobileNavToggle,
+  NavBody,
+  Navbar,
+} from "@tunnet/ui/components/ui/resizable-navbar";
 import {
   MotionNavigationMenu,
   MotionNavigationMenuContent,
@@ -9,301 +18,307 @@ import {
   motionNavigationMenuTriggerStyle,
 } from "@tunnet/ui/components/unlumen-ui/motion-navigation-menu";
 import { cn } from "@tunnet/ui/lib/utils";
-import {
-  ArrowRightIcon,
-  DownloadIcon,
-  GlobeIcon,
-  KeyRoundIcon,
-  MenuIcon,
-  NetworkIcon,
-  RadioTowerIcon,
-  ShareIcon,
-  TerminalSquareIcon,
-  XIcon,
-} from "lucide-react";
-import {
-  AnimatePresence,
-  motion,
-  useMotionValueEvent,
-  useScroll,
-} from "motion/react";
-import { type ReactNode, useRef, useState } from "react";
+import { ArrowRightIcon } from "lucide-react";
+import { type ReactNode, useEffect, useState } from "react";
+import { FaGithub } from "react-icons/fa6";
 
 const APP_URL = "https://app.tunnet.io";
+const GITHUB_URL = "https://github.com/tunnetio/Tunnet";
 
-const PRODUCT_ITEMS = [
+const PRODUCT_LINKS = [
   {
-    label: "Mesh",
-    href: "/#mesh",
-    description: "Private network for every machine.",
-    icon: NetworkIcon,
+    name: "Remote access",
+    href: "/#product",
+    blurb: "A private network for every machine.",
   },
   {
-    label: "Serve",
-    href: "/#mesh",
-    description: "Internal HTTPS in one command.",
-    icon: ShareIcon,
+    name: "SSH",
+    href: "/#product",
+    blurb: "Connect by name. No keys to copy.",
   },
   {
-    label: "Tunnel",
-    href: "/#edge",
-    description: "Public HTTPS. Zero firewall theatre.",
-    icon: GlobeIcon,
+    name: "Public HTTPS",
+    href: "/#product",
+    blurb: "Share a URL. Keep the origin private.",
   },
-  {
-    label: "SSH",
-    href: "/#cli",
-    description: "Keyless SSH by identity.",
-    icon: TerminalSquareIcon,
-  },
-  {
-    label: "Send",
-    href: "/#cli",
-    description: "P2P file transfer, verified.",
-    icon: RadioTowerIcon,
-  },
-  {
-    label: "Security",
-    href: "/#security",
-    description: "TLS, policy, and audit by default.",
-    icon: KeyRoundIcon,
-  },
-] as const;
+];
 
-const HOME_LINKS = [
-  { label: "Modes", href: "/#modes" },
-  { label: "Pricing", href: "/pricing" },
-  { label: "Download", href: "/download" },
-  { label: "Docs", href: "https://docs.tunnet.io", external: true },
-] as const;
-
-const PRICING_LINKS = [
-  { label: "Plans", href: "#plans" },
-  { label: "Calculator", href: "#calculator" },
-  { label: "Compare", href: "#compare" },
-  { label: "FAQ", href: "#faq" },
-  { label: "Home", href: "/" },
-  { label: "Download", href: "/download" },
-  { label: "Docs", href: "https://docs.tunnet.io", external: true },
-] as const;
-
-const DOWNLOAD_LINKS = [
-  { label: "Install", href: "#install" },
-  { label: "Home", href: "/" },
-  { label: "Pricing", href: "/pricing" },
-  { label: "Docs", href: "https://docs.tunnet.io", external: true },
-] as const;
+const RESOURCE_LINKS = [
+  {
+    name: "GitHub",
+    href: GITHUB_URL,
+    blurb: "Open source. Read every line.",
+    external: true,
+  },
+  {
+    name: "Discord",
+    href: "https://discord.gg/y5bNc3MYKz",
+    blurb: "Community and support.",
+    external: true,
+  },
+  {
+    name: "Status",
+    href: "https://status.tunnet.io",
+    blurb: "Cloud and relay uptime.",
+    external: true,
+  },
+];
 
 const triggerClass =
-  "rounded-full px-3.5 py-1.5 text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--l1-muted)] hover:text-[var(--l1-copper)] focus:text-[var(--l1-copper)] data-[state=open]:text-[var(--l1-copper)] h-auto bg-transparent";
+  "h-8 px-3 text-[13px] font-medium text-neutral-600 dark:text-neutral-300";
 
-export function MarketingNav({
-  variant = "home",
+function MenuLink({
+  href,
+  name,
+  blurb,
+  external,
 }: {
-  variant?: "home" | "pricing" | "download";
-}): ReactNode {
-  const NAV_LINKS =
-    variant === "pricing"
-      ? PRICING_LINKS
-      : variant === "download"
-        ? DOWNLOAD_LINKS
-        : HOME_LINKS;
-  const [scrolled, setScrolled] = useState(false);
-  const [hidden, setHidden] = useState(false);
+  href: string;
+  name: string;
+  blurb: string;
+  external?: boolean;
+}) {
+  return (
+    <MotionNavigationMenuLink
+      href={href}
+      {...(external ? { target: "_blank", rel: "noreferrer" } : {})}
+      className="min-w-[15rem] rounded-xl px-3 py-2.5"
+    >
+      <span className="text-[13px] font-semibold text-neutral-900 dark:text-neutral-50">
+        {name}
+      </span>
+      <span className="text-[12.5px] leading-snug text-neutral-500 dark:text-neutral-400">
+        {blurb}
+      </span>
+    </MotionNavigationMenuLink>
+  );
+}
+
+function DesktopMenu(): ReactNode {
+  return (
+    <MotionNavigationMenu
+      className="relative z-10 hidden lg:flex"
+      viewportClassName="rounded-2xl border-black/8 bg-white/95 shadow-[0_24px_80px_-28px_rgba(15,18,22,0.45)] dark:border-white/10 dark:bg-neutral-950/95"
+    >
+      <MotionNavigationMenuList
+        className="gap-0"
+        highlightClassName="rounded-full bg-neutral-100 dark:bg-neutral-800"
+      >
+        <MotionNavigationMenuItem value="product">
+          <MotionNavigationMenuTrigger className={triggerClass}>
+            Product
+          </MotionNavigationMenuTrigger>
+          <MotionNavigationMenuContent innerClassName="flex flex-col gap-0.5">
+            {PRODUCT_LINKS.map((item) => (
+              <MenuLink key={item.name} {...item} />
+            ))}
+          </MotionNavigationMenuContent>
+        </MotionNavigationMenuItem>
+
+        <MotionNavigationMenuItem value="resources">
+          <MotionNavigationMenuTrigger className={triggerClass}>
+            Resources
+          </MotionNavigationMenuTrigger>
+          <MotionNavigationMenuContent innerClassName="flex flex-col gap-0.5">
+            {RESOURCE_LINKS.map((item) => (
+              <MenuLink key={item.name} {...item} />
+            ))}
+          </MotionNavigationMenuContent>
+        </MotionNavigationMenuItem>
+
+        <MotionNavigationMenuItem>
+          <a
+            href="https://docs.tunnet.io"
+            target="_blank"
+            rel="noreferrer"
+            className={cn(motionNavigationMenuTriggerStyle(), triggerClass)}
+          >
+            Docs
+          </a>
+        </MotionNavigationMenuItem>
+
+        <MotionNavigationMenuItem>
+          <Link
+            to="/pricing"
+            className={cn(motionNavigationMenuTriggerStyle(), triggerClass)}
+          >
+            Pricing
+          </Link>
+        </MotionNavigationMenuItem>
+
+        <MotionNavigationMenuItem>
+          <Link
+            to="/download"
+            className={cn(motionNavigationMenuTriggerStyle(), triggerClass)}
+          >
+            Download
+          </Link>
+        </MotionNavigationMenuItem>
+      </MotionNavigationMenuList>
+    </MotionNavigationMenu>
+  );
+}
+
+function NavActions({ compact }: { compact?: boolean }): ReactNode {
+  return (
+    <div className="relative z-20 flex shrink-0 items-center gap-1.5">
+      <ThemeToggle
+        variant="circle-blur"
+        start="top-right"
+        className="size-9 rounded-full text-neutral-700 dark:text-neutral-200"
+        iconClassName="size-4"
+      />
+      <a
+        href={GITHUB_URL}
+        target="_blank"
+        rel="noreferrer"
+        aria-label="Tunnet on GitHub"
+        className="grid size-9 place-items-center rounded-full text-neutral-700 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800"
+      >
+        <FaGithub className="size-4" />
+      </a>
+      {compact ? null : (
+        <a
+          href={APP_URL}
+          className="l1-btn l1-btn--copper h-9 !px-3.5 !text-[12.5px]"
+        >
+          Start for free
+          <ArrowRightIcon className="size-3.5" />
+        </a>
+      )}
+    </div>
+  );
+}
+
+export function MarketingNav(): ReactNode {
   const [open, setOpen] = useState(false);
-  const lastY = useRef(0);
-  const { scrollY } = useScroll();
-  useMotionValueEvent(scrollY, "change", (y) => {
-    setScrolled(y > 8);
-    const delta = y - lastY.current;
-    if (y > 140 && delta > 3) setHidden(true);
-    else if (delta < -3 || y < 140) setHidden(false);
-    lastY.current = y;
-  });
+
+  useEffect(() => {
+    document.body.style.overflow = open ? "hidden" : "";
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [open]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1024px)");
+    const onChange = () => {
+      if (media.matches) setOpen(false);
+    };
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
 
   return (
-    <header
-      className={cn(
-        "sticky top-0 z-50 transition-[background-color,border-color,box-shadow,transform] duration-300 ease-out",
-        hidden && "-translate-y-full",
-        scrolled
-          ? "border-b border-[var(--l1-steel)] bg-[oklch(0.128_0.007_258/0.85)] shadow-[0_18px_40px_-28px_rgba(0,0,0,0.8)] backdrop-blur-xl"
-          : "border-b border-transparent",
-      )}
-    >
-      <div className="mx-auto grid h-16 max-w-[1200px] grid-cols-[auto_1fr_auto] items-center gap-4 px-5 sm:px-8">
-        <Link to="/" className="group inline-flex items-center gap-2.5">
-          <img alt="Tunnet" src="/logo.png" className="size-8" />
-          <span className="l1-engraved font-display text-[19px] font-bold uppercase tracking-[0.08em] text-[var(--l1-fg)]">
+    <Navbar className="top-0">
+      <NavBody className="max-w-[1120px] gap-4">
+        <Link
+          to="/"
+          className="relative z-20 flex shrink-0 items-center gap-2 px-2 py-1"
+        >
+          <img alt="" src="/logo.png" className="size-7" />
+          <span className="text-[15px] font-semibold tracking-tight text-neutral-900 dark:text-white">
             Tunnet
           </span>
         </Link>
+        <div className="flex min-w-0 flex-1 justify-center">
+          <DesktopMenu />
+        </div>
+        <NavActions />
+      </NavBody>
 
-        <nav className="hidden justify-center lg:flex" aria-label="Primary">
-          <div className="flex items-center gap-0.5 rounded-full border border-[var(--l1-steel)] bg-[var(--l1-panel)]/60 p-1 backdrop-blur">
-            {variant === "home" ? (
-              <MotionNavigationMenu
-                className="relative max-w-max flex-1 justify-start"
-                viewportClassName="border-[var(--l1-steel)] bg-[var(--l1-panel)]/95 text-[var(--l1-fg)] shadow-[0_24px_60px_-28px_rgba(0,0,0,0.85)] backdrop-blur-xl"
-              >
-                <MotionNavigationMenuList className="gap-0.5">
-                  <MotionNavigationMenuItem value="product">
-                    <MotionNavigationMenuTrigger className={triggerClass}>
-                      Product
-                    </MotionNavigationMenuTrigger>
-                    <MotionNavigationMenuContent
-                      className="w-[min(92vw,34rem)]"
-                      highlightClassName="bg-[var(--l1-copper-soft)]"
-                      innerClassName="p-3"
-                    >
-                      <ul className="grid gap-1 sm:grid-cols-2">
-                        {PRODUCT_ITEMS.map((item) => (
-                          <li key={item.label}>
-                            <MotionNavigationMenuLink
-                              href={item.href}
-                              className="hover:bg-[var(--l1-copper-faint)] focus:bg-[var(--l1-copper-faint)] gap-2 rounded-xl p-3 text-[var(--l1-fg-dim)] hover:text-[var(--l1-fg)]"
-                            >
-                              <div className="flex items-start gap-3">
-                                <span className="mt-0.5 grid size-8 place-items-center rounded-lg border border-[var(--l1-steel)] bg-[var(--l1-bg)] text-[var(--l1-copper)]">
-                                  <item.icon className="size-4" />
-                                </span>
-                                <span className="flex flex-col gap-0.5">
-                                  <span className="text-[13px] font-semibold text-[var(--l1-fg)]">
-                                    {item.label}
-                                  </span>
-                                  <span className="text-[12px] leading-snug text-[var(--l1-muted)]">
-                                    {item.description}
-                                  </span>
-                                </span>
-                              </div>
-                            </MotionNavigationMenuLink>
-                          </li>
-                        ))}
-                      </ul>
-                    </MotionNavigationMenuContent>
-                  </MotionNavigationMenuItem>
-
-                  {HOME_LINKS.map((item) => (
-                    <MotionNavigationMenuItem
-                      key={item.href}
-                      value={item.label.toLowerCase()}
-                    >
-                      <MotionNavigationMenuLink
-                        href={item.href}
-                        {...("external" in item && item.external
-                          ? { target: "_blank", rel: "noreferrer" }
-                          : {})}
-                        className={cn(
-                          motionNavigationMenuTriggerStyle(),
-                          triggerClass,
-                          "hover:bg-transparent focus:bg-transparent data-[active=true]:bg-transparent",
-                        )}
-                      >
-                        {item.label}
-                      </MotionNavigationMenuLink>
-                    </MotionNavigationMenuItem>
-                  ))}
-                </MotionNavigationMenuList>
-              </MotionNavigationMenu>
-            ) : (
-              NAV_LINKS.map((item) => (
-                <a
-                  key={item.href}
-                  href={item.href}
-                  {...("external" in item && item.external
-                    ? { target: "_blank", rel: "noreferrer" }
-                    : {})}
-                  className={triggerClass}
-                >
-                  {item.label}
-                </a>
-              ))
-            )}
+      <MobileNav className="max-w-[calc(100vw-1.25rem)]">
+        <MobileNavHeader>
+          <Link to="/" className="flex items-center gap-2 px-1">
+            <img alt="" src="/logo.png" className="size-7" />
+            <span className="text-[15px] font-semibold tracking-tight">
+              Tunnet
+            </span>
+          </Link>
+          <div className="flex items-center gap-0.5">
+            <NavActions compact />
+            <MobileNavToggle
+              isOpen={open}
+              onClick={() => setOpen((value) => !value)}
+            />
           </div>
-        </nav>
-
-        <div className="flex items-center gap-2">
-          <motion.div whileHover={{ y: -1 }} whileTap={{ scale: 0.98 }}>
+        </MobileNavHeader>
+        <MobileNavMenu isOpen={open} onClose={() => setOpen(false)}>
+          <p className="px-3 pt-1 text-[11px] font-medium tracking-[0.14em] text-neutral-400 uppercase">
+            Product
+          </p>
+          {PRODUCT_LINKS.map((item) => (
+            <a
+              key={item.name}
+              href={item.href}
+              className="rounded-xl px-3 py-2.5 text-[16px] font-medium text-neutral-800 dark:text-neutral-100"
+              onClick={() => setOpen(false)}
+            >
+              {item.name}
+            </a>
+          ))}
+          <p className="mt-3 px-3 text-[11px] font-medium tracking-[0.14em] text-neutral-400 uppercase">
+            Resources
+          </p>
+          {RESOURCE_LINKS.map((item) => (
+            <a
+              key={item.name}
+              href={item.href}
+              {...(item.external
+                ? { target: "_blank", rel: "noreferrer" }
+                : {})}
+              className="rounded-xl px-3 py-2.5 text-[16px] font-medium text-neutral-800 dark:text-neutral-100"
+              onClick={() => setOpen(false)}
+            >
+              {item.name}
+            </a>
+          ))}
+          <a
+            href="https://docs.tunnet.io"
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-xl px-3 py-2.5 text-[16px] font-medium text-neutral-800 dark:text-neutral-100"
+            onClick={() => setOpen(false)}
+          >
+            Docs
+          </a>
+          <Link
+            to="/pricing"
+            className="rounded-xl px-3 py-2.5 text-[16px] font-medium text-neutral-800 dark:text-neutral-100"
+            onClick={() => setOpen(false)}
+          >
+            Pricing
+          </Link>
+          <Link
+            to="/download"
+            className="rounded-xl px-3 py-2.5 text-[16px] font-medium text-neutral-800 dark:text-neutral-100"
+            onClick={() => setOpen(false)}
+          >
+            Download
+          </Link>
+          <div className="mt-auto flex flex-col gap-2 pt-4">
             <a
               href={APP_URL}
-              className="l1-btn l1-btn--copper h-9 !px-4 !text-[12.5px]"
+              className="l1-btn l1-btn--copper h-11 w-full"
+              onClick={() => setOpen(false)}
             >
-              Get started
-              <ArrowRightIcon className="size-3.5" />
+              Start for free
+              <ArrowRightIcon className="size-4" />
             </a>
-          </motion.div>
-
-          <button
-            type="button"
-            className="grid size-9 place-items-center rounded-[10px] border border-[var(--l1-steel-strong)] bg-[var(--l1-panel)] text-[var(--l1-fg-dim)] lg:hidden"
-            aria-expanded={open}
-            aria-label={open ? "Close menu" : "Open menu"}
-            onClick={() => setOpen((v) => !v)}
-          >
-            {open ? (
-              <XIcon className="size-4" />
-            ) : (
-              <MenuIcon className="size-4" />
-            )}
-          </button>
-        </div>
-      </div>
-
-      <AnimatePresence>
-        {open ? (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: "auto" }}
-            exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-            className="overflow-hidden border-t border-[var(--l1-steel)] bg-[var(--l1-bg)] lg:hidden"
-          >
-            <div className="flex flex-col gap-1 px-5 py-4">
-              {variant === "home"
-                ? [
-                    ...PRODUCT_ITEMS.map((item) => ({
-                      label: item.label,
-                      href: item.href,
-                    })),
-                    ...HOME_LINKS,
-                  ].map((item) => (
-                    <a
-                      key={`${item.label}-${item.href}`}
-                      href={item.href}
-                      {...("external" in item && item.external
-                        ? { target: "_blank", rel: "noreferrer" }
-                        : {})}
-                      className="rounded-xl px-3 py-2.5 text-[13px] font-medium text-[var(--l1-fg-dim)]"
-                      onClick={() => setOpen(false)}
-                    >
-                      {item.label}
-                    </a>
-                  ))
-                : NAV_LINKS.map((item) => (
-                    <a
-                      key={item.href}
-                      href={item.href}
-                      {...("external" in item && item.external
-                        ? { target: "_blank", rel: "noreferrer" }
-                        : {})}
-                      className="rounded-xl px-3 py-2.5 text-[13px] font-medium text-[var(--l1-fg-dim)]"
-                      onClick={() => setOpen(false)}
-                    >
-                      {item.label}
-                    </a>
-                  ))}
-              <a
-                href={APP_URL}
-                className="inline-flex items-center gap-2 rounded-xl px-3 py-2.5 text-[13px] font-medium text-[var(--l1-muted)]"
-                onClick={() => setOpen(false)}
-              >
-                <DownloadIcon className="size-3.5" />
-                Sign in
-              </a>
-            </div>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
-    </header>
+            <a
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="l1-btn l1-btn--ghost h-11 w-full"
+              onClick={() => setOpen(false)}
+            >
+              <FaGithub className="size-4" />
+              Open source on GitHub
+            </a>
+          </div>
+        </MobileNavMenu>
+      </MobileNav>
+    </Navbar>
   );
 }

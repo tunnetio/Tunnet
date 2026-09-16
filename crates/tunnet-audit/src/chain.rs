@@ -99,6 +99,7 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic() {
+        let test_key: [u8; 32] = rand::random();
         let mut e = AuditEvent::new(
             "org_1",
             DEVICE_ACTIVITY,
@@ -124,8 +125,8 @@ mod tests {
         let c1 = canonical_v1(&e, GENESIS_HASH);
         let c2 = canonical_v1(&e, GENESIS_HASH);
         assert_eq!(c1, c2);
-        let h1 = compute_entry_hash(b"test-key-at-least-32-bytes-long!!", &c1);
-        let h2 = compute_entry_hash(b"test-key-at-least-32-bytes-long!!", &c2);
+        let h1 = compute_entry_hash(&test_key, &c1);
+        let h2 = compute_entry_hash(&test_key, &c2);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
     }

@@ -67,7 +67,7 @@ iroh-gossip.workspace = true
 iroh-blobs = { workspace = true, optional = true }
 iroh-docs = { workspace = true, optional = true }
 
-hmac.workspace = true
+hkdf.workspace = true
 sha2.workspace = true
 blake3.workspace = true
 toml.workspace = true

@@ -32,12 +32,16 @@ export function TerminalDemo({
             <span className="size-2.5 rounded-full bg-[var(--l1-warn)]/70" />
             <span className="size-2.5 rounded-full bg-[var(--l1-good)]/70" />
           </span>
-          <span className="l1-readout truncate text-[var(--l1-muted)]">
+          <span className="l1-readout truncate text-[var(--l1-on-bezel-muted)]">
             {title}
           </span>
         </div>
         {showCopy ? (
-          <CopyButton value={copyValue ?? code} label="Copy" />
+          <CopyButton
+            value={copyValue ?? code}
+            label="Copy"
+            className="!border-white/20 !bg-white/10 !text-[var(--l1-on-bezel)] hover:!border-white/40 hover:!text-[var(--l1-on-bezel)]"
+          />
         ) : null}
       </div>
       <div className="p-4">
@@ -45,7 +49,7 @@ export function TerminalDemo({
       </div>
       <span
         aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,oklch(0.82_0.1_62/0.35),transparent)]"
+        className="pointer-events-none absolute inset-x-0 top-0 h-px bg-[linear-gradient(90deg,transparent,oklch(1_0_0/0.2),transparent)]"
       />
     </div>
   );

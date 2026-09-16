@@ -126,14 +126,14 @@ export function Comparison(): ReactNode {
                       key={h}
                       className={
                         h === HIGHLIGHT
-                          ? "border-l border-[oklch(0.75_0.115_58/0.3)] bg-[var(--l1-copper-soft)]/50 px-5 py-5 text-center"
+                          ? "border-l border-[var(--l1-steel-strong)] bg-[var(--l1-bg-2)] px-5 py-5 text-center"
                           : "border-l border-[var(--l1-steel)] px-5 py-5 text-center"
                       }
                     >
                       <span
                         className={
                           h === HIGHLIGHT
-                            ? "l1-label !text-[11px] text-[var(--l1-copper)]"
+                            ? "l1-label !text-[11px] text-[var(--l1-fg)]"
                             : "l1-label !text-[11px] text-[var(--l1-muted)]"
                         }
                       >
@@ -157,7 +157,7 @@ export function Comparison(): ReactNode {
                         key={col.id}
                         className={
                           isHighlightCol(col.id)
-                            ? "border-l border-[oklch(0.75_0.115_58/0.3)] bg-[var(--l1-copper-soft)]/25 px-5 py-4 text-center"
+                            ? "border-l border-[var(--l1-steel-strong)] bg-[var(--l1-bg-2)]/60 px-5 py-4 text-center"
                             : "border-l border-[var(--l1-steel)] px-5 py-4 text-center"
                         }
                       >

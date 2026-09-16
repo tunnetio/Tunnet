@@ -7,7 +7,8 @@
 //! Tiers (best available wins unless plaintext forced):
 //! 1. `tpm` - Windows DPAPI (TPM-backed when present); Linux falls through today
 //! 2. `keychain` - macOS System/login Keychain
-//! 3. `derived` - HKDF from machine-id + boot-id + salt (offline-copy protection)
+//! 3. `derived` - HKDF from stable machine identity + random per-state salt
+//!    (offline-copy protection)
 //! 4. `plaintext` - explicit `--no-encrypt-state` / `TUNNET_NO_ENCRYPT_STATE`
 
 mod derived;
@@ -20,7 +21,7 @@ use aes_gcm::aead::{Aead, Generate, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use std::collections::BTreeMap;
 
@@ -30,7 +31,7 @@ use crate::identity::AgentIdentity;
 use crate::state::{CliAuthTokens, StatePaths};
 
 const PAYLOAD_VERSION: u32 = 2;
-const META_VERSION: u32 = 1;
+const META_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -261,14 +262,15 @@ pub fn load_secrets(paths: &StatePaths) -> anyhow::Result<(AgentSecrets, SealTie
         bail!("state.enc too short");
     }
 
-    let mut dek = resolve_dek(&meta)?;
-    let cipher = Aes256Gcm::new_from_slice(&dek).map_err(|_| anyhow::anyhow!("invalid DEK"))?;
+    validate_meta(&meta)?;
+    let dek = resolve_dek(&meta)?;
+    let dek = Zeroizing::new(dek);
+    let cipher =
+        Aes256Gcm::new_from_slice(dek.as_slice()).map_err(|_| anyhow::anyhow!("invalid DEK"))?;
     let nonce = nonce_from_bytes(&blob[..12])?;
     let plain = cipher
         .decrypt(&nonce, &blob[12..])
         .map_err(|_| anyhow::anyhow!("failed to decrypt state.enc (wrong machine or corrupt?)"))?;
-    dek.zeroize();
-
     let payload: SensitivePayload =
         serde_json::from_slice(&plain).context("parse decrypted sensitive payload")?;
     if payload.version != PAYLOAD_VERSION {
@@ -291,6 +293,16 @@ pub fn load_secrets(paths: &StatePaths) -> anyhow::Result<(AgentSecrets, SealTie
         },
         meta.tier,
     ))
+}
+
+fn validate_meta(meta: &SealMeta) -> anyhow::Result<()> {
+    if meta.version != META_VERSION {
+        bail!(
+            "unsupported seal metadata version {} (supported: {META_VERSION}); reset or re-enroll to create new sealed state",
+            meta.version
+        );
+    }
+    Ok(())
 }
 
 fn resolve_dek(meta: &SealMeta) -> anyhow::Result<[u8; 32]> {
@@ -553,5 +565,37 @@ mod tests {
         let wrapped = wrap_dek(&key, dek.as_slice()).unwrap();
         let out = unwrap_dek(&key, &wrapped).unwrap();
         assert_eq!(out.as_slice(), dek.as_slice());
+    }
+
+    #[test]
+    fn derived_wrap_remains_decryptable_after_simulated_reboot() {
+        let machine_id_before_reboot = derived::StableMachineId::new("stable-machine-id");
+        let salt = random_salt();
+        let key_before =
+            derived::derive_wrap_key_for_machine(&machine_id_before_reboot, &salt).unwrap();
+        let dek = Key::<Aes256Gcm>::generate();
+        let wrapped = wrap_dek(&key_before, dek.as_slice()).unwrap();
+
+        let machine_id_after_reboot = machine_id_before_reboot.clone();
+        let key_after =
+            derived::derive_wrap_key_for_machine(&machine_id_after_reboot, &salt).unwrap();
+        let unwrapped = unwrap_dek(&key_after, &wrapped).unwrap();
+
+        assert_eq!(unwrapped.as_slice(), dek.as_slice());
+    }
+
+    #[test]
+    fn old_metadata_is_rejected_without_compatibility_fallback() {
+        let meta = SealMeta {
+            version: META_VERSION - 1,
+            tier: SealTier::Derived,
+            salt_hex: Some(hex::encode(random_salt())),
+            wrapped_dek_hex: Some("00".into()),
+            dek_hex: None,
+        };
+
+        let error = validate_meta(&meta).unwrap_err().to_string();
+        assert!(error.contains("unsupported seal metadata version 1"));
+        assert!(error.contains("reset or re-enroll"));
     }
 }

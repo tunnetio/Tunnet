@@ -38,7 +38,7 @@ const PLATFORMS: {
     note: "Requires Administrator",
     gui: {
       available: true,
-      file: "Tunnet Desktop",
+      file: "Windows installer",
       url: `${GET}/desktop/windows`,
     },
   },
@@ -90,9 +90,9 @@ export function DownloadPage(): ReactNode {
   const active = PLATFORMS.find((p) => p.id === selected) ?? PLATFORMS[0];
 
   return (
-    <div className="marketing-root relative min-h-svh overflow-x-hidden bg-[var(--l1-bg)] text-[var(--l1-fg)]">
-      <MarketingNav variant="download" />
-      <main ref={root}>
+    <div className="marketing-root relative min-h-svh bg-[var(--l1-bg)] text-[var(--l1-fg)]">
+      <MarketingNav />
+      <main ref={root} className="overflow-x-hidden">
         {/* Hero */}
         <section className="relative isolate overflow-hidden px-5 py-15 sm:px-8">
           <div
@@ -104,7 +104,7 @@ export function DownloadPage(): ReactNode {
               className="absolute inset-x-0 top-0 h-[640px]"
               style={{
                 background:
-                  "radial-gradient(ellipse 62% 58% at 50% 0%, oklch(0.6_0.115_50/0.16), transparent 62%)",
+                  "radial-gradient(ellipse 62% 58% at 50% 0%, oklch(0.2 0.01 260 / 0.05), transparent 62%)",
               }}
             />
             <div className="p-perf absolute inset-x-0 top-0 h-[420px] opacity-40" />
@@ -167,7 +167,7 @@ export function DownloadPage(): ReactNode {
                   {/* CLI + daemon */}
                   <div className="flex items-center justify-between gap-4">
                     <div className="flex items-center gap-3.5">
-                      <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-[var(--l1-steel)] bg-[var(--l1-bezel)] text-[var(--l1-copper)]">
+                      <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-[var(--l1-steel)] bg-[var(--l1-bg-2)] text-[var(--l1-fg)]">
                         <TerminalIcon className="size-4" />
                       </span>
                       <div>
@@ -190,13 +190,16 @@ export function DownloadPage(): ReactNode {
                   </div>
 
                   <div className="p-bezel mt-8 flex items-center gap-3.5 rounded-xl px-5 py-4">
-                    <span className="l1-readout select-none text-[var(--l1-muted-2)]">
+                    <span className="l1-readout select-none text-[var(--l1-on-bezel-muted)]">
                       $
                     </span>
-                    <code className="flex-1 truncate text-left font-mono text-[13.5px] text-[var(--l1-fg)]">
+                    <code className="flex-1 truncate text-left font-mono text-[13.5px] text-[var(--l1-on-bezel)]">
                       {active.command}
                     </code>
-                    <CopyButton value={active.command} />
+                    <CopyButton
+                      value={active.command}
+                      className="!border-white/20 !bg-white/10 !text-[var(--l1-on-bezel)] hover:!border-white/40 hover:!text-[var(--l1-on-bezel)]"
+                    />
                   </div>
 
                   {/* Desktop */}

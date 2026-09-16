@@ -1,109 +1,159 @@
-/* ══════════════════════════════════════════════════════════════════════
-   TUNNET · LAYER-1 DESIGN SYSTEM
-   The physical network: obsidian graphite, brushed steel, warm copper,
-   phosphor status lamps. Engraved instrument lettering. No neon, no glass,
-   no gradient hype. The page reads like the front of a piece of real gear.
-   ══════════════════════════════════════════════════════════════════════ */
+/* Tunnet marketing: matte paper and ink. No copper. */
 
 .marketing-root {
-  /* ── Palette ─────────────────────────────────────────── */
-  --l1-bg: oklch(0.128 0.007 258);
-  --l1-bg-2: oklch(0.143 0.008 258);
-  --l1-panel: oklch(0.17 0.009 258);
-  --l1-panel-2: oklch(0.198 0.01 256);
-  --l1-raised: oklch(0.238 0.011 254);
-  --l1-bezel: oklch(0.096 0.006 258);
+  --l1-bg: oklch(0.97 0.004 90);
+  --l1-bg-2: oklch(0.94 0.006 90);
+  --l1-panel: oklch(0.995 0.002 90);
+  --l1-panel-2: oklch(0.93 0.006 90);
+  --l1-raised: oklch(0.99 0.002 90);
+  --l1-bezel: oklch(0.18 0.01 260);
 
-  --l1-fg: oklch(0.95 0.006 245);
-  --l1-fg-dim: oklch(0.84 0.009 248);
-  --l1-muted: oklch(0.62 0.011 250);
-  --l1-muted-2: oklch(0.49 0.01 252);
+  --l1-fg: oklch(0.18 0.012 260);
+  --l1-fg-dim: oklch(0.32 0.01 260);
+  --l1-muted: oklch(0.48 0.012 260);
+  --l1-muted-2: oklch(0.62 0.01 260);
 
-  --l1-copper: oklch(0.75 0.115 58);
-  --l1-copper-bright: oklch(0.84 0.09 62);
-  --l1-copper-deep: oklch(0.6 0.115 50);
-  --l1-copper-soft: oklch(0.75 0.115 58 / 0.13);
-  --l1-copper-faint: oklch(0.75 0.115 58 / 0.07);
+  --l1-copper: oklch(0.2 0.012 260);
+  --l1-copper-bright: oklch(0.28 0.01 260);
+  --l1-copper-deep: oklch(0.14 0.012 260);
+  --l1-copper-soft: oklch(0.2 0.012 260 / 0.08);
+  --l1-copper-faint: oklch(0.2 0.012 260 / 0.05);
 
-  --l1-steel: oklch(1 0 0 / 0.09);
-  --l1-steel-strong: oklch(1 0 0 / 0.17);
-  --l1-steel-faint: oklch(1 0 0 / 0.045);
+  --l1-steel: oklch(0.2 0.01 260 / 0.1);
+  --l1-steel-strong: oklch(0.2 0.01 260 / 0.18);
+  --l1-steel-faint: oklch(0.2 0.01 260 / 0.06);
 
-  --l1-good: oklch(0.79 0.13 150);
-  --l1-warn: oklch(0.82 0.12 85);
-  --l1-bad: oklch(0.69 0.17 28);
+  --l1-good: oklch(0.62 0.12 150);
+  --l1-warn: oklch(0.72 0.12 75);
+  --l1-bad: oklch(0.58 0.18 28);
 
-  /* Bridge shadcn / Unlumen tokens so components inherit the dark marketing palette */
+  --l1-on-fg: var(--primary-foreground);
+  --l1-on-fg-muted: color-mix(
+    in oklch,
+    var(--primary-foreground) 68%,
+    transparent
+  );
+  --l1-on-bezel: oklch(0.94 0.006 90);
+  --l1-on-bezel-muted: oklch(0.72 0.012 90);
+
   --background: var(--l1-bg);
   --foreground: var(--l1-fg);
   --card: var(--l1-panel);
   --card-foreground: var(--l1-fg);
   --popover: var(--l1-panel);
   --popover-foreground: var(--l1-fg);
-  --primary: var(--l1-copper);
-  --primary-foreground: var(--l1-bezel);
-  --secondary: var(--l1-raised);
+  --primary: var(--l1-fg);
+  --primary-foreground: oklch(0.99 0.002 90);
+  --secondary: var(--l1-bg-2);
   --secondary-foreground: var(--l1-fg);
   --muted: var(--l1-panel-2);
   --muted-foreground: var(--l1-muted);
   --accent: var(--l1-copper-soft);
-  --accent-foreground: var(--l1-copper-bright);
+  --accent-foreground: var(--l1-fg);
   --destructive: var(--l1-bad);
   --border: var(--l1-steel);
   --input: var(--l1-steel-strong);
-  --ring: var(--l1-copper);
+  --ring: var(--l1-fg);
   --surface: var(--l1-panel);
   --color-surface: var(--surface);
-  color-scheme: dark;
+  color-scheme: light;
 
-  /* ── Radii (machined, not bubbly) ────────────────────── */
   --l1-r: 12px;
   --l1-r-lg: 18px;
   --l1-r-xl: 26px;
 
-  /* ── Shadows ─────────────────────────────────────────── */
   --l1-shadow-panel:
-    inset 0 1px 0 oklch(1 0 0 / 0.05), 0 30px 80px -40px oklch(0 0 0 / 0.75);
+    0 1px 0 oklch(1 0 0 / 0.7), 0 18px 40px -28px oklch(0.2 0.02 260 / 0.35);
   --l1-shadow-lift:
-    inset 0 1px 0 oklch(1 0 0 / 0.06), 0 45px 110px -45px oklch(0 0 0 / 0.85);
-  --l1-shadow-bezel:
-    inset 0 2px 10px oklch(0 0 0 / 0.55), inset 0 -1px 0 oklch(1 0 0 / 0.04);
+    0 1px 0 oklch(1 0 0 / 0.8), 0 28px 60px -30px oklch(0.2 0.02 260 / 0.4);
+  --l1-shadow-bezel: inset 0 1px 2px oklch(0 0 0 / 0.45);
 
   background-color: var(--l1-bg);
   color: var(--l1-fg);
-  font-feature-settings: "cv02", "cv03", "cv11";
 }
 
-/* ════════════════ TYPE REGISTER ════════════════
-   Barlow Condensed = engraved instrument plates
-   Geist            = body / interface
-   Geist Mono       = readouts, labels, code          */
+.dark .marketing-root {
+  --l1-bg: oklch(0.16 0.008 260);
+  --l1-bg-2: oklch(0.19 0.008 260);
+  --l1-panel: oklch(0.2 0.009 260);
+  --l1-panel-2: oklch(0.24 0.01 260);
+  --l1-raised: oklch(0.26 0.01 258);
+  --l1-bezel: oklch(0.1 0.006 260);
+
+  --l1-fg: oklch(0.96 0.005 250);
+  --l1-fg-dim: oklch(0.84 0.008 250);
+  --l1-muted: oklch(0.7 0.01 250);
+  --l1-muted-2: oklch(0.56 0.01 250);
+
+  --l1-copper: oklch(0.96 0.005 250);
+  --l1-copper-bright: oklch(0.99 0.002 250);
+  --l1-copper-deep: oklch(0.86 0.008 250);
+  --l1-copper-soft: oklch(1 0 0 / 0.08);
+  --l1-copper-faint: oklch(1 0 0 / 0.04);
+
+  --l1-steel: oklch(1 0 0 / 0.1);
+  --l1-steel-strong: oklch(1 0 0 / 0.16);
+  --l1-steel-faint: oklch(1 0 0 / 0.05);
+
+  --primary: var(--l1-fg);
+  --primary-foreground: oklch(0.16 0.008 260);
+  --secondary: var(--l1-bg-2);
+  --secondary-foreground: var(--l1-fg);
+  --muted: var(--l1-panel-2);
+  --muted-foreground: var(--l1-muted);
+  --accent: var(--l1-copper-soft);
+  --accent-foreground: var(--l1-fg);
+  --border: var(--l1-steel);
+  --input: var(--l1-steel-strong);
+  --ring: var(--l1-fg);
+  --card: var(--l1-panel);
+  --card-foreground: var(--l1-fg);
+  --popover: var(--l1-panel);
+  --popover-foreground: var(--l1-fg);
+  --surface: var(--l1-panel);
+  --color-surface: var(--surface);
+  --l1-on-fg: var(--primary-foreground);
+  --l1-on-fg-muted: color-mix(
+    in oklch,
+    var(--primary-foreground) 68%,
+    transparent
+  );
+  --l1-on-bezel: oklch(0.94 0.006 90);
+  --l1-on-bezel-muted: oklch(0.7 0.01 90);
+  --background: var(--l1-bg);
+  --foreground: var(--l1-fg);
+  color-scheme: dark;
+
+  --l1-shadow-panel:
+    inset 0 1px 0 oklch(1 0 0 / 0.05), 0 24px 60px -36px oklch(0 0 0 / 0.7);
+  --l1-shadow-lift:
+    inset 0 1px 0 oklch(1 0 0 / 0.06), 0 32px 80px -40px oklch(0 0 0 / 0.8);
+}
 
 .l1-h-hero {
-  font-family: var(--font-display);
-  font-size: clamp(3.1rem, 8.6vw, 7.2rem);
-  line-height: 0.92;
-  letter-spacing: -0.015em;
-  font-weight: 800;
+  font-family: var(--font-sans);
+  font-size: clamp(2.4rem, 6vw, 4.4rem);
+  line-height: 0.98;
+  letter-spacing: -0.04em;
+  font-weight: 650;
   text-wrap: balance;
 }
 .l1-h-section {
-  font-family: var(--font-display);
-  font-size: clamp(2rem, 4.6vw, 3.5rem);
-  line-height: 1;
-  letter-spacing: -0.005em;
-  font-weight: 700;
+  font-family: var(--font-sans);
+  font-size: clamp(1.85rem, 3.8vw, 3rem);
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  font-weight: 650;
   text-wrap: balance;
 }
 .l1-h-sub {
-  font-family: var(--font-display);
-  font-size: clamp(1.35rem, 2.5vw, 1.75rem);
-  line-height: 1.12;
+  font-family: var(--font-sans);
+  font-size: clamp(1.2rem, 2vw, 1.5rem);
+  line-height: 1.2;
   font-weight: 600;
-  letter-spacing: 0;
 }
 .l1-lead {
-  font-size: clamp(1rem, 1.3vw, 1.14rem);
+  font-size: clamp(1rem, 1.25vw, 1.125rem);
   line-height: 1.6;
   color: var(--l1-muted);
 }
@@ -111,7 +161,7 @@
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 500;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
 }
 .l1-readout {
@@ -121,158 +171,85 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Engraved / embossed text treatments */
 .l1-engraved {
-  text-shadow:
-    0 1px 0 oklch(1 0 0 / 0.06),
-    0 -1px 2px oklch(0 0 0 / 0.65);
+  text-shadow: none;
 }
-.l1-engraved-copper {
-  color: var(--l1-copper);
-  text-shadow:
-    0 1px 0 oklch(1 0.08 60 / 0.22),
-    0 -1px 2px oklch(0 0 0 / 0.7);
-}
+.l1-engraved-copper,
 .l1-copper-text {
-  background: linear-gradient(
-    180deg,
-    var(--l1-copper-bright) 0%,
-    var(--l1-copper) 45%,
-    oklch(0.68 0.12 55) 100%
-  );
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--l1-fg);
+  background: none;
+  -webkit-background-clip: unset;
+  background-clip: unset;
 }
 
-/* ════════════════ MATERIALS ════════════════ */
-
-/* Front plate */
 .p-panel {
   position: relative;
   border-radius: var(--l1-r-lg);
   border: 1px solid var(--l1-steel);
-  background: linear-gradient(
-    180deg,
-    color-mix(in oklch, var(--l1-panel) 92%, transparent) 0%,
-    color-mix(in oklch, var(--l1-bg-2) 96%, transparent) 100%
-  );
+  background: var(--l1-panel);
   box-shadow: var(--l1-shadow-panel);
 }
 .p-panel--raise {
   box-shadow: var(--l1-shadow-lift);
 }
 
-/* Brushed steel sheen */
 .p-brushed {
-  background-image: repeating-linear-gradient(
-    180deg,
-    oklch(1 0 0 / 0.018) 0px,
-    oklch(1 0 0 / 0.018) 1px,
-    transparent 1px,
-    transparent 3px
-  );
+  background-image: none;
 }
 
-/* Recessed inset for readouts / terminals */
 .p-bezel {
   position: relative;
   border-radius: var(--l1-r);
-  border: 1px solid oklch(0 0 0 / 0.42);
-  background: linear-gradient(
-    180deg,
-    var(--l1-bezel),
-    color-mix(in oklch, var(--l1-bezel) 88%, var(--l1-bg))
-  );
+  border: 1px solid var(--l1-steel-strong);
+  background: var(--l1-bezel);
   box-shadow: var(--l1-shadow-bezel);
+  color: var(--l1-on-bezel);
+}
+.p-bezel .l1-readout {
+  color: var(--l1-on-bezel-muted);
+}
+.p-bezel code,
+.p-bezel pre {
+  color: inherit;
 }
 
-/* Perforation pattern (replaces the old dot grid) */
 .p-perf {
-  background-image: radial-gradient(
-    oklch(1 0 0 / 0.075) 1px,
-    transparent 1.5px
-  );
-  background-size: 20px 20px;
+  background-image: none;
 }
 
-/* Hairline divider */
 .p-hairline {
   height: 1px;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    var(--l1-steel-strong),
-    transparent
-  );
+  background: var(--l1-steel);
 }
 
 .p-screws::before,
 .p-screws::after {
-  content: "";
-  position: absolute;
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: radial-gradient(
-    circle at 35% 35%,
-    oklch(0.52 0.012 250),
-    oklch(0.2 0.012 250)
-  );
-  box-shadow:
-    inset 0 1px 1px oklch(0 0 0 / 0.85),
-    0 1px 0 oklch(1 0 0 / 0.05);
-  z-index: 1;
-}
-.p-screws::before {
-  top: 14px;
-  right: 14px;
-}
-.p-screws::after {
-  bottom: 14px;
-  left: 14px;
+  content: none;
 }
 
-/* ════════════════ STATUS LAMPS ════════════════ */
 .l1-lamp {
   width: 7px;
   height: 7px;
   border-radius: 999px;
   background: var(--l1-muted-2);
-  box-shadow:
-    inset 0 1px 1px oklch(0 0 0 / 0.6),
-    0 0 0 1px oklch(1 0 0 / 0.04);
 }
 .l1-lamp--good {
   background: var(--l1-good);
-  box-shadow:
-    inset 0 1px 1px oklch(1 0 0 / 0.55),
-    0 0 7px oklch(0.79 0.13 150 / 0.45);
 }
 .l1-lamp--warn {
   background: var(--l1-warn);
-  box-shadow:
-    inset 0 1px 1px oklch(1 0 0 / 0.55),
-    0 0 7px oklch(0.82 0.12 85 / 0.45);
 }
 .l1-lamp--bad {
   background: var(--l1-bad);
-  box-shadow:
-    inset 0 1px 1px oklch(1 0 0 / 0.5),
-    0 0 7px oklch(0.69 0.17 28 / 0.5);
-}
-.l1-lamp--live {
-  animation: l1-flicker 2.8s ease-in-out infinite;
 }
 
-/* ════════════════ BUTTONS ════════════════ */
 .l1-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 0.5rem;
-  height: 2.9rem;
-  padding: 0 1.3rem;
+  height: 2.75rem;
+  padding: 0 1.15rem;
   border-radius: 999px;
   font-family: var(--font-sans);
   font-size: 13.5px;
@@ -285,199 +262,61 @@
     box-shadow 0.25s ease,
     background-color 0.25s ease,
     border-color 0.25s ease,
-    color 0.25s ease,
-    filter 0.25s ease;
+    color 0.25s ease;
 }
 .l1-btn:active {
   transform: translateY(1px);
 }
 .l1-btn--copper {
-  color: oklch(0.12 0.03 55);
-  background: linear-gradient(
-    180deg,
-    var(--l1-copper-bright) 0%,
-    var(--l1-copper) 55%,
-    var(--l1-copper-deep) 100%
-  );
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.5),
-    inset 0 -1px 0 oklch(0 0 0 / 0.35),
-    0 16px 34px -12px oklch(0.6 0.12 50 / 0.55);
+  color: var(--primary-foreground);
+  background: var(--l1-fg);
+  box-shadow: 0 10px 24px -16px oklch(0.2 0.02 260 / 0.7);
 }
 .l1-btn--copper:hover {
-  filter: brightness(1.06);
   transform: translateY(-1px);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.55),
-    inset 0 -1px 0 oklch(0 0 0 / 0.35),
-    0 20px 40px -12px oklch(0.6 0.12 50 / 0.7);
+  filter: none;
+  opacity: 0.92;
 }
 .l1-btn--steel {
-  color: var(--l1-fg-dim);
-  background: linear-gradient(180deg, var(--l1-raised), var(--l1-panel));
+  color: var(--l1-fg);
+  background: var(--l1-bg-2);
   border: 1px solid var(--l1-steel-strong);
-  box-shadow:
-    inset 0 1px 0 oklch(1 0 0 / 0.06),
-    0 12px 26px -14px oklch(0 0 0 / 0.8);
+  box-shadow: none;
 }
 .l1-btn--steel:hover {
   color: var(--l1-fg);
-  border-color: oklch(0.75 0.115 58 / 0.45);
+  border-color: var(--l1-fg);
   transform: translateY(-1px);
+  background: var(--l1-panel);
 }
 .l1-btn--ghost {
   color: var(--l1-muted);
   background: transparent;
   border: 1px solid transparent;
+  text-decoration: underline;
+  text-underline-offset: 4px;
 }
 .l1-btn--ghost:hover {
   color: var(--l1-fg);
-  background: oklch(1 0 0 / 0.04);
+  background: transparent;
 }
 
-/* ════════════════ COPPER TRACES (SVG) ════════════════ */
 .p-trace {
   fill: none;
-  stroke: var(--l1-copper);
+  stroke: var(--l1-muted-2);
   stroke-width: 1.25;
   stroke-linecap: round;
-  stroke-linejoin: round;
-  opacity: 0.5;
-}
-.p-trace--dim {
-  stroke: var(--l1-steel-strong);
-  opacity: 0.8;
-}
-.p-pkt {
-  position: absolute;
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: var(--l1-copper-bright);
-  box-shadow:
-    0 0 8px oklch(0.84 0.09 62 / 0.9),
-    0 0 2px oklch(0.84 0.09 62 / 1);
-  will-change: offset-distance, opacity;
-}
-.p-pkt--green {
-  background: var(--l1-good);
-  box-shadow: 0 0 8px oklch(0.79 0.13 150 / 0.8);
-}
-.p-trace-live {
-  fill: none;
-  stroke: var(--l1-copper);
-  stroke-width: 1.4;
-  stroke-linecap: round;
-  stroke-dasharray: 6 28;
-  opacity: 0.9;
-  animation: l1-dash 1.6s linear infinite;
+  opacity: 0.7;
 }
 .p-node {
   fill: var(--l1-panel);
   stroke: var(--l1-steel-strong);
-}
-.p-node-hub {
-  fill: var(--l1-panel-2);
-  stroke: oklch(0.75 0.115 58 / 0.55);
-}
-.p-node-badge {
-  fill: color-mix(in oklch, var(--l1-copper-soft) 70%, var(--l1-panel));
-  stroke: oklch(0.75 0.115 58 / 0.4);
-}
-.p-pkt-svg {
-  filter: drop-shadow(0 0 3px oklch(0.84 0.09 62 / 0.8));
-}
-.p-pkt-svg--good {
-  filter: drop-shadow(0 0 3px oklch(0.79 0.13 150 / 0.7));
-}
-
-/* ════════════════ KEYFRAMES ════════════════ */
-@keyframes l1-flicker {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.55;
-  }
-}
-@keyframes l1-pkt-travel {
-  from {
-    offset-distance: 0%;
-    opacity: 0;
-  }
-  8% {
-    opacity: 1;
-  }
-  92% {
-    opacity: 1;
-  }
-  to {
-    offset-distance: 100%;
-    opacity: 0;
-  }
-}
-@keyframes l1-scan {
-  0% {
-    transform: translateY(-110%);
-  }
-  100% {
-    transform: translateY(110%);
-  }
-}
-@keyframes l1-wipe {
-  from {
-    clip-path: inset(0 100% 0 0);
-  }
-  to {
-    clip-path: inset(0 0% 0 0);
-  }
-}
-@keyframes l1-fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(16px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-@keyframes l1-tick {
-  0% {
-    opacity: 0.35;
-  }
-  20% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0.35;
-  }
-}
-@keyframes l1-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.4;
-  }
-}
-@keyframes l1-dash {
-  to {
-    stroke-dashoffset: -34;
-  }
-}
-
-.l1-anim-tick {
-  animation: l1-tick 2.2s ease-in-out infinite;
 }
 
 .l1-reveal {
   will-change: opacity, transform;
 }
 
-/* ════════════════ RANGE SLIDER ════════════════ */
 .l1-range {
   -webkit-appearance: none;
   appearance: none;
@@ -486,9 +325,9 @@
   border-radius: 999px;
   background: linear-gradient(
     90deg,
-    var(--l1-copper) 0%,
-    var(--l1-copper) var(--l1-fill, 50%),
-    var(--l1-raised) var(--l1-fill, 50%)
+    var(--l1-fg) 0%,
+    var(--l1-fg) var(--l1-fill, 50%),
+    var(--l1-panel-2) var(--l1-fill, 50%)
   );
   outline: none;
   cursor: pointer;
@@ -499,41 +338,16 @@
   width: 18px;
   height: 18px;
   border-radius: 999px;
-  background: radial-gradient(
-    circle at 35% 35%,
-    oklch(0.93 0.05 60),
-    var(--l1-copper-deep)
-  );
-  border: 1px solid oklch(0 0 0 / 0.35);
-  box-shadow:
-    0 2px 8px oklch(0 0 0 / 0.5),
-    inset 0 1px 0 oklch(1 0 0 / 0.5);
+  background: var(--l1-fg);
+  border: 1px solid var(--l1-fg);
   cursor: grab;
 }
 .l1-range::-moz-range-thumb {
   width: 18px;
   height: 18px;
   border-radius: 999px;
-  background: radial-gradient(
-    circle at 35% 35%,
-    oklch(0.93 0.05 60),
-    var(--l1-copper-deep)
-  );
-  border: 1px solid oklch(0 0 0 / 0.35);
-  box-shadow:
-    0 2px 8px oklch(0 0 0 / 0.5),
-    inset 0 1px 0 oklch(1 0 0 / 0.5);
+  background: var(--l1-fg);
   cursor: grab;
-}
-
-/* Scrollbars inside bezels */
-.l1-scroll::-webkit-scrollbar {
-  height: 6px;
-  width: 6px;
-}
-.l1-scroll::-webkit-scrollbar-thumb {
-  background: var(--l1-steel-strong);
-  border-radius: 999px;
 }
 
 @media (prefers-reduced-motion: reduce) {

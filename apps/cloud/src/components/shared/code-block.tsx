@@ -79,7 +79,7 @@ export function CodeBlock({
   return (
     <pre
       className={cn(
-        "l1-scroll overflow-x-auto font-mono text-[13px] leading-[1.75] text-[var(--l1-fg-dim)]",
+        "l1-scroll overflow-x-auto font-mono text-[13px] leading-[1.75] text-[var(--l1-on-bezel)]",
         className,
       )}
     >
@@ -92,7 +92,7 @@ export function CodeBlock({
                 className={cn(
                   "mr-3 select-none",
                   showPrompt && !isComment
-                    ? "text-[var(--l1-muted-2)]"
+                    ? "text-[var(--l1-on-bezel-muted)]"
                     : "opacity-0",
                 )}
               >
@@ -102,18 +102,18 @@ export function CodeBlock({
                 {tokenize(line, lineIndex).map((tok) => {
                   const cls =
                     tok.kind === "cmt"
-                      ? "text-[var(--l1-muted-2)] italic"
+                      ? "text-[var(--l1-on-bezel-muted)] italic"
                       : tok.kind === "cmd"
-                        ? "text-[oklch(0.82_0.1_62)]"
+                        ? "text-[var(--l1-on-bezel)]"
                         : tok.kind === "verb"
-                          ? "text-[oklch(0.79_0.12_150)]"
+                          ? "text-[var(--l1-on-bezel)]"
                           : tok.kind === "flag"
-                            ? "text-[oklch(0.82_0.12_85)]"
+                            ? "text-[var(--l1-on-bezel-muted)]"
                             : tok.kind === "str"
-                              ? "text-[oklch(0.85_0.05_200)]"
+                              ? "text-[var(--l1-on-bezel)]"
                               : tok.kind === "op"
-                                ? "text-[var(--l1-muted-2)]"
-                                : "text-[var(--l1-fg-dim)]";
+                                ? "text-[var(--l1-on-bezel-muted)]"
+                                : "text-[var(--l1-on-bezel)]";
                   return (
                     <span key={tok.id} className={cls}>
                       {tok.text}

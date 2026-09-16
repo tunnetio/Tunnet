@@ -22,7 +22,7 @@ const FAQ = [
   },
   {
     q: "What is a resource?",
-    a: "A machine enrolled in your mesh - a laptop, server, CI runner, or edge node. Resource caps scale with seats on Team and Business.",
+    a: "A machine on your network - a laptop, server, CI runner, or edge. Caps scale with seats on Team and Business.",
   },
   {
     q: "What is managed traffic?",

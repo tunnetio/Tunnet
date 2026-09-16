@@ -91,7 +91,7 @@ jobs:
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
       - name: Set up JDK
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -117,13 +117,28 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "using NDK $NDK"
 
+      # `-D warnings` matches the host Clippy job: no host job builds this
+      # target, so warnings here went unnoticed.
       - name: Cross-compile the agent (arm64 only; a x86_64-only break surfaces in the Gradle leg)
+        env:
+          RUSTFLAGS: "-D warnings"
         run: |
           BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android26-clang"
           export CC_aarch64_linux_android="$BIN/aarch64-linux-android26-clang"
           export AR_aarch64_linux_android="$BIN/llvm-ar"
           cargo build -p tunnet-mobile --target aarch64-linux-android --release
+
+      # The JNI bridge is `cfg(target_os = "android")`, so no host job lints it.
+      - name: Clippy (Android target)
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android26-clang"
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          cargo clippy -p tunnet-mobile -p tunnet-agent --target aarch64-linux-android -- -D warnings
 
       - name: Assemble the APK
         working-directory: apps/android
