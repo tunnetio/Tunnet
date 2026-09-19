@@ -56,7 +56,9 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         revisions,
         self_ipv4: "10.9.0.1".parse().unwrap(),
         paths,
+        #[cfg(feature = "local-api")]
         serves: tunnet_core::ServeManager::new("10.9.0.1".parse().unwrap(), routes),
+        #[cfg(feature = "local-api")]
         tunnels: tunnet_core::TunnelManager::new(pool),
         send,
         signed: None,

@@ -183,17 +183,25 @@ impl Default for DnsConfig {
 }
 
 /// Host-local PeerDNS resolver endpoint. Never part of Direct network state.
+///
+/// Desktop OS DNS is pointed at this loopback socket. Android cannot use it:
+/// `netd` would resolve `127.0.0.1` as the querying app, not the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalResolverEndpoint {
     pub ip: std::net::Ipv4Addr,
     pub port: u16,
 }
 
+impl LocalResolverEndpoint {
+    pub const IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    pub const PORT: u16 = 53;
+}
+
 impl Default for LocalResolverEndpoint {
     fn default() -> Self {
         Self {
-            ip: std::net::Ipv4Addr::new(127, 0, 0, 1),
-            port: 53,
+            ip: Self::IP,
+            port: Self::PORT,
         }
     }
 }
@@ -202,6 +210,40 @@ impl LocalResolverEndpoint {
     pub fn socket_addr(&self) -> std::net::SocketAddr {
         std::net::SocketAddr::from((self.ip, self.port))
     }
+}
+
+/// In-TUN PeerDNS address. IANA TEST-NET-1 (`192.0.2.0/24`), not a Tunnet
+/// allocation and not a typical LAN prefix. Android `addDnsServer` uses this;
+/// the data plane intercepts packets to it. Desktop still binds loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VirtualResolverEndpoint {
+    pub ip: std::net::Ipv4Addr,
+    pub port: u16,
+}
+
+impl VirtualResolverEndpoint {
+    pub const IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 53);
+    pub const PORT: u16 = 53;
+
+    pub fn host_route() -> ipnet::Ipv4Net {
+        ipnet::Ipv4Net::new(Self::IP, 32).expect("/32 is valid")
+    }
+}
+
+impl Default for VirtualResolverEndpoint {
+    fn default() -> Self {
+        Self {
+            ip: Self::IP,
+            port: Self::PORT,
+        }
+    }
+}
+
+/// Addresses PeerDNS answers on. System-resolver snapshots drop these IPs
+/// (OS stubs use port 53). Explicit upstream URLs are filtered by IP+port in
+/// `parse_upstream` so a test/forwarder on 127.0.0.1:5353 still works.
+pub fn resolver_self_ips() -> [std::net::Ipv4Addr; 2] {
+    [LocalResolverEndpoint::IP, VirtualResolverEndpoint::IP]
 }
 
 /// Exit node advertisement in the snapshot.

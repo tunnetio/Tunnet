@@ -53,6 +53,8 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prost = { version = "0.14", features = ["derive"] }
+prost-build = "0.14"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
@@ -114,7 +116,7 @@ jiff = { version = "0.2", features = ["serde"] }
 ipnet = { version = "2", features = ["serde"] }
 ipnetwork = { version = "0.21", features = ["serde"] }
 netdev = { version = "0.46", default-features = false, features = ["gateway"] }
-osdns = { version = "0.2.0", features = ["tracing"] }
+osdns = { version = "0.2", features = ["tracing"] }
 prefix-trie = "0.10"
 hickory-proto = "0.26"
 hickory-resolver = { version = "0.26", default-features = false, features = [

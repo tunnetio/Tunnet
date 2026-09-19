@@ -20,6 +20,7 @@ use bytes::Bytes;
 use ed25519_dalek::SigningKey;
 use futures_util::StreamExt;
 use iroh::protocol::ProtocolHandler;
+use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::store::fs::FsStore;
 use iroh_docs::api::Doc;
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
@@ -44,6 +45,73 @@ use crate::direct::grants::{
 };
 use crate::routing::RoutingTable;
 use crate::state::{DirectState, StatePaths};
+
+fn peers_for_sync(nodes: Vec<EndpointAddr>, self_endpoint_id: &str) -> Vec<EndpointAddr> {
+    let Ok(self_id) = EndpointId::from_str(self_endpoint_id) else {
+        return nodes;
+    };
+    nodes.into_iter().filter(|n| n.id != self_id).collect()
+}
+
+async fn open_membership_replica(
+    docs: &Docs,
+    direct: &DirectState,
+    self_endpoint_id: &str,
+) -> anyhow::Result<(Doc, Option<String>, Option<String>)> {
+    if let Some(ticket_str) = &direct.doc_ticket {
+        let ticket = DocTicket::from_str(ticket_str).context("parse doc_ticket")?;
+        let capability = ticket.capability;
+        let peers = peers_for_sync(ticket.nodes, self_endpoint_id);
+        if !peers.is_empty() {
+            let (doc, _events) = docs
+                .import_and_subscribe(DocTicket::new(capability, peers))
+                .await
+                .context("import doc ticket")?;
+            let ns = doc.id().to_string();
+            return Ok((doc, None, Some(ns)));
+        }
+        if let Some(ns) = &direct.namespace_id {
+            let id = NamespaceId::from_str(ns).context("parse namespace_id")?;
+            if let Some(doc) = docs
+                .open(id)
+                .await
+                .context("open namespace on unified docs engine")?
+            {
+                return Ok((doc, None, Some(ns.clone())));
+            }
+        }
+        let doc = docs
+            .import_namespace(capability)
+            .await
+            .context("import namespace from self-only doc ticket")?;
+        let ns = doc.id().to_string();
+        return Ok((doc, None, Some(ns)));
+    }
+
+    if let Some(ns) = &direct.namespace_id {
+        let id = NamespaceId::from_str(ns).context("parse namespace_id")?;
+        let doc = docs
+            .open(id)
+            .await
+            .context("open namespace on unified docs engine")?
+            .context("namespace not found in unified docs store; re-join with a fresh invite")?;
+        return Ok((doc, None, Some(ns.clone())));
+    }
+
+    if direct.coordinator {
+        let doc = docs.create().await.context("create membership doc")?;
+        let ticket = doc
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await
+            .context("share new doc")?;
+        let ns = doc.id().to_string();
+        return Ok((doc, Some(ticket.to_string()), Some(ns)));
+    }
+
+    anyhow::bail!(
+        "Direct join state is missing doc_ticket; re-run `tunnet join` with a fresh invite"
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipEntry {
@@ -245,37 +313,8 @@ impl DocsMembership {
         let network_epoch = Arc::new(AtomicU64::new(direct.network_epoch));
         let revoked = Arc::new(Mutex::new(HashSet::new()));
 
-        let (doc, created_ticket, namespace_str) = if let Some(ticket_str) = &direct.doc_ticket {
-            let ticket = DocTicket::from_str(ticket_str).context("parse doc_ticket")?;
-            let (doc, _events) = docs
-                .import_and_subscribe(ticket)
-                .await
-                .context("import doc ticket")?;
-            let ns = doc.id().to_string();
-            (doc, None, Some(ns))
-        } else if let Some(ns) = &direct.namespace_id {
-            let id = NamespaceId::from_str(ns).context("parse namespace_id")?;
-            let doc = docs
-                .open(id)
-                .await
-                .context("open namespace on unified docs engine")?
-                .context(
-                    "namespace not found in unified docs store; re-join with a fresh doc ticket",
-                )?;
-            (doc, None, Some(ns.clone()))
-        } else if direct.coordinator {
-            let doc = docs.create().await.context("create membership doc")?;
-            let ticket = doc
-                .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
-                .await
-                .context("share new doc")?;
-            let ns = doc.id().to_string();
-            (doc, Some(ticket.to_string()), Some(ns))
-        } else {
-            anyhow::bail!(
-                "Direct join state is missing doc_ticket; re-run `tunnet join` with a fresh invite"
-            );
-        };
+        let (doc, created_ticket, namespace_str) =
+            open_membership_replica(&docs, direct, self_endpoint_id).await?;
 
         let events = doc.subscribe().await.context("subscribe doc")?;
 
@@ -1039,5 +1078,34 @@ impl crate::direct::join::JoinPublisher for DocsMembership {
         entry: &MembershipEntry,
     ) -> anyhow::Result<crate::direct::join::JoinAdmission> {
         self.recover_admission(entry).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(seed: u8) -> EndpointId {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        EndpointId::from_bytes(sk.verifying_key().as_bytes()).expect("verifying key")
+    }
+
+    #[test]
+    fn peers_for_sync_drops_self_and_keeps_others() {
+        let me = endpoint(1);
+        let other = endpoint(2);
+        let peers = peers_for_sync(
+            vec![EndpointAddr::new(me), EndpointAddr::new(other)],
+            &me.to_string(),
+        );
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, other);
+    }
+
+    #[test]
+    fn peers_for_sync_empty_when_ticket_is_only_self() {
+        let me = endpoint(1);
+        let peers = peers_for_sync(vec![EndpointAddr::new(me)], &me.to_string());
+        assert!(peers.is_empty());
     }
 }

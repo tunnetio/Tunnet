@@ -45,9 +45,9 @@ pub const OWNER: &str = "io.tunnet.agent";
 ///
 /// This is intentionally not a wrapper around `osdns`: it contains only
 /// Tunnet-specific policy (PeerDNS IP, DNS suffix, target TUN name,
-/// split/full fallback choice). Everything below `osdns::DnsConfig` —
+/// split/full fallback choice). Everything below `osdns::DnsConfig` -
 /// validation, interface resolution, transactions, Enforce observation,
-/// reconciliation, restoration — is owned by `osdns`.
+/// reconciliation, restoration - is owned by `osdns`.
 pub struct DnsController {
     manager: DnsManager,
     state: parking_lot::Mutex<State>,
@@ -291,7 +291,7 @@ pub fn desired_config(
             .routing_domain(suffix);
         // Explicit default-route control is itself a capability
         // (NetworkManager-style backends expose routing domains without it).
-        // `None` means preserve/unspecified — never fake `false`.
+        // `None` means preserve/unspecified - never fake `false`.
         if caps.default_route {
             builder = builder.default_route(false);
         }

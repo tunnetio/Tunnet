@@ -165,6 +165,7 @@ impl DirectAuthority {
             genesis: self.genesis.clone(),
             invite_secret: secret,
             expires_at,
+            coordinator_addr: None,
         })
     }
 

@@ -27,7 +27,16 @@ impl Actor for RouteActor {
     type Error = Infallible;
 
     async fn on_start(_args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let engine = RouteEngine::new().ok();
+        let engine = {
+            #[cfg(not(target_os = "android"))]
+            {
+                RouteEngine::new().ok()
+            }
+            #[cfg(target_os = "android")]
+            {
+                None
+            }
+        };
         let mut actor = Self {
             engine,
             listener: None,
@@ -136,12 +145,22 @@ impl RouteActor {
     }
 
     async fn ensure_engine(&mut self) -> Result<&mut RouteEngine, RouteError> {
-        if self.engine.is_none() {
-            self.engine = RouteEngine::new()
-                .map(Some)
-                .map_err(|e| RouteError::List(e.to_string()))?;
+        #[cfg(target_os = "android")]
+        {
+            let _ = self;
+            return Err(RouteError::List(
+                "OS route reconciliation is not used on Android".into(),
+            ));
         }
-        Ok(self.engine.as_mut().expect("engine ensured"))
+        #[cfg(not(target_os = "android"))]
+        {
+            if self.engine.is_none() {
+                self.engine = RouteEngine::new()
+                    .map(Some)
+                    .map_err(|e| RouteError::List(e.to_string()))?;
+            }
+            Ok(self.engine.as_mut().expect("engine ensured"))
+        }
     }
 }
 

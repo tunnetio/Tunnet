@@ -181,14 +181,13 @@ pub async fn run_enroll(args: EnrollArgs, state_dir: Option<&str>) -> anyhow::Re
     let tier = persist_agent(&paths, &identity, persisted, policy)?;
     tunnet_core::state::save_snapshot_cache(&paths, &resp.snapshot)?;
 
-    println!(
-        "Enrolled. endpoint_id={} ip={} network={} (secrets: {})",
-        identity.endpoint_id_hex(),
-        membership.assigned_ipv4,
-        resp.network_name,
-        tier.as_str(),
+    tracing::info!(
+        endpoint_id = %identity.endpoint_id_hex(),
+        ip = %membership.assigned_ipv4,
+        network = %resp.network_name,
+        seal = %tier.as_str(),
+        "enrolled"
     );
-    crate::cmds::finish_after_config(state_dir, false).await?;
     Ok(())
 }
 

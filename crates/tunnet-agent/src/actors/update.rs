@@ -96,7 +96,7 @@ impl UpdateActor {
         }
     }
 
-    /// Next check delay, re-read every tick — same semantics as the pre-actor
+    /// Next check delay, re-read every tick - same semantics as the pre-actor
     /// updater. Disabled means a quiet 1h re-poll of the flag.
     fn check_interval(
         paths: &tunnet_core::StatePaths,

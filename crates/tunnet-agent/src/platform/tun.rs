@@ -3,8 +3,7 @@
 //! Desktop platforms open the TUN themselves. Android cannot: only the
 //! framework may do so, via `VpnService.Builder.establish()`, which lives on the
 //! JVM side. The parameters, however, are known only to the agent, and only
-//! once the node has bootstrapped (`runtime.rs` computes them just before
-//! `build_tun`).
+//! once the node has bootstrapped.
 //!
 //! So the dependency runs agent -> app, not app -> agent: the embedder installs
 //! a [`TunProvider`] and the data plane calls it whenever it needs a device.
@@ -18,6 +17,7 @@
 use std::net::Ipv4Addr;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -31,6 +31,9 @@ use ipnet::Ipv4Net;
 /// from the other is what broke when addressing moved to exact `/32`s: a route
 /// computed from the address prefix is a host route to the node itself, so no
 /// peer traffic is captured and the tunnel silently carries nothing.
+///
+/// IPv6 passthrough and metered inheritance are agent policy. The host applies
+/// them mechanically.
 #[derive(Debug, Clone)]
 pub struct TunRequest {
     /// Mesh addresses for this node, one per joined network, each applied with
@@ -41,14 +44,16 @@ pub struct TunRequest {
     pub routes: Vec<Ipv4Net>,
     /// Resolvers to advertise, from `VpnService.Builder.addDnsServer`.
     ///
-    /// Only addresses reachable *through the tunnel* belong here. The agent's
-    /// PeerDNS binds host loopback, which is useless to Android: `netd`
-    /// resolves on behalf of each app, so `127.0.0.1` would name that app
-    /// rather than the agent. Until PeerDNS answers on an in-tunnel address
-    /// this stays empty and the phone resolves names outside the mesh.
+    /// These must be reachable through the tunnel. PeerDNS answers on
+    /// [`tunnet_common::VirtualResolverEndpoint`] inside the TUN.
     pub dns: Vec<Ipv4Addr>,
     /// Tunnel MTU, from `VpnService.Builder.setMtu`.
     pub mtu: u16,
+    /// `VpnService.Builder.allowFamily(AF_INET6)` so IPv6 stays on the underlay
+    /// while Tunnet is IPv4-only.
+    pub allow_ipv6_passthrough: bool,
+    /// `setMetered(false)`: inherit the underlying network's metered state.
+    pub inherit_underlying_metered: bool,
 }
 
 /// Bridge to the platform VPN API. Implemented by the embedding app.
@@ -61,15 +66,37 @@ pub trait TunProvider: Send + Sync {
     fn establish(&self, request: TunRequest) -> anyhow::Result<OwnedFd>;
 }
 
-static PROVIDER: ArcSwapOption<Box<dyn TunProvider>> = ArcSwapOption::const_empty();
-
-/// Install the platform bridge. Must happen before the agent starts.
-pub fn set_provider(provider: Box<dyn TunProvider>) {
-    PROVIDER.store(Some(Arc::new(provider)));
+struct BoundProvider {
+    epoch: u64,
+    inner: Box<dyn TunProvider>,
 }
 
-/// Remove the bridge so a stopped agent cannot establish a new tunnel.
+impl TunProvider for BoundProvider {
+    fn establish(&self, request: TunRequest) -> anyhow::Result<OwnedFd> {
+        if EPOCH.load(Ordering::SeqCst) != self.epoch {
+            bail!("TunProvider was replaced; this Service is no longer the host");
+        }
+        self.inner.establish(request)
+    }
+}
+
+static PROVIDER: ArcSwapOption<BoundProvider> = ArcSwapOption::const_empty();
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Install the platform bridge. Replaces any previous provider.
+pub fn set_provider(provider: Box<dyn TunProvider>) {
+    let epoch = EPOCH.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    PROVIDER.store(Some(Arc::new(BoundProvider {
+        epoch,
+        inner: provider,
+    })));
+}
+
+/// Drop the bridge so a destroyed Service cannot establish a new tunnel.
+///
+/// Does not stop the agent. A later [`set_provider`] rebinds a new host.
 pub fn clear_provider() {
+    EPOCH.fetch_add(1, Ordering::SeqCst);
     PROVIDER.store(None);
 }
 
@@ -79,8 +106,13 @@ pub fn establish(request: TunRequest) -> anyhow::Result<OwnedFd> {
         bail!("no TunProvider installed; the VpnService must register one before starting");
     };
     let summary = format!(
-        "addrs={:?} routes={:?} dns={:?} mtu={}",
-        request.addrs, request.routes, request.dns, request.mtu
+        "addrs={:?} routes={:?} dns={:?} mtu={} ipv6_passthrough={} inherit_metered={}",
+        request.addrs,
+        request.routes,
+        request.dns,
+        request.mtu,
+        request.allow_ipv6_passthrough,
+        request.inherit_underlying_metered
     );
     let fd = provider
         .establish(request)
@@ -119,8 +151,10 @@ mod tests {
         TunRequest {
             addrs: vec![Ipv4Addr::new(10, 1, 2, 3)],
             routes: vec!["10.1.0.0/16".parse().unwrap()],
-            dns: Vec::new(),
+            dns: vec![tunnet_common::VirtualResolverEndpoint::IP],
             mtu: 1280,
+            allow_ipv6_passthrough: true,
+            inherit_underlying_metered: true,
         }
     }
 
@@ -139,5 +173,29 @@ mod tests {
         let fd = establish(request()).expect("provider should supply a descriptor");
         assert!(fd.as_raw_fd() >= 0);
         clear_provider();
+    }
+
+    #[test]
+    fn replaced_provider_cannot_establish() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_provider(Box::new(Fake));
+        let old = PROVIDER.load_full().expect("bound");
+        set_provider(Box::new(Fake));
+        let err = old.establish(request()).unwrap_err().to_string();
+        assert!(err.contains("replaced"), "{err}");
+        establish(request()).expect("new provider works");
+        clear_provider();
+    }
+
+    #[test]
+    fn clear_provider_invalidates_a_held_handle() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_provider(Box::new(Fake));
+        let old = PROVIDER.load_full().expect("bound");
+        clear_provider();
+        let err = old.establish(request()).unwrap_err().to_string();
+        assert!(err.contains("replaced"), "{err}");
+        let err = establish(request()).unwrap_err().to_string();
+        assert!(err.contains("no TunProvider"), "{err}");
     }
 }

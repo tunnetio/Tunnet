@@ -424,6 +424,16 @@ pub(crate) fn peer_summaries(
     state: &LocalApiState,
     network_id: Option<uuid::Uuid>,
 ) -> Vec<PeerSummary> {
+    if let Some(observe) = &state.mesh_observe {
+        let peers = observe().peers;
+        return match network_id {
+            Some(id) => {
+                let id = id.to_string();
+                peers.into_iter().filter(|p| p.network_id == id).collect()
+            }
+            None => peers,
+        };
+    }
     let pool = &state.node.tunnel_pool;
     let self_id = state.node.endpoint_id_hex();
     state
@@ -547,6 +557,48 @@ pub(crate) fn build_network_summary(
     })
 }
 
+pub(crate) fn node_summary_from_observation(
+    daemon_version: &str,
+    observation: &super::observe::MeshObservation,
+) -> NodeSummary {
+    NodeSummary {
+        endpoint_id: observation.endpoint_id.clone(),
+        hostname: observation.hostname.clone(),
+        mode: observation.mode,
+        daemon_version: daemon_version.to_string(),
+        api_version: API_VERSION,
+        data_plane_up: observation.data_plane_up,
+        uptime_secs: observation.uptime_secs,
+        snapshot_version: 0,
+        networks: observation
+            .networks
+            .iter()
+            .map(|n| NetworkSummary {
+                network_id: n.network_id.clone(),
+                network_name: n.network_name.clone(),
+                mode: n.mode.clone(),
+                ip: n.ip.clone(),
+                role: n.role.clone(),
+                peers_total: n.peers_total,
+                peers_online: n.peers_online,
+                organization_id: None,
+                control_url: None,
+                management_url: None,
+                dashboard_url: None,
+                firewall_drops: None,
+                conntrack_entries: None,
+                relay_status: "n/a".into(),
+                expires_at: None,
+                expires_in_secs: None,
+                keep_alive: None,
+                control: None,
+            })
+            .collect(),
+        on_demand: None,
+        control: None,
+    }
+}
+
 pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
     let pool = &state.node.tunnel_pool;
     let od = pool.on_demand_stats();
@@ -582,7 +634,7 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             .collect(),
     };
 
-    NodeSummary {
+    let mut summary = NodeSummary {
         endpoint_id: state.node.endpoint_id_hex(),
         hostname: state.hostname.clone(),
         mode: node_mode(state),
@@ -602,7 +654,27 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
             dials_suppressed: od.dials_suppressed,
         }),
         control,
+    };
+    if let Some(observe) = &state.mesh_observe {
+        let obs = observe();
+        summary.endpoint_id = obs.endpoint_id;
+        summary.hostname = obs.hostname;
+        summary.mode = obs.mode;
+        summary.data_plane_up = obs.data_plane_up;
+        summary.uptime_secs = obs.uptime_secs;
+        for net in &mut summary.networks {
+            if let Some(o) = obs.networks.iter().find(|n| n.network_id == net.network_id) {
+                net.peers_total = o.peers_total;
+                net.peers_online = o.peers_online;
+                net.role = o.role.clone();
+                net.mode = o.mode.clone();
+                if !o.ip.is_empty() {
+                    net.ip = o.ip.clone();
+                }
+            }
+        }
     }
+    summary
 }
 
 pub(crate) fn build_meta(state: &LocalApiState, peer: &PeerIdentity) -> MetaInfo {
@@ -1212,9 +1284,10 @@ pub(crate) async fn direct_invite(
         anyhow::bail!("invite expiry must be positive");
     }
     let authority = authority_for(state, direct.network_id)?;
-    let invite = authority
+    let mut invite = authority
         .issue_invite(&state.node.endpoint_id_hex(), reusable, expires)
         .await?;
+    crate::direct::stamp_coordinator_addr(&mut invite, &state.node.endpoint);
     crate::direct::encode_invite(&invite)
 }
 

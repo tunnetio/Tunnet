@@ -8,7 +8,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -35,97 +34,98 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.lifecycleScope
+import io.tunnet.android.wire.Lifecycle
+import io.tunnet.android.wire.Peer
+import io.tunnet.android.wire.Snapshot
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/**
- * The whole UI: join a network, connect, see peers.
- *
- * Holds no mesh logic. Every fact on screen comes from the agent via
- * [TunnetState]; the buttons only start/stop the service or forward a join.
- */
 class MainActivity : ComponentActivity() {
 
-    companion object {
-        /** Guard so a configuration-driven `onCreate` does not re-trigger the
-         * auto-connect. The flag is per process, like the agent itself. */
-        private var autoConnected = false
-    }
+    private val vpnConsentDenied = MutableStateFlow<String?>(null)
+    private val vpnConsentInProgress = MutableStateFlow(false)
+    private val lanDenied = MutableStateFlow(false)
+    private var pendingConnectInvite: String? = null
 
-    /**
-     * VPN consent. Android requires [VpnService.prepare] before a tunnel can be
-     * established, and the result arrives asynchronously, so connecting is a
-     * two-step flow: ask, then start the service once granted.
-     */
     private val vpnConsent = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
+        vpnConsentInProgress.value = false
         if (result.resultCode == Activity.RESULT_OK) {
-            startVpnService()
+            vpnConsentDenied.value = null
+            startVpnService(pendingConnectInvite)
         } else {
-            // `connect()` optimistically moved to Starting before asking, so a
-            // refusal has to undo that or the UI spins on "Starting" forever
-            // for something that will never arrive. Any invite parked for the
-            // service to redeem goes too: nothing will start to consume it, and
-            // leaving it would silently join on some later connect.
-            TunnetState.abandonStart("VPN permission is required to connect")
+            pendingConnectInvite = null
+            vpnConsentDenied.value = "VPN permission is required to connect"
         }
     }
 
-    /**
-     * Notifications are how a foreground service stays visible. A denial is not
-     * fatal (the VPN still runs), so the result is deliberately ignored.
-     */
     private val notificationPermission = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { }
 
+    private val localNetworkPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        refreshLanState()
+        continueVpn(pendingConnectInvite)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestNotificationPermissionIfNeeded()
-
-        // The product promise is "connected until switched off", so opening the
-        // app reconnects. A join without this would only appear after the user
-        // tapped something, because a killed process loses the in-memory stage
-        // and the poll refuses to run while Stopped. The daemon decides what
-        // "connect" means: idle bootstrap when nothing is joined, the full
-        // runtime (tunnel up) when state exists.
-        if (!autoConnected) {
-            autoConnected = true
-            connect()
-        }
+        refreshLanState()
+        handleLaunchInvite(intent)
 
         setContent {
             MaterialTheme {
-                val status by TunnetState.status.collectAsStateWithLifecycle()
-                // Poll rather than refresh-once: after a join the daemon
-                // rebinds its API (idle bootstrap -> full runtime) and a single
-                // refresh hits exactly that ~300ms window, reporting "not
-                // joined" even though the join succeeded.
-                LaunchedEffect(Unit) {
-                    while (isActive) {
-                        if (TunnetState.status.value.stage != Stage.Stopped) refresh()
-                        delay(2000)
-                    }
-                }
+                val snapshot by TunnetVpnService.snapshots.collectAsStateWithLifecycle()
+                val denied by vpnConsentDenied.collectAsStateWithLifecycle()
+                val askingVpn by vpnConsentInProgress.collectAsStateWithLifecycle()
+                val noLan by lanDenied.collectAsStateWithLifecycle()
                 TunnetScreen(
-                    status = status,
-                    onConnect = ::connect,
+                    snapshot = snapshot,
+                    vpnConsentDenied = denied,
+                    vpnConsentInProgress = askingVpn,
+                    lanDenied = noLan,
+                    onConnect = { connect(invite = null) },
                     onDisconnect = ::disconnect,
-                    onJoin = ::join,
+                    onJoin = { connect(invite = it) },
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchInvite(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshLanState()
+        TunnetVpnService.pushLanAvailability()
+    }
+
+    private fun handleLaunchInvite(intent: Intent?) {
+        val invite = intent?.getStringExtra(TunnetVpnService.EXTRA_INVITE)?.trim().orEmpty()
+        if (invite.isEmpty()) return
+        intent?.removeExtra(TunnetVpnService.EXTRA_INVITE)
+        connect(invite)
+    }
+
+    private fun refreshLanState() {
+        lanDenied.value = LocalNetworkAccess.state(this) == LocalNetworkAccess.State.Denied
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -134,26 +134,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Ask for VPN consent if needed, then start the service. */
-    private fun connect() {
-        TunnetState.setError(null)
-        // Show progress on THIS tap. Starting the agent takes a couple of
-        // seconds, and the service only reports Starting once it is itself
-        // running, so without this the screen sat unchanged long enough to look
-        // broken.
-        TunnetState.setStage(Stage.Starting)
-        val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnConsent.launch(intent)
+    private fun connect(invite: String?) {
+        vpnConsentDenied.value = null
+        pendingConnectInvite = invite
+        if (LocalNetworkAccess.shouldRequest(this)) {
+            localNetworkPermission.launch(LocalNetworkAccess.PERMISSION)
+            return
+        }
+        continueVpn(invite)
+    }
+
+    private fun continueVpn(invite: String?) {
+        val prepare = VpnService.prepare(this)
+        if (prepare != null) {
+            vpnConsentInProgress.value = true
+            vpnConsent.launch(prepare)
         } else {
-            startVpnService()
+            startVpnService(invite)
         }
     }
 
-    private fun startVpnService() {
-        startForegroundService(
-            Intent(this, TunnetVpnService::class.java).setAction(TunnetVpnService.ACTION_CONNECT),
-        )
+    private fun startVpnService(invite: String?) {
+        pendingConnectInvite = null
+        val intent = Intent(this, TunnetVpnService::class.java)
+            .setAction(TunnetVpnService.ACTION_CONNECT)
+        if (!invite.isNullOrBlank()) {
+            intent.putExtra(TunnetVpnService.EXTRA_INVITE, invite)
+        }
+        startForegroundService(intent)
     }
 
     private fun disconnect() {
@@ -161,153 +169,34 @@ class MainActivity : ComponentActivity() {
             Intent(this, TunnetVpnService::class.java).setAction(TunnetVpnService.ACTION_DISCONNECT),
         )
     }
-
-    /**
-     * Join a Direct network by invite code.
-     *
-     * The agent must already be running, because the join goes through its Local
-     * API: with no network joined the agent parks in its bootstrap mode serving
-     * exactly that endpoint. Once state is written it proceeds to the full
-     * runtime and establishes the tunnel on its own, so joining is also
-     * connecting.
-     */
-    private fun join(inviteCode: String) {
-        lifecycleScope.launch {
-            TunnetState.setError(null)
-            if (TunnetState.status.value.stage == Stage.Stopped) {
-                // One tap, one intent: park the invite and let the service
-                // redeem it once the agent is up, rather than asking the user
-                // to tap again for a step that is our implementation detail.
-                TunnetState.setPendingInvite(inviteCode)
-                connect()
-                return@launch
-            }
-            // The agent stays Running for the whole join, so this flag is the
-            // only thing that moves on screen between the tap and membership
-            // arriving. Cleared in `finally` so a failed or throwing join does
-            // not leave the UI spinning forever.
-            TunnetState.setJoining(true)
-            try {
-                val result = withContext(Dispatchers.IO) {
-                    TunnetNative.join(inviteCode, Build.MODEL ?: "android")
-                }
-                when (result) {
-                    // Keep the indicator up until membership is actually
-                    // visible. The agent acknowledges the join before its
-                    // status lists the network, so a single refresh here
-                    // returns an empty list and the screen flashes
-                    // "Not joined", which reads as failure.
-                    is TunnetNative.Result.Ok -> awaitMembership()
-                    is TunnetNative.Result.Err -> TunnetState.setError(result.message)
-                }
-            } finally {
-                TunnetState.setJoining(false)
-            }
-        }
-    }
-
-    /** Pull fresh status; the agent is the truth for everything shown. */
-    private fun refresh() {
-        lifecycleScope.launch { refreshNow() }
-    }
-
-    /**
-     * Pull status and wait for it, so a caller can sequence against the result.
-     *
-     * [refresh] fires and forgets, which is right for polling but wrong after a
-     * join: clearing `joining` before the new status arrived left one frame
-     * reading "Not joined", which looks like the join failed.
-     */
-    private suspend fun refreshNow() {
-        withContext(Dispatchers.IO) {
-                when (val status = TunnetNative.status()) {
-                    is TunnetNative.Result.Ok -> {
-                        val data = status.data
-                        val networks = AgentJson.networks(data)
-                        // A poll must not clear an error the user has not seen
-                        // yet (same rule as the service).
-                        TunnetState.update {
-                            it.copy(
-                                dataPlaneUp = data.optBoolean("data_plane_up", false),
-                                endpointId = data.optString("endpoint_id"),
-                                hostname = data.optString("hostname"),
-                                networks = networks,
-                            )
-                        }
-                        // Peers come with the same poll, so the list is live.
-                        networks.firstOrNull()?.let { loadPeersIntoState(it.id) }
-                    }
-                    is TunnetNative.Result.Err -> {
-                        // "not running" is expected while stopped/stopping and
-                        // would be noise on screen; anything else is real.
-                        if (!status.message.contains("not running")) {
-                            TunnetState.setError(status.message)
-                        }
-                    }
-                }
-            }
-    }
-
-    /**
-     * Refresh until the agent reports membership, or the budget runs out.
-     *
-     * Joining is acknowledged before it is observable: the agent returns from
-     * `join` once the coordinator has admitted it, while membership reaches
-     * local status a moment later. Measured at roughly 2-3s on a phone. The
-     * budget bounds the wait so a genuinely stuck join still resolves to the
-     * normal "not joined" screen instead of spinning forever.
-     */
-    private suspend fun awaitMembership(budgetMillis: Long = 15_000) {
-        val deadline = System.currentTimeMillis() + budgetMillis
-        while (true) {
-            refreshNow()
-            if (TunnetState.status.value.joined) return
-            if (System.currentTimeMillis() >= deadline) return
-            delay(250)
-        }
-    }
-
-    /** Peers of the first joined network, driving the peer list. */
-    private fun loadPeersIntoState(networkId: String) {
-        when (val result = TunnetNative.peers(networkId)) {
-            is TunnetNative.Result.Ok ->
-                TunnetState.update { it.copy(peers = AgentJson.peers(result.data)) }
-            is TunnetNative.Result.Err -> {}
-        }
-    }
-
-    override fun onResume() {
-        super.onResume()
-        if (TunnetState.status.value.stage == Stage.Running) refresh()
-    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TunnetScreen(
-    status: TunnetStatus,
+    snapshot: Snapshot,
+    vpnConsentDenied: String?,
+    vpnConsentInProgress: Boolean,
+    lanDenied: Boolean,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onJoin: (String) -> Unit,
 ) {
     Scaffold(topBar = { TopAppBar(title = { Text("Tunnet") }) }) { padding ->
-        // One LazyColumn for the whole screen rather than a Column that grows:
-        // an invite code is ~600 characters, and an unbounded field pushed the
-        // Join button off the bottom with no way to scroll to it. This also
-        // avoids nesting the peer list's scroller inside another scroller,
-        // which Compose rejects at measure time.
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                // Keep the focused field and its button above the keyboard.
                 .imePadding(),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            item { StatusCard(status) }
+            item { StatusCard(snapshot, vpnConsentDenied, vpnConsentInProgress, lanDenied) }
 
-            status.error?.let { error ->
+            val errorText = vpnConsentDenied ?: snapshot.error.message.takeIf {
+                snapshot.hasError() && snapshot.lifecycle == Lifecycle.LIFECYCLE_FAILED && it.isNotEmpty()
+            }
+            errorText?.let { error ->
                 item {
                     Card(Modifier.fillMaxWidth()) {
                         Text(
@@ -319,57 +208,64 @@ private fun TunnetScreen(
                 }
             }
 
-            if (status.joined) {
-                item { ConnectionControls(status, onConnect, onDisconnect) }
-                if (status.peers.isEmpty()) {
+            item {
+                ConnectionControls(
+                    snapshot,
+                    vpnConsentInProgress,
+                    onConnect,
+                    onDisconnect,
+                )
+            }
+
+            if (snapshot.isJoined()) {
+                if (snapshot.peersList.isEmpty()) {
                     item { Text("No peers yet.", style = MaterialTheme.typography.bodyMedium) }
                 } else {
                     item { Text("Peers", style = MaterialTheme.typography.titleMedium) }
-                    items(status.peers) { peer -> PeerCard(peer) }
+                    items(snapshot.peersList, key = { it.endpointId.ifEmpty { it.ip } }) { peer ->
+                        PeerCard(peer, snapshot.endpointId)
+                    }
                 }
             } else {
-                item { JoinCard(status, onJoin) }
+                item { JoinCard(snapshot, vpnConsentInProgress, onJoin) }
             }
         }
     }
 }
 
 @Composable
-private fun StatusCard(status: TunnetStatus) {
+private fun StatusCard(
+    snapshot: Snapshot,
+    vpnConsentDenied: String?,
+    vpnConsentInProgress: Boolean,
+    lanDenied: Boolean,
+) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = when {
-                        status.connected -> "Connected"
-                        status.stage == Stage.Starting -> "Starting"
-                        status.stage == Stage.Stopping -> "Stopping"
-                        // Running but not joined is not "connecting": there is
-                        // nothing to connect to until a network is joined, and
-                        // claiming progress that will never arrive is a lie.
-                        // Progress that is really happening, unlike the idle
-                        // "Running but not joined" case below.
-                        status.joining -> "Joining"
-                        status.stage == Stage.Running && !status.joined -> "Not joined"
-                        status.stage == Stage.Running -> "Connecting"
-                        else -> "Disconnected"
-                    },
+                    text = if (vpnConsentInProgress) "Starting" else snapshot.headline(vpnConsentDenied),
                     style = MaterialTheme.typography.headlineSmall,
                 )
-                if (status.joining ||
-                    status.stage == Stage.Starting ||
-                    status.stage == Stage.Stopping
-                ) {
+                if (vpnConsentInProgress || snapshot.busy()) {
                     Spacer(Modifier.fillMaxWidth(0.05f))
                     CircularProgressIndicator(Modifier.height(20.dp))
                 }
             }
-            status.networks.firstOrNull()?.let { network ->
-                Text("Network: ${network.name}", style = MaterialTheme.typography.bodyMedium)
+            snapshot.networksList.firstOrNull()?.let { network ->
+                Text("Network: ${network.networkName}", style = MaterialTheme.typography.bodyMedium)
                 Text("Mesh IP: ${network.ip}", style = MaterialTheme.typography.bodyMedium)
             }
-            if (status.hostname.isNotEmpty()) {
-                Text("This device: ${status.hostname}", style = MaterialTheme.typography.bodySmall)
+            if (snapshot.hostname.isNotEmpty()) {
+                Text("This device: ${snapshot.hostname}", style = MaterialTheme.typography.bodySmall)
+            }
+            if (lanDenied) {
+                Text(
+                    "Local network access is off. Nearby discovery is disabled; " +
+                        "peers can still connect through relay.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -377,12 +273,15 @@ private fun StatusCard(status: TunnetStatus) {
 
 @Composable
 private fun ConnectionControls(
-    status: TunnetStatus,
+    snapshot: Snapshot,
+    vpnConsentInProgress: Boolean,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    val busy = status.stage == Stage.Starting || status.stage == Stage.Stopping
-    if (status.stage == Stage.Stopped) {
+    val stopped = snapshot.lifecycle == Lifecycle.LIFECYCLE_STOPPED ||
+        snapshot.lifecycle == Lifecycle.LIFECYCLE_UNSPECIFIED
+    val busy = snapshot.busy() || vpnConsentInProgress
+    if (stopped) {
         Button(onClick = onConnect, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
             Text("Connect")
         }
@@ -394,9 +293,15 @@ private fun ConnectionControls(
 }
 
 @Composable
-private fun JoinCard(status: TunnetStatus, onJoin: (String) -> Unit) {
+private fun JoinCard(
+    snapshot: Snapshot,
+    vpnConsentInProgress: Boolean,
+    onJoin: (String) -> Unit,
+) {
     var invite by remember { mutableStateOf("") }
-    val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val stopped = snapshot.lifecycle == Lifecycle.LIFECYCLE_STOPPED ||
+        snapshot.lifecycle == Lifecycle.LIFECYCLE_UNSPECIFIED
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Join a network", style = MaterialTheme.typography.titleMedium)
@@ -409,30 +314,35 @@ private fun JoinCard(status: TunnetStatus, onJoin: (String) -> Unit) {
                 value = invite,
                 onValueChange = { invite = it },
                 label = { Text("Invite code") },
-                // Capped so a long code scrolls inside the field instead of
-                // growing it without limit.
                 maxLines = 4,
                 modifier = Modifier.fillMaxWidth(),
             )
-            // An invite code is far too long to type, so pasting is the only
-            // realistic path and deserves to be one tap.
             OutlinedButton(
-                onClick = { clipboard.getText()?.text?.let { invite = it.trim() } },
+                onClick = {
+                    val pasted = context.getSystemService(android.content.ClipboardManager::class.java)
+                        ?.primaryClip
+                        ?.takeIf { it.itemCount > 0 }
+                        ?.getItemAt(0)
+                        ?.coerceToText(context)
+                        ?.toString()
+                        ?.trim()
+                    if (!pasted.isNullOrEmpty()) {
+                        invite = pasted
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("Paste from clipboard")
             }
             Button(
                 onClick = { onJoin(invite.trim()) },
-                enabled = invite.isNotBlank() &&
-                    status.stage != Stage.Starting &&
-                    !status.joining,
+                enabled = invite.isNotBlank() && !snapshot.busy() && !vpnConsentInProgress,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
                     when {
-                        status.joining -> "Joining…"
-                        status.stage == Stage.Stopped -> "Start and join"
+                        snapshot.lifecycle == Lifecycle.LIFECYCLE_JOINING -> "Joining…"
+                        stopped -> "Start and join"
                         else -> "Join"
                     },
                 )
@@ -442,20 +352,50 @@ private fun JoinCard(status: TunnetStatus, onJoin: (String) -> Unit) {
 }
 
 @Composable
-private fun PeerCard(peer: Peer) {
+private fun PeerCard(peer: Peer, selfEndpointId: String) {
+    val scope = rememberCoroutineScope()
+    var pinging by remember { mutableStateOf(false) }
+    var pingText by remember { mutableStateOf<String?>(null) }
+    val canPing = peer.ip.isNotBlank() &&
+        (peer.endpointId.isEmpty() || peer.endpointId != selfEndpointId)
     Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(peer.hostname, style = MaterialTheme.typography.bodyLarge)
             Text(
                 buildString {
                     append(peer.ip)
                     append(" · ")
-                    append(peer.status)
-                    peer.path?.let { append(" · ").append(it) }
-                    peer.latencyMs?.let { append(" · ").append("%.0f ms".format(it)) }
+                    append(peer.statusLabel())
+                    peer.pathLabel()?.let { append(" · ").append(it) }
+                    if (peer.hasLatencyMs()) {
+                        append(" · ").append("%.0f ms".format(peer.latencyMs))
+                    }
                 },
                 style = MaterialTheme.typography.bodySmall,
             )
+            if (canPing) {
+                Button(
+                    onClick = {
+                        pinging = true
+                        pingText = null
+                        scope.launch {
+                            val result = withContext(Dispatchers.IO) { IcmpPing.ping(peer.ip) }
+                            pingText = when (result) {
+                                is IcmpPing.Result.Reply ->
+                                    "%.1f ms".format(result.latencyMs)
+                                is IcmpPing.Result.Failure -> result.message
+                            }
+                            pinging = false
+                        }
+                    },
+                    enabled = !pinging,
+                ) {
+                    Text(if (pinging) "Pinging…" else "Ping")
+                }
+                pingText?.let { text ->
+                    Text(text, style = MaterialTheme.typography.bodySmall)
+                }
+            }
         }
     }
 }

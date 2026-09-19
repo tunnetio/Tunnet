@@ -35,10 +35,16 @@ pub fn parse_upstream(specs: &[String]) -> anyhow::Result<UpstreamSource> {
     let mut order: Vec<IpAddr> = Vec::new();
     for spec in trimmed {
         let (ip, connections) = parse_spec(spec)?;
+        if is_self_resolver(ip, &connections) {
+            continue;
+        }
         if !by_ip.contains_key(&ip) {
             order.push(ip);
         }
         by_ip.entry(ip).or_default().extend(connections);
+    }
+    if order.is_empty() {
+        bail!("upstream nameservers point only at PeerDNS; refusing a recursive loop");
     }
 
     let name_servers = order
@@ -58,6 +64,20 @@ fn parse_spec(spec: &str) -> anyhow::Result<(IpAddr, Vec<ConnectionConfig>)> {
         return parse_url(scheme, rest).with_context(|| format!("nameserver {spec}"));
     }
     parse_plain(spec).with_context(|| format!("nameserver {spec}"))
+}
+
+fn is_self_resolver(ip: IpAddr, connections: &[ConnectionConfig]) -> bool {
+    let IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    let port_match = |port: u16| connections.iter().any(|c| c.port == port);
+    if v4 == tunnet_common::VirtualResolverEndpoint::IP {
+        return port_match(tunnet_common::VirtualResolverEndpoint::PORT);
+    }
+    if v4 == tunnet_common::LocalResolverEndpoint::IP {
+        return port_match(tunnet_common::LocalResolverEndpoint::PORT);
+    }
+    false
 }
 
 fn parse_plain(spec: &str) -> anyhow::Result<(IpAddr, Vec<ConnectionConfig>)> {
@@ -257,6 +277,29 @@ mod tests {
                     connection_summary(&c.name_servers[0]),
                     vec![(ProtocolKind::Udp, 53), (ProtocolKind::Tls, 853)]
                 );
+            }
+            UpstreamSource::System => panic!("config"),
+        }
+    }
+
+    #[test]
+    fn self_resolver_ips_are_not_valid_upstreams() {
+        assert!(
+            parse_upstream(&["127.0.0.1".into()]).is_err(),
+            "loopback PeerDNS cannot be upstream"
+        );
+        assert!(
+            parse_upstream(&["192.0.2.53".into()]).is_err(),
+            "in-TUN PeerDNS cannot be upstream"
+        );
+        assert!(
+            parse_upstream(&["udp://127.0.0.1:5353".into()]).is_ok(),
+            "loopback on a non-PeerDNS port is a valid test/upstream"
+        );
+        match parse_upstream(&["192.0.2.53".into(), "1.1.1.1".into()]).unwrap() {
+            UpstreamSource::Config(c) => {
+                assert_eq!(c.name_servers.len(), 1);
+                assert_eq!(c.name_servers[0].ip.to_string(), "1.1.1.1");
             }
             UpstreamSource::System => panic!("config"),
         }

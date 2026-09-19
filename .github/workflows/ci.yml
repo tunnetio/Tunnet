@@ -28,7 +28,7 @@ jobs:
     name: Rust + Android
     runs-on: ubuntu-latest
     env:
-      ANDROID_API_LEVEL: "36"
+      ANDROID_API_LEVEL: "37.0"
       ANDROID_BUILD_TOOLS_VERSION: "36.0.0"
       ANDROID_NDK_VERSION: "30.0.16248370"
       ANDROID_MIN_SDK: "26"
@@ -65,6 +65,9 @@ jobs:
       - name: Add Android Rust targets
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1 --locked
+
       - name: Set up JDK
         uses: actions/setup-java@v6
         with:
@@ -95,26 +98,13 @@ jobs:
 
       - name: Clippy (Android)
         run: |
-          BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android${ANDROID_MIN_SDK}-clang"
-          export CC_aarch64_linux_android="$BIN/aarch64-linux-android${ANDROID_MIN_SDK}-clang"
-          export AR_aarch64_linux_android="$BIN/llvm-ar"
-
-          cargo clippy \
+          cargo ndk -t arm64-v8a --platform "${ANDROID_MIN_SDK}" clippy \
             -p tunnet-mobile \
             -p tunnet-agent \
-            --target aarch64-linux-android \
             -- -D warnings
-
-          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$BIN/x86_64-linux-android${ANDROID_MIN_SDK}-clang"
-          export CC_x86_64_linux_android="$BIN/x86_64-linux-android${ANDROID_MIN_SDK}-clang"
-          export AR_x86_64_linux_android="$BIN/llvm-ar"
-
-          cargo clippy \
+          cargo ndk -t x86_64 --platform "${ANDROID_MIN_SDK}" clippy \
             -p tunnet-mobile \
             -p tunnet-agent \
-            --target x86_64-linux-android \
             -- -D warnings
 
       - name: Build and check Android app

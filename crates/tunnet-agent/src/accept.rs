@@ -1,6 +1,8 @@
 //! Inbound ALPN demux via iroh [`Router`] + [`ProtocolHandler`].
 //!
-//! The Router owns `endpoint.accept()` so the agent must not run a parallel accept loop.
+//! The Router owns `endpoint.accept()`. Keep the returned [`Router`] alive for the
+//! mesh lifetime: dropping it aborts the accept loop (incoming JOIN/AUTH never
+//! complete). Do not run a second accept loop on the same endpoint.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -8,21 +10,27 @@ use std::sync::Arc;
 
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+#[cfg(feature = "ssh")]
+use tunnet_common::RECORDING_ALPN;
 use tunnet_common::local_api::LocalEvent;
+#[cfg(feature = "ssh")]
 use tunnet_common::ws::ClientMsg;
-use tunnet_common::{RECORDING_ALPN, SEND_ALPN, TUNNEL_ALPN};
+use tunnet_common::{SEND_ALPN, TUNNEL_ALPN};
 use tunnet_core::Docs;
+#[cfg(feature = "ssh")]
+use tunnet_core::SignedClient;
 use tunnet_core::direct::{
     AUTH_ALPN, AuthCache, CONNECT_ALPN, DOCS_ALPN, DirectAuthority, DocsMembership, FirewallEngine,
     GOSSIP_ALPN, JOIN_ALPN, SharedAuthServerContext, SpoofTracker, run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, SignedClient, StatePaths};
+use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, StatePaths};
 use uuid::Uuid;
 
 use crate::actors::dataplane::PublishedPlane;
 use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
+#[cfg(feature = "ssh")]
 use crate::recorder::{RecordingStore, serve_recording_connection};
 use crate::tun_io::{InboundDeps, serve_tunnel_connection};
 
@@ -33,10 +41,14 @@ pub struct AcceptDeps {
     pub metrics: AgentMetrics,
     pub tun: PublishedPlane,
     pub stream_handler: StreamHandler,
+    #[cfg(feature = "ssh")]
     pub cp_tx: Option<tokio::sync::mpsc::Sender<ClientMsg>>,
+    #[cfg(feature = "ssh")]
     pub recording_store: Option<Arc<RecordingStore>>,
+    #[cfg(feature = "ssh")]
     pub signed: Option<SignedClient>,
     pub self_endpoint_id: String,
+    #[cfg(feature = "ssh")]
     pub recorder_enabled: bool,
     pub send: SendManager,
     pub direct_auth: Option<AuthCache>,
@@ -89,12 +101,13 @@ pub fn spawn(deps: AcceptDeps) -> Router {
     let gossip = GossipHandler {
         agent_gossip: deps.agent_gossip,
     };
+    #[cfg(feature = "ssh")]
     let recording = RecordingHandler {
         enabled: deps.recorder_enabled,
         store: deps.recording_store,
-        cp_tx: deps.cp_tx,
-        signed: deps.signed,
-        self_endpoint_id: deps.self_endpoint_id,
+        cp_tx: deps.cp_tx.clone(),
+        signed: deps.signed.clone(),
+        self_endpoint_id: deps.self_endpoint_id.clone(),
     };
     let send = SendOfferHandler {
         send: deps.send.clone(),
@@ -113,7 +126,10 @@ pub fn spawn(deps: AcceptDeps) -> Router {
     builder = builder.accept(CONNECT_ALPN, connect);
     builder = builder.accept(DOCS_ALPN, docs);
     builder = builder.accept(GOSSIP_ALPN, gossip);
-    builder = builder.accept(RECORDING_ALPN, recording);
+    #[cfg(feature = "ssh")]
+    {
+        builder = builder.accept(RECORDING_ALPN, recording);
+    }
     builder = builder.accept(SEND_ALPN, send);
     builder = builder.accept(iroh_blobs::ALPN, blobs);
 
@@ -232,6 +248,7 @@ impl fmt::Debug for JoinHandler {
 
 impl ProtocolHandler for JoinHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        tracing::info!(peer = %conn.remote_id(), "JOIN_ALPN accepted");
         if self.authorities.is_empty() {
             conn.close(0u32.into(), b"not_coordinator");
             return Ok(());
@@ -436,6 +453,7 @@ impl ProtocolHandler for GossipHandler {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "ssh")]
 struct RecordingHandler {
     enabled: bool,
     store: Option<Arc<RecordingStore>>,
@@ -444,6 +462,7 @@ struct RecordingHandler {
     self_endpoint_id: String,
 }
 
+#[cfg(feature = "ssh")]
 impl fmt::Debug for RecordingHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecordingHandler")
@@ -452,6 +471,7 @@ impl fmt::Debug for RecordingHandler {
     }
 }
 
+#[cfg(feature = "ssh")]
 impl ProtocolHandler for RecordingHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         if !self.enabled {

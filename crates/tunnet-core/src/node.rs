@@ -32,7 +32,8 @@ use crate::direct::{
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::direct::{
-    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_auth_denied_detail,
+    ConnectivityOptions, apply_connectivity, apply_overlay_addr_filter, endpoint_builder,
+    relay_auth_denied_detail,
 };
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
@@ -398,10 +399,15 @@ impl CoreNode {
             .secret_key(secret)
             .alpns(alpns)
             .hooks(crate::transport_auth::TransportHook::managed(&routes));
-        let endpoint = apply_connectivity(builder, &connectivity)
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
+        let overlay = [
+            ipnet::Ipv4Net::new(membership.assigned_ipv4, 32).expect("/32 is valid"),
+            tunnet_common::VirtualResolverEndpoint::host_route(),
+        ];
+        let endpoint =
+            apply_overlay_addr_filter(apply_connectivity(builder, &connectivity), &overlay)
+                .bind()
+                .await
+                .context("bind iroh endpoint")?;
 
         debug_assert_eq!(format!("{}", endpoint.id()), my_id_hex);
 
@@ -587,10 +593,15 @@ impl CoreNode {
             .secret_key(secret)
             .alpns(alpns)
             .hooks(DirectAuthHook::new(auth.clone()));
-        let endpoint = apply_connectivity(builder, &cfg.connectivity)
-            .bind()
-            .await
-            .context("bind iroh endpoint (direct)")?;
+        let overlay: Vec<_> = networks
+            .iter()
+            .map(|d| d.genesis.address_plan.peer_cidr)
+            .collect();
+        let endpoint =
+            apply_overlay_addr_filter(apply_connectivity(builder, &cfg.connectivity), &overlay)
+                .bind()
+                .await
+                .context("bind iroh endpoint (direct)")?;
 
         {
             let ep = endpoint.clone();
@@ -915,7 +926,9 @@ async fn bootstrap_one_direct_network(
     };
 
     let mut seeds = Vec::new();
-    if let Some(coord) = &direct.coordinator_endpoint_id {
+    if let Some(coord) = &direct.coordinator_endpoint_id
+        && coord != args.my_id_hex
+    {
         seeds.push(coord.clone());
     }
     seeds.sort();

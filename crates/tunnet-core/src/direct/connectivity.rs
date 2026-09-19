@@ -3,15 +3,23 @@
 //! Relay selection is [`EffectiveRelayPolicy`] only. DHT, mDNS, and LAN discovery
 //! are separate and never implied by a connectivity "profile".
 
+use std::borrow::Cow;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::Arc;
 
+use ipnet::Ipv4Net;
 use iroh::Endpoint;
 use iroh::RelayMode;
+use iroh::address_lookup::AddrFilter;
+use iroh::dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData};
 use iroh::endpoint::Builder;
 use iroh::endpoint::presets;
-use iroh::{RelayConfig, RelayMap};
+use iroh::{EndpointAddr, RelayConfig, RelayMap, TransportAddr};
 #[cfg(feature = "direct")]
 use iroh_mainline_address_lookup::DhtAddressLookup;
+use tunnet_common::VirtualResolverEndpoint;
 use tunnet_common::{ConnectivityRelayConfig, ConnectivityRelayFallback};
 
 #[cfg(feature = "direct")]
@@ -135,6 +143,95 @@ fn apply_relay_policy(builder: Builder, policy: &EffectiveRelayPolicy) -> Builde
     }
 }
 
+/// DNS that omits AAAA when A exists.
+///
+/// iroh picks the relay TCP family from `udp_v6` in net report (IPv6 first when
+/// IPv6 STUN works). n0's IPv4 and IPv6 frontends do not share QUIC-over-relay
+/// sessions, so a dual-stack coordinator never sees an IPv4-only joiner. Direct
+/// UDP IPv6 is unchanged: magicsock still binds `[::]` and holepunches.
+fn ipv4_preferred_dns() -> DnsResolver {
+    DnsResolver::custom(Ipv4PreferredDns {
+        inner: DnsResolver::new(),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct Ipv4PreferredDns {
+    inner: DnsResolver,
+}
+
+impl Ipv4PreferredDns {
+    fn lookup_v4(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv4Addr>, DnsError>> + Send>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let addrs = inner.lookup_ipv4(host, DNS_TIMEOUT).await?;
+            let v4: Vec<Ipv4Addr> = addrs
+                .filter_map(|ip| match ip {
+                    IpAddr::V4(v) => Some(v),
+                    IpAddr::V6(_) => None,
+                })
+                .collect();
+            Ok(Box::new(v4.into_iter()) as BoxIter<Ipv4Addr>)
+        })
+    }
+}
+
+impl Resolver for Ipv4PreferredDns {
+    fn lookup_ipv4(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv4Addr>, DnsError>> + Send>> {
+        self.lookup_v4(host)
+    }
+
+    fn lookup_ipv6(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv6Addr>, DnsError>> + Send>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            if let Ok(mut v4) = inner.lookup_ipv4(host.clone(), DNS_TIMEOUT).await
+                && v4.any(|ip| ip.is_ipv4())
+            {
+                return Ok(Box::new(std::iter::empty()) as BoxIter<Ipv6Addr>);
+            }
+            let addrs = inner.lookup_ipv6(host, DNS_TIMEOUT).await?;
+            let v6: Vec<Ipv6Addr> = addrs
+                .filter_map(|ip| match ip {
+                    IpAddr::V6(v) => Some(v),
+                    IpAddr::V4(_) => None,
+                })
+                .collect();
+            Ok(Box::new(v6.into_iter()) as BoxIter<Ipv6Addr>)
+        })
+    }
+
+    fn lookup_txt(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<TxtRecordData>, DnsError>> + Send>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let recs: Vec<TxtRecordData> = inner.lookup_txt(host, DNS_TIMEOUT).await?.collect();
+            Ok(Box::new(recs.into_iter()) as BoxIter<TxtRecordData>)
+        })
+    }
+
+    fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+
+    fn reset(&self) -> Box<dyn Resolver> {
+        self.inner.reset();
+        Box::new(Self {
+            inner: self.inner.clone(),
+        })
+    }
+}
+
 /// Start an endpoint builder from the resolved relay policy.
 ///
 /// N0 uses the n0 preset (relays + n0 DNS lookup). Custom and Disabled use
@@ -146,7 +243,50 @@ pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
             Endpoint::builder(presets::Minimal)
         }
     };
-    apply_relay_policy(builder, &opts.relay)
+    apply_relay_policy(builder.dns_resolver(ipv4_preferred_dns()), &opts.relay)
+}
+
+/// True when an IPv4 address belongs to a Tunnet overlay or the in-TUN resolver.
+pub fn is_overlay_underlay_ip(ip: std::net::Ipv4Addr, overlay_nets: &[Ipv4Net]) -> bool {
+    ip == VirtualResolverEndpoint::IP || overlay_nets.iter().any(|net| net.contains(&ip))
+}
+
+/// Drop overlay/TUN IPv4 candidates. Relays, IPv6, and non-overlay IPv4 stay.
+pub fn strip_overlay_addrs(mut addr: EndpointAddr, overlay_nets: &[Ipv4Net]) -> EndpointAddr {
+    addr.addrs.retain(|a| match a {
+        TransportAddr::Ip(sa) => match sa.ip() {
+            IpAddr::V4(v4) => !is_overlay_underlay_ip(v4, overlay_nets),
+            IpAddr::V6(_) => true,
+        },
+        _ => true,
+    });
+    addr
+}
+
+/// Do not publish overlay interface addresses as iroh underlay candidates.
+///
+/// iroh 1.2 `AddrFilter` applies to address *publish*. It does not filter
+/// QNT/handshake candidates on an existing connection (n0-computer/iroh#4399).
+pub fn apply_overlay_addr_filter(builder: Builder, overlay_nets: &[Ipv4Net]) -> Builder {
+    if overlay_nets.is_empty() {
+        return builder;
+    }
+    let nets = overlay_nets.to_vec();
+    builder.addr_filter(AddrFilter::new(move |addrs| {
+        Cow::Owned(
+            addrs
+                .iter()
+                .filter(|a| match a {
+                    TransportAddr::Ip(sa) => match sa.ip() {
+                        IpAddr::V4(v4) => !is_overlay_underlay_ip(v4, &nets),
+                        IpAddr::V6(_) => true,
+                    },
+                    _ => true,
+                })
+                .cloned()
+                .collect(),
+        )
+    }))
 }
 
 /// Attach address-lookup services independently of relay policy.
@@ -352,5 +492,29 @@ mod tests {
         assert!(opts.enable_lan_discovery);
         assert!(opts.enable_mdns);
         assert!(!relay_uses_n0_preset(&opts.relay));
+    }
+
+    #[test]
+    fn strip_overlay_keeps_relay_lan_and_v6() {
+        let overlay: Ipv4Net = "10.38.0.0/16".parse().unwrap();
+        let id = iroh::SecretKey::generate().public();
+        let relay: iroh::RelayUrl = "https://euc1-1.relay.n0.iroh.link.".parse().unwrap();
+        let addr = strip_overlay_addrs(
+            EndpointAddr::new(id)
+                .with_relay_url(relay.clone())
+                .with_ip_addr("10.38.150.60:11204".parse().unwrap())
+                .with_ip_addr("192.168.1.20:11204".parse().unwrap())
+                .with_ip_addr("[2001:db8::1]:11204".parse().unwrap())
+                .with_ip_addr((tunnet_common::VirtualResolverEndpoint::IP, 53).into()),
+            &[overlay],
+        );
+        assert!(addr.relay_urls().any(|u| u == &relay));
+        let ips: Vec<_> = addr.ip_addrs().copied().collect();
+        assert!(ips.iter().any(|a| a.ip().to_string() == "192.168.1.20"));
+        assert!(ips.iter().any(|a| a.is_ipv6()));
+        assert!(!ips.iter().any(|a| a.ip().to_string() == "10.38.150.60"));
+        assert!(!ips
+            .iter()
+            .any(|a| a.ip() == std::net::IpAddr::V4(tunnet_common::VirtualResolverEndpoint::IP)));
     }
 }

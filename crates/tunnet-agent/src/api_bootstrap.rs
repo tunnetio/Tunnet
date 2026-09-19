@@ -24,6 +24,7 @@ use tunnet_posture::{
 pub struct AgentBootstrapOps {
     paths: StatePaths,
     updater: std::sync::Arc<crate::core_update::CoreUpdater>,
+    handle: Option<crate::runtime::AgentHandle>,
 }
 
 impl AgentBootstrapOps {
@@ -32,7 +33,33 @@ impl AgentBootstrapOps {
         events: tokio::sync::broadcast::Sender<tunnet_common::local_api::LocalEvent>,
     ) -> Self {
         let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events);
-        Self { paths, updater }
+        Self {
+            paths,
+            updater,
+            handle: None,
+        }
+    }
+
+    pub fn with_handle(mut self, handle: crate::runtime::AgentHandle) -> Self {
+        self.handle = Some(handle);
+        self
+    }
+
+    fn require_handle(&self) -> Result<&crate::runtime::AgentHandle, ApiError> {
+        self.handle
+            .as_ref()
+            .ok_or_else(|| map_error("embedded runtime handle is missing"))
+    }
+
+    async fn activate_if_idle(&self) -> Result<(), ApiError> {
+        let handle = self.require_handle()?;
+        if handle.snapshot().await.lifecycle == crate::runtime::AgentLifecycle::Idle {
+            handle
+                .activate_persisted()
+                .await
+                .map_err(|e| map_error(format!("{e:#}")))?;
+        }
+        Ok(())
     }
 
     fn state_dir(&self) -> Option<String> {
@@ -130,34 +157,37 @@ impl BootstrapOps for AgentBootstrapOps {
         crate::cli::run_enroll(args, self.state_dir().as_deref())
             .await
             .map_err(|e| map_error(format!("{e:#}")))?;
+        self.activate_if_idle().await?;
         Ok(ok("enrolled"))
     }
 
     async fn network_create(&self, req: NetworkCreateRequest) -> Result<OkResponse, ApiError> {
-        let args = crate::cmds_direct::CreateArgs {
-            hostname: req.hostname,
-            open: req.open,
-            network_name: req.network_name,
-            secret: req.secret,
-            cidr: req.cidr,
-            no_encrypt_state: req.no_encrypt_state,
-        };
-        crate::cmds_direct::run_create(args, self.state_dir().as_deref())
+        let handle = self.require_handle()?;
+        handle
+            .create(crate::runtime::CreateRequest {
+                hostname: req.hostname,
+                open: req.open,
+                network_name: req.network_name,
+                secret: req.secret,
+                cidr: req.cidr,
+                no_encrypt_state: req.no_encrypt_state,
+            })
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(format!("{e:#}")))?;
         Ok(ok("direct network created"))
     }
 
     async fn network_join(&self, req: NetworkJoinRequest) -> Result<OkResponse, ApiError> {
-        let args = crate::cmds_direct::JoinArgs {
-            invite_code: req.invite_code,
-            hostname: req.hostname,
-            auto_accept_firewall: req.auto_accept_firewall,
-            no_encrypt_state: req.no_encrypt_state,
-        };
-        crate::cmds_direct::run_join(args, self.state_dir().as_deref())
+        let handle = self.require_handle()?;
+        handle
+            .join(crate::runtime::JoinRequest {
+                invite_code: req.invite_code,
+                hostname: req.hostname,
+                auto_accept_firewall: req.auto_accept_firewall,
+                no_encrypt_state: req.no_encrypt_state,
+            })
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(format!("{e:#}")))?;
         Ok(ok("joined direct network"))
     }
 
@@ -548,5 +578,9 @@ impl BootstrapOps for AgentBootstrapOps {
             "tags": tags,
             "expires_at": expires_at,
         })))
+    }
+
+    fn observe_mesh(&self) -> Option<tunnet_core::local_api::MeshObservation> {
+        self.handle.as_ref().map(|h| h.observe_mesh())
     }
 }

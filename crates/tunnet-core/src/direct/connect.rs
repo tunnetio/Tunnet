@@ -2,20 +2,31 @@
 
 use std::collections::HashSet;
 
+#[cfg(feature = "local_api")]
 use anyhow::Context;
+#[cfg(feature = "local_api")]
 use iroh::EndpointId;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "local_api")]
 use crate::direct::CONNECT_ALPN;
+#[cfg(feature = "local_api")]
 use crate::direct::contact::{contact_id_from_endpoint, parse_contact_id};
+#[cfg(feature = "local_api")]
 use crate::direct::grants::NetworkGrant;
+#[cfg(feature = "local_api")]
 use crate::identity::AgentIdentity;
+#[cfg(feature = "local_api")]
 use tunnet_common::local_api::DirectConnectPendingInfo;
 
+#[cfg(feature = "local_api")]
 use crate::local_api::LocalApiState;
+#[cfg(feature = "local_api")]
 use crate::routing::PeerInfo;
-use crate::state::{PersistedState, StatePaths};
+#[cfg(feature = "local_api")]
+use crate::state::PersistedState;
+use crate::state::StatePaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectPending {
@@ -25,16 +36,19 @@ pub struct ConnectPending {
     pub received_at: Timestamp,
 }
 
+#[cfg(feature = "local_api")]
 fn load_allowlist(state: &LocalApiState) -> anyhow::Result<HashSet<String>> {
     Ok(crate::agent_config::load_connect_allowlist(
         &state.node.paths,
     ))
 }
 
+#[cfg(feature = "local_api")]
 fn save_allowlist(state: &LocalApiState, set: &HashSet<String>) -> anyhow::Result<()> {
     crate::agent_config::save_connect_allowlist(&state.node.paths, set.iter().cloned())
 }
 
+#[cfg(feature = "local_api")]
 fn load_pending(paths: &StatePaths) -> anyhow::Result<Vec<ConnectPending>> {
     let p = paths.connect_pending_file();
     if !p.exists() {
@@ -43,6 +57,7 @@ fn load_pending(paths: &StatePaths) -> anyhow::Result<Vec<ConnectPending>> {
     Ok(serde_json::from_slice(&std::fs::read(&p)?)?)
 }
 
+#[cfg(feature = "local_api")]
 fn save_pending(paths: &StatePaths, list: &[ConnectPending]) -> anyhow::Result<()> {
     paths.ensure()?;
     std::fs::write(
@@ -52,6 +67,7 @@ fn save_pending(paths: &StatePaths, list: &[ConnectPending]) -> anyhow::Result<(
     Ok(())
 }
 
+#[cfg(feature = "local_api")]
 fn install_peer_route(
     state: &LocalApiState,
     endpoint: EndpointId,
@@ -108,6 +124,7 @@ fn install_peer_route(
     Ok(())
 }
 
+#[cfg(feature = "local_api")]
 fn peer_hostname(peer: &crate::routing::PeerInfo) -> &str {
     if peer.hostname.is_empty() {
         "peer"
@@ -116,6 +133,7 @@ fn peer_hostname(peer: &crate::routing::PeerInfo) -> &str {
     }
 }
 
+#[cfg(feature = "local_api")]
 fn require_grant(direct: &crate::state::DirectState) -> anyhow::Result<NetworkGrant> {
     let raw = direct
         .network_grant
@@ -125,6 +143,7 @@ fn require_grant(direct: &crate::state::DirectState) -> anyhow::Result<NetworkGr
 }
 
 /// Initiate a connect dial to a remote contact id.
+#[cfg(feature = "local_api")]
 pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(None)?;
     let peer = parse_contact_id(contact_id).context("parse contact id")?;
@@ -187,6 +206,7 @@ pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow:
     }
 }
 
+#[cfg(feature = "local_api")]
 pub fn allow_contact(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let _ = state.node.persisted.require_direct_network(None)?;
     let _ = parse_contact_id(contact_id)?;
@@ -196,6 +216,7 @@ pub fn allow_contact(state: &LocalApiState, contact_id: &str) -> anyhow::Result<
     Ok(format!("Pre-approved {contact_id}"))
 }
 
+#[cfg(feature = "local_api")]
 pub fn list_pending(state: &LocalApiState) -> anyhow::Result<Vec<DirectConnectPendingInfo>> {
     let _ = state.node.persisted.require_direct_network(None)?;
     let list = load_pending(&state.node.paths)?;
@@ -210,6 +231,7 @@ pub fn list_pending(state: &LocalApiState) -> anyhow::Result<Vec<DirectConnectPe
         .collect())
 }
 
+#[cfg(feature = "local_api")]
 pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(None)?.clone();
     let mut list = load_pending(&state.node.paths)?;
@@ -256,6 +278,7 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
     ))
 }
 
+#[cfg(feature = "local_api")]
 pub fn deny_pending(state: &LocalApiState, contact_id: &str) -> anyhow::Result<String> {
     let _ = state.node.persisted.require_direct_network(None)?;
     let mut list = load_pending(&state.node.paths)?;
@@ -268,6 +291,7 @@ pub fn deny_pending(state: &LocalApiState, contact_id: &str) -> anyhow::Result<S
     Ok(format!("Denied {contact_id}"))
 }
 
+#[cfg(feature = "local_api")]
 pub async fn rotate_identity(state: &LocalApiState) -> anyhow::Result<String> {
     let networks = state.node.persisted.direct_networks().to_vec();
     if networks.is_empty() {

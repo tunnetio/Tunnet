@@ -1,58 +1,95 @@
-//! JNI surface for the Android app: `io.tunnet.android.TunnetNative`.
+//! JNI surface for `io.tunnet.android.TunnetNative`.
 //!
-//! Mechanical marshalling only. Every call returns a JSON string so the Kotlin
-//! side needs no generated types and errors cross the boundary as data rather
-//! than as Java exceptions thrown from native code:
+//! Commands return protobuf `NativeResult`. Snapshots are pushed as protobuf
+//! `Snapshot` bytes through `SnapshotListener.onSnapshot`. Runtime/network
+//! threads never wait on Java: encoded snapshots land in a latest-wins slot
+//! and a dedicated delivery thread attaches to the JVM.
 //!
-//! ```json
-//! {"ok": true,  "data": { ... }}
-//! {"ok": false, "error": "human readable reason"}
-//! ```
-//!
-//! All of these block. Kotlin must call them off the main thread.
+//! Command calls still block. Kotlin must invoke them off the main thread.
 
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::sync::{Mutex, Once};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, bail};
-use jni::JNIEnv;
-use jni::objects::{GlobalRef, JClass, JObject, JString};
-use jni::{JavaVM, sys::jstring};
+use jni::objects::{Global, JByteArray, JClass, JObject, JObjectArray, JString, JValue};
+use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use tunnet_agent::android_tun::{self, TunProvider, TunRequest};
-use tunnet_common::local_api::NetworkJoinRequest;
+use tunnet_agent::{
+    AgentError, AgentErrorKind, JoinRequest, LatestSlot, MulticastHost, PlatformSealer, SealError,
+    SealErrorKind, UnderlayProtect, WireNativeResult, clear_multicast_host, clear_underlay_protect,
+    sanitize_hostname, set_multicast_host, set_platform_sealer, set_underlay_protect,
+};
 
 use crate::session::AgentSession;
 
-/// The one embedded agent. A process hosts a single VPN session, so a single
-/// session is the honest model; a second `start` is a bug, not a use case.
 static SESSION: Mutex<Option<AgentSession>> = Mutex::new(None);
+static LISTENER: Mutex<Option<PinnedListener>> = Mutex::new(None);
+static LISTENER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static DELIVERY: Mutex<Option<Delivery>> = Mutex::new(None);
+
+struct PinnedListener {
+    obj: Arc<Global<JObject<'static>>>,
+    epoch: u64,
+}
+
+struct Delivery {
+    latest: Arc<LatestSlot>,
+    thread: JoinHandle<()>,
+}
 
 /// Register the JVM `Context` with `ndk-context`, exactly once per process.
 ///
-/// Rust code in the tree resolves TLS through the platform verifier on Android
-/// (`hickory-resolver`'s `rustls-platform-verifier` feature, and iroh's DNS
-/// stack): loading the platform trust store needs the JVM `Context`, fetched
-/// via `ndk_context::android_context()`, which PANICS with "android context
-/// was not initialized" when nobody registered it. The release profile aborts
-/// on panic, so without this call the app process dies mid-join.
-///
-/// `ndk-context` also asserts on double initialization, hence the `Once`: the
-/// user can stop and restart the agent, but the process keeps its context.
+/// TLS through the platform verifier needs `ndk_context::android_context()`.
+/// `ndk-context` asserts on double initialization, so this is `Once`: stop and
+/// restart the agent, but keep the process context.
 static INIT_ANDROID_CONTEXT: Once = Once::new();
 
-fn init_android_context(env: &mut JNIEnv, service: &JObject) -> Result<()> {
+struct LogAndDefault;
+
+impl<T: Default, E: std::fmt::Display> jni::errors::ErrorPolicy<T, E> for LogAndDefault {
+    type Captures<'unowned_env_local: 'native_method, 'native_method> = ();
+
+    fn on_error<'unowned_env_local: 'native_method, 'native_method>(
+        _env: &mut Env<'unowned_env_local>,
+        _cap: &mut Self::Captures<'unowned_env_local, 'native_method>,
+        err: E,
+    ) -> jni::errors::Result<T> {
+        tracing::error!(error = %err, "jni native method failed");
+        Ok(T::default())
+    }
+
+    fn on_panic<'unowned_env_local: 'native_method, 'native_method>(
+        _env: &mut Env<'unowned_env_local>,
+        _captures: &mut Self::Captures<'unowned_env_local, 'native_method>,
+        payload: Box<dyn std::any::Any + Send + 'static>,
+    ) -> jni::errors::Result<T> {
+        let msg = panic_message(&payload);
+        tracing::error!(panic = %msg, "jni native method panicked");
+        Ok(T::default())
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "native panic".into())
+}
+
+fn init_android_context(env: &mut Env, service: &JObject) -> Result<()> {
     let vm = env.get_java_vm().context("obtain JavaVM")?;
 
-    // The *application* context, not the Service: ndk-context keeps the pointer
-    // for the process lifetime, but `stopAgent` calls `stopSelf()` and the next
-    // connect builds a new Service. Pinning the Service would leave consumers
-    // (notably rustls-platform-verifier, which fetches it lazily mid-join)
-    // holding a context belonging to a destroyed Service after any stop/start.
+    // Pin the application context, not the Service: ndk-context keeps the
+    // pointer for the process lifetime, and `stopSelf()` destroys the Service.
     let app_context = env
         .call_method(
             service,
-            "getApplicationContext",
-            "()Landroid/content/Context;",
+            jni_str!("getApplicationContext"),
+            jni_sig!("()Landroid/content/Context;"),
             &[],
         )
         .and_then(|v| v.l())
@@ -62,87 +99,59 @@ fn init_android_context(env: &mut JNIEnv, service: &JObject) -> Result<()> {
         .context("pin application context")?;
 
     INIT_ANDROID_CONTEXT.call_once(|| {
-        // SAFETY: the JavaVM pointer is valid for the process lifetime, and the
-        // context object is held by `app_ref` for the same lifetime, so the
-        // pointers stay valid for however long ndk-context holds them. Called
-        // exactly once, satisfying the crate's own contract.
+        // SAFETY: JavaVM is process-lived. The application Context is held by
+        // `app_ref` for the same lifetime. Called once.
         unsafe {
-            ndk_context::initialize_android_context(
-                vm.get_java_vm_pointer().cast(),
-                app_ref.as_obj().as_raw().cast(),
-            );
+            ndk_context::initialize_android_context(vm.get_raw().cast(), app_ref.as_raw().cast());
         }
-        // Deliberate: ndk-context needs the context for the rest of the
-        // process, so it must never be freed.
         std::mem::forget(app_ref);
     });
     Ok(())
 }
 
-/// Bridges [`TunProvider`] to `TunnetVpnService.establishTun`.
 struct JvmTunProvider {
     vm: JavaVM,
-    service: GlobalRef,
+    service: Global<JObject<'static>>,
 }
 
-/// Build a `String[]` for the JVM from any iterator of owned strings.
 fn string_array<'a>(
-    env: &mut JNIEnv<'a>,
+    env: &mut Env<'a>,
     items: impl ExactSizeIterator<Item = String>,
-) -> Result<jni::objects::JObjectArray<'a>> {
-    let len = i32::try_from(items.len()).context("too many elements for a JVM array")?;
+) -> jni::errors::Result<JObjectArray<'a, JString<'a>>> {
     let empty = env.new_string("")?;
-    let array = env.new_object_array(len, "java/lang/String", &empty)?;
+    let array = JObjectArray::<JString>::new(env, items.len(), &empty)?;
     for (index, item) in items.enumerate() {
         let value = env.new_string(&item)?;
-        env.set_object_array_element(&array, index as i32, &value)?;
+        array.set_element(env, index, &value)?;
     }
     Ok(array)
 }
 
 impl TunProvider for JvmTunProvider {
     fn establish(&self, request: TunRequest) -> Result<OwnedFd> {
-        // The data plane establishes from a tokio worker thread, which the JVM
-        // has never seen, so it must be attached before any JNI call.
-        let mut env = self
+        let fd = self
             .vm
-            .attach_current_thread()
-            .context("attach data-plane thread to the JVM")?;
+            .attach_current_thread(|env| -> jni::errors::Result<i32> {
+                let addrs = string_array(env, request.addrs.iter().map(|a| a.to_string()))?;
+                let routes = string_array(env, request.routes.iter().map(|r| r.to_string()))?;
+                let dns = string_array(env, request.dns.iter().map(|d| d.to_string()))?;
+                env.call_method(
+                    &self.service,
+                    jni_str!("establishTun"),
+                    jni_sig!("([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;IZZ)I"),
+                    &[
+                        JValue::from(&addrs),
+                        JValue::from(&routes),
+                        JValue::from(&dns),
+                        JValue::Int(i32::from(request.mtu)),
+                        JValue::Bool(request.allow_ipv6_passthrough),
+                        JValue::Bool(request.inherit_underlying_metered),
+                    ],
+                )?
+                .i()
+            })
+            .map_err(|e: jni::errors::Error| anyhow::anyhow!("VpnService.establishTun: {e}"))?;
 
-        // Addresses, routes and resolvers cross as string arrays in canonical
-        // text form (`10.9.0.2`, `10.9.0.0/24`). Parsing on the Kotlin side
-        // keeps the JNI signature stable as the lists grow, and avoids
-        // encoding an address family into ints.
-        let addrs = string_array(&mut env, request.addrs.iter().map(|a| a.to_string()))
-            .context("marshal tunnel addresses")?;
-        let routes = string_array(&mut env, request.routes.iter().map(|r| r.to_string()))
-            .context("marshal tunnel routes")?;
-        let dns = string_array(&mut env, request.dns.iter().map(|d| d.to_string()))
-            .context("marshal tunnel resolvers")?;
-
-        let fd = env
-            .call_method(
-                &self.service,
-                "establishTun",
-                "([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;I)I",
-                &[
-                    (&addrs).into(),
-                    (&routes).into(),
-                    (&dns).into(),
-                    jni::objects::JValue::Int(i32::from(request.mtu)),
-                ],
-            )
-            .and_then(|v| v.i());
-
-        // A Java-side exception leaves the thread in a pending-exception state;
-        // clear it or the next JNI call on this thread aborts the process.
-        if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_describe();
-            let _ = env.exception_clear();
-            bail!("VpnService.establishTun threw");
-        }
-
-        let fd = fd.context("call VpnService.establishTun")?;
         if fd < 0 {
             bail!(
                 "VpnService could not establish a tunnel (returned {fd}); \
@@ -150,258 +159,527 @@ impl TunProvider for JvmTunProvider {
             );
         }
 
-        // SAFETY: the Kotlin side returns ParcelFileDescriptor.detachFd(), so
-        // ownership has transferred to us and nothing else will close it.
+        // SAFETY: Kotlin returns ParcelFileDescriptor.detachFd(); ownership
+        // transfers here and nothing else will close it.
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 
-fn ok_json(data: serde_json::Value) -> String {
-    serde_json::json!({ "ok": true, "data": data }).to_string()
+struct JvmPlatformSealer {
+    vm: JavaVM,
+    class: Global<JClass<'static>>,
 }
 
-fn err_json(error: &anyhow::Error) -> String {
-    // `{:#}` includes the context chain, which is what makes a failure
-    // diagnosable from a phone screen.
-    serde_json::json!({ "ok": false, "error": format!("{error:#}") }).to_string()
+fn seal_kind_from_code(code: i32) -> SealErrorKind {
+    match code {
+        1 => SealErrorKind::KeyUnavailable,
+        2 => SealErrorKind::KeyInvalidated,
+        3 => SealErrorKind::CiphertextInvalid,
+        4 => SealErrorKind::DecryptFailed,
+        5 => SealErrorKind::OperationFailed,
+        6 => SealErrorKind::Unsupported,
+        _ => SealErrorKind::OperationFailed,
+    }
 }
 
-fn envelope(result: Result<serde_json::Value>) -> String {
-    match result {
-        Ok(data) => ok_json(data),
-        Err(e) => {
-            tracing::warn!(error = ?e, "native call failed");
-            err_json(&e)
+impl JvmPlatformSealer {
+    fn invoke(&self, wrap: bool, input: &[u8]) -> Result<Vec<u8>, SealError> {
+        let outcome = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<SealOpJni> {
+                let bytes = env.byte_array_from_slice(input)?;
+                let raw = if wrap {
+                    env.call_static_method(
+                        &self.class,
+                        jni_str!("wrap"),
+                        jni_sig!("([B)Lio/tunnet/android/SealOp;"),
+                        &[JValue::from(&bytes)],
+                    )
+                } else {
+                    env.call_static_method(
+                        &self.class,
+                        jni_str!("unwrap"),
+                        jni_sig!("([B)Lio/tunnet/android/SealOp;"),
+                        &[JValue::from(&bytes)],
+                    )
+                }?
+                .l()?;
+                if raw.is_null() {
+                    return Ok(SealOpJni {
+                        kind: 5,
+                        blob: Vec::new(),
+                        message: "keystore returned null".into(),
+                    });
+                }
+                let kind = env
+                    .call_method(&raw, jni_str!("getKind"), jni_sig!("()I"), &[])?
+                    .i()?;
+                let message = {
+                    let obj = env
+                        .call_method(
+                            &raw,
+                            jni_str!("getMessage"),
+                            jni_sig!("()Ljava/lang/String;"),
+                            &[],
+                        )?
+                        .l()?;
+                    if obj.is_null() {
+                        String::new()
+                    } else {
+                        let as_string = unsafe { JString::from_raw(env, obj.as_raw()) };
+                        as_string.try_to_string(env).unwrap_or_default()
+                    }
+                };
+                let blob = {
+                    let obj = env
+                        .call_method(&raw, jni_str!("getBlob"), jni_sig!("()[B"), &[])?
+                        .l()?;
+                    if obj.is_null() {
+                        Vec::new()
+                    } else {
+                        let array = unsafe { JByteArray::from_raw(env, obj.as_raw()) };
+                        env.convert_byte_array(&array)?
+                    }
+                };
+                Ok(SealOpJni {
+                    kind,
+                    blob,
+                    message,
+                })
+            });
+        let op = outcome
+            .map_err(|_| SealError::new(SealErrorKind::OperationFailed, "keystore jni call"))?;
+        if op.kind != 0 {
+            return Err(SealError::new(seal_kind_from_code(op.kind), op.message));
         }
+        Ok(op.blob)
     }
 }
 
-/// Marshal a Rust `String` back to the JVM, falling back to a null pointer only
-/// if even the error envelope cannot be allocated.
-fn to_jstring(env: &mut JNIEnv, value: String) -> jstring {
-    match env.new_string(value) {
-        Ok(s) => s.into_raw(),
-        Err(_) => JObject::null().into_raw(),
+struct SealOpJni {
+    kind: i32,
+    blob: Vec<u8>,
+    message: String,
+}
+
+impl PlatformSealer for JvmPlatformSealer {
+    fn wrap(&self, plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
+        self.invoke(true, plaintext)
+    }
+
+    fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, SealError> {
+        self.invoke(false, wrapped)
     }
 }
 
-fn read_string(env: &mut JNIEnv, value: &JString) -> Result<String> {
-    Ok(env
-        .get_string(value)
-        .context("read Java string argument")?
-        .into())
+fn install_sealer(env: &mut Env) -> Result<()> {
+    let class = env
+        .find_class(jni_str!("io/tunnet/android/TunnetKeystore"))
+        .context("find TunnetKeystore")?;
+    let class = env
+        .new_global_ref(&class)
+        .context("pin TunnetKeystore class")?;
+    set_platform_sealer(Arc::new(JvmPlatformSealer {
+        vm: env.get_java_vm().context("obtain JavaVM")?,
+        class,
+    }));
+    Ok(())
 }
 
-/// Run `f` against the running session, or fail with a clear reason.
+fn ok_bytes() -> Vec<u8> {
+    WireNativeResult::ok().to_vec()
+}
+
+fn err_anyhow(error: &anyhow::Error) -> Vec<u8> {
+    tracing::warn!(error = ?error, "native call failed");
+    WireNativeResult::err(AgentErrorKind::Internal, format!("{error:#}")).to_vec()
+}
+
+fn err_agent(err: &AgentError) -> Vec<u8> {
+    WireNativeResult::err(err.kind, err.message.clone()).to_vec()
+}
+
+fn read_string(env: &Env, value: &JString<'_>) -> jni::errors::Result<String> {
+    value.try_to_string(env)
+}
+
 fn with_session<T>(f: impl FnOnce(&AgentSession) -> Result<T>) -> Result<T> {
     let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let session = guard
         .as_ref()
-        .context("agent is not running; call nativeStart first")?;
+        .ok_or_else(|| anyhow::anyhow!("agent session is missing; call nativeStart first"))?;
     f(session)
 }
 
-fn json_of<T: serde::Serialize>(value: T) -> Result<serde_json::Value> {
-    serde_json::to_value(value).context("serialize response")
-}
-
-/// Start the embedded agent. `service` must implement
-/// `int establishTun(String[] addrs, String[] routes, String[] dns, int mtu)`,
-/// matching the JNI descriptor used below.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStart(
-    mut env: JNIEnv,
-    _class: JClass,
-    state_dir: JString,
-    device_name: JString,
-    service: JObject,
-) -> jstring {
-    let result = (|| -> Result<serde_json::Value> {
-        init_logging();
-
-        let state_dir = read_string(&mut env, &state_dir)?;
-        let device_name = read_string(&mut env, &device_name)?;
-
-        let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_some() {
-            bail!("agent is already running");
-        }
-
-        // Before anything that might touch TLS: platform-verifier code paths
-        // fetch this context lazily, including inside the join flow itself.
-        init_android_context(&mut env, &service)?;
-
-        // Install the tunnel bridge before starting: the agent establishes the
-        // TUN during startup, so a provider registered afterwards is too late.
-        let provider = JvmTunProvider {
-            vm: env.get_java_vm().context("obtain JavaVM")?,
-            service: env
-                .new_global_ref(service)
-                .context("pin VpnService reference")?,
-        };
-        android_tun::set_provider(Box::new(provider));
-
-        match AgentSession::start(&state_dir, &device_name) {
-            Ok(session) => {
-                *guard = Some(session);
-                Ok(serde_json::json!({ "state_dir": state_dir, "hostname": device_name }))
-            }
-            Err(e) => {
-                // Leaving a live provider behind would let a dead agent
-                // establish a tunnel on a later callback.
-                android_tun::clear_provider();
-                Err(e)
-            }
-        }
-    })();
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
-}
-
-/// Stop the agent and tear the tunnel down. Idempotent.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStop(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    // The lock is held across stop(), not just across take(). Releasing it
-    // first leaves a window where `nativeStart` sees `None` and starts a second
-    // agent against the same state dir while the first is still draining: two
-    // endpoints on one identity, two writers on the same sealed state, and a
-    // second bind of the socket the first still holds.
-    let stopped = {
-        let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        android_tun::clear_provider();
-        match guard.take() {
-            Some(session) => {
-                session.stop();
-                true
-            }
-            None => false,
-        }
+fn install_provider(env: &mut Env, service: &JObject) -> Result<()> {
+    let provider = JvmTunProvider {
+        vm: env.get_java_vm().context("obtain JavaVM")?,
+        service: env
+            .new_global_ref(service)
+            .context("pin VpnService reference")?,
     };
-
-    let payload = ok_json(serde_json::json!({ "stopped": stopped }));
-    to_jstring(&mut env, payload)
+    android_tun::set_provider(Box::new(provider));
+    Ok(())
 }
 
-/// Node status: mode, endpoint id, networks, and whether the data plane is up.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStatus(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    let result = with_session(|session| {
-        // An agent that died after startup leaves this session in place, so a
-        // failed query here is ambiguous: transient, or a corpse. Report the
-        // agent's own exit error when there is one, so the app can leave
-        // "connected" instead of decorating it with a socket error forever.
-        if let Some(cause) = session.exit_error() {
-            bail!("agent is not running: {cause}");
+struct JvmMulticastHost {
+    vm: JavaVM,
+    service: Global<JObject<'static>>,
+}
+
+impl MulticastHost for JvmMulticastHost {
+    fn set_held(&self, held: bool) {
+        let result = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<()> {
+                env.call_method(
+                    &self.service,
+                    jni_str!("setMulticastDemand"),
+                    jni_sig!("(Z)V"),
+                    &[JValue::Bool(held)],
+                )?;
+                Ok(())
+            });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "setMulticastDemand failed");
         }
-        let node = session
-            .block_on(session.client().node())
-            .context("query node status")?;
-        json_of(node)
-    });
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
+    }
 }
 
-/// Join a Direct network with an invite code.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeJoin(
-    mut env: JNIEnv,
-    _class: JClass,
-    invite_code: JString,
-    hostname: JString,
-) -> jstring {
-    let result = (|| -> Result<serde_json::Value> {
-        let invite_code = read_string(&mut env, &invite_code)?;
-        let hostname = crate::session::sanitize_hostname(&read_string(&mut env, &hostname)?);
-        if invite_code.trim().is_empty() {
-            bail!("invite code is empty");
+fn install_multicast_host(env: &mut Env, service: &JObject) -> Result<()> {
+    let host = JvmMulticastHost {
+        vm: env.get_java_vm().context("obtain JavaVM")?,
+        service: env
+            .new_global_ref(service)
+            .context("pin VpnService multicast host")?,
+    };
+    set_multicast_host(Box::new(host));
+    Ok(())
+}
+
+struct JvmUnderlayProtect {
+    vm: JavaVM,
+    service: Global<JObject<'static>>,
+}
+
+impl UnderlayProtect for JvmUnderlayProtect {
+    fn protect_fd(&self, fd: i32) {
+        let result = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<()> {
+                env.call_method(
+                    &self.service,
+                    jni_str!("protectSocket"),
+                    jni_sig!("(I)V"),
+                    &[JValue::Int(fd)],
+                )?;
+                Ok(())
+            });
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "protectSocket failed");
         }
+    }
+}
 
-        let request = NetworkJoinRequest {
-            invite_code: invite_code.trim().to_string(),
-            hostname: Some(hostname).filter(|h| !h.trim().is_empty()),
-            // The phone is joining someone else's network and cannot answer a
-            // firewall prompt mid-join, so accept the network's policy.
-            auto_accept_firewall: true,
-            no_encrypt_state: false,
-        };
+fn install_underlay_protect(env: &mut Env, service: &JObject) -> Result<()> {
+    let host = JvmUnderlayProtect {
+        vm: env.get_java_vm().context("obtain JavaVM")?,
+        service: env
+            .new_global_ref(service)
+            .context("pin VpnService underlay protect")?,
+    };
+    set_underlay_protect(Box::new(host));
+    Ok(())
+}
 
-        with_session(|session| {
-            let response = session
-                .block_on(session.client().network_join(&request))
-                .context("join network")?;
-            json_of(response)
+fn drop_host_bridges() {
+    android_tun::clear_provider();
+    clear_multicast_host();
+    clear_underlay_protect();
+}
+
+/// Contract: one agent per process. A second call rebinds the TUN provider to
+/// `service` and does not create another runtime.
+fn attach_or_start(
+    env: &mut Env,
+    state_dir: &str,
+    device_name: &str,
+    service: &JObject,
+) -> Result<()> {
+    init_android_context(env, service)?;
+    install_provider(env, service)?;
+    install_multicast_host(env, service)?;
+    install_underlay_protect(env, service)?;
+    install_sealer(env)?;
+
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(session) = guard.as_ref() {
+        tracing::info!("nativeStart rebound TUN provider; existing agent kept");
+        start_delivery(env.get_java_vm()?, session.latest().clone())?;
+        return Ok(());
+    }
+
+    match AgentSession::start(state_dir, device_name) {
+        Ok(session) => {
+            tracing::info!("nativeStart created agent runtime");
+            start_delivery(env.get_java_vm()?, session.latest().clone())?;
+            *guard = Some(session);
+            Ok(())
+        }
+        Err(e) => {
+            drop_host_bridges();
+            Err(e)
+        }
+    }
+}
+
+fn stop_session() {
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(session) = guard.take() {
+        session.stop();
+    }
+    drop_host_bridges();
+    drop(guard);
+    stop_delivery();
+}
+
+fn start_delivery(vm: JavaVM, latest: Arc<LatestSlot>) -> Result<()> {
+    let mut delivery = DELIVERY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = delivery.as_ref()
+        && !existing.latest.is_closed()
+    {
+        return Ok(());
+    }
+    if let Some(old) = delivery.take() {
+        old.latest.close();
+        let _ = old.thread.join();
+    }
+    let slot = latest.clone();
+    let thread = std::thread::Builder::new()
+        .name("tunnet-snap".into())
+        .spawn(move || {
+            let mut seen = 0u64;
+            while let Some((seq, bytes)) = slot.wait_after(seen) {
+                seen = seq;
+                let _ = catch_unwind(AssertUnwindSafe(|| push_snapshot(&vm, &bytes)));
+            }
         })
-    })();
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
+        .context("snapshot delivery thread")?;
+    *delivery = Some(Delivery { latest, thread });
+    Ok(())
 }
 
-/// Peers of `network_id`, for the peer list.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativePeers(
-    mut env: JNIEnv,
-    _class: JClass,
-    network_id: JString,
-) -> jstring {
-    let result = (|| -> Result<serde_json::Value> {
-        let network_id = read_string(&mut env, &network_id)?;
-        with_session(|session| {
-            let peers = session
-                .block_on(session.client().network_peers(&network_id))
-                .context("query peers")?;
-            json_of(peers)
+fn stop_delivery() {
+    let mut delivery = DELIVERY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = delivery.take() {
+        old.latest.close();
+        let _ = old.thread.join();
+    }
+}
+
+fn push_snapshot(vm: &JavaVM, bytes: &[u8]) {
+    let listener = {
+        let g = LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|l| (l.obj.clone(), l.epoch))
+    };
+    let Some((obj, epoch)) = listener else {
+        return;
+    };
+    let _ = vm.attach_current_thread(|env| -> jni::errors::Result<()> {
+        if LISTENER_EPOCH.load(Ordering::SeqCst) != epoch {
+            return Ok(());
+        }
+        let array = env.byte_array_from_slice(bytes)?;
+        env.call_method(
+            obj.as_obj(),
+            jni_str!("onSnapshot"),
+            jni_sig!("([B)V"),
+            &[JValue::from(&array)],
+        )?;
+        Ok(())
+    });
+}
+
+fn deliver_current(env: &mut Env) -> jni::errors::Result<()> {
+    let latest = {
+        let g = DELIVERY.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|d| d.latest.clone())
+    };
+    let Some((_, bytes)) = latest.as_ref().and_then(|s| s.current()) else {
+        return Ok(());
+    };
+    let listener = {
+        let g = LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|l| (l.obj.clone(), l.epoch))
+    };
+    let Some((obj, epoch)) = listener else {
+        return Ok(());
+    };
+    if LISTENER_EPOCH.load(Ordering::SeqCst) != epoch {
+        return Ok(());
+    }
+    let array = env.byte_array_from_slice(&bytes)?;
+    env.call_method(
+        obj.as_obj(),
+        jni_str!("onSnapshot"),
+        jni_sig!("([B)V"),
+        &[JValue::from(&array)],
+    )?;
+    Ok(())
+}
+
+fn replace_listener(env: &mut Env, listener: &JObject) -> jni::errors::Result<()> {
+    let epoch = LISTENER_EPOCH
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let mut g = LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+    *g = if listener.is_null() {
+        None
+    } else {
+        Some(PinnedListener {
+            obj: Arc::new(env.new_global_ref(listener)?),
+            epoch,
         })
-    })();
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
+    };
+    Ok(())
 }
 
-/// Bring the data plane up (establishes a tunnel through the provider).
+/// Start or attach the embedded agent.
+///
+/// `service` must implement
+/// `int establishTun(...)` and `void protectSocket(int fd)`.
+///
+/// Idempotent: a second start in this process rebinds the TUN provider to the
+/// new Service and does not create a second runtime.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeUp(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    let result = with_session(|session| {
-        let response = session
-            .block_on(session.client().data_plane_up())
-            .context("bring data plane up")?;
-        json_of(response)
-    });
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStart<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    state_dir: JString<'local>,
+    device_name: JString<'local>,
+    service: JObject<'local>,
+) -> JByteArray<'local> {
+    unowned
+        .with_env(|env| -> jni::errors::Result<JByteArray> {
+            init_logging();
+            let bytes = (|| -> Result<Vec<u8>> {
+                let state_dir = read_string(env, &state_dir).context("state dir")?;
+                let device_name = read_string(env, &device_name).context("device name")?;
+                attach_or_start(env, &state_dir, &device_name, &service)?;
+                Ok(ok_bytes())
+            })();
+            match bytes {
+                Ok(b) => env.byte_array_from_slice(&b),
+                Err(e) => env.byte_array_from_slice(&err_anyhow(&e)),
+            }
+        })
+        .resolve::<LogAndDefault>()
 }
 
-/// Take the data plane down without stopping the agent.
+/// Stop the agent if it is running. Harmless when already stopped.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeDown(
-    mut env: JNIEnv,
-    _class: JClass,
-) -> jstring {
-    let result = with_session(|session| {
-        let response = session
-            .block_on(session.client().data_plane_down())
-            .context("bring data plane down")?;
-        json_of(response)
-    });
-
-    let payload = envelope(result);
-    to_jstring(&mut env, payload)
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeStop<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> JByteArray<'local> {
+    unowned
+        .with_env(|env| -> jni::errors::Result<JByteArray> {
+            stop_session();
+            env.byte_array_from_slice(&ok_bytes())
+        })
+        .resolve::<LogAndDefault>()
 }
 
-/// Route `tracing` into logcat once, so `adb logcat -s tunnet` shows agent logs.
+/// Drop the TUN provider for a destroyed Service without stopping the agent.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeReleaseHost<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) {
+    unowned
+        .with_env(|_env| -> jni::errors::Result<()> {
+            drop_host_bridges();
+            Ok(())
+        })
+        .resolve::<LogAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeSetSnapshotListener<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    listener: JObject<'local>,
+) {
+    unowned
+        .with_env(|env| -> jni::errors::Result<()> {
+            replace_listener(env, &listener)?;
+            if !listener.is_null() {
+                deliver_current(env)?;
+            }
+            Ok(())
+        })
+        .resolve::<LogAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeJoin<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    invite_code: JString<'local>,
+    hostname: JString<'local>,
+) -> JByteArray<'local> {
+    unowned
+        .with_env(|env| -> jni::errors::Result<JByteArray> {
+            let invite_code = match read_string(env, &invite_code) {
+                Ok(s) => s,
+                Err(e) => {
+                    return env.byte_array_from_slice(&err_anyhow(&anyhow::anyhow!(e)));
+                }
+            };
+            let hostname = match read_string(env, &hostname) {
+                Ok(s) => sanitize_hostname(&s),
+                Err(e) => {
+                    return env.byte_array_from_slice(&err_anyhow(&anyhow::anyhow!(e)));
+                }
+            };
+            if invite_code.trim().is_empty() {
+                return env.byte_array_from_slice(&err_agent(&AgentError::new(
+                    AgentErrorKind::InvalidRequest,
+                    "invite code is empty",
+                )));
+            }
+            let request = JoinRequest {
+                invite_code: invite_code.trim().to_string(),
+                hostname: Some(hostname).filter(|h| !h.trim().is_empty()),
+                auto_accept_firewall: true,
+                no_encrypt_state: false,
+            };
+            let bytes = match with_session(|session| {
+                Ok(session.block_on(session.handle().join(request)))
+            }) {
+                Err(e) => err_anyhow(&e),
+                Ok(Ok(_)) => ok_bytes(),
+                Ok(Err(e)) => err_agent(&e),
+            };
+            env.byte_array_from_slice(&bytes)
+        })
+        .resolve::<LogAndDefault>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeSetLanAvailable<'local>(
+    mut unowned: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    available: bool,
+) {
+    unowned
+        .with_env(|_env| -> jni::errors::Result<()> {
+            tunnet_agent::set_lan_available(available);
+            Ok(())
+        })
+        .resolve::<LogAndDefault>()
+}
+
 fn init_logging() {
     use std::sync::Once;
     static ONCE: Once = Once::new();

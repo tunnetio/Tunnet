@@ -150,7 +150,7 @@ pub fn answer_ptr(
         response.metadata.response_code = ResponseCode::NoError;
         return Some(response);
     }
-    if ip == tunnet_common::LocalResolverEndpoint::default().ip {
+    if tunnet_common::resolver_self_ips().contains(&ip) {
         let ns = Name::from_utf8(format!("ns.{suffix}."))
             .unwrap_or_else(|_| Name::from_utf8("ns.tunnet.").expect("literal"));
         response.add_answer(Record::from_rdata(

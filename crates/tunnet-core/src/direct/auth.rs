@@ -155,7 +155,11 @@ impl EndpointHooks for DirectAuthHook {
         if self.auth.contains(&peer_hex) {
             AfterHandshakeOutcome::Accept
         } else {
-            tracing::debug!(%peer_hex, "inbound connection blocked (not authenticated)");
+            tracing::warn!(
+                %peer_hex,
+                alpn = %String::from_utf8_lossy(alpn),
+                "inbound connection blocked (not authenticated)"
+            );
             AfterHandshakeOutcome::Reject {
                 error_code: crate::transport_auth::CLOSE_AUTH_REQUIRED.into(),
                 reason: crate::transport_auth::CLOSE_AUTH_REQUIRED_REASON.to_vec(),

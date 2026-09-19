@@ -20,10 +20,12 @@ use tunnet_core::{CoreNode, StatePaths};
 use uuid::Uuid;
 
 use super::dataplane::{BringDown, DataPlaneActor};
+#[cfg(feature = "posture")]
 use super::posture::{
     ApplyPostureConfig, ApplyRemoteAgentPolicy, PostureActor, PostureStatusChanged, Recheck,
 };
 use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
+#[cfg(feature = "ssh")]
 use super::ssh_registry::SshRegistryActor;
 use crate::system_routes::desired_from_membership;
 
@@ -40,7 +42,9 @@ pub struct ControlPlaneActorArgs {
     /// Late-bound by the supervisor (`SetRouteActor`); `None` until wired.
     pub route_actor: Option<ActorRef<RouteActor>>,
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
+    #[cfg(feature = "posture")]
     pub posture_actor: Option<ActorRef<PostureActor>>,
+    #[cfg(feature = "ssh")]
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
 }
 
@@ -75,7 +79,7 @@ impl Actor for ControlPlaneActor {
         // Drive the node's own link object (when present) so Local API
         // status and event wiring observe the live transport. The link is a
         // read model; the actor owns the task driving it. Restarts reuse the
-        // same link — it never becomes stale.
+        // same link - it never becomes stale.
         let link = args
             .node
             .control_link
@@ -196,6 +200,7 @@ impl Actor for ControlPlaneActor {
         let revisions = args.node.revisions.clone();
         // Route serve/send reports through this transport (overwrites the dead
         // bootstrap senders; bootstrap spawns no transport task).
+        #[cfg(feature = "local-api")]
         args.node.serves.set_client_tx(client_tx.clone());
         args.node.send.set_client_tx(client_tx.clone());
         // Say hello (best-effort, bounded).
@@ -328,17 +333,32 @@ impl ControlPlaneActor {
                             tracing::debug!("route actor not wired yet; skipping route apply");
                         }
                     }
-                    if let Some(posture) = self.cfg.posture_actor.clone() {
-                        let _ = posture
-                            .tell(ApplyRemoteAgentPolicy {
-                                policy,
-                                paths,
-                                store,
-                                version: crate::actors::ControlVersion::Snapshot(network_version),
-                            })
-                            .send()
-                            .await;
-                    } else {
+                    let posture_forwarded = {
+                        #[cfg(feature = "posture")]
+                        {
+                            if let Some(posture) = self.cfg.posture_actor.clone() {
+                                let _ = posture
+                                    .tell(ApplyRemoteAgentPolicy {
+                                        policy: policy.clone(),
+                                        paths: paths.clone(),
+                                        store: store.clone(),
+                                        version: crate::actors::ControlVersion::Snapshot(
+                                            network_version,
+                                        ),
+                                    })
+                                    .send()
+                                    .await;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        #[cfg(not(feature = "posture"))]
+                        {
+                            false
+                        }
+                    };
+                    if !posture_forwarded {
                         let local = tunnet_core::TunnetConfig::try_load(&paths)
                             .ok()
                             .flatten()
@@ -456,58 +476,90 @@ impl ControlPlaneActor {
                 allowed_endpoint_ids,
                 target_addr,
             } => {
-                let mgr = node.serves.clone();
-                let tx = self.client_tx.clone();
-                tokio::spawn(async move {
-                    let parsed_target = target_addr
-                        .as_deref()
-                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
-                    let result = mgr
-                        .start(
-                            serve_id.clone(),
-                            port,
-                            &protocol,
-                            &internal_hostname,
-                            certificate_pem.as_deref(),
-                            private_key_pem.as_deref(),
-                            tunnet_core::serve::ServeAcl {
-                                access_mode,
-                                allowed_tags,
-                                allowed_endpoint_ids,
-                            },
-                            parsed_target,
-                            true,
-                        )
-                        .await;
-                    match result {
-                        Ok(_) => {
-                            let _ = tx.send(ClientMsg::ServeReady { serve_id }).await;
+                #[cfg(feature = "local-api")]
+                {
+                    let mgr = node.serves.clone();
+                    let tx = self.client_tx.clone();
+                    tokio::spawn(async move {
+                        let parsed_target = target_addr
+                            .as_deref()
+                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+                        let result = mgr
+                            .start(
+                                serve_id.clone(),
+                                port,
+                                &protocol,
+                                &internal_hostname,
+                                certificate_pem.as_deref(),
+                                private_key_pem.as_deref(),
+                                tunnet_core::serve::ServeAcl {
+                                    access_mode,
+                                    allowed_tags,
+                                    allowed_endpoint_ids,
+                                },
+                                parsed_target,
+                                true,
+                            )
+                            .await;
+                        match result {
+                            Ok(_) => {
+                                let _ = tx.send(ClientMsg::ServeReady { serve_id }).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, %serve_id, "StartServe failed");
+                                let _ = tx
+                                    .send(ClientMsg::ServeFailed {
+                                        serve_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(?e, %serve_id, "StartServe failed");
-                            let _ = tx
-                                .send(ClientMsg::ServeFailed {
-                                    serve_id,
-                                    error: e.to_string(),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                    });
+                }
+                #[cfg(not(feature = "local-api"))]
+                {
+                    let _ = (
+                        serve_id,
+                        port,
+                        protocol,
+                        internal_hostname,
+                        certificate_pem,
+                        private_key_pem,
+                        access_mode,
+                        allowed_tags,
+                        allowed_endpoint_ids,
+                        target_addr,
+                    );
+                }
             }
             ServerMsg::ReconcileServes { serve_ids } => {
-                let mgr = node.serves.clone();
-                tokio::spawn(async move {
-                    mgr.reconcile_managed(&serve_ids).await;
-                });
+                #[cfg(feature = "local-api")]
+                {
+                    let mgr = node.serves.clone();
+                    tokio::spawn(async move {
+                        mgr.reconcile_managed(&serve_ids).await;
+                    });
+                }
+                #[cfg(not(feature = "local-api"))]
+                {
+                    let _ = serve_ids;
+                }
             }
             ServerMsg::StopServe { serve_id } => {
-                let mgr = node.serves.clone();
-                let tx = self.client_tx.clone();
-                tokio::spawn(async move {
-                    let _ = mgr.stop_by_id(&serve_id).await;
-                    let _ = tx.send(ClientMsg::ServeStopped { serve_id }).await;
-                });
+                #[cfg(feature = "local-api")]
+                {
+                    let mgr = node.serves.clone();
+                    let tx = self.client_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = mgr.stop_by_id(&serve_id).await;
+                        let _ = tx.send(ClientMsg::ServeStopped { serve_id }).await;
+                    });
+                }
+                #[cfg(not(feature = "local-api"))]
+                {
+                    let _ = serve_id;
+                }
             }
             ServerMsg::OpenTunnel {
                 tunnel_id,
@@ -520,53 +572,78 @@ impl ControlPlaneActor {
                 redirect_rules,
                 target_addr,
             } => {
-                let mgr = node.tunnels.clone();
-                let tx = self.client_tx.clone();
-                tokio::spawn(async move {
-                    let parsed_target = target_addr
-                        .as_deref()
-                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
-                    match mgr
-                        .start(
-                            tunnel_id.clone(),
-                            &edge_addr,
-                            &subdomain,
-                            &public_hostname,
-                            local_port,
-                            &protocol,
-                            &auth_token,
-                            redirect_rules,
-                            parsed_target,
-                            false,
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(info) => {
-                            tracing::info!(url = %info.public_url, "OpenTunnel active");
-                            let _ = tx.send(ClientMsg::TunnelReady { tunnel_id }).await;
+                #[cfg(feature = "local-api")]
+                {
+                    let mgr = node.tunnels.clone();
+                    let tx = self.client_tx.clone();
+                    tokio::spawn(async move {
+                        let parsed_target = target_addr
+                            .as_deref()
+                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+                        match mgr
+                            .start(
+                                tunnel_id.clone(),
+                                &edge_addr,
+                                &subdomain,
+                                &public_hostname,
+                                local_port,
+                                &protocol,
+                                &auth_token,
+                                redirect_rules,
+                                parsed_target,
+                                false,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(info) => {
+                                tracing::info!(url = %info.public_url, "OpenTunnel active");
+                                let _ = tx.send(ClientMsg::TunnelReady { tunnel_id }).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, %tunnel_id, "OpenTunnel failed");
+                                let _ = tx
+                                    .send(ClientMsg::TunnelFailed {
+                                        tunnel_id,
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(?e, %tunnel_id, "OpenTunnel failed");
-                            let _ = tx
-                                .send(ClientMsg::TunnelFailed {
-                                    tunnel_id,
-                                    error: e.to_string(),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                    });
+                }
+                #[cfg(not(feature = "local-api"))]
+                {
+                    let _ = (
+                        tunnel_id,
+                        edge_addr,
+                        subdomain,
+                        public_hostname,
+                        local_port,
+                        protocol,
+                        auth_token,
+                        redirect_rules,
+                        target_addr,
+                    );
+                }
             }
             ServerMsg::StopTunnel { tunnel_id } => {
-                let mgr = node.tunnels.clone();
-                let tx = self.client_tx.clone();
-                tokio::spawn(async move {
-                    let _ = mgr.stop(&tunnel_id);
-                    let _ = tx.send(ClientMsg::TunnelStopped { tunnel_id }).await;
-                });
+                #[cfg(feature = "local-api")]
+                {
+                    let mgr = node.tunnels.clone();
+                    let tx = self.client_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = mgr.stop(&tunnel_id);
+                        let _ = tx.send(ClientMsg::TunnelStopped { tunnel_id }).await;
+                    });
+                }
+                #[cfg(not(feature = "local-api"))]
+                {
+                    let _ = tunnel_id;
+                }
             }
             ServerMsg::KillSshSession { session_id } => {
+                #[cfg(feature = "ssh")]
                 if let Some(reg) = self.cfg.ssh_registry.clone() {
                     tokio::spawn(async move {
                         use super::ssh_registry::KillSession;
@@ -574,6 +651,10 @@ impl ControlPlaneActor {
                     });
                 } else {
                     tracing::warn!(%session_id, "KillSshSession ignored (registry not wired)");
+                }
+                #[cfg(not(feature = "ssh"))]
+                {
+                    let _ = session_id;
                 }
             }
             ServerMsg::SendFile {
@@ -642,7 +723,9 @@ impl ControlPlaneActor {
                     mgr.set_config(cfg);
                 });
             }
-            ServerMsg::PostureRecheck => {
+            ServerMsg::PostureRecheck =>
+            {
+                #[cfg(feature = "posture")]
                 if let Some(p) = &self.cfg.posture_actor {
                     let p = p.clone();
                     tokio::spawn(async move {
@@ -650,6 +733,7 @@ impl ControlPlaneActor {
                     });
                 }
             }
+            #[cfg(feature = "posture")]
             ServerMsg::PostureConfigUpdate {
                 interval_secs,
                 enabled_collectors,
@@ -669,6 +753,9 @@ impl ControlPlaneActor {
                     });
                 }
             }
+            #[cfg(not(feature = "posture"))]
+            ServerMsg::PostureConfigUpdate { .. } => {}
+            #[cfg(feature = "posture")]
             ServerMsg::AgentConfigUpdate { policy } => {
                 if let Some(p) = &self.cfg.posture_actor {
                     let p = p.clone();
@@ -680,8 +767,6 @@ impl ControlPlaneActor {
                                 policy,
                                 paths,
                                 store,
-                                // Direct operator command, not snapshot
-                                // state: explicit intent always applies.
                                 version: crate::actors::ControlVersion::Local,
                             })
                             .send()
@@ -689,6 +774,9 @@ impl ControlPlaneActor {
                     });
                 }
             }
+            #[cfg(not(feature = "posture"))]
+            ServerMsg::AgentConfigUpdate { .. } => {}
+            #[cfg(feature = "posture")]
             ServerMsg::PostureStatus {
                 postures,
                 enforcement_action,
@@ -710,6 +798,8 @@ impl ControlPlaneActor {
                     });
                 }
             }
+            #[cfg(not(feature = "posture"))]
+            ServerMsg::PostureStatus { .. } => {}
         }
     }
 }
@@ -828,7 +918,7 @@ impl Message<GetControlStatus> for ControlPlaneActor {
 
 /// The owned transport task ended without cancellation. Abnormal: the
 /// supervisor must restart us (the transport is recreated in `on_start`).
-/// Normal network disconnects never produce this — the transport reconnects
+/// Normal network disconnects never produce this - the transport reconnects
 /// internally and only returns when cancelled.
 struct TransportExited;
 
@@ -890,8 +980,10 @@ impl Message<SetDataPlaneActor> for ControlPlaneActor {
 }
 
 /// Late-bind the posture actor.
+#[cfg(feature = "posture")]
 pub struct SetPostureActor(pub Option<ActorRef<PostureActor>>);
 
+#[cfg(feature = "posture")]
 impl Message<SetPostureActor> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, msg: SetPostureActor, _ctx: &mut Context<Self, Self::Reply>) {
@@ -920,6 +1012,7 @@ mod tests {
             super::super::routes::RouteActorArgs,
             kameo::mailbox::bounded(super::super::ROUTE_MAILBOX),
         );
+        #[cfg(feature = "ssh")]
         let ssh = SshRegistryActor::spawn_with_mailbox(
             (),
             kameo::mailbox::bounded(super::super::SSH_REGISTRY_MAILBOX),
@@ -930,7 +1023,7 @@ mod tests {
         ControlPlaneActorArgs {
             transport: TransportConfig {
                 // Nothing listens here: connect fails fast (refused) and the
-                // transport backs off — offline-safe.
+                // transport backs off - offline-safe.
                 control_url: "http://127.0.0.1:9".into(),
                 endpoint_id,
                 signing_key,
@@ -943,7 +1036,9 @@ mod tests {
             poll_secs: 30,
             route_actor: Some(route),
             dataplane_actor: None,
+            #[cfg(feature = "posture")]
             posture_actor: None,
+            #[cfg(feature = "ssh")]
             ssh_registry: Some(ssh),
         }
     }

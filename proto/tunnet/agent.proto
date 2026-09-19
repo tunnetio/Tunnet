@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package tunnet.agent;
+
+option java_package = "io.tunnet.android.wire";
+option java_outer_classname = "AgentProto";
+option java_multiple_files = true;
+
+// Host snapshot and command result. Field numbers are the compatibility
+// contract: never reuse a number after it has been published. Hosts (Android,
+// later iOS) generate language bindings from this file; Java options apply
+// only to the Android generator.
+//
+// Closed domains are enums. Unknown future numeric values must be preserved
+// as-is and treated as unrecognized by the host, not mapped onto an existing
+// variant. Diagnostic `message` text is for display and logs, never control
+// flow. Branch on `ErrorKind`.
+
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_IDLE = 1;
+  LIFECYCLE_JOINING = 2;
+  LIFECYCLE_ACTIVATING = 3;
+  LIFECYCLE_RUNNING = 4;
+  LIFECYCLE_STOPPING = 5;
+  LIFECYCLE_FAILED = 6;
+  LIFECYCLE_STOPPED = 7;
+}
+
+enum Mode {
+  MODE_UNSPECIFIED = 0;
+  MODE_IDLE = 1;
+  MODE_DIRECT = 2;
+  MODE_MANAGED = 3;
+}
+
+enum DataPlane {
+  DATA_PLANE_UNSPECIFIED = 0;
+  DATA_PLANE_DOWN = 1;
+  DATA_PLANE_UP = 2;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_COORDINATOR = 1;
+  ROLE_MEMBER = 2;
+  ROLE_MANAGED = 3;
+}
+
+enum PeerPath {
+  PEER_PATH_UNSPECIFIED = 0;
+  PEER_PATH_DIRECT = 1;
+  PEER_PATH_RELAY = 2;
+}
+
+enum PeerConn {
+  PEER_CONN_UNSPECIFIED = 0;
+  PEER_CONN_CONNECTED = 1;
+  PEER_CONN_DIALING = 2;
+  PEER_CONN_IDLE = 3;
+  PEER_CONN_BACKOFF = 4;
+  PEER_CONN_BLOCKED = 5;
+  PEER_CONN_REJECTED = 6;
+}
+
+enum ErrorKind {
+  ERROR_KIND_UNSPECIFIED = 0;
+  ERROR_KIND_NOT_JOINED = 1;
+  ERROR_KIND_ALREADY_JOINED = 2;
+  ERROR_KIND_INVALID_REQUEST = 3;
+  ERROR_KIND_JOIN_FAILED = 4;
+  ERROR_KIND_ACTIVATE_FAILED = 5;
+  ERROR_KIND_DATA_PLANE = 6;
+  ERROR_KIND_BUSY = 7;
+  ERROR_KIND_STOPPED = 8;
+  ERROR_KIND_FAILED = 9;
+  ERROR_KIND_INTERNAL = 10;
+}
+
+message SnapshotError {
+  ErrorKind kind = 1;
+  string message = 2;
+}
+
+message Network {
+  string network_id = 1;
+  string network_name = 2;
+  string ip = 3;
+  Mode mode = 4;
+  Role role = 5;
+  uint32 peers_total = 6;
+  uint32 peers_online = 7;
+}
+
+message Peer {
+  string network_id = 1;
+  string ip = 2;
+  string hostname = 3;
+  string endpoint_id = 4;
+  repeated string tags = 5;
+  optional bool online = 6;
+  optional double latency_ms = 7;
+  optional PeerConn conn_state = 8;
+  optional PeerPath path = 9;
+  optional uint64 bytes_in = 10;
+  optional uint64 bytes_out = 11;
+  optional uint64 last_seen_secs_ago = 12;
+  optional bool keep_alive = 13;
+  optional string ssh_host_key = 14;
+}
+
+message Snapshot {
+  Lifecycle lifecycle = 1;
+  Mode mode = 2;
+  string endpoint_id = 3;
+  string hostname = 4;
+  DataPlane data_plane = 5;
+  uint64 uptime_secs = 6;
+  repeated Network networks = 7;
+  repeated Peer peers = 8;
+  optional SnapshotError error = 9;
+}
+
+message NativeResult {
+  bool ok = 1;
+  ErrorKind kind = 2;
+  string message = 3;
+}

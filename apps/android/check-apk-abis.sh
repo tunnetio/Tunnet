@@ -34,10 +34,18 @@ for abi in "${required_abis[@]}"; do
   fi
 done
 
-# The library must actually export the JNI entry points. A missing export is an
-# UnsatisfiedLinkError on first use, not a build error, and the ABI check above
-# would still pass because the file is present.
-#
+required_exports=(
+  "Java_io_tunnet_android_TunnetNative_nativeStart"
+  "Java_io_tunnet_android_TunnetNative_nativeStop"
+  "Java_io_tunnet_android_TunnetNative_nativeReleaseHost"
+  "Java_io_tunnet_android_TunnetNative_nativeJoin"
+  "Java_io_tunnet_android_TunnetNative_nativeSetSnapshotListener"
+  "Java_io_tunnet_android_TunnetNative_nativeSetLanAvailable"
+)
+forbidden_exports=(
+  "Java_io_tunnet_android_TunnetNative_nativeUp"
+  "Java_io_tunnet_android_TunnetNative_nativeDown"
+)
 # Note this does NOT guard against `strip = "symbols"` in the release profile,
 # despite what an earlier version of this comment claimed: stripping removes
 # debug and local symbols, while JNI exports live in `.dynsym` and are required
@@ -51,8 +59,17 @@ nm=""
 if command -v llvm-nm >/dev/null 2>&1; then
   nm="llvm-nm"
 elif [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
-  candidate="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
-  [[ -x "$candidate" ]] && nm="$candidate"
+  for prebuilt in linux-x86_64 windows-x86_64 darwin-x86_64; do
+    candidate="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$prebuilt/bin/llvm-nm"
+    if [[ -x "$candidate" ]]; then
+      nm="$candidate"
+      break
+    fi
+    if [[ -x "${candidate}.exe" ]]; then
+      nm="${candidate}.exe"
+      break
+    fi
+  done
 fi
 
 if [[ -z "$nm" ]]; then
@@ -62,12 +79,26 @@ else
   trap 'rm -rf "$workdir"' EXIT
   for abi in "${required_abis[@]}"; do
     unzip -o -q "$apk" "lib/$abi/$lib" -d "$workdir"
-    if "$nm" -D --defined-only "$workdir/lib/$abi/$lib" 2>/dev/null | grep -q "Java_io_tunnet"; then
-      echo "ok: $abi exports Java_io_tunnet_*"
-    else
+    defined="$("$nm" -D --defined-only "$workdir/lib/$abi/$lib" 2>/dev/null || true)"
+    if ! grep -q "Java_io_tunnet" <<<"$defined"; then
       echo "FAIL: $abi exports no Java_io_tunnet_*; wrong crate-type, renamed package, or hidden visibility" >&2
       missing=1
+      continue
     fi
+    for sym in "${required_exports[@]}"; do
+      if grep -q "$sym" <<<"$defined"; then
+        echo "ok: $abi exports $sym"
+      else
+        echo "FAIL: $abi missing $sym" >&2
+        missing=1
+      fi
+    done
+    for sym in "${forbidden_exports[@]}"; do
+      if grep -q "$sym" <<<"$defined"; then
+        echo "FAIL: $abi still exports removed $sym" >&2
+        missing=1
+      fi
+    done
   done
 fi
 

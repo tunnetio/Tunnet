@@ -7,13 +7,12 @@
 //!
 //! Two layers, split so the JVM-free half stays testable on the host:
 //!
-//! * [`session`] - agent lifecycle and Local API access. Platform-agnostic.
+//! * [`session`] - owns the tokio executor around [`tunnet_agent::AgentRuntime`].
 //! * `jni_bridge` - the `Java_..._native*` exports and the `TunProvider` that
 //!   calls back into `VpnService.Builder`. Android-only.
 //!
-//! The app never speaks the mesh protocol: it drives the agent through the same
-//! Local Management API the CLI and desktop app use, so there is one control
-//! surface rather than a mobile-specific fork of it.
+//! The app never speaks the mesh protocol. It hosts the agent and drives it
+//! through the in-process runtime handle.
 
 pub mod session;
 

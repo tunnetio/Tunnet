@@ -18,9 +18,12 @@ use tunnet_core::CoreNode;
 use tunnet_core::local_api::{DataPlaneControl, DataPlaneStatusSnapshot};
 use uuid::Uuid;
 
-use super::routes::{ApplyDesiredRoutes, ClearRoutes, GetKernelRoutes, RouteActor};
+use super::routes::RouteActor;
+#[cfg(not(target_os = "android"))]
+use super::routes::{ApplyDesiredRoutes, ClearRoutes, GetKernelRoutes};
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
+#[cfg(not(target_os = "android"))]
 use crate::system_routes::desired_from_membership;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +113,7 @@ pub struct DataPlaneActor {
     metrics: AgentMetrics,
     peer_dns_active: Arc<AtomicBool>,
     events: tokio::sync::broadcast::Sender<LocalEvent>,
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     route_actor: ActorRef<RouteActor>,
     published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
@@ -119,6 +123,10 @@ pub struct DataPlaneActor {
     outbound: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
     dns_task: Option<tokio::task::JoinHandle<()>>,
+    in_tun_dns: Option<std::sync::Arc<tunnet_core::dns::InTun>>,
+    tun_if_index: Option<u32>,
+    #[cfg(target_os = "android")]
+    underlay_protect: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Actor for DataPlaneActor {
@@ -142,11 +150,15 @@ impl Actor for DataPlaneActor {
             outbound: None,
             generation_cancel: None,
             dns_task: None,
+            in_tun_dns: None,
+            tun_if_index: None,
+            #[cfg(target_os = "android")]
+            underlay_protect: None,
         };
         if auto_up {
             // Reconstruct service after (re)start from durable state.
-            // Prioritized by Kameo ahead of external messages.
-            let _ = actor_ref.tell(BringUpSelf).send().await;
+            // try_send avoids a bounded self-tell deadlock during on_start.
+            let _ = actor_ref.tell(BringUpSelf).try_send();
         }
         Ok(this)
     }
@@ -166,24 +178,32 @@ impl Actor for DataPlaneActor {
 
 impl DataPlaneActor {
     async fn direct_conflicts(&self) -> Vec<tunnet_core::direct::NetworkConflict> {
-        let (kernel, owned) = self
-            .route_actor
-            .ask(GetKernelRoutes)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "kernel route snapshot unavailable; checking interfaces only");
-                (Vec::new(), Vec::new())
-            });
-        crate::conflict::check_direct_conflicts_with_routes(
-            &self.node,
-            &self.metrics,
-            &kernel,
-            &owned,
-        )
+        #[cfg(target_os = "android")]
+        {
+            crate::conflict::check_direct_conflicts_with_routes(&self.node, &self.metrics, &[], &[])
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let (kernel, owned) = self
+                .route_actor
+                .ask(GetKernelRoutes)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "kernel route snapshot unavailable; checking interfaces only");
+                    (Vec::new(), Vec::new())
+                });
+            crate::conflict::check_direct_conflicts_with_routes(
+                &self.node,
+                &self.metrics,
+                &kernel,
+                &owned,
+            )
+        }
     }
 
+    #[cfg(not(target_os = "android"))]
     fn desired_routes(&self) -> crate::system_routes::DesiredRoutes {
-        if self.cfg.is_direct {
+        let mut desired = if self.cfg.is_direct {
             let peer_ips: Vec<Ipv4Addr> = self.node.routes.peers().iter().map(|p| p.ip).collect();
             crate::system_routes::desired_direct(
                 &self.cfg.ifname,
@@ -208,9 +228,14 @@ impl DataPlaneActor {
                 has_exit,
                 &self.cfg.underlay_hosts,
             )
+        };
+        if let Some(index) = self.tun_if_index {
+            desired.tun_if_index = Some(index);
         }
+        desired
     }
 
+    #[cfg(not(target_os = "android"))]
     async fn reconcile_routes(&self) -> Result<(), DataPlaneError> {
         tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -236,14 +261,21 @@ impl DataPlaneActor {
         if let Some(dns_task) = self.dns_task.take() {
             dns_task.abort();
         }
+        self.in_tun_dns = None;
+        #[cfg(target_os = "android")]
+        if let Some(protect) = self.underlay_protect.take() {
+            protect.abort();
+        }
         // Close tunnel connections so old ingress readers exit.
         self.node.tunnel_pool.close_all().await;
-        // Best-effort route/DNS cleanup; never fail shutdown.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.route_actor.ask(ClearRoutes),
-        )
-        .await;
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.route_actor.ask(ClearRoutes),
+            )
+            .await;
+        }
         crate::forward::teardown_exit_nat();
         if let Some(dns) = self.cfg.dns.clone() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -252,6 +284,7 @@ impl DataPlaneActor {
             .await;
         }
         self.peer_dns_active.store(false, Ordering::SeqCst);
+        self.tun_if_index = None;
         self.up = false;
         self.status.set_up(false);
     }
@@ -270,16 +303,17 @@ impl DataPlaneActor {
                 conflicts.len()
             )));
         }
+        let resolver = tunnet_core::dns::Resolver::new(self.node.routes.clone(), &self.cfg.dns_cfg)
+            .map_err(|error| DataPlaneError::Dns(format!("{error:#}")))?;
+        self.in_tun_dns = Some(tunnet_core::dns::InTun::new(resolver.clone()));
         if self.cfg.dns.is_some() {
-            self.dns_task = Some(
-                tunnet_core::dns::start(
-                    tunnet_core::dns::bind_addr(),
-                    self.node.routes.clone(),
-                    self.cfg.dns_cfg.clone(),
-                )
-                .await
-                .map_err(|error| DataPlaneError::Dns(format!("{error:#}")))?,
-            );
+            match tunnet_core::dns::listen_udp(tunnet_core::dns::bind_addr(), resolver).await {
+                Ok(task) => self.dns_task = Some(task),
+                Err(error) => {
+                    self.teardown().await;
+                    return Err(DataPlaneError::Dns(format!("{error:#}")));
+                }
+            }
         }
         let result = self.do_bring_up_mutating(self_ref).await;
         if result.is_err() {
@@ -302,6 +336,10 @@ impl DataPlaneActor {
             )
             .map_err(|e| DataPlaneError::Tun(format!("{e:#}")))?,
         );
+        #[cfg(not(target_os = "android"))]
+        {
+            self.tun_if_index = tun.if_index().ok();
+        }
         crate::system_firewall::configure(&self.cfg.ifname);
 
         let generation = self.generation.wrapping_add(1);
@@ -312,6 +350,19 @@ impl DataPlaneActor {
             cancel: cancel.clone(),
         })));
         self.generation_cancel = Some(cancel);
+
+        #[cfg(target_os = "android")]
+        {
+            if let Some(protect) = self.underlay_protect.take() {
+                protect.abort();
+            }
+            self.underlay_protect = Some(tokio::spawn(async {
+                loop {
+                    crate::platform::underlay::protect_existing();
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }));
+        }
 
         // OS DNS work stays off the actor executor thread. Probe the
         // host-local endpoint before switching OS DNS toward it.
@@ -334,12 +385,14 @@ impl DataPlaneActor {
                     Err(e) => return Err(DataPlaneError::Dns(format!("configuration task: {e}"))),
                 }
             }
-            None => false,
+            None => true,
         };
         self.peer_dns_active.store(dns_active, Ordering::SeqCst);
 
         // Reconcile routes via RouteActor (one-way ask, bounded timeout).
         // Direct uses exact /32 peer routes; Managed uses subnet snapshots.
+        // Android captures those destinations on VpnService.Builder instead.
+        #[cfg(not(target_os = "android"))]
         self.reconcile_routes().await?;
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
 
@@ -365,6 +418,7 @@ impl DataPlaneActor {
             firewalls,
             metrics: self.metrics.clone(),
             mtu: self.cfg.mtu,
+            in_tun_dns: self.in_tun_dns.clone(),
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
                     && let Some(actor) = exit_weak.upgrade()
@@ -383,7 +437,11 @@ impl DataPlaneActor {
     }
 
     async fn do_bring_down(&mut self) -> Result<(), DataPlaneError> {
-        if !self.up && self.published.load().is_none() && self.dns_task.is_none() {
+        if !self.up
+            && self.published.load().is_none()
+            && self.dns_task.is_none()
+            && self.in_tun_dns.is_none()
+        {
             return Ok(());
         }
         // Stop ingress readers first (registry abort), then withdraw the
@@ -518,7 +576,14 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
             )));
         }
         if self.up {
-            self.reconcile_routes().await
+            #[cfg(not(target_os = "android"))]
+            {
+                return self.reconcile_routes().await;
+            }
+            #[cfg(target_os = "android")]
+            {
+                return Ok(());
+            }
         } else {
             self.do_bring_up(ctx.actor_ref().downgrade()).await
         }

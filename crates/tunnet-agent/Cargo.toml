@@ -8,15 +8,16 @@ publish = false
 [[bin]]
 name = "tunnetd"
 path = "src/main.rs"
+required-features = ["daemon"]
 
 [dependencies]
 tunnet-common.workspace = true
-tunnet-core.workspace = true
-tunnet-client.workspace = true
-tunnet-service.workspace = true
-tunnet-update.workspace = true
-tunnet-posture.workspace = true
-tunnet-policy-engine.workspace = true
+tunnet-core = { path = "../tunnet-core", default-features = false, features = [
+  "managed",
+  "direct",
+  "dns",
+  "send",
+] }
 
 tokio.workspace = true
 futures-util.workspace = true
@@ -24,32 +25,25 @@ anyhow.workspace = true
 thiserror.workspace = true
 kameo.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-appender.workspace = true
-file-rotate.workspace = true
-clap.workspace = true
-dotenvy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+prost.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 arc-swap.workspace = true
 hex.workspace = true
-base64.workspace = true
 jiff.workspace = true
 uuid.workspace = true
 rand.workspace = true
 metrics.workspace = true
-metrics-exporter-prometheus.workspace = true
 ipnet.workspace = true
 netdev.workspace = true
-osdns.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
-semver.workspace = true
-zip.workspace = true
+clap = { workspace = true, optional = true }
+async-trait.workspace = true
 
 iroh.workspace = true
 iroh-gossip.workspace = true
@@ -57,20 +51,35 @@ iroh-blobs.workspace = true
 ed25519-dalek.workspace = true
 etherparse.workspace = true
 tun-rs.workspace = true
-portable-pty.workspace = true
-russh.workspace = true
-russh-sftp.workspace = true
-async-trait.workspace = true
-rusqlite.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 
-# Android routes are installed by VpnService.Builder, and route_manager has no
-# Android backend: FrameworkOwnedBackend in src/system_routes.rs.
+tunnet-client = { workspace = true, optional = true }
+tunnet-service = { workspace = true, optional = true }
+tunnet-update = { workspace = true, optional = true }
+tunnet-posture = { workspace = true, optional = true }
+tunnet-policy-engine = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+file-rotate = { workspace = true, optional = true }
+dotenvy = { workspace = true, optional = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+osdns = { workspace = true, optional = true }
+semver = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+portable-pty = { workspace = true, optional = true }
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+
+# Android routes are installed by VpnService.Builder; this crate does not
+# reconcile the kernel table there.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 route_manager.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 ecdysis = { version = "1.1.1", features = ["tokio_ecdysis", "systemd_notify"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target."cfg(windows)".dependencies]
@@ -83,8 +92,39 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-default = []
-actor-console = ["kameo/console"]
+default = ["daemon"]
+ssh = ["dep:russh", "dep:russh-sftp", "dep:portable-pty", "dep:rusqlite"]
+updater = ["dep:tunnet-update", "dep:semver", "dep:zip"]
+metrics-serve = ["dep:metrics-exporter-prometheus"]
+host-dns = ["dep:osdns"]
+posture = ["dep:tunnet-posture"]
+policy = ["dep:tunnet-policy-engine"]
+local-api = [
+  "tunnet-core/local_api",
+  "tunnet-core/serve",
+  "tunnet-core/tunnel",
+  "tunnet-core/recording",
+  "dep:tunnet-client",
+  "dep:clap",
+]
+daemon = [
+  "ssh",
+  "updater",
+  "metrics-serve",
+  "host-dns",
+  "posture",
+  "policy",
+  "local-api",
+  "dep:tunnet-service",
+  "dep:tracing-subscriber",
+  "dep:tracing-appender",
+  "dep:file-rotate",
+  "dep:dotenvy",
+]
+
+[build-dependencies]
+prost-build.workspace = true
+protox = "0.9"
 
 [dev-dependencies]
 rstest.workspace = true

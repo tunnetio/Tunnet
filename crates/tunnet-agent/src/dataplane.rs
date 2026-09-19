@@ -20,6 +20,7 @@ pub struct OutboundSpawn {
     pub firewalls: std::collections::HashMap<uuid::Uuid, tunnet_core::direct::FirewallEngine>,
     pub metrics: AgentMetrics,
     pub mtu: u16,
+    pub in_tun_dns: Option<std::sync::Arc<tunnet_core::dns::InTun>>,
     /// Called when the loop ends without shutdown (abnormal service death).
     pub on_unexpected_end: Box<dyn FnOnce() + Send + 'static>,
 }
@@ -33,6 +34,7 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
         firewalls,
         metrics,
         mtu,
+        in_tun_dns,
         on_unexpected_end,
     } = spawn;
     tokio::spawn(async move {
@@ -44,6 +46,7 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
             firewalls,
             metrics,
             mtu,
+            in_tun_dns,
         })
         .await
         {

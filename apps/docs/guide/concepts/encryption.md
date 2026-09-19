@@ -30,8 +30,9 @@ Sensitive material is stored separately from public config:
 On write, Tunnet picks the best available seal tier:
 
 1. **tpm** - Windows DPAPI (TPM-backed when present)
-2. **keychain** - macOS Keychain
-3. **derived** - key derived from stable machine identity and a random per-state salt (resists offline copy to another machine)
-4. **plaintext** - only when forced
+2. **keystore** - Android Keystore AES-256-GCM wrapping key (non-exportable; StrongBox when the device provides it, otherwise TEE)
+3. **keychain** - macOS Keychain
+4. **derived** - key derived from stable machine identity and a random per-state salt (resists offline copy to another machine). Not used on Android.
+5. **plaintext** - only when forced
 
 Force plaintext with `--no-encrypt-state` or `TUNNET_NO_ENCRYPT_STATE=1` on `enroll`, `create`, `join`, or `run`. Use this only for containers and CI.

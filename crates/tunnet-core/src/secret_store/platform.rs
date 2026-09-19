@@ -5,6 +5,10 @@ use anyhow::bail;
 
 /// Prefer the strongest available local seal.
 pub fn best_tier() -> SealTier {
+    #[cfg(target_os = "android")]
+    {
+        SealTier::Keystore
+    }
     #[cfg(windows)]
     {
         SealTier::Tpm // DPAPI; uses TPM when available for system keys
@@ -13,7 +17,7 @@ pub fn best_tier() -> SealTier {
     {
         SealTier::Keychain
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android")))]
     {
         // Full TSS TPM seal is not wired yet; derived is the portable Linux tier.
         SealTier::Derived

@@ -28,10 +28,13 @@ use super::control::{ControlPlaneActor, ControlPlaneActorArgs};
 use super::dataplane::{
     DataPlaneActor, DataPlaneActorArgs, DataPlaneActorConfig, PublishedPlane, ShutdownPlane,
 };
+#[cfg(feature = "posture")]
 use super::posture::{PostureActor, PostureActorArgs};
 use super::presence::{PresenceActor, PresenceActorArgs, ShutdownPresence};
 use super::routes::{RouteActor, RouteActorArgs};
+#[cfg(feature = "ssh")]
 use super::ssh_registry::{ShutdownSshRegistry, SshRegistryActor};
+#[cfg(feature = "updater")]
 use super::update::{ShutdownUpdate, UpdateActor, UpdateActorArgs};
 use crate::metrics::AgentMetrics;
 
@@ -149,6 +152,7 @@ impl Message<GetDataPlaneChildren> for DataPlaneSupervisor {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+#[cfg(feature = "posture")]
 pub struct PostureSpawnConfig {
     pub agent_version: String,
     pub src_posture_ok: Arc<arc_swap::ArcSwap<bool>>,
@@ -158,17 +162,22 @@ pub struct PostureSpawnConfig {
 pub struct AgentSupervisorArgs {
     pub dataplane: DataPlaneSupervisorArgs,
     pub control: Option<ControlPlaneActorArgs>,
+    #[cfg(feature = "posture")]
     pub posture: Option<PostureSpawnConfig>,
     pub presence: Vec<PresenceActorArgs>,
+    #[cfg(feature = "updater")]
     pub update: Option<UpdateActorArgs>,
 }
 
 pub struct AgentSupervisor {
     dataplane_sup: Option<ActorRef<DataPlaneSupervisor>>,
     control_actor: Option<ActorRef<ControlPlaneActor>>,
+    #[cfg(feature = "posture")]
     posture_actor: Option<ActorRef<PostureActor>>,
     presence_actors: Vec<ActorRef<PresenceActor>>,
+    #[cfg(feature = "updater")]
     update_actor: Option<ActorRef<UpdateActor>>,
+    #[cfg(feature = "ssh")]
     ssh_registry: Option<ActorRef<SshRegistryActor>>,
 }
 
@@ -187,6 +196,7 @@ impl Actor for AgentSupervisor {
             .spawn_with_mailbox(kameo::mailbox::bounded(super::SUPERVISOR_MAILBOX))
             .await;
 
+        #[cfg(feature = "ssh")]
         let ssh_registry = SshRegistryActor::supervise(&actor_ref, ())
             .restart_policy(RestartPolicy::Transient)
             .restart_limit(5, Duration::from_secs(60))
@@ -195,9 +205,13 @@ impl Actor for AgentSupervisor {
 
         // Control needs the ssh registry ref; patch args with the supervised one.
         // Spawned before posture so posture reports can forward through it.
-        let control_actor = if let Some(mut c) = args.control.clone() {
-            // SshRegistryActor restarts in place; the ref stays valid.
-            c.ssh_registry = Some(ssh_registry.clone());
+        let control_actor = if let Some(c) = args.control.clone() {
+            #[cfg(feature = "ssh")]
+            let mut c = c;
+            #[cfg(feature = "ssh")]
+            {
+                c.ssh_registry = Some(ssh_registry.clone());
+            }
             Some(
                 ControlPlaneActor::supervise(&actor_ref, c)
                     .restart_policy(RestartPolicy::Transient)
@@ -209,6 +223,7 @@ impl Actor for AgentSupervisor {
             None
         };
 
+        #[cfg(feature = "posture")]
         let posture_actor = match (args.posture.clone(), control_actor.clone()) {
             (Some(p), Some(control)) => Some(
                 PostureActor::supervise(
@@ -230,7 +245,9 @@ impl Actor for AgentSupervisor {
         // Wire late-bound subsystem refs into the control actor. Refs stay
         // valid across supervised restarts (restart is in place).
         if let Some(control) = &control_actor {
-            use super::control::{SetDataPlaneActor, SetPostureActor, SetRouteActor};
+            #[cfg(feature = "posture")]
+            use super::control::SetPostureActor;
+            use super::control::{SetDataPlaneActor, SetRouteActor};
             let mut route_ref = None;
             let mut dataplane_ref = None;
             if let Ok(children) = dataplane_sup.ask(GetDataPlaneChildren).await {
@@ -239,6 +256,7 @@ impl Actor for AgentSupervisor {
             }
             let _ = control.tell(SetRouteActor(route_ref)).send().await;
             let _ = control.tell(SetDataPlaneActor(dataplane_ref)).send().await;
+            #[cfg(feature = "posture")]
             let _ = control
                 .tell(SetPostureActor(posture_actor.clone()))
                 .send()
@@ -255,6 +273,7 @@ impl Actor for AgentSupervisor {
             presence_actors.push(a);
         }
 
+        #[cfg(feature = "updater")]
         let update_actor = if let Some(u) = args.update.clone() {
             Some(
                 UpdateActor::supervise(&actor_ref, u)
@@ -270,9 +289,12 @@ impl Actor for AgentSupervisor {
         Ok(Self {
             dataplane_sup: Some(dataplane_sup),
             control_actor,
+            #[cfg(feature = "posture")]
             posture_actor,
             presence_actors,
+            #[cfg(feature = "updater")]
             update_actor,
+            #[cfg(feature = "ssh")]
             ssh_registry: Some(ssh_registry),
         })
     }
@@ -283,7 +305,6 @@ impl Actor for AgentSupervisor {
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
         use super::control::ShutdownControl;
-        use super::posture::ShutdownPosture;
         // Reverse dependency order with bounded waits; abort only as fallback.
         if let Some(c) = self.control_actor.take() {
             let _ = tokio::time::timeout(Duration::from_secs(10), c.ask(ShutdownControl)).await;
@@ -295,11 +316,14 @@ impl Actor for AgentSupervisor {
             let _ = p.stop_gracefully().await;
             p.wait_for_shutdown().await;
         }
+        #[cfg(feature = "posture")]
         if let Some(p) = self.posture_actor.take() {
+            use super::posture::ShutdownPosture;
             let _ = p.tell(ShutdownPosture).send().await;
             let _ = p.stop_gracefully().await;
             p.wait_for_shutdown().await;
         }
+        #[cfg(feature = "updater")]
         if let Some(u) = self.update_actor.take() {
             let _ = u.tell(ShutdownUpdate).send().await;
             let _ = u.stop_gracefully().await;
@@ -309,6 +333,7 @@ impl Actor for AgentSupervisor {
             let _ = dp.stop_gracefully().await;
             dp.wait_for_shutdown().await;
         }
+        #[cfg(feature = "ssh")]
         if let Some(s) = self.ssh_registry.take() {
             let _ = s.tell(ShutdownSshRegistry).send().await;
             let _ = s.stop_gracefully().await;
@@ -326,8 +351,11 @@ pub struct GetAgentChildren;
 pub struct AgentChildren {
     pub dataplane_sup: Option<ActorRef<DataPlaneSupervisor>>,
     pub control_actor: Option<ActorRef<ControlPlaneActor>>,
+    #[cfg(feature = "posture")]
     pub posture_actor: Option<ActorRef<PostureActor>>,
+    #[cfg(feature = "updater")]
     pub update_actor: Option<ActorRef<UpdateActor>>,
+    #[cfg(feature = "ssh")]
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
 }
 
@@ -341,8 +369,11 @@ impl Message<GetAgentChildren> for AgentSupervisor {
         AgentChildren {
             dataplane_sup: self.dataplane_sup.clone(),
             control_actor: self.control_actor.clone(),
+            #[cfg(feature = "posture")]
             posture_actor: self.posture_actor.clone(),
+            #[cfg(feature = "updater")]
             update_actor: self.update_actor.clone(),
+            #[cfg(feature = "ssh")]
             ssh_registry: self.ssh_registry.clone(),
         }
     }
@@ -624,14 +655,17 @@ mod tests {
         };
         use crate::actors::routes::RouteActorArgs;
         use crate::actors::test_support::{test_metrics, test_node};
+        #[cfg(feature = "updater")]
         use crate::actors::update::{UpdateActorArgs, UpdateState};
         use tunnet_core::local_api::{DataPlaneControl, DataPlaneStatusSnapshot};
 
         let (node, tmp) = test_node().await;
+        #[cfg(feature = "updater")]
         let paths = node.paths.clone();
         let (events_tx, _) = tokio::sync::broadcast::channel(8);
         let published = new_published_plane();
         let status = DataPlaneStatusSnapshot::new(false);
+        #[cfg(feature = "updater")]
         let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
         let _ = tmp;
         let args = AgentSupervisorArgs {
@@ -660,8 +694,10 @@ mod tests {
                 auto_up: false,
             },
             control: None,
+            #[cfg(feature = "posture")]
             posture: None,
             presence: vec![],
+            #[cfg(feature = "updater")]
             update: Some(UpdateActorArgs {
                 paths,
                 store: None,
@@ -679,7 +715,9 @@ mod tests {
         let dp_children: DataPlaneChildren =
             dp_sup.ask(GetDataPlaneChildren).await.expect("children");
         let dp = dp_children.dataplane_actor.expect("dataplane");
+        #[cfg(feature = "ssh")]
         let ssh = children.ssh_registry.expect("ssh registry");
+        #[cfg(feature = "ssh")]
         assert!(ssh.is_alive());
         let plane: crate::actors::dataplane::DataPlaneStatus =
             dp.ask(GetStatus).await.expect("status");
@@ -693,6 +731,7 @@ mod tests {
         assert!(!sup.is_alive());
         assert!(!dp_sup.is_alive());
         assert!(!dp.is_alive(), "dataplane must stay stopped (no restart)");
+        #[cfg(feature = "ssh")]
         assert!(!ssh.is_alive());
         assert!(published.load_full().is_none(), "TUN generation withdrawn");
         assert!(!status.is_up(), "status read-model down");

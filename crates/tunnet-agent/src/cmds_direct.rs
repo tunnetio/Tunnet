@@ -1,63 +1,81 @@
 use std::collections::HashSet;
 
 use anyhow::Context;
-use clap::Args;
+#[cfg(feature = "local-api")]
+use tunnet_core::direct::MembershipEntry;
 use tunnet_core::direct::{
     AddressPlan, ConnectivityOptions, GENESIS_SCHEMA_VERSION, Genesis, JOIN_ALPN, JoinStatus,
-    MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant, allocate_peer_ip,
-    apply_connectivity, decode_and_preflight, endpoint_builder, generate_coordinator_keypair,
-    grant_expiry, network_id_from_topic, relay_auth_denied_detail, run_join_client, sign_genesis,
-    sign_grant, sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
+    MEMBER_SCHEMA_VERSION, MemberRole, NetworkGrant, allocate_peer_ip, apply_connectivity,
+    decode_and_preflight, endpoint_builder, generate_coordinator_keypair, grant_expiry,
+    network_id_from_topic, relay_auth_denied_detail, run_join_client, sign_genesis, sign_grant,
+    sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
 };
 use tunnet_core::{
-    AgentIdentity, DirectState, PersistedState, SealPolicy, StatePaths, TunnetConfig, load_agent,
-    persist_agent,
+    DirectState, PersistedState, SealPolicy, StatePaths, TunnetConfig, load_agent, persist_agent,
 };
 
-#[derive(Args, Debug)]
+fn log_join_paths(conn: &iroh::endpoint::Connection) {
+    let paths = conn.paths();
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| p.remote_addr().to_string());
+    let relays: Vec<_> = paths
+        .iter()
+        .filter(|p| p.is_relay())
+        .map(|p| p.remote_addr().to_string())
+        .collect();
+    let ips: Vec<_> = paths
+        .iter()
+        .filter(|p| p.is_ip())
+        .map(|p| p.remote_addr().to_string())
+        .collect();
+    tracing::info!(
+        ?selected,
+        ?relays,
+        ?ips,
+        open = paths.len(),
+        "join connection paths"
+    );
+}
+
+#[derive(Debug)]
 pub struct CreateArgs {
-    #[arg(long, env = "TUNNET_HOSTNAME")]
     pub hostname: Option<String>,
-    #[arg(long)]
     pub open: bool,
-    #[arg(long = "name")]
     pub network_name: Option<String>,
-    #[arg(long)]
     pub secret: Option<String>,
-    #[arg(long)]
     pub cidr: Option<String>,
-    #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Debug)]
 pub struct JoinArgs {
     pub invite_code: String,
-    #[arg(long, env = "TUNNET_HOSTNAME")]
     pub hostname: Option<String>,
-    #[arg(long)]
     pub auto_accept_firewall: bool,
-    #[arg(long, env = "TUNNET_NO_ENCRYPT_STATE")]
     pub no_encrypt_state: bool,
 }
 
-#[derive(Args, Debug)]
+#[cfg(feature = "local-api")]
+#[derive(Debug)]
 pub struct UpgradeArgs {
-    #[arg(
-        long,
-        env = "CONTROL_PLANE_URL",
-        default_value = "http://127.0.0.1:8080"
-    )]
     pub control_url: String,
-    #[arg(long, env = "TUNNET_ENROLL_TOKEN")]
     pub token: Option<String>,
 }
 
-#[derive(Args, Debug)]
+#[cfg(feature = "local-api")]
+#[derive(Debug)]
 pub struct LeaveArgs {
-    #[arg(long)]
     pub network: Option<String>,
     pub name: Option<String>,
+}
+
+pub struct DirectCreateOutcome {
+    pub network_name: String,
+    pub network_id: uuid::Uuid,
+    pub endpoint_id: String,
+    pub ipv4: std::net::Ipv4Addr,
 }
 
 fn paths(state_dir: Option<&str>) -> StatePaths {
@@ -92,7 +110,10 @@ fn existing_plans(networks: &[DirectState]) -> Vec<(uuid::Uuid, ipnet::Ipv4Net)>
         .collect()
 }
 
-pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
+pub async fn persist_direct_create(
+    args: CreateArgs,
+    state_dir: Option<&str>,
+) -> anyhow::Result<DirectCreateOutcome> {
     let paths = paths(state_dir);
     paths.ensure()?;
     let existing = PersistedState::try_load(&paths)?;
@@ -102,8 +123,6 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
             m.network_name
         );
     }
-    let had_networks =
-        matches!(&existing, Some(PersistedState::Direct { networks }) if !networks.is_empty());
 
     let hostname = hostname_arg(args.hostname);
     let network_name = args
@@ -147,7 +166,10 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
             }
             (identity, networks)
         }
-        _ => (AgentIdentity::generate(), Vec::new()),
+        _ => {
+            let (secrets, _) = tunnet_core::secret_store::load_or_create_secrets(&paths, policy)?;
+            (secrets.identity(), Vec::new())
+        }
     };
     let my_id = identity.endpoint_id_hex();
 
@@ -260,21 +282,34 @@ pub async fn run_create(args: CreateArgs, state_dir: Option<&str>) -> anyhow::Re
         cfg.save(&paths)?;
     }
 
-    println!(
-        "Created Direct network '{}'. endpoint_id={} ip={} cidr={} (secrets: {})",
-        network_name,
-        my_id,
-        self_ip,
-        address_plan.peer_cidr,
-        tier.as_str()
+    tracing::info!(
+        network = %network_name,
+        endpoint_id = %my_id,
+        ip = %self_ip,
+        cidr = %address_plan.peer_cidr,
+        seal = %tier.as_str(),
+        "created Direct network"
     );
-    println!("State directory: {}", paths.root().display());
-    crate::cmds::finish_after_config(state_dir, had_networks).await?;
-    println!("Next: `tunnet invite` and share the code.");
-    Ok(())
+
+    Ok(DirectCreateOutcome {
+        network_name,
+        network_id,
+        endpoint_id: my_id,
+        ipv4: self_ip,
+    })
 }
 
-pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
+pub struct DirectJoinOutcome {
+    pub network_name: String,
+    pub network_id: uuid::Uuid,
+    pub endpoint_id: String,
+    pub ipv4: std::net::Ipv4Addr,
+}
+
+pub async fn persist_direct_join(
+    args: JoinArgs,
+    state_dir: Option<&str>,
+) -> anyhow::Result<DirectJoinOutcome> {
     let paths = paths(state_dir);
     paths.ensure()?;
 
@@ -282,8 +317,6 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
     let policy = SealPolicy::from_env_and_flag(args.no_encrypt_state);
 
     let loaded = PersistedState::try_load(&paths)?;
-    let had_networks =
-        matches!(&loaded, Some(PersistedState::Direct { networks }) if !networks.is_empty());
     let (identity, existing_networks) = match loaded {
         Some(PersistedState::Managed(m)) => anyhow::bail!(
             "already enrolled in Managed network '{}'; run `tunnet reset --yes` first",
@@ -293,7 +326,12 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
             let (id, _, _) = load_agent(&paths, policy)?;
             (id, networks)
         }
-        None => (AgentIdentity::generate(), Vec::new()),
+        None => {
+            // Persist the join key immediately. Pending approval must retry the
+            // same endpoint id the coordinator just saw.
+            let (secrets, _) = tunnet_core::secret_store::load_or_create_secrets(&paths, policy)?;
+            (secrets.identity(), Vec::new())
+        }
     };
 
     let invite = decode_and_preflight(
@@ -320,21 +358,36 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         anyhow::bail!("invalid tunnet.toml: {}", errs.join("; "));
     }
     let credentials = tunnet_core::secret_store::load_relay_auth(&paths).unwrap_or_default();
-    let connectivity = ConnectivityOptions::from_direct_config(&agent_cfg, credentials, None, None)
-        .context("resolve Direct relay policy")?;
+    let mut connectivity =
+        ConnectivityOptions::from_direct_config(&agent_cfg, credentials, None, None)
+            .context("resolve Direct relay policy")?;
+    crate::host_constraints::constrain_lan(&mut connectivity);
+    let dial = tunnet_core::direct::join_dial_addr(&invite).context("coordinator dial address")?;
+    // iroh 1.2 `SendDatagram` uses only `selected_path` once an IP path exists.
+    // Unreachable join-client IPs (emulator NAT, CGNAT) then starve a working
+    // relay for the rest of the handshake. This ephemeral endpoint is relay-only;
+    // the mesh endpoint created after admission still binds IP + discovery.
+    let relay_bootstrap = dial.relay_urls().next().is_some();
+    if relay_bootstrap {
+        connectivity.enable_mdns = false;
+        connectivity.enable_dht = false;
+    }
     tracing::info!(
         relay = connectivity.relay.kind(),
+        mdns = connectivity.enable_mdns,
+        dht = connectivity.enable_dht,
         "join using Direct relay policy"
     );
-    let endpoint = apply_connectivity(
+    let mut builder = apply_connectivity(
         endpoint_builder(&connectivity)
             .secret_key(secret)
             .alpns(vec![JOIN_ALPN.to_vec()]),
         &connectivity,
-    )
-    .bind()
-    .await
-    .context("bind join endpoint")?;
+    );
+    if relay_bootstrap {
+        builder = builder.clear_address_lookup().clear_ip_transports();
+    }
+    let endpoint = builder.bind().await.context("bind join endpoint")?;
 
     let join_result = async {
         match tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await {
@@ -348,16 +401,21 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
                 None => tracing::warn!("relay not ready yet; attempting join connect anyway"),
             },
         }
-
-        let coord: iroh::EndpointId = invite
-            .genesis
-            .coordinator_endpoint_id
-            .parse()
-            .context("invalid coordinator endpoint id in invite")?;
+        let relay_urls: Vec<String> = dial.relay_urls().map(|u| u.to_string()).collect();
+        let ip_v4: Vec<_> = dial.ip_addrs().filter(|a| a.is_ipv4()).copied().collect();
+        let ip_v6: Vec<_> = dial.ip_addrs().filter(|a| a.is_ipv6()).copied().collect();
+        tracing::info!(
+            coordinator = %dial.id,
+            ?relay_urls,
+            ?ip_v4,
+            ?ip_v6,
+            "connecting to coordinator"
+        );
         let conn = endpoint
-            .connect(coord, JOIN_ALPN)
+            .connect(dial, JOIN_ALPN)
             .await
-            .context("connect to coordinator")?;
+            .map_err(|e| anyhow::anyhow!("connect to coordinator: {e:#}"))?;
+        log_join_paths(&conn);
         let resp = run_join_client(&conn, &invite.invite_secret, &hostname)
             .await
             .context("direct join")?;
@@ -416,17 +474,23 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         cfg.upsert_direct(&network_name, &hostname, false, false);
         cfg.save(&paths)?;
     }
-
-    println!(
-        "Joined Direct network '{}'. endpoint_id={} ip={} (secrets: {})",
-        network_name,
-        my_id,
-        ipv4,
-        tier.as_str()
+    tracing::info!(
+        network = %network_name,
+        endpoint_id = %my_id,
+        %ipv4,
+        seal = %tier.as_str(),
+        "joined Direct network"
     );
-    crate::cmds::finish_after_config(state_dir, had_networks).await?;
-    Ok(())
+
+    Ok(DirectJoinOutcome {
+        network_name,
+        network_id,
+        endpoint_id: my_id,
+        ipv4,
+    })
 }
+
+#[cfg(feature = "local-api")]
 pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
     let policy = SealPolicy::from_env_and_flag(false);
@@ -515,12 +579,144 @@ pub async fn run_upgrade(args: UpgradeArgs, state_dir: Option<&str>) -> anyhow::
     Ok(())
 }
 
+#[cfg(feature = "local-api")]
 pub async fn run_leave(args: LeaveArgs, state_dir: Option<&str>) -> anyhow::Result<()> {
     let paths = paths(state_dir);
     let policy = SealPolicy::from_env_and_flag(false);
     let name = args.network.or(args.name);
     let nname = tunnet_core::leave_direct_network(&paths, policy, name.as_deref())?;
     println!("Left Direct network '{nname}'. Restart the agent to apply.");
+    #[cfg(feature = "local-api")]
     crate::cmds::finish_after_config(state_dir, true).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod live_join {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "live coordinator"]
+    async fn relay_only_connect_join_alpn() {
+        let code = std::env::var("TUNNET_LIVE_INVITE").expect("TUNNET_LIVE_INVITE");
+        let invite = tunnet_core::direct::decode_invite(&code).unwrap();
+        let dial = tunnet_core::direct::join_dial_addr(&invite).unwrap();
+        let opts = tunnet_core::direct::ConnectivityOptions::direct_default(false);
+        let ep = apply_connectivity(endpoint_builder(&opts), &opts)
+            .alpns(vec![JOIN_ALPN.to_vec()])
+            .clear_address_lookup()
+            .clear_ip_transports()
+            .bind()
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), ep.online())
+            .await
+            .expect("join probe online");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            ep.connect(dial, JOIN_ALPN),
+        )
+        .await
+        .expect("connect wait")
+        .unwrap_or_else(|e| panic!("connect JOIN_ALPN: {e:#}"));
+        conn.close(0u32.into(), b"probe");
+    }
+
+    #[tokio::test]
+    #[ignore = "live coordinator"]
+    async fn lan_ip_only_connect_join_alpn() {
+        let code = std::env::var("TUNNET_LIVE_INVITE").expect("TUNNET_LIVE_INVITE");
+        let invite = tunnet_core::direct::decode_invite(&code).unwrap();
+        let stamped = invite
+            .coordinator_addr
+            .clone()
+            .expect("invite missing coordinator_addr");
+        let lan: Vec<_> = stamped
+            .ip_addrs()
+            .filter(|a| match a.ip() {
+                std::net::IpAddr::V4(v4) => v4.is_private() && !v4.is_loopback(),
+                std::net::IpAddr::V6(_) => false,
+            })
+            .copied()
+            .collect();
+        assert!(!lan.is_empty(), "no private IPv4 on invite: {stamped:?}");
+        let mut dial = iroh::EndpointAddr::new(stamped.id);
+        for ip in lan {
+            if ip.ip() == std::net::Ipv4Addr::new(192, 168, 1, 80) {
+                dial.addrs.insert(iroh::TransportAddr::Ip(ip));
+            }
+        }
+        if dial.ip_addrs().next().is_none() {
+            dial.addrs.insert(iroh::TransportAddr::Ip(
+                stamped.ip_addrs().next().copied().unwrap(),
+            ));
+        }
+        let opts = tunnet_core::direct::ConnectivityOptions {
+            relay: tunnet_core::direct::EffectiveRelayPolicy::Disabled,
+            enable_dht: false,
+            enable_mdns: false,
+            enable_lan_discovery: false,
+        };
+        let ep = apply_connectivity(endpoint_builder(&opts), &opts)
+            .alpns(vec![JOIN_ALPN.to_vec()])
+            .clear_address_lookup()
+            .bind()
+            .await
+            .unwrap();
+        tracing::info!(?dial, "LAN-only JOIN dial");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            ep.connect(dial, JOIN_ALPN),
+        )
+        .await
+        .expect("connect wait")
+        .unwrap_or_else(|e| panic!("connect JOIN_ALPN via LAN IP: {e:#}"));
+        conn.close(0u32.into(), b"probe");
+    }
+
+    #[tokio::test]
+    #[ignore = "live coordinator"]
+    async fn snapshot_ips_connect_join_alpn() {
+        let code = std::env::var("TUNNET_LIVE_INVITE").expect("TUNNET_LIVE_INVITE");
+        let invite = tunnet_core::direct::decode_invite(&code).unwrap();
+        let dial = invite
+            .coordinator_addr
+            .clone()
+            .expect("invite missing coordinator_addr");
+        let opts = tunnet_core::direct::ConnectivityOptions::direct_default(false);
+        let ep = apply_connectivity(endpoint_builder(&opts), &opts)
+            .alpns(vec![JOIN_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            ep.connect(dial, JOIN_ALPN),
+        )
+        .await
+        .expect("connect wait")
+        .unwrap_or_else(|e| panic!("connect JOIN_ALPN via snapshot IPs: {e:#}"));
+        conn.close(0u32.into(), b"probe");
+    }
+}
+
+#[cfg(test)]
+mod join_identity {
+    use super::*;
+
+    #[test]
+    fn pending_join_reuses_persisted_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = StatePaths::resolve(Some(dir.path().to_str().unwrap()));
+        paths.ensure().unwrap();
+        let policy = SealPolicy::from_env_and_flag(true);
+        let (a, _) = tunnet_core::secret_store::load_or_create_secrets(&paths, policy).unwrap();
+        let (b, _) = tunnet_core::secret_store::load_or_create_secrets(&paths, policy).unwrap();
+        assert_eq!(
+            a.identity().endpoint_id_hex(),
+            b.identity().endpoint_id_hex()
+        );
+        assert!(paths.secrets_file().is_file());
+        assert!(PersistedState::try_load(&paths).unwrap().is_none());
+    }
 }

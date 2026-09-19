@@ -78,6 +78,7 @@ pub struct RoutingTable {
     /// when the protocol version does not, so blocked connection state can
     /// retry on actual change rather than on timers.
     change_seq: Arc<std::sync::atomic::AtomicU64>,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for RoutingTable {
@@ -121,7 +122,12 @@ impl RoutingTable {
             })),
             slices: Arc::new(Mutex::new(BTreeMap::new())),
             change_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            changes: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
     }
 
     /// Look up peer by (network, ip) for inbound / firewall context.
@@ -728,6 +734,7 @@ impl RoutingTable {
             allow_local_lan,
             version,
         }));
+        let _ = self.changes.send(version);
     }
 }
 
@@ -1038,6 +1045,27 @@ mod tests {
         assert_eq!(table.version(), 3);
         assert!(table.lookup_endpoint(&peer_a).is_none());
         assert!(table.lookup_endpoint(&peer_b).is_some());
+    }
+
+    #[tokio::test]
+    async fn subscribe_changes_fires_on_rebuild() {
+        let table = RoutingTable::new();
+        let mut rx = table.subscribe_changes();
+        let self_id = "a".repeat(64);
+        table.replace(
+            &[peer(&"b".repeat(64), "10.7.0.5", "alice")],
+            &[],
+            &[],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            Uuid::nil(),
+            &self_id,
+            1,
+        );
+        rx.changed().await.expect("rebuild");
+        assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]

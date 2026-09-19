@@ -1,4 +1,8 @@
 //! PeerDNS stub: authoritative mesh answers, Hickory for everything else.
+//!
+//! The resolution engine is independent of how queries arrive. Desktop binds
+//! UDP on loopback. The data plane can also intercept in-TUN packets to
+//! [`tunnet_common::VirtualResolverEndpoint`].
 
 use anyhow::Context;
 use hickory_proto::op::{DEFAULT_MAX_PAYLOAD_LEN, Message, MessageType, OpCode, ResponseCode};
@@ -12,10 +16,12 @@ use tunnet_common::DnsConfig;
 
 use crate::routing::RoutingTable;
 
+mod in_tun;
 mod nameserver;
 mod peerdns;
 mod upstream;
 
+pub use in_tun::{InTun, targets_virtual_resolver};
 pub use nameserver::{UpstreamSource, parse_upstream};
 pub use upstream::{
     HickoryLookup, build_resolver, capture_underlay_upstream_specs, filter_self_nameservers,
@@ -27,22 +33,52 @@ use upstream::{ExternalLookup, map_external};
 
 const UDP_BUF: usize = DEFAULT_MAX_PAYLOAD_LEN as usize;
 
+/// Shared PeerDNS engine. Transport (loopback UDP, in-TUN) is separate.
+pub struct Resolver {
+    routes: RoutingTable,
+    suffix: Arc<str>,
+    lookup: Arc<HickoryLookup>,
+}
+
+impl Resolver {
+    pub fn new(routes: RoutingTable, dns: &DnsConfig) -> anyhow::Result<Arc<Self>> {
+        let dns = with_underlay_upstream(dns);
+        Ok(Arc::new(Self {
+            routes,
+            suffix: Arc::from(dns.suffix.as_str()),
+            lookup: Arc::new(HickoryLookup::from_dns_config(&dns)?),
+        }))
+    }
+
+    pub async fn answer(&self, bytes: &[u8]) -> Vec<u8> {
+        process_query(bytes, &self.routes, &self.suffix, self.lookup.as_ref()).await
+    }
+
+    pub async fn answer_udp(&self, bytes: &[u8], max_payload: usize) -> Vec<u8> {
+        truncate_udp(self.answer(bytes).await, max_payload)
+    }
+}
+
 pub async fn start(
     bind: SocketAddr,
     routes: RoutingTable,
     dns: DnsConfig,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    // Capture the underlay and bind before returning readiness. The caller may
-    // now safely point OS DNS at this socket.
-    let dns = with_underlay_upstream(&dns);
-    let lookup = Arc::new(HickoryLookup::from_dns_config(&dns)?);
+    let resolver = Resolver::new(routes, &dns)?;
+    listen_udp(bind, resolver).await
+}
+
+pub async fn listen_udp(
+    bind: SocketAddr,
+    resolver: Arc<Resolver>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     if !bind.ip().is_loopback() {
-        anyhow::bail!("PeerDNS must bind a loopback address, got {bind}");
+        anyhow::bail!("PeerDNS UDP listener must bind a loopback address, got {bind}");
     }
     let socket = bind_udp_with_retry(bind).await?;
-    tracing::info!(%bind, suffix = %dns.suffix, "PeerDNS stub listening");
+    tracing::info!(%bind, suffix = %resolver.suffix, "PeerDNS stub listening");
     Ok(tokio::spawn(async move {
-        if let Err(e) = run_bound(socket, bind, routes, dns, lookup).await {
+        if let Err(e) = run_bound(socket, bind, resolver).await {
             tracing::error!(?e, %bind, "PeerDNS stub exited");
         }
     }))
@@ -81,12 +117,9 @@ async fn bind_udp_with_retry(bind: SocketAddr) -> anyhow::Result<UdpSocket> {
 async fn run_bound(
     sock: UdpSocket,
     bind: SocketAddr,
-    routes: RoutingTable,
-    dns: DnsConfig,
-    lookup: Arc<HickoryLookup>,
+    resolver: Arc<Resolver>,
 ) -> anyhow::Result<()> {
     let sock = Arc::new(sock);
-    let suffix = Arc::new(dns.suffix);
     let mut buf = vec![0u8; UDP_BUF];
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
@@ -99,11 +132,9 @@ async fn run_bound(
         };
         let request = buf[..n].to_vec();
         let sock = sock.clone();
-        let routes = routes.clone();
-        let suffix = suffix.clone();
-        let lookup = lookup.clone();
+        let resolver = resolver.clone();
         tokio::spawn(async move {
-            let out = process_query(&request, &routes, &suffix, lookup.as_ref()).await;
+            let out = resolver.answer_udp(&request, UDP_BUF).await;
             if let Err(e) = sock.send_to(&out, peer).await {
                 tracing::debug!(?e, %peer, "dns send failed");
             }
@@ -122,7 +153,7 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
     )
 }
 
-async fn process_query(
+pub async fn process_query(
     bytes: &[u8],
     routes: &RoutingTable,
     suffix: &str,
@@ -208,6 +239,25 @@ fn formerr_from_raw(bytes: &[u8]) -> Vec<u8> {
     msg.metadata.response_code = ResponseCode::FormErr;
     msg.metadata.recursion_available = true;
     msg.to_bytes().unwrap_or_default()
+}
+
+pub(crate) fn truncate_udp(bytes: Vec<u8>, max_payload: usize) -> Vec<u8> {
+    if bytes.len() <= max_payload {
+        return bytes;
+    }
+    let Ok(mut msg) = Message::from_bytes(&bytes) else {
+        return bytes;
+    };
+    msg.metadata.truncation = true;
+    msg.answers.clear();
+    msg.authorities.clear();
+    msg.additionals.clear();
+    let truncated = msg.to_bytes().unwrap_or(bytes);
+    if truncated.len() <= max_payload {
+        truncated
+    } else {
+        truncated[..max_payload].to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -454,18 +504,28 @@ mod tests {
 
     #[test]
     fn loop_prevention_filters_peerdns_loopback_from_candidates() {
-        use super::upstream::local_resolver_ip;
-        let loopback = local_resolver_ip();
+        let loopback = tunnet_common::LocalResolverEndpoint::IP;
+        let virtual_ip = tunnet_common::VirtualResolverEndpoint::IP;
         let filtered = filter_self_nameservers(
             [
                 std::net::IpAddr::V4(loopback),
                 std::net::IpAddr::from([1, 1, 1, 1]),
                 std::net::IpAddr::V4(loopback),
+                std::net::IpAddr::V4(virtual_ip),
             ],
-            loopback,
+            tunnet_common::resolver_self_ips(),
         );
         assert_eq!(filtered, vec![std::net::IpAddr::from([1, 1, 1, 1])]);
-        assert!(filter_self_nameservers([std::net::IpAddr::V4(loopback)], loopback).is_empty());
+        assert!(
+            filter_self_nameservers(
+                [
+                    std::net::IpAddr::V4(loopback),
+                    std::net::IpAddr::V4(virtual_ip)
+                ],
+                tunnet_common::resolver_self_ips(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -477,12 +537,10 @@ mod tests {
 
     #[test]
     fn underlay_snapshot_never_selects_peerdns_itself() {
-        use super::upstream::local_resolver_ip;
         let dns = DnsConfig {
             upstream: vec!["system".into()],
             ..DnsConfig::default()
         };
-        let loopback = local_resolver_ip();
         let pinned = with_underlay_upstream(&dns);
         match parse_upstream(&pinned.upstream).unwrap() {
             UpstreamSource::System => {}
@@ -492,7 +550,9 @@ mod tests {
                     config
                         .name_servers
                         .iter()
-                        .all(|ns| ns.ip != std::net::IpAddr::V4(loopback)),
+                        .all(|ns| !tunnet_common::resolver_self_ips()
+                            .iter()
+                            .any(|ip| ns.ip == std::net::IpAddr::V4(*ip))),
                     "Hickory must never use PeerDNS as its own upstream"
                 );
             }

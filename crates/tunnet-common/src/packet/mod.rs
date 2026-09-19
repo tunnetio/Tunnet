@@ -12,7 +12,7 @@
 //! [`FragmentTable`] remembers the first fragment's transport metadata, keyed by
 //! IP fragment identity, with a bounded capacity and short TTL. Later fragments
 //! reuse that metadata when present; otherwise policy is fail-closed.
-//! Packets themselves are forwarded as original fragments — this is not a
+//! Packets themselves are forwarded as original fragments - this is not a
 //! reassembly pool (`IpDefragPool` is intentionally unused).
 
 mod build;
@@ -257,6 +257,25 @@ pub struct Packet<'a> {
 impl<'a> Packet<'a> {
     pub fn policy_protocol(&self) -> Protocol {
         self.transport.protocol()
+    }
+
+    /// Bytes after the transport header. Empty for later fragments.
+    pub fn l4_payload(&self) -> &'a [u8] {
+        if self.transport.is_later_fragment() {
+            return &[];
+        }
+        let l4 = match self.transport {
+            Transport::Tcp { header_len, .. } => header_len,
+            Transport::Udp { .. } => 8,
+            _ => return &[],
+        };
+        let start = self.ip.header_len().saturating_add(l4);
+        let end = self.wire_len.min(self.raw.len());
+        if start >= end {
+            &[]
+        } else {
+            &self.raw[start..end]
+        }
     }
 }
 

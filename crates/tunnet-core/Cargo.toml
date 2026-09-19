@@ -23,7 +23,6 @@ dns = ["dep:hickory-proto", "dep:hickory-resolver", "dep:rustls"]
 recording = []
 local_api = [
   "dep:axum",
-  "dep:async-trait",
   "dep:hyper",
   "dep:hyper-util",
   "dep:tower",
@@ -81,7 +80,7 @@ rustls-pemfile = { workspace = true, optional = true }
 aes-gcm.workspace = true
 zeroize = { version = "1.9.0", features = ["std", "derive"] }
 mdns-sd = { version = "0.21", optional = true }
-async-trait = { workspace = true, optional = true }
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 httparse = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }

@@ -36,6 +36,22 @@ pub async fn spawn_bootstrap(state: BootstrapApiState) -> anyhow::Result<LocalAp
     Ok(handle)
 }
 
+/// One listener that serves bootstrap routes until mesh state appears, then
+/// the full router. The socket is never rebound.
+pub async fn spawn_switching(
+    idle: BootstrapApiState,
+    mesh: tokio::sync::watch::Receiver<Option<Arc<LocalApiState>>>,
+) -> anyhow::Result<LocalApiServer> {
+    let events = idle.events.clone();
+    let handle = spawn_listener(move |peer| match mesh.borrow().clone() {
+        Some(state) => router::app(state).layer(Extension(peer)),
+        None => bootstrap_router::bootstrap_app(idle.clone()).layer(Extension(peer)),
+    })
+    .await?;
+    let _ = events.send(LocalEvent::DaemonReady);
+    Ok(handle)
+}
+
 pub struct LocalApiServer {
     cancel: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,

@@ -41,6 +41,11 @@ pub trait BootstrapOps: Send + Sync {
     async fn posture_check(&self, req: PostureCheckRequest) -> Result<JsonPayload, ApiError>;
     async fn policy_op(&self, req: PolicyOpRequest) -> Result<JsonPayload, ApiError>;
     async fn device_info(&self) -> Result<JsonPayload, ApiError>;
+
+    /// Idle Local API node GET uses the runtime snapshot when a handle exists.
+    fn observe_mesh(&self) -> Option<super::observe::MeshObservation> {
+        None
+    }
 }
 
 /// Map an `anyhow` error into a structured [`ApiError`].

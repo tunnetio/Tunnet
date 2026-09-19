@@ -52,20 +52,23 @@ pub struct RequestsArgs {
 
 #[derive(Args, Debug)]
 pub struct AcceptArgs {
-    pub network: Option<String>,
     pub peer_id: String,
+    #[arg(long)]
+    pub network: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct DenyArgs {
-    pub network: Option<String>,
     pub peer_id: String,
+    #[arg(long)]
+    pub network: Option<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct KickArgs {
-    pub network: Option<String>,
     pub peer_id: String,
+    #[arg(long)]
+    pub network: Option<String>,
 }
 
 #[derive(Args, Debug)]

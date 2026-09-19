@@ -1,21 +1,20 @@
-//! Agent bootstrap/composition layer.
+//! Mesh composition: identity through actors, dataplane, and outer services.
 //!
-//! This module only: loads immutable startup config, constructs core
-//! resources and shared read models, spawns `AgentSupervisor`, starts the
-//! Local API and required outer services, signals readiness, waits for
-//! OS/service shutdown, then drains the actor tree deterministically.
-//! Subsystem lifecycle lives in the owning actors.
+//! Starts the networking runtime and returns a live session. Local API binding,
+//! systemd notify, and process-signal wait belong to the daemon host.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "local-api")]
 use std::time::Instant;
 
 use anyhow::Context;
 use kameo::actor::Spawn;
 use tunnet_core::direct::ConnectivityOptions;
 use tunnet_core::direct::build_auth_server_context;
-use tunnet_core::local_api::{LocalApiState, spawn_local_api};
+#[cfg(feature = "local-api")]
+use tunnet_core::local_api::LocalApiState;
 use tunnet_core::{CoreNode, CoreNodeConfig};
 use uuid::Uuid;
 
@@ -24,26 +23,62 @@ use crate::actors::control::{ControlPlaneActorArgs, TransportConfig};
 use crate::actors::dataplane::{ActorDataPlaneControl, DataPlaneActorConfig, new_published_plane};
 use crate::actors::presence::PresenceActorArgs;
 use crate::actors::routes::RouteActorArgs;
+#[cfg(feature = "posture")]
+use crate::actors::supervisor::PostureSpawnConfig;
 use crate::actors::supervisor::{
     AgentSupervisor, AgentSupervisorArgs, DataPlaneSupervisorArgs, GetAgentChildren,
-    GetDataPlaneChildren, PostureSpawnConfig,
+    GetDataPlaneChildren,
 };
-use crate::actors::update::{UpdateActorArgs, UpdateState};
-use crate::daemon::RunArgs;
 use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
-use crate::recorder::RecordingStore;
 use crate::system_dns::DnsController;
 
-pub async fn run(
+use super::AgentConfig;
+use super::AgentHandle;
+
+/// Live mesh: actor tree, node, and the pieces a host needs to observe or drain.
+pub(crate) struct MeshSession {
+    supervisor: kameo::actor::ActorRef<AgentSupervisor>,
+    ssh_handle: Option<tokio::task::JoinHandle<()>>,
+    dns_controller: Option<Arc<DnsController>>,
+    /// Released when the mesh drains. iroh mDNS is bound at construction.
+    _multicast: crate::multicast_demand::MulticastLease,
+    pub(crate) node: CoreNode,
+    pub(crate) dataplane: Arc<ActorDataPlaneControl>,
+    pub(crate) peer_rtt: Arc<dashmap::DashMap<String, f64>>,
+    #[cfg(feature = "local-api")]
+    pub(crate) api_state: Arc<LocalApiState>,
+    pub(crate) hostname: String,
+    /// Must be stored: dropping iroh's Router aborts `endpoint.accept()`.
+    router: iroh::protocol::Router,
+}
+
+impl MeshSession {
+    pub(crate) fn is_alive(&self) -> bool {
+        self.supervisor.is_alive()
+    }
+
+    pub(crate) async fn drain(self) {
+        drain(
+            self.supervisor,
+            self.ssh_handle,
+            self.dns_controller,
+            self.router,
+            &self.node,
+        )
+        .await;
+    }
+}
+
+pub(crate) async fn start_mesh(
     identity: tunnet_core::AgentIdentity,
     persisted: tunnet_core::PersistedState,
     paths: tunnet_core::StatePaths,
-    args: RunArgs,
-    shutdown: Option<tokio_util::sync::CancellationToken>,
-    mut on_ready: Option<tokio::sync::oneshot::Sender<()>>,
-) -> anyhow::Result<()> {
+    args: &AgentConfig,
+    handle: AgentHandle,
+) -> anyhow::Result<MeshSession> {
     let metrics = AgentMetrics::new().context("metrics")?;
+    #[cfg(feature = "local-api")]
     let started_at = Instant::now();
 
     let hostname = args
@@ -99,6 +134,7 @@ pub async fn run(
         if args.no_mdns {
             opts.enable_mdns = false;
         }
+        crate::host_constraints::constrain_lan(&mut opts);
         tracing::info!(
             relay = opts.relay.kind(),
             mdns = opts.enable_mdns,
@@ -113,8 +149,16 @@ pub async fn run(
                 "ignoring [network] relay-mode / relay-urls in Managed mode; control-plane snapshot is authoritative"
             );
         }
-        ConnectivityOptions::managed_default()
+        let mut opts = ConnectivityOptions::managed_default();
+        crate::host_constraints::constrain_lan(&mut opts);
+        opts
     };
+
+    // mDNS lookup is attached during bootstrap. Service relay (mdns-sd) is
+    // separate and also needs multicast reception while it runs.
+    let lan = crate::host_constraints::lan_available();
+    let need_multicast = connectivity.enable_mdns || (agent_cfg.effective_service_relay() && lan);
+    let multicast = crate::multicast_demand::MulticastLease::request(need_multicast);
 
     let (node, _pending_control) = CoreNode::bootstrap(
         identity.clone(),
@@ -153,6 +197,7 @@ pub async fn run(
         let _ = config_store.apply_remote(&agent_cfg, remote);
     }
 
+    #[cfg(feature = "updater")]
     if let Err(e) = crate::auto_update::on_agent_start(&node.paths) {
         tracing::warn!(?e, "auto-update pending check failed");
     }
@@ -235,16 +280,23 @@ pub async fn run(
     // One long-lived osdns manager for the agent lifetime. Owned by the
     // DataPlaneActor via config; created here because it needs blocking init.
     let dns_controller: Option<Arc<DnsController>> = {
-        match tokio::task::spawn_blocking(DnsController::create).await {
-            Ok(Ok(controller)) => Some(controller),
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "osdns DNS integration unavailable");
-                None
+        #[cfg(feature = "host-dns")]
+        {
+            match tokio::task::spawn_blocking(DnsController::create).await {
+                Ok(Ok(controller)) => Some(controller),
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "osdns DNS integration unavailable");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "osdns init task failed");
+                    None
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "osdns init task failed");
-                None
-            }
+        }
+        #[cfg(not(feature = "host-dns"))]
+        {
+            None
         }
     };
 
@@ -255,6 +307,7 @@ pub async fn run(
     let status_snapshot = tunnet_core::local_api::DataPlaneStatusSnapshot::new(false);
 
     // Child configs for the supervisor tree.
+    #[cfg(any(feature = "ssh", feature = "metrics-serve"))]
     let ssh_bind = dataplane_ssh_bind(&node);
     let dataplane_cfg = DataPlaneActorConfig {
         ifname: args.ifname.clone(),
@@ -288,10 +341,13 @@ pub async fn run(
             // Late-bound by the supervisor after the dataplane tree starts.
             route_actor: None,
             dataplane_actor: None,
+            #[cfg(feature = "posture")]
             posture_actor: None,
+            #[cfg(feature = "ssh")]
             ssh_registry: None,
         })
     };
+    #[cfg(feature = "posture")]
     let posture_cfg = if is_direct {
         None
     } else {
@@ -317,7 +373,11 @@ pub async fn run(
     // and the DataPlaneActor (which aborts readers on BringDown).
     let ingress = IngressRegistry::new();
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
-    let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(UpdateState::Idle));
+    #[cfg(feature = "updater")]
+    let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::actors::update::UpdateState::Idle,
+    ));
+    #[cfg(feature = "updater")]
     let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
     let supervisor = AgentSupervisor::spawn_with_mailbox(
         AgentSupervisorArgs {
@@ -338,9 +398,11 @@ pub async fn run(
                 auto_up: true,
             },
             control: control_args,
+            #[cfg(feature = "posture")]
             posture: posture_cfg,
             presence: presence_args,
-            update: Some(UpdateActorArgs {
+            #[cfg(feature = "updater")]
+            update: Some(crate::actors::update::UpdateActorArgs {
                 paths: paths.clone(),
                 store: Some(config_store.clone()),
                 updater: updater.clone(),
@@ -366,54 +428,55 @@ pub async fn run(
     if let Some(control) = &children.control_actor {
         control.wait_for_startup().await;
     }
+    #[cfg(feature = "ssh")]
     let ssh_registry = children
         .ssh_registry
         .clone()
         .context("ssh registry missing")?;
 
-    // Local API first: bind + readiness before TUN/SSH bring-up.
     let data_plane_control = Arc::new(ActorDataPlaneControl::new(
         status_snapshot.clone(),
         dataplane_ref.clone(),
     ));
-    let bootstrap: Arc<dyn tunnet_core::local_api::BootstrapOps> = Arc::new(
-        crate::api_bootstrap::AgentBootstrapOps::new(paths.clone(), events_tx.clone()),
-    );
-    let api_state = Arc::new(LocalApiState {
-        node: node.clone(),
-        hostname: hostname.clone(),
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at,
-        dns_upstream: dns_cfg.upstream.clone(),
-        dnssec: dns_cfg.dnssec,
-        resolver_endpoint: tunnet_common::LocalResolverEndpoint::default()
-            .socket_addr()
-            .to_string(),
-        peer_dns_active: peer_dns_active.clone(),
-        peer_rtt: Arc::new(dashmap::DashMap::new()),
-        serves: node.serves.clone(),
-        tunnels: node.tunnels.clone(),
-        send: node.send.clone(),
-        data_plane: data_plane_control,
-        bootstrap,
-        events: events_tx,
-    });
-    api_state.send.set_events_tx(api_state.events.clone());
-    if let Some(link) = &node.control_link {
-        link.set_events_tx(api_state.events.clone());
-        if link.snapshot().connected {
-            api_state.emit(tunnet_common::local_api::LocalEvent::ControlConnected);
+    let peer_rtt = Arc::new(dashmap::DashMap::new());
+    #[cfg(feature = "local-api")]
+    let api_state = {
+        let bootstrap: Arc<dyn tunnet_core::local_api::BootstrapOps> = Arc::new(
+            crate::api_bootstrap::AgentBootstrapOps::new(paths.clone(), events_tx.clone())
+                .with_handle(handle.clone()),
+        );
+        let api_state = Arc::new(LocalApiState {
+            node: node.clone(),
+            hostname: hostname.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            started_at,
+            dns_upstream: dns_cfg.upstream.clone(),
+            dnssec: dns_cfg.dnssec,
+            resolver_endpoint: tunnet_common::LocalResolverEndpoint::default()
+                .socket_addr()
+                .to_string(),
+            peer_dns_active: peer_dns_active.clone(),
+            peer_rtt: peer_rtt.clone(),
+            serves: node.serves.clone(),
+            tunnels: node.tunnels.clone(),
+            send: node.send.clone(),
+            data_plane: data_plane_control.clone(),
+            bootstrap,
+            events: events_tx.clone(),
+            mesh_observe: Some(Arc::new({
+                let handle = handle.clone();
+                move || handle.observe_mesh()
+            })),
+        });
+        api_state.send.set_events_tx(api_state.events.clone());
+        if let Some(link) = &node.control_link {
+            link.set_events_tx(api_state.events.clone());
+            if link.snapshot().connected {
+                api_state.emit(tunnet_common::local_api::LocalEvent::ControlConnected);
+            }
         }
-    }
-    let api_server = spawn_local_api(api_state.clone())
-        .await
-        .context("start Local Management API")?;
-    if let Some(tx) = on_ready.take() {
-        let _ = tx.send(());
-    }
-    #[cfg(unix)]
-    crate::sd_notify::ready("running");
-    api_state.emit(tunnet_common::local_api::LocalEvent::DaemonReady);
+        api_state
+    };
 
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
@@ -446,17 +509,6 @@ pub async fn run(
                 }
             }
         });
-    }
-
-    let recording_store = match RecordingStore::open(node.paths.recordings_dir()) {
-        Ok(s) => Some(Arc::new(s)),
-        Err(e) => {
-            tracing::warn!(?e, "recording store unavailable");
-            None
-        }
-    };
-    if args.recorder {
-        tracing::info!("session recorder enabled (ALPN tunnet/recording/1)");
     }
 
     let stream_handler = tunnet_core::stream_handler(node.routes.clone(), node.acl.clone());
@@ -539,91 +591,120 @@ pub async fn run(
         node.send.set_content_key(Some(key));
     }
 
+    #[cfg(feature = "ssh")]
     let network_name = node
         .persisted
         .primary_network_name()
         .unwrap_or("tunnet")
         .to_string();
 
+    #[cfg(feature = "ssh")]
     for rt in node.direct.values() {
         rt.firewall
             .ensure_inbound_tcp_allow(crate::ssh_nat::SSH_EXTERNAL_PORT);
     }
 
-    let ssh_deps = crate::ssh::SshServeDeps {
-        routes: node.routes.clone(),
-        acl: node.acl.clone(),
-        sessions: ssh_registry.clone(),
-        cp_tx: node.serves.client_tx(),
-        pool: node.pool.clone(),
-        store: recording_store.clone(),
-        signed: node.signed.clone(),
-        hostname: hostname.clone(),
-        network_name: network_name.clone(),
-    };
-    if ssh_deps.cp_tx.is_none() {
-        tracing::warn!(
-            "SSH session reporting disabled (no control-plane WS channel yet); sessions will not appear in the dashboard"
-        );
-    }
-    let ssh_handle = match crate::ssh::spawn_ssh_listener(ssh_bind, &node.paths, ssh_deps).await {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            tracing::error!(?e, "failed to start SSH listener");
-            None
-        }
-    };
-
-    // Publish host pubkey: control-plane metadata (managed) / iroh-docs (direct).
-    let ssh_pubkey = match crate::ssh::host_pubkey_openssh(&node.paths) {
-        Ok(k) => Some(k),
-        Err(e) => {
-            tracing::warn!(?e, "SSH host pubkey unavailable for distribution");
-            None
-        }
-    };
-    if let Some(ref pubkey) = ssh_pubkey {
-        if let Some(signed) = node.signed.clone() {
-            let hostname = hostname.clone();
-            let pubkey = pubkey.clone();
-            tokio::spawn(async move {
-                let mut meta = tunnet_core::control::basic_metadata(
-                    &hostname,
-                    env!("CARGO_PKG_VERSION"),
-                    "agent",
+    let ssh_handle = {
+        #[cfg(feature = "ssh")]
+        {
+            let recording_store =
+                match crate::recorder::RecordingStore::open(node.paths.recordings_dir()) {
+                    Ok(s) => Some(Arc::new(s)),
+                    Err(e) => {
+                        tracing::warn!(?e, "recording store unavailable");
+                        None
+                    }
+                };
+            let ssh_deps = crate::ssh::SshServeDeps {
+                routes: node.routes.clone(),
+                acl: node.acl.clone(),
+                sessions: ssh_registry.clone(),
+                #[cfg(feature = "local-api")]
+                cp_tx: node.serves.client_tx(),
+                #[cfg(not(feature = "local-api"))]
+                cp_tx: None,
+                pool: node.pool.clone(),
+                store: recording_store.clone(),
+                signed: node.signed.clone(),
+                hostname: hostname.clone(),
+                network_name: network_name.clone(),
+            };
+            if ssh_deps.cp_tx.is_none() {
+                tracing::warn!(
+                    "SSH session reporting disabled (no control-plane WS channel yet); sessions will not appear in the dashboard"
                 );
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.insert("sshHostKey".into(), serde_json::Value::String(pubkey));
-                }
-                match signed
-                    .register(&hostname, env!("CARGO_PKG_VERSION"), Some(meta))
-                    .await
-                {
-                    Ok(_) => tracing::info!("published SSH host key to control plane"),
-                    Err(e) => tracing::warn!(?e, "failed to publish SSH host key"),
-                }
-            });
-        }
-        for rt in node.direct.values() {
-            if let Err(e) = rt.docs.set_ssh_host_key(pubkey).await {
-                tracing::warn!(?e, "failed to publish SSH host key to iroh-docs");
-            } else {
-                tracing::info!("published SSH host key to iroh-docs");
             }
+            let ssh_handle =
+                match crate::ssh::spawn_ssh_listener(ssh_bind, &node.paths, ssh_deps).await {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        tracing::error!(?e, "failed to start SSH listener");
+                        None
+                    }
+                };
+            if let Ok(pubkey) = crate::ssh::host_pubkey_openssh(&node.paths) {
+                if let Some(signed) = node.signed.clone() {
+                    let hostname = hostname.clone();
+                    let pubkey = pubkey.clone();
+                    tokio::spawn(async move {
+                        let mut meta = tunnet_core::control::basic_metadata(
+                            &hostname,
+                            env!("CARGO_PKG_VERSION"),
+                            "agent",
+                        );
+                        if let Some(obj) = meta.as_object_mut() {
+                            obj.insert("sshHostKey".into(), serde_json::Value::String(pubkey));
+                        }
+                        match signed
+                            .register(&hostname, env!("CARGO_PKG_VERSION"), Some(meta))
+                            .await
+                        {
+                            Ok(_) => tracing::info!("published SSH host key to control plane"),
+                            Err(e) => tracing::warn!(?e, "failed to publish SSH host key"),
+                        }
+                    });
+                }
+                for rt in node.direct.values() {
+                    if let Err(e) = rt.docs.set_ssh_host_key(&pubkey).await {
+                        tracing::warn!(?e, "failed to publish SSH host key to iroh-docs");
+                    } else {
+                        tracing::info!("published SSH host key to iroh-docs");
+                    }
+                }
+            }
+            let _ = recording_store;
+            ssh_handle
         }
-    }
+        #[cfg(not(feature = "ssh"))]
+        {
+            None
+        }
+    };
 
-    let _router = crate::accept::spawn(AcceptDeps {
+    let router = crate::accept::spawn(AcceptDeps {
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
         acl: node.acl.clone(),
         metrics: metrics.clone(),
         tun: published.clone(),
         stream_handler,
-        cp_tx: node.serves.client_tx(),
-        recording_store,
+        #[cfg(feature = "ssh")]
+        cp_tx: {
+            #[cfg(feature = "local-api")]
+            {
+                node.serves.client_tx()
+            }
+            #[cfg(not(feature = "local-api"))]
+            {
+                None
+            }
+        },
+        #[cfg(feature = "ssh")]
+        recording_store: None,
+        #[cfg(feature = "ssh")]
         signed: node.signed.clone(),
         self_endpoint_id: node.endpoint_id_hex(),
+        #[cfg(feature = "ssh")]
         recorder_enabled: args.recorder,
         send: node.send.clone(),
         direct_auth: node.direct_auth.clone(),
@@ -636,13 +717,13 @@ pub async fn run(
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
         ingress: ingress.clone(),
-        events: api_state.events.clone(),
+        events: events_tx.clone(),
     });
 
-    let first_local = ssh_bind;
-    crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, first_local);
+    #[cfg(feature = "metrics-serve")]
+    crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, ssh_bind);
 
-    if agent_cfg.effective_service_relay() {
+    if agent_cfg.effective_service_relay() && lan {
         if let Some(gossip) = node.shared_gossip() {
             let peers: Vec<iroh::EndpointId> = node
                 .routes
@@ -663,34 +744,74 @@ pub async fn run(
         } else {
             tracing::warn!("mDNS service relay skipped (no shared Gossip)");
         }
+    } else if agent_cfg.effective_service_relay() {
+        tracing::info!("mDNS service relay skipped (LAN unavailable)");
     }
 
-    // Explicit shutdown drain: supervisor first (control → presence/posture →
-    // update → dataplane → ssh registry), then outer services, then endpoint.
-    #[cfg(unix)]
-    {
-        let _ = shutdown;
-        let upgrade = crate::upgrade::UpgradeGuard::install()?;
-        let reason = upgrade.wait().await;
-        tracing::info!(?reason, "shutdown signal; draining");
-        drain(supervisor, ssh_handle, dns_controller, api_server, &node).await;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        if let Some(token) = shutdown {
-            token.cancelled().await;
-            tracing::info!("service stop, shutting down");
-        } else {
-            tokio::signal::ctrl_c().await?;
-            tracing::info!("ctrl-c, shutting down");
+    spawn_view_pump(
+        handle,
+        node.routes.clone(),
+        events_tx.clone(),
+        supervisor.clone(),
+    );
+
+    Ok(MeshSession {
+        supervisor,
+        ssh_handle,
+        dns_controller,
+        _multicast: multicast,
+        node,
+        dataplane: data_plane_control,
+        peer_rtt,
+        #[cfg(feature = "local-api")]
+        api_state,
+        hostname,
+        router,
+    })
+}
+
+fn spawn_view_pump(
+    handle: AgentHandle,
+    routes: tunnet_core::RoutingTable,
+    events: tokio::sync::broadcast::Sender<tunnet_common::local_api::LocalEvent>,
+    supervisor: kameo::actor::ActorRef<crate::actors::supervisor::AgentSupervisor>,
+) {
+    let shutdown = handle.shutdown_token();
+    tokio::spawn(async move {
+        let mut routes_rx = routes.subscribe_changes();
+        let mut events_rx = events.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = supervisor.wait_for_shutdown() => {
+                    handle.record_dead_mesh().await;
+                    break;
+                }
+                r = routes_rx.changed() => {
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                ev = events_rx.recv() => {
+                    match ev {
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                _ = shutdown.cancelled() => break,
+            }
+            let snap = handle.snapshot_now();
+            handle.publish(snap);
         }
-        drain(supervisor, ssh_handle, dns_controller, api_server, &node).await;
-        Ok(())
-    }
+    });
 }
 
 /// Graceful drain with bounded waits; abort only as a final fallback.
+#[cfg(any(feature = "ssh", feature = "metrics-serve"))]
 fn dataplane_ssh_bind(node: &CoreNode) -> std::net::Ipv4Addr {
     node.persisted
         .direct_networks()
@@ -703,25 +824,20 @@ async fn drain(
     supervisor: kameo::actor::ActorRef<AgentSupervisor>,
     ssh_handle: Option<tokio::task::JoinHandle<()>>,
     dns_controller: Option<Arc<DnsController>>,
-    api_server: tunnet_core::local_api::LocalApiServer,
+    router: iroh::protocol::Router,
     node: &CoreNode,
 ) {
     use crate::actors::supervisor::ShutdownAgent;
 
-    // 1. Stop accepting new lifecycle/control mutations and drain clients.
-    api_server.shutdown().await;
-    // 2. Actor tree: control → presence/posture/update → dataplane → ssh.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _ = supervisor.tell(ShutdownAgent).send().await;
         let _ = supervisor.stop_gracefully().await;
         supervisor.wait_for_shutdown().await;
     })
     .await;
-    // 3. Outer raw services owned by bootstrap.
     if let Some(handle) = ssh_handle {
         handle.abort();
     }
-    // 4. DNS lease restore is idempotent (actor teardown already did it).
     if let Some(dns) = dns_controller {
         match tokio::task::spawn_blocking(move || dns.restore()).await {
             Ok(Ok(())) => {}
@@ -729,7 +845,9 @@ async fn drain(
             Err(e) => tracing::warn!(error = %e, "DNS shutdown task failed"),
         }
     }
-    // 5. Close Iroh endpoint.
+    if let Err(e) = router.shutdown().await {
+        tracing::warn!(error = %e, "iroh accept router shutdown failed");
+    }
     node.shutdown().await;
 }
 

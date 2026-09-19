@@ -7,68 +7,124 @@
 
 mod accept;
 mod actors;
-// Unix-shaped in content (it owns a raw fd), Android-only in use. Also built
-// under `test` on Unix hosts so its behaviour is covered by the host test run
-// rather than only on a device. The `unix` bound is required: `test` alone is
-// true on Windows too, where `std::os::fd` does not exist and `libc` is not a
-// dependency.
-#[cfg(any(target_os = "android", all(test, unix)))]
-pub mod android_tun;
-mod api_bootstrap;
-mod auto_update;
-mod cli;
-mod cmds;
-mod cmds_device;
 mod cmds_direct;
-mod cmds_login;
-mod cmds_update;
 mod conflict;
-mod core_update;
-pub mod daemon;
 mod dataplane;
 mod dgram_pump;
 mod forward;
+mod host_constraints;
 mod ingress;
 mod metrics;
-mod policy_api;
+mod multicast_demand;
+mod platform;
 mod qos;
-mod recorder;
-mod runtime;
-#[cfg(unix)]
-mod sd_notify;
-mod service;
-mod ssh;
-mod ssh_nat;
-mod system_dns;
+pub mod runtime;
 mod system_firewall;
+#[cfg(feature = "local-api")]
 mod system_info;
 mod system_routes;
 mod tun_io;
 mod underlay;
-#[cfg(unix)]
-mod upgrade;
-#[cfg(windows)]
-mod win_service;
 #[cfg(windows)]
 mod wintun;
 
-use clap::Parser;
+#[cfg(feature = "host-dns")]
+mod system_dns;
+#[cfg(not(feature = "host-dns"))]
+mod system_dns {
+    use std::net::Ipv4Addr;
+
+    pub struct DnsController;
+
+    impl DnsController {
+        pub fn restore(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        pub fn is_active(&self) -> bool {
+            false
+        }
+
+        pub fn apply(&self, _: &str, _: Ipv4Addr, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "ssh")]
+mod recorder;
+#[cfg(feature = "ssh")]
+mod ssh;
+#[cfg(feature = "ssh")]
+mod ssh_nat;
+
+#[cfg(feature = "updater")]
+mod auto_update;
+#[cfg(feature = "updater")]
+mod cmds_update;
+#[cfg(feature = "updater")]
+mod core_update;
+
+#[cfg(feature = "local-api")]
+mod api_bootstrap;
+#[cfg(feature = "local-api")]
+mod cli;
+#[cfg(feature = "local-api")]
+mod cmds;
+#[cfg(feature = "local-api")]
+mod cmds_device;
+#[cfg(feature = "local-api")]
+mod cmds_login;
+#[cfg(all(feature = "local-api", feature = "policy"))]
+mod policy_api;
+
+#[cfg(feature = "daemon")]
+pub mod daemon;
+#[cfg(all(feature = "daemon", unix, not(target_os = "android")))]
+mod sd_notify;
+#[cfg(feature = "daemon")]
+mod service;
+#[cfg(all(feature = "daemon", unix, not(target_os = "android")))]
+mod upgrade;
+#[cfg(all(feature = "daemon", windows))]
+mod win_service;
+
+pub use host_constraints::{constrain_lan, lan_available, set_lan_available};
+pub use multicast_demand::{
+    MulticastHost, MulticastLease, clear_multicast_host, multicast_needed, set_multicast_host,
+};
+#[cfg(any(target_os = "android", all(test, unix)))]
+pub use platform::tun as android_tun;
+#[cfg(any(target_os = "android", all(test, unix)))]
+pub use platform::underlay::{
+    UnderlayProtect, clear_underlay_protect, protect_existing as protect_underlay_sockets,
+    set_underlay_protect,
+};
+pub use runtime::{
+    AgentConfig, AgentError, AgentErrorInfo, AgentErrorKind, AgentHandle, AgentLifecycle,
+    AgentMode, AgentNetwork, AgentPeer, AgentRole, AgentRuntime, AgentSnapshot, CreateRequest,
+    DataPlaneState, JoinOutcome, JoinRequest, LatestSlot, PeerConnKind, PeerPath, WireNativeResult,
+    WireSnapshot, decode_snapshot, encode_snapshot, sanitize_hostname,
+};
+pub use tunnet_core::{
+    PlatformSealer, SealError, SealErrorKind, clear_platform_sealer, set_platform_sealer,
+};
 
 /// Install the process-wide rustls provider. Idempotent, and required before
 /// any TLS work. Embedders must call this before starting the agent.
 pub fn install_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        return;
-    }
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls CryptoProvider");
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+#[cfg(feature = "daemon")]
+use clap::Parser;
+
 /// `tunnetd` entry point. Parses argv, so only the binary should call it.
+#[cfg(feature = "daemon")]
 pub fn run_cli() {
     install_crypto_provider();
 
+    #[cfg(feature = "updater")]
     match crate::core_update::maybe_run_activation_worker() {
         Ok(true) => return,
         Ok(false) => {}
@@ -104,12 +160,14 @@ pub fn run_cli() {
     }
 }
 
+#[cfg(feature = "daemon")]
 fn exit_with(code: i32) -> ! {
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let _ = std::io::Write::flush(&mut std::io::stderr());
     std::process::exit(code);
 }
 
+#[cfg(feature = "daemon")]
 async fn async_main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     let cli = daemon::DaemonCli::parse();

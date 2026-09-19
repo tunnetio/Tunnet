@@ -14,7 +14,7 @@ pub mod antispoof;
 pub mod auth;
 #[cfg(feature = "direct")]
 pub mod authority;
-#[cfg(all(feature = "direct", feature = "local_api"))]
+#[cfg(feature = "direct")]
 pub mod connect;
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub mod connectivity;
@@ -54,8 +54,8 @@ pub use auth::{
 pub use authority::{DirectAuthority, JoinDecision, JoinSnapshot, PendingJoin};
 #[cfg(any(feature = "direct", feature = "managed"))]
 pub use connectivity::{
-    ConnectivityOptions, apply_connectivity, endpoint_builder, relay_auth_denied_detail,
-    relay_map_from_configs, relay_uses_n0_preset,
+    ConnectivityOptions, apply_connectivity, apply_overlay_addr_filter, endpoint_builder,
+    relay_auth_denied_detail, relay_map_from_configs, relay_uses_n0_preset, strip_overlay_addrs,
 };
 pub use contact::{contact_id_from_endpoint, contact_id_from_hex, is_contact_id, parse_contact_id};
 #[cfg(feature = "direct")]
@@ -72,7 +72,9 @@ pub use grants::{
     verify_genesis, verify_grant, verify_member_record, verify_revocation, verifying_key_from_hex,
 };
 #[cfg(feature = "direct")]
-pub use invite::{InviteCode, decode_invite, encode_invite};
+pub use invite::{
+    InviteCode, decode_invite, encode_invite, join_dial_addr, stamp_coordinator_addr,
+};
 #[cfg(feature = "direct")]
 pub use ip::network_id_from_topic;
 #[cfg(feature = "direct")]

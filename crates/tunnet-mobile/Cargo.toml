@@ -17,23 +17,15 @@ name = "tunnet_mobile"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-tunnet-agent.workspace = true
-tunnet-client.workspace = true
-tunnet-common.workspace = true
-tunnet-core.workspace = true
+tunnet-agent = { path = "../tunnet-agent", default-features = false }
 
 anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 tracing.workspace = true
 
-# The JNI bridge is Android-only: the host test build stays JVM-free, exactly as
-# the `werust-android-core` crate does it.
-ndk-context = "0.1"
 [target.'cfg(target_os = "android")'.dependencies]
-jni = { version = "0.21", default-features = false }
+ndk-context = "0.1"
+jni = { version = "0.22", default-features = false }
 tracing-android = "0.2"
 tracing-subscriber.workspace = true
 

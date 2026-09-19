@@ -1,9 +1,7 @@
-//! Desired-state OS route reconciliation via native routing APIs
+//! Desired-state OS route reconciliation via native routing APIs.
 //!
-//! On Android `VpnService.Builder` owns the routing table: `RouteEngine::new`
-//! returns `FrameworkOwnedBackend` and `reconcile` returns before the native
-//! path, so this layer is compiled but unreachable there alone. Scoped, so the
-//! platforms that do use it keep dead-code detection.
+//! Android never invokes this layer: capture routes are declared on
+//! `VpnService.Builder` at TUN establish. Desktop uses [`RouteEngine`].
 #![cfg_attr(target_os = "android", allow(dead_code))]
 
 use std::collections::BTreeSet;
@@ -203,39 +201,6 @@ impl NativeBackend {
     }
 }
 
-/// Android backend: the framework installed the routes, so reconciliation has
-/// nothing to do and must not claim otherwise.
-///
-/// Reporting an empty table is truthful from this process's point of view: it
-/// owns no routes, so it has none to add or remove. The engine then computes an
-/// empty diff rather than repeatedly trying to install routes it cannot.
-#[cfg(target_os = "android")]
-struct FrameworkOwnedBackend;
-
-#[cfg(target_os = "android")]
-#[async_trait]
-impl RouteBackend for FrameworkOwnedBackend {
-    async fn list(&mut self) -> Result<Vec<RouteSpec>, RouteError> {
-        Ok(Vec::new())
-    }
-
-    async fn add(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
-        tracing::debug!(
-            ?route,
-            "route add skipped; VpnService.Builder owns the table"
-        );
-        Ok(())
-    }
-
-    async fn delete(&mut self, route: &RouteSpec) -> Result<(), RouteError> {
-        tracing::debug!(
-            ?route,
-            "route delete skipped; VpnService.Builder owns the table"
-        );
-        Ok(())
-    }
-}
-
 #[cfg(not(target_os = "android"))]
 fn spec_to_route(spec: &RouteSpec) -> Route {
     let mut route = Route::new(IpAddr::V4(spec.dest.network()), spec.dest.prefix_len())
@@ -406,12 +371,10 @@ pub(crate) struct RouteEngine {
 }
 
 impl RouteEngine {
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn new() -> anyhow::Result<Self> {
-        #[cfg(not(target_os = "android"))]
         let backend: Box<dyn RouteBackend> =
             Box::new(NativeBackend::new().map_err(|e| anyhow::anyhow!("route manager: {e}"))?);
-        #[cfg(target_os = "android")]
-        let backend: Box<dyn RouteBackend> = Box::new(FrameworkOwnedBackend);
         Ok(Self::with_backend(backend))
     }
 
@@ -440,19 +403,15 @@ impl RouteEngine {
 
     pub(crate) async fn reconcile(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
         self.last_desired = Some(desired.clone());
+        #[cfg(not(target_os = "android"))]
+        {
+            self.reconcile_native(desired).await
+        }
         #[cfg(target_os = "android")]
         {
-            // Routes were declared to `VpnService` when the tunnel was
-            // established, so there is nothing to reconcile. Returning early
-            // also avoids the interface lookup in the native path: the agent's
-            // configured `ifname` does not exist on Android, where the
-            // framework names the device (`tun0`), so resolving it yields
-            // `InvalidInterface`. That degrades the Direct lifecycle, which
-            // retries, which re-establishes the tunnel every couple of seconds.
+            let _ = desired;
             Ok(())
         }
-        #[cfg(not(target_os = "android"))]
-        self.reconcile_native(desired).await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -641,10 +600,18 @@ impl RouteEngine {
     }
 }
 
+fn interface_name_matches(iface: &netdev::Interface, name: &str) -> bool {
+    iface.name.eq_ignore_ascii_case(name)
+        || iface
+            .friendly_name
+            .as_deref()
+            .is_some_and(|friendly| friendly.eq_ignore_ascii_case(name))
+}
+
 fn resolve_if_index(name: &str) -> Option<u32> {
     netdev::get_interfaces()
         .into_iter()
-        .find(|iface| iface.name == name)
+        .find(|iface| interface_name_matches(iface, name))
         .map(|iface| iface.index)
 }
 
@@ -1141,6 +1108,36 @@ mod tests {
                 .iter()
                 .any(|s| s.dest == "10.7.0.2/32".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn lookup_matches_adapter_name_or_friendly_name() {
+        let mut iface = netdev::Interface::dummy();
+        iface.index = 7;
+        iface.name = "{319b674d-30df-4530-8ae3-89b41983040a}".into();
+        iface.friendly_name = Some("tunnet0".into());
+        assert!(interface_name_matches(&iface, "tunnet0"));
+        assert!(interface_name_matches(
+            &iface,
+            "{319b674d-30df-4530-8ae3-89b41983040a}"
+        ));
+        assert!(!interface_name_matches(&iface, "Ethernet"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_friendly_name_resolves_to_index() {
+        let iface = netdev::get_interfaces()
+            .into_iter()
+            .find(|i| {
+                i.friendly_name
+                    .as_deref()
+                    .is_some_and(|friendly| !friendly.is_empty() && friendly != i.name)
+            })
+            .expect("Windows adapters expose a friendly name distinct from AdapterName");
+        let friendly = iface.friendly_name.as_deref().unwrap();
+        assert_eq!(resolve_if_index(friendly), Some(iface.index));
+        assert_ne!(friendly, iface.name.as_str());
     }
 
     #[test]

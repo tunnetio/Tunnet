@@ -1,4 +1,10 @@
 //! Local Management API - HTTP JSON over Unix domain socket / Windows named pipe.
+//!
+//! [`DataPlaneControl`] / [`DataPlaneStatusSnapshot`] are always available: the
+//! embedded runtime uses them without binding this HTTP API.
+
+pub mod dataplane;
+pub use dataplane::{DataPlaneControl, DataPlaneStatusSnapshot};
 
 #[cfg(feature = "local_api")]
 pub mod auth;
@@ -6,8 +12,6 @@ pub mod auth;
 pub mod bootstrap;
 #[cfg(feature = "local_api")]
 pub mod bootstrap_router;
-#[cfg(feature = "local_api")]
-pub mod dataplane;
 #[cfg(feature = "local_api")]
 pub mod handlers;
 #[cfg(feature = "local_api")]
@@ -24,15 +28,19 @@ pub use bootstrap::BootstrapOps;
 #[cfg(feature = "local_api")]
 pub use bootstrap_router::BootstrapApiState;
 #[cfg(feature = "local_api")]
-pub use dataplane::{DataPlaneControl, DataPlaneStatusSnapshot};
-#[cfg(feature = "local_api")]
 pub use server::LocalApiServer;
 #[cfg(feature = "local_api")]
 pub use server::spawn as spawn_local_api;
 #[cfg(feature = "local_api")]
 pub use server::spawn_bootstrap as spawn_bootstrap_api;
 #[cfg(feature = "local_api")]
+pub use server::spawn_switching as spawn_switching_api;
+#[cfg(feature = "local_api")]
 pub use state::LocalApiState;
+#[cfg(feature = "local_api")]
+pub mod observe;
+#[cfg(feature = "local_api")]
+pub use observe::{MeshObservation, ObservedNetwork};
 #[cfg(feature = "local_api")]
 pub use transport::{default_api_path, endpoint_reachable};
 

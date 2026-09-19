@@ -92,7 +92,13 @@ async fn idle_node(
     State(state): State<ApiState>,
 ) -> ApiResult<Json<NodeSummary>> {
     peer.require_cap(STATUS_READ)?;
-    Ok(Json(handlers::idle_node_summary(&state.daemon_version)))
+    Ok(Json(
+        state
+            .bootstrap
+            .observe_mesh()
+            .map(|obs| handlers::node_summary_from_observation(&state.daemon_version, &obs))
+            .unwrap_or_else(|| handlers::idle_node_summary(&state.daemon_version)),
+    ))
 }
 
 async fn idle_events(

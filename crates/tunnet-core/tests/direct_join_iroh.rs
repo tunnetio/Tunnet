@@ -560,9 +560,113 @@ async fn decode_rejects_unsigned_genesis_in_invite() {
         genesis: bad,
         invite_secret: hex::encode([1u8; 32]),
         expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
+        coordinator_addr: None,
     };
     let code = tunnet_core::direct::encode_invite(&invite).unwrap();
     assert!(tunnet_core::direct::decode_invite(&code).is_err());
     let _ = sk;
     let _ = Ipv4Addr::UNSPECIFIED;
+}
+
+/// Two local N0 endpoints, handshake over relay only (IPs stripped).
+#[tokio::test]
+#[ignore = "live n0 relay"]
+async fn n0_relay_only_connects_two_local_endpoints() {
+    let alpn = b"tunnet/n0-relay-probe/1";
+    let opts = tunnet_core::direct::ConnectivityOptions::direct_default(false);
+    let server = tunnet_core::direct::endpoint_builder(&opts)
+        .alpns(vec![alpn.to_vec()])
+        .bind()
+        .await
+        .expect("server bind");
+    let client = tunnet_core::direct::endpoint_builder(&opts)
+        .alpns(vec![alpn.to_vec()])
+        .bind()
+        .await
+        .expect("client bind");
+    tokio::time::timeout(std::time::Duration::from_secs(20), server.online())
+        .await
+        .expect("server online");
+    tokio::time::timeout(std::time::Duration::from_secs(20), client.online())
+        .await
+        .expect("client online");
+    let mut addr = server.addr();
+    addr.addrs.retain(|a| !a.is_ip());
+    assert!(
+        addr.relay_urls().next().is_some(),
+        "server has no relay: {addr:?}"
+    );
+    let accept = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let incoming = server.accept().await.expect("accept");
+            incoming.await.expect("handshake")
+        }
+    });
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(35),
+        client.connect(addr, alpn),
+    )
+    .await
+    .expect("connect wait")
+    .unwrap_or_else(|e| panic!("connect: {e:#}"));
+    let _accepted = tokio::time::timeout(std::time::Duration::from_secs(10), accept)
+        .await
+        .expect("accept wait")
+        .expect("accept join");
+    conn.close(0u32.into(), b"ok");
+}
+
+#[derive(Debug, Clone)]
+struct ProbeHandler;
+
+impl ProtocolHandler for ProbeHandler {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        conn.closed().await;
+        Ok(())
+    }
+}
+
+/// Same as [`n0_relay_only_connects_two_local_endpoints`], but with DirectAuthHook + Router.
+#[tokio::test]
+#[ignore = "live n0 relay"]
+async fn n0_relay_only_join_alpn_with_router_and_auth_hook() {
+    let opts = tunnet_core::direct::ConnectivityOptions::direct_default(false);
+    let auth = tunnet_core::direct::AuthCache::new();
+    let server = tunnet_core::direct::endpoint_builder(&opts)
+        .alpns(vec![JOIN_ALPN.to_vec()])
+        .hooks(tunnet_core::direct::DirectAuthHook::new(auth))
+        .bind()
+        .await
+        .expect("server bind");
+    let _router = Router::builder(server.clone())
+        .accept(JOIN_ALPN, ProbeHandler)
+        .spawn();
+    let client = tunnet_core::direct::endpoint_builder(&opts)
+        .alpns(vec![JOIN_ALPN.to_vec()])
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind()
+        .await
+        .expect("client bind");
+    tokio::time::timeout(std::time::Duration::from_secs(20), server.online())
+        .await
+        .expect("server online");
+    tokio::time::timeout(std::time::Duration::from_secs(20), client.online())
+        .await
+        .expect("client online");
+    let mut addr = server.addr();
+    addr.addrs.retain(|a| !a.is_ip());
+    assert!(
+        addr.relay_urls().next().is_some(),
+        "server has no relay: {addr:?}"
+    );
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(35),
+        client.connect(addr, JOIN_ALPN),
+    )
+    .await
+    .expect("connect wait")
+    .unwrap_or_else(|e| panic!("connect JOIN_ALPN via router: {e:#}"));
+    conn.close(0u32.into(), b"ok");
 }

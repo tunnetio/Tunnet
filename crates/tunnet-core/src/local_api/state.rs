@@ -12,6 +12,7 @@ use crate::tunnel::TunnelManager;
 
 use super::bootstrap::BootstrapOps;
 use super::dataplane::DataPlaneControl;
+use super::observe::MeshObservation;
 
 /// Live agent state shared with the Local Management API server.
 pub struct LocalApiState {
@@ -30,6 +31,8 @@ pub struct LocalApiState {
     pub data_plane: Arc<dyn DataPlaneControl>,
     pub bootstrap: Arc<dyn BootstrapOps>,
     pub events: tokio::sync::broadcast::Sender<LocalEvent>,
+    /// Authoritative mesh status from [`tunnet_agent::AgentHandle`].
+    pub mesh_observe: Option<Arc<dyn Fn() -> MeshObservation + Send + Sync>>,
 }
 
 impl LocalApiState {

@@ -6,22 +6,28 @@
 
 pub mod control;
 pub mod dataplane;
+#[cfg(feature = "posture")]
 pub mod posture;
 pub mod presence;
 pub mod routes;
+#[cfg(feature = "ssh")]
 pub mod ssh_registry;
 pub mod supervisor;
 #[cfg(test)]
 pub mod test_support;
+#[cfg(feature = "updater")]
 pub mod update;
 
 /// Bounded mailbox capacities, chosen by traffic semantics (not arbitrary).
 pub(crate) const ROUTE_MAILBOX: usize = 16;
 pub(crate) const DATAPLANE_MAILBOX: usize = 16;
+#[cfg(feature = "posture")]
 pub(crate) const POSTURE_MAILBOX: usize = 32;
 pub(crate) const CONTROL_MAILBOX: usize = 128;
 pub(crate) const PRESENCE_MAILBOX: usize = 16;
+#[cfg(feature = "updater")]
 pub(crate) const UPDATE_MAILBOX: usize = 16;
+#[cfg(feature = "ssh")]
 pub(crate) const SSH_REGISTRY_MAILBOX: usize = 32;
 pub(crate) const SUPERVISOR_MAILBOX: usize = 32;
 
@@ -99,7 +105,7 @@ impl OwnedTask {
     /// lossy `try_send`): unexpected service death is supervision-critical
     /// and must not disappear under mailbox pressure. Shutdown completions
     /// stay silent, and a gone actor is fine. The owner must treat the
-    /// message as abnormal failure (panic) so supervision restarts it — a
+    /// message as abnormal failure (panic) so supervision restarts it - a
     /// long-lived owned service must never terminate silently while its
     /// actor lives on.
     ///
@@ -151,7 +157,7 @@ impl OwnedTask {
                 // Observe the abort (`abort()` is asynchronous). Awaiting a
                 // completed handle would panic, so this only runs after a
                 // real timeout. Graceful completions are already reaped by
-                // the timeout poll above — nothing is left detached either way.
+                // the timeout poll above - nothing is left detached either way.
                 let _ = handle.await;
             }
         }

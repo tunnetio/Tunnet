@@ -1,53 +1,76 @@
-use std::time::Duration;
-
 use metrics::{counter, describe_counter, describe_gauge, gauge};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 #[derive(Clone)]
+#[cfg_attr(not(feature = "metrics-serve"), derive(Default))]
 pub struct AgentMetrics {
-    handle: PrometheusHandle,
+    #[cfg(feature = "metrics-serve")]
+    handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 impl AgentMetrics {
     /// Test handle without installing a global recorder (parallel tests).
     #[cfg(test)]
     pub fn for_tests() -> Self {
-        let recorder = PrometheusBuilder::new()
-            .with_recommended_naming(true)
-            .build_recorder();
-        Self {
-            handle: recorder.handle(),
+        #[cfg(feature = "metrics-serve")]
+        {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_recommended_naming(true)
+                .build_recorder();
+            Self {
+                handle: recorder.handle(),
+            }
         }
+        #[cfg(not(feature = "metrics-serve"))]
+        Self::default()
     }
 
     pub fn new() -> anyhow::Result<Self> {
-        let handle = PrometheusBuilder::new()
-            .with_recommended_naming(true)
-            .install_recorder()?;
+        #[cfg(feature = "metrics-serve")]
+        {
+            let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_recommended_naming(true)
+                .install_recorder()?;
 
-        describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
-        describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
-        describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
-        describe_gauge!("tunnet_active_connections", "Live peer connections");
-        describe_gauge!(
-            "tunnet_direct_network_conflicts",
-            "Active Direct address-plan conflicts by category"
-        );
-        describe_gauge!(
-            "tunnet_direct_network_healthy",
-            "Direct network health (1 healthy, 0 degraded)"
-        );
+            describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
+            describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
+            describe_gauge!("tunnet_active_connections", "Live peer connections");
+            describe_gauge!(
+                "tunnet_direct_network_conflicts",
+                "Active Direct address-plan conflicts by category"
+            );
+            describe_gauge!(
+                "tunnet_direct_network_healthy",
+                "Direct network health (1 healthy, 0 degraded)"
+            );
 
-        let upkeep = handle.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                upkeep.run_upkeep();
-            }
-        });
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    upkeep.run_upkeep();
+                }
+            });
 
-        Ok(Self { handle })
+            Ok(Self { handle })
+        }
+        #[cfg(not(feature = "metrics-serve"))]
+        {
+            describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
+            describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
+            describe_gauge!("tunnet_active_connections", "Live peer connections");
+            describe_gauge!(
+                "tunnet_direct_network_conflicts",
+                "Active Direct address-plan conflicts by category"
+            );
+            describe_gauge!(
+                "tunnet_direct_network_healthy",
+                "Direct network health (1 healthy, 0 degraded)"
+            );
+            Ok(Self::default())
+        }
     }
 
     pub fn packets_inc(&self, direction: &'static str) {
@@ -78,16 +101,19 @@ impl AgentMetrics {
         gauge!("tunnet_direct_network_healthy").set(if healthy { 1.0 } else { 0.0 });
     }
 
+    #[cfg(feature = "metrics-serve")]
     pub fn render(&self) -> String {
         self.handle.render()
     }
 }
 
+#[cfg(feature = "metrics-serve")]
 pub fn metrics_port(bind: &str) -> &str {
     bind.rsplit(':').next().unwrap_or("9100")
 }
 
 /// Listen on localhost and the assigned overlay IP so peers can scrape via VPN.
+#[cfg(feature = "metrics-serve")]
 pub fn spawn_listeners(metrics: AgentMetrics, metrics_bind: &str, overlay_ip: std::net::Ipv4Addr) {
     let port = metrics_port(metrics_bind);
     for bind in [
@@ -99,6 +125,7 @@ pub fn spawn_listeners(metrics: AgentMetrics, metrics_bind: &str, overlay_ip: st
     }
 }
 
+#[cfg(feature = "metrics-serve")]
 pub async fn serve_metrics(metrics: AgentMetrics, bind: String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = match tokio::net::TcpListener::bind(&bind).await {

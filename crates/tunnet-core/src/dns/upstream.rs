@@ -70,7 +70,7 @@ fn ensure_rustls() {
 }
 
 /// Read the OS resolver list, dropping any entry that points at PeerDNS
-/// itself (host-local loopback endpoint).
+/// itself (loopback listener or in-TUN virtual address).
 ///
 /// This is the second line of defense against DNS loops. The primary
 /// invariant is ordering: the agent captures the underlay upstream
@@ -78,28 +78,24 @@ fn ensure_rustls() {
 /// (see `capture_underlay_upstream_specs`). Even if a resolver is (re)built
 /// after the overlay is live, filtering guarantees Hickory never selects
 /// PeerDNS as its own upstream merely because system DNS changed.
-pub fn local_resolver_ip() -> Ipv4Addr {
-    tunnet_common::LocalResolverEndpoint::default().ip
-}
-
-pub fn system_nameservers_excluding(resolver_ip: Ipv4Addr) -> Vec<IpAddr> {
+pub fn system_nameservers_excluding(excluded: impl IntoIterator<Item = Ipv4Addr>) -> Vec<IpAddr> {
     let Ok((conf, _)) = hickory_resolver::system_conf::read_system_conf() else {
         return Vec::new();
     };
-    filter_self_nameservers(conf.name_servers.iter().map(|ns| ns.ip), resolver_ip)
+    filter_self_nameservers(conf.name_servers.iter().map(|ns| ns.ip), excluded)
 }
 
 /// Pure filter used by [`system_nameservers_excluding`] and unit-tested
-/// directly: drop PeerDNS's own address so a post-overlay system state can
+/// directly: drop PeerDNS's own addresses so a post-overlay system state can
 /// never become our upstream.
 pub fn filter_self_nameservers(
     candidates: impl IntoIterator<Item = IpAddr>,
-    resolver_ip: Ipv4Addr,
+    excluded: impl IntoIterator<Item = Ipv4Addr>,
 ) -> Vec<IpAddr> {
-    let excluded = IpAddr::V4(resolver_ip);
+    let excluded: Vec<IpAddr> = excluded.into_iter().map(IpAddr::V4).collect();
     let mut out = Vec::new();
     for ip in candidates {
-        if ip == excluded || out.contains(&ip) {
+        if excluded.contains(&ip) || out.contains(&ip) {
             continue;
         }
         out.push(ip);
@@ -113,8 +109,10 @@ pub fn filter_self_nameservers(
 /// Returns an empty vec when the system exposes no usable upstream; callers
 /// should then fail safely instead of falling back to a recursive `"system"`
 /// read performed after the overlay is installed.
-pub fn capture_underlay_upstream_specs(resolver_ip: Ipv4Addr) -> Vec<String> {
-    system_nameservers_excluding(resolver_ip)
+pub fn capture_underlay_upstream_specs(
+    excluded: impl IntoIterator<Item = Ipv4Addr>,
+) -> Vec<String> {
+    system_nameservers_excluding(excluded)
         .into_iter()
         .map(|ip| format!("udp+tcp://{ip}:53"))
         .collect()
@@ -135,7 +133,7 @@ pub fn with_underlay_upstream(dns: &DnsConfig) -> DnsConfig {
     if !wants_system {
         return dns.clone();
     }
-    let captured = capture_underlay_upstream_specs(local_resolver_ip());
+    let captured = capture_underlay_upstream_specs(tunnet_common::resolver_self_ips());
     if captured.is_empty() {
         return dns.clone();
     }
@@ -147,7 +145,6 @@ pub fn with_underlay_upstream(dns: &DnsConfig) -> DnsConfig {
 
 pub fn build_resolver(dns: &DnsConfig) -> anyhow::Result<TokioResolver> {
     ensure_rustls();
-    let resolver_ip = local_resolver_ip();
     match parse_upstream(&dns.upstream)? {
         UpstreamSource::System => {
             // Never resolve through ourselves: the OS state may already point
@@ -155,14 +152,15 @@ pub fn build_resolver(dns: &DnsConfig) -> anyhow::Result<TokioResolver> {
             // (or after roaming re-pointed the stub at us).
             let (conf, _) = hickory_resolver::system_conf::read_system_conf()
                 .map_err(|e| anyhow::anyhow!("system DNS configuration: {e}"))?;
-            let filtered =
-                filter_self_nameservers(conf.name_servers.iter().map(|ns| ns.ip), resolver_ip);
+            let filtered = filter_self_nameservers(
+                conf.name_servers.iter().map(|ns| ns.ip),
+                tunnet_common::resolver_self_ips(),
+            );
             if filtered.is_empty() {
                 anyhow::bail!(
-                    "system DNS points only at PeerDNS ({}); refusing to create \
+                    "system DNS points only at PeerDNS; refusing to create \
                      a recursive upstream loop. Configure an explicit upstream \
-                     or capture the underlay resolver before installing the OS overlay",
-                    resolver_ip
+                     or capture the underlay resolver before installing the OS overlay"
                 );
             }
             let explicit = ResolverConfig::from_parts(

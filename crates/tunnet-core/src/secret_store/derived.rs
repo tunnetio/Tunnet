@@ -2,17 +2,24 @@
 
 #[cfg(any(target_os = "macos", windows))]
 use anyhow::Context;
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    windows,
+    target_os = "android"
+))]
 use anyhow::bail;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
 const INFO: &[u8] = b"tunnet-state-enc-v1";
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[derive(Clone)]
 pub(super) struct StableMachineId(String);
 
 impl StableMachineId {
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub(super) fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -22,6 +29,7 @@ pub fn derive_wrap_key(salt: &[u8]) -> anyhow::Result<[u8; 32]> {
     derive_wrap_key_for_machine(&read_machine_id()?, salt)
 }
 
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub(super) fn derive_wrap_key_for_machine(
     machine_id: &StableMachineId,
     salt: &[u8],
@@ -93,7 +101,16 @@ fn read_machine_id() -> anyhow::Result<StableMachineId> {
         }
         bail!("MachineGuid not found");
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(target_os = "android")]
+    {
+        bail!("derived sealing is not available on Android");
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        windows,
+        target_os = "android"
+    )))]
     {
         Ok(StableMachineId::new("unknown-machine"))
     }

@@ -362,6 +362,21 @@ fn mark_local_blocked(slot: &mut impl ConnSlot, generation: u64) -> bool {
     fresh
 }
 
+fn selected_path_kind(conn: Option<&Connection>) -> String {
+    let Some(conn) = conn else {
+        return "unknown".into();
+    };
+    let paths = conn.paths();
+    let Some(path) = paths.iter().find(|p| p.is_selected()) else {
+        return "unknown".into();
+    };
+    if path.is_relay() {
+        "relay".into()
+    } else {
+        "direct".into()
+    }
+}
+
 fn selected_path_is_cloud_relay(conn: &Connection, urls: &HashSet<String>) -> bool {
     let paths = conn.paths();
     let Some(path) = paths.iter().find(|p| p.is_selected()) else {
@@ -1585,13 +1600,16 @@ impl ConnPool {
         };
         // Try non-blocking; if locked, return coarse has_live info.
         match slot.try_lock() {
-            Ok(g) => PeerConnSnapshot {
-                state: g.state.as_str().into(),
-                keep_alive: keep_alive || g.peer_keep_alive,
-                last_activity_secs_ago: g.last_activity.elapsed().as_secs(),
-                live: g.live_conn().is_some(),
-                path: "unknown".into(),
-            },
+            Ok(g) => {
+                let live = g.live_conn();
+                PeerConnSnapshot {
+                    state: g.state.as_str().into(),
+                    keep_alive: keep_alive || g.peer_keep_alive,
+                    last_activity_secs_ago: g.last_activity.elapsed().as_secs(),
+                    live: live.is_some(),
+                    path: selected_path_kind(live.as_ref()),
+                }
+            }
             Err(_) => PeerConnSnapshot {
                 state: (if keep_alive { "connected" } else { "idle" }).into(),
                 keep_alive,

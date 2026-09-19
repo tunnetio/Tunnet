@@ -6,16 +6,21 @@
 //!
 //! Tiers (best available wins unless plaintext forced):
 //! 1. `tpm` - Windows DPAPI (TPM-backed when present); Linux falls through today
-//! 2. `keychain` - macOS System/login Keychain
-//! 3. `derived` - HKDF from stable machine identity + random per-state salt
-//!    (offline-copy protection)
-//! 4. `plaintext` - explicit `--no-encrypt-state` / `TUNNET_NO_ENCRYPT_STATE`
+//! 2. `keystore` - Android Keystore AES-256-GCM wrapping key (non-exportable)
+//! 3. `keychain` - macOS System/login Keychain
+//! 4. `derived` - HKDF from stable machine identity + random per-state salt
+//!    (offline-copy protection). Not used on Android.
+//! 5. `plaintext` - explicit `--no-encrypt-state` / `TUNNET_NO_ENCRYPT_STATE`
 
 mod derived;
 mod persist;
 mod platform;
+mod sealer;
 
 pub use persist::{load_agent, persist_agent};
+pub use sealer::{
+    PlatformSealer, SealError, SealErrorKind, clear_platform_sealer, set_platform_sealer,
+};
 
 use aes_gcm::aead::{Aead, Generate, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -37,6 +42,7 @@ const META_VERSION: u32 = 2;
 #[serde(rename_all = "lowercase")]
 pub enum SealTier {
     Tpm,
+    Keystore,
     Keychain,
     Derived,
     Plaintext,
@@ -46,6 +52,7 @@ impl SealTier {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tpm => "tpm",
+            Self::Keystore => "keystore",
             Self::Keychain => "keychain",
             Self::Derived => "derived",
             Self::Plaintext => "plaintext",
@@ -163,6 +170,14 @@ pub fn save_secrets(
 ) -> anyhow::Result<SealTier> {
     paths.ensure()?;
     let tier = policy.pick_tier();
+    seal_secrets(paths, secrets, tier)
+}
+
+fn seal_secrets(
+    paths: &StatePaths,
+    secrets: &AgentSecrets,
+    tier: SealTier,
+) -> anyhow::Result<SealTier> {
     let payload = SensitivePayload {
         version: PAYLOAD_VERSION,
         identity_seed_hex: hex::encode(secrets.identity_seed),
@@ -173,6 +188,7 @@ pub fn save_secrets(
     let plain = serde_json::to_vec(&payload).context("serialize sensitive payload")?;
 
     let mut dek = Key::<Aes256Gcm>::generate();
+    let meta = dek_meta(tier, dek.as_slice())?;
     let cipher = Aes256Gcm::new(&dek);
     let nonce = Nonce::generate();
     let ciphertext = cipher
@@ -191,48 +207,6 @@ pub fn save_secrets(
         let _ =
             std::fs::set_permissions(paths.secrets_file(), std::fs::Permissions::from_mode(0o600));
     }
-
-    let meta = match tier {
-        SealTier::Plaintext => SealMeta {
-            version: META_VERSION,
-            tier,
-            salt_hex: None,
-            wrapped_dek_hex: None,
-            dek_hex: Some(hex::encode(dek.as_slice())),
-        },
-        SealTier::Derived => {
-            let salt = random_salt();
-            let wrap_key = derived::derive_wrap_key(&salt)?;
-            let wrapped = wrap_dek(&wrap_key, dek.as_slice())?;
-            SealMeta {
-                version: META_VERSION,
-                tier,
-                salt_hex: Some(hex::encode(salt)),
-                wrapped_dek_hex: Some(hex::encode(wrapped)),
-                dek_hex: None,
-            }
-        }
-        SealTier::Keychain => {
-            platform::store_dek_keychain(dek.as_slice())?;
-            SealMeta {
-                version: META_VERSION,
-                tier,
-                salt_hex: None,
-                wrapped_dek_hex: None,
-                dek_hex: None,
-            }
-        }
-        SealTier::Tpm => {
-            let wrapped = platform::wrap_dek_tpm(dek.as_slice())?;
-            SealMeta {
-                version: META_VERSION,
-                tier,
-                salt_hex: None,
-                wrapped_dek_hex: Some(hex::encode(wrapped)),
-                dek_hex: None,
-            }
-        }
-    };
 
     let meta_json = serde_json::to_vec_pretty(&meta).context("serialize seal meta")?;
     std::fs::write(paths.secrets_meta_file(), meta_json)
@@ -263,6 +237,7 @@ pub fn load_secrets(paths: &StatePaths) -> anyhow::Result<(AgentSecrets, SealTie
     }
 
     validate_meta(&meta)?;
+    refuse_android_derived(meta.tier)?;
     let dek = resolve_dek(&meta)?;
     let dek = Zeroizing::new(dek);
     let cipher =
@@ -293,6 +268,77 @@ pub fn load_secrets(paths: &StatePaths) -> anyhow::Result<(AgentSecrets, SealTie
         },
         meta.tier,
     ))
+}
+
+fn dek_meta(tier: SealTier, dek: &[u8]) -> anyhow::Result<SealMeta> {
+    Ok(match tier {
+        SealTier::Plaintext => SealMeta {
+            version: META_VERSION,
+            tier,
+            salt_hex: None,
+            wrapped_dek_hex: None,
+            dek_hex: Some(hex::encode(dek)),
+        },
+        SealTier::Derived => {
+            let salt = random_salt();
+            let wrap_key = derived::derive_wrap_key(&salt)?;
+            let wrapped = wrap_dek(&wrap_key, dek)?;
+            SealMeta {
+                version: META_VERSION,
+                tier,
+                salt_hex: Some(hex::encode(salt)),
+                wrapped_dek_hex: Some(hex::encode(wrapped)),
+                dek_hex: None,
+            }
+        }
+        SealTier::Keystore => {
+            let wrapped = sealer::wrap_with_platform(dek).map_err(anyhow::Error::new)?;
+            SealMeta {
+                version: META_VERSION,
+                tier,
+                salt_hex: None,
+                wrapped_dek_hex: Some(hex::encode(wrapped)),
+                dek_hex: None,
+            }
+        }
+        SealTier::Keychain => {
+            platform::store_dek_keychain(dek)?;
+            SealMeta {
+                version: META_VERSION,
+                tier,
+                salt_hex: None,
+                wrapped_dek_hex: None,
+                dek_hex: None,
+            }
+        }
+        SealTier::Tpm => {
+            let wrapped = platform::wrap_dek_tpm(dek)?;
+            SealMeta {
+                version: META_VERSION,
+                tier,
+                salt_hex: None,
+                wrapped_dek_hex: Some(hex::encode(wrapped)),
+                dek_hex: None,
+            }
+        }
+    })
+}
+
+fn refuse_android_derived(tier: SealTier) -> anyhow::Result<()> {
+    if cfg!(target_os = "android") {
+        android_refuses_derived_tier(tier).map_err(anyhow::Error::new)?;
+    }
+    Ok(())
+}
+
+fn android_refuses_derived_tier(tier: SealTier) -> Result<(), SealError> {
+    if tier == SealTier::Derived {
+        return Err(SealError::new(
+            SealErrorKind::Unsupported,
+            "derived sealing is not used on Android; clear app storage and rejoin",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_meta(meta: &SealMeta) -> anyhow::Result<()> {
@@ -327,6 +373,20 @@ fn resolve_dek(meta: &SealMeta) -> anyhow::Result<[u8; 32]> {
             let wrapped = hex::decode(wrapped_hex).context("wrapped dek hex")?;
             let wrap_key = derived::derive_wrap_key(&salt)?;
             unwrap_dek(&wrap_key, &wrapped)
+        }
+        SealTier::Keystore => {
+            let wrapped_hex = meta
+                .wrapped_dek_hex
+                .as_deref()
+                .context("keystore tier missing wrapped_dek")?;
+            let wrapped = hex::decode(wrapped_hex).context("wrapped dek hex")?;
+            let plain = sealer::unwrap_with_platform(&wrapped).map_err(anyhow::Error::new)?;
+            if plain.len() != 32 {
+                bail!("unwrapped DEK wrong length");
+            }
+            let mut dek = [0u8; 32];
+            dek.copy_from_slice(&plain);
+            Ok(dek)
         }
         SealTier::Keychain => platform::load_dek_keychain(),
         SealTier::Tpm => {
@@ -597,5 +657,182 @@ mod tests {
         let error = validate_meta(&meta).unwrap_err().to_string();
         assert!(error.contains("unsupported seal metadata version 1"));
         assert!(error.contains("reset or re-enroll"));
+    }
+
+    static SEALER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct MemorySealer {
+        key: [u8; 32],
+    }
+
+    impl PlatformSealer for MemorySealer {
+        fn wrap(&self, plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
+            wrap_dek(&self.key, plaintext)
+                .map_err(|e| SealError::new(SealErrorKind::OperationFailed, e.to_string()))
+        }
+
+        fn unwrap(&self, wrapped: &[u8]) -> Result<Vec<u8>, SealError> {
+            if wrapped.len() < 12 + 16 {
+                return Err(SealError::new(
+                    SealErrorKind::CiphertextInvalid,
+                    "wrapped DEK too short",
+                ));
+            }
+            unwrap_dek(&self.key, wrapped)
+                .map(|dek| dek.to_vec())
+                .map_err(|_| SealError::new(SealErrorKind::DecryptFailed, "unwrap DEK failed"))
+        }
+    }
+
+    struct FailSealer(SealError);
+
+    impl PlatformSealer for FailSealer {
+        fn wrap(&self, _plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
+            Err(self.0.clone())
+        }
+
+        fn unwrap(&self, _wrapped: &[u8]) -> Result<Vec<u8>, SealError> {
+            Err(self.0.clone())
+        }
+    }
+
+    fn sample_secrets() -> AgentSecrets {
+        AgentSecrets::from_identity(&AgentIdentity::generate())
+    }
+
+    fn with_sealer<T>(sealer: std::sync::Arc<dyn PlatformSealer>, body: impl FnOnce() -> T) -> T {
+        let _guard = SEALER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_platform_sealer(sealer);
+        let result = body();
+        clear_platform_sealer();
+        result
+    }
+
+    fn seal_kind(err: anyhow::Error) -> SealErrorKind {
+        err.downcast_ref::<SealError>()
+            .unwrap_or_else(|| panic!("expected SealError, got {err:#}"))
+            .kind
+    }
+
+    #[test]
+    fn keystore_seal_open_roundtrip_and_restart() {
+        let sealer = std::sync::Arc::new(MemorySealer { key: [9u8; 32] });
+        with_sealer(sealer, || {
+            let (_tmp, paths) = test_paths();
+            let secrets = sample_secrets();
+            let tier = seal_secrets(&paths, &secrets, SealTier::Keystore).unwrap();
+            assert_eq!(tier, SealTier::Keystore);
+            let (loaded, loaded_tier) = load_secrets(&paths).unwrap();
+            assert_eq!(loaded_tier, SealTier::Keystore);
+            assert_eq!(loaded.identity_seed, secrets.identity_seed);
+            let (again, _) = load_secrets(&paths).unwrap();
+            assert_eq!(again.identity_seed, secrets.identity_seed);
+        });
+    }
+
+    #[test]
+    fn keystore_wrong_key_fails_open() {
+        let a = std::sync::Arc::new(MemorySealer { key: [1u8; 32] });
+        let (_tmp, paths) = test_paths();
+        let secrets = sample_secrets();
+        with_sealer(a, || {
+            seal_secrets(&paths, &secrets, SealTier::Keystore).unwrap();
+        });
+        let b = std::sync::Arc::new(MemorySealer { key: [2u8; 32] });
+        with_sealer(b, || match load_secrets(&paths) {
+            Ok(_) => panic!("wrong key must not open secrets"),
+            Err(err) => assert_eq!(seal_kind(err), SealErrorKind::DecryptFailed),
+        });
+    }
+
+    #[test]
+    fn keystore_corrupt_wrapped_dek_fails() {
+        let sealer = std::sync::Arc::new(MemorySealer { key: [3u8; 32] });
+        with_sealer(sealer, || {
+            let (_tmp, paths) = test_paths();
+            seal_secrets(&paths, &sample_secrets(), SealTier::Keystore).unwrap();
+            let mut meta: SealMeta =
+                serde_json::from_slice(&std::fs::read(paths.secrets_meta_file()).unwrap()).unwrap();
+            let mut wrapped = hex::decode(meta.wrapped_dek_hex.as_ref().unwrap()).unwrap();
+            *wrapped.last_mut().unwrap() ^= 0xff;
+            meta.wrapped_dek_hex = Some(hex::encode(wrapped));
+            std::fs::write(
+                paths.secrets_meta_file(),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            match load_secrets(&paths) {
+                Ok(_) => panic!("corrupt wrapped DEK must not open"),
+                Err(err) => assert_eq!(seal_kind(err), SealErrorKind::DecryptFailed),
+            }
+        });
+    }
+
+    #[test]
+    fn keystore_missing_sealer_fails_structurally() {
+        let _guard = SEALER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_platform_sealer();
+        let (_tmp, paths) = test_paths();
+        let err = seal_secrets(&paths, &sample_secrets(), SealTier::Keystore).unwrap_err();
+        assert_eq!(seal_kind(err), SealErrorKind::NotInstalled);
+        assert!(!paths.secrets_file().exists());
+    }
+
+    #[test]
+    fn keystore_platform_failure_on_open() {
+        let sealer = std::sync::Arc::new(MemorySealer { key: [4u8; 32] });
+        let (_tmp, paths) = test_paths();
+        with_sealer(sealer, || {
+            seal_secrets(&paths, &sample_secrets(), SealTier::Keystore).unwrap();
+        });
+        let fail = std::sync::Arc::new(FailSealer(SealError::new(
+            SealErrorKind::KeyInvalidated,
+            "wrapping key invalidated",
+        )));
+        with_sealer(fail, || {
+            match load_secrets(&paths) {
+                Ok(_) => panic!("invalidated key must not open"),
+                Err(err) => assert_eq!(seal_kind(err), SealErrorKind::KeyInvalidated),
+            }
+            assert!(paths.secrets_file().is_file());
+        });
+    }
+
+    #[test]
+    fn keystore_inaccessible_on_startup_leaves_files() {
+        let sealer = std::sync::Arc::new(MemorySealer { key: [5u8; 32] });
+        let (_tmp, paths) = test_paths();
+        with_sealer(sealer, || {
+            seal_secrets(&paths, &sample_secrets(), SealTier::Keystore).unwrap();
+        });
+        let fail = std::sync::Arc::new(FailSealer(SealError::new(
+            SealErrorKind::KeyUnavailable,
+            "wrapping key missing",
+        )));
+        with_sealer(fail, || match load_secrets(&paths) {
+            Ok(_) => panic!("missing wrapping key must not open"),
+            Err(err) => assert_eq!(seal_kind(err), SealErrorKind::KeyUnavailable),
+        });
+        assert!(paths.secrets_file().is_file());
+        assert!(paths.secrets_meta_file().is_file());
+    }
+
+    #[test]
+    fn android_does_not_open_legacy_derived_state() {
+        let err = android_refuses_derived_tier(SealTier::Derived).unwrap_err();
+        assert_eq!(err.kind, SealErrorKind::Unsupported);
+        assert!(android_refuses_derived_tier(SealTier::Keystore).is_ok());
+    }
+
+    #[test]
+    fn partial_enc_without_meta_fails_cleanly() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure().unwrap();
+        std::fs::write(paths.secrets_file(), [0u8; 40]).unwrap();
+        let err = match load_secrets(&paths) {
+            Ok(_) => panic!("enc without meta must not open"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("state.enc.meta") || err.contains("read"));
     }
 }

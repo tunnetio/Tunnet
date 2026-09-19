@@ -853,7 +853,7 @@ pub fn spawn_managed_driver(
 ///
 /// Overlapping polls can complete out of order: a provably older snapshot
 /// (strictly lower version than already applied) is skipped. Equal versions
-/// still re-apply — peer lists / keys can change without a version bump.
+/// still re-apply - peer lists / keys can change without a version bump.
 #[allow(clippy::too_many_arguments)]
 pub async fn poll_once(
     client: &SignedClient,

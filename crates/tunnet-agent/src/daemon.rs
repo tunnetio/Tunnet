@@ -2,7 +2,9 @@
 
 use anyhow::Context;
 use clap::Parser;
-use tunnet_core::{PersistedState, SealPolicy, StatePaths, load_agent};
+use tunnet_core::StatePaths;
+
+use crate::runtime::AgentRuntime;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -142,118 +144,98 @@ pub async fn run_with_shutdown(
     let paths = paths(state_dir);
     paths.ensure()?;
 
-    let bootstrap_api = if !has_network_state(&paths) {
-        let handle = start_idle_bootstrap(&paths, &mut on_ready).await?;
-        wait_for_network_state(&paths, shutdown.as_ref()).await?;
-        Some(handle)
-    } else {
-        None
-    };
-    if let Some(handle) = bootstrap_api {
-        handle.shutdown().await;
-    }
-
-    if let Some(token) = &shutdown
-        && token.is_cancelled()
-    {
-        return Ok(());
-    }
-
-    let policy = SealPolicy::from_env_and_flag(args.no_encrypt_state);
-    let (identity, persisted, tier) = load_agent(&paths, policy).with_context(|| {
-        format!(
-            "no persisted identity in {}; run `tunnet enroll` or `tunnet create` first",
-            paths.root().display()
-        )
-    })?;
-    match &persisted {
-        PersistedState::Managed(m) => {
-            tracing::info!(
-                endpoint_id = %identity.endpoint_id_hex(),
-                network = %m.network_name,
-                control = %m.control_url,
-                mode = "managed",
-                seal = %tier.as_str(),
-                "starting agent",
-            );
-        }
-        PersistedState::Direct { networks } => {
-            let names: Vec<_> = networks.iter().map(|d| d.network_name.as_str()).collect();
-            tracing::info!(
-                endpoint_id = %identity.endpoint_id_hex(),
-                networks = %names.join(","),
-                mode = "direct",
-                seal = %tier.as_str(),
-                "starting agent",
-            );
-        }
-    }
-    crate::runtime::run(identity, persisted, paths, args, shutdown, on_ready).await
-}
-
-fn has_network_state(paths: &StatePaths) -> bool {
-    paths.secrets_file().is_file() && matches!(PersistedState::try_load(paths), Ok(Some(_)))
-}
-
-async fn start_idle_bootstrap(
-    paths: &StatePaths,
-    on_ready: &mut Option<tokio::sync::oneshot::Sender<()>>,
-) -> anyhow::Result<tunnet_core::local_api::LocalApiServer> {
-    use std::sync::Arc;
-
-    use tunnet_core::local_api::{BootstrapApiState, spawn_bootstrap_api};
+    let config = agent_config(args, &paths);
+    let runtime = AgentRuntime::start(config, shutdown.clone()).await?;
+    let handle = runtime.handle();
 
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    let bootstrap = Arc::new(crate::api_bootstrap::AgentBootstrapOps::new(
-        paths.clone(),
-        events_tx.clone(),
-    ));
-    let handle = spawn_bootstrap_api(BootstrapApiState {
-        bootstrap,
-        daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-        events: events_tx,
-    })
+    let bootstrap = std::sync::Arc::new(
+        crate::api_bootstrap::AgentBootstrapOps::new(paths.clone(), events_tx.clone())
+            .with_handle(handle.clone()),
+    );
+    let api_server = tunnet_core::local_api::spawn_switching_api(
+        tunnet_core::local_api::BootstrapApiState {
+            bootstrap,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            events: events_tx,
+        },
+        handle.watch_mesh_api(),
+    )
     .await
-    .context("start idle Local Management API")?;
+    .context("start Local Management API")?;
     if let Some(tx) = on_ready.take() {
         let _ = tx.send(());
     }
-    #[cfg(unix)]
-    crate::sd_notify::ready("idle - Local API ready");
-    Ok(handle)
+    #[cfg(all(unix, not(target_os = "android")))]
+    crate::sd_notify::ready("running");
+
+    wait_for_host_shutdown(shutdown).await;
+
+    api_server.shutdown().await;
+    runtime.shutdown().await;
+    Ok(())
 }
 
-async fn wait_for_network_state(
-    paths: &StatePaths,
-    shutdown: Option<&tokio_util::sync::CancellationToken>,
-) -> anyhow::Result<()> {
-    let mut logged = false;
-    loop {
-        if let Some(token) = shutdown
-            && token.is_cancelled()
-        {
-            return Ok(());
-        }
-        let has_secrets = paths.secrets_file().is_file();
-        if has_secrets && let Ok(Some(_)) = PersistedState::try_load(paths) {
-            return Ok(());
-        }
-        if !logged {
-            tracing::info!(
-                dir = %paths.root().display(),
-                "agent idle - waiting for `tunnet create`, `tunnet enroll`, or `tunnet join`"
-            );
-            logged = true;
-        }
-        if let Some(token) = shutdown {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Ok(());
+fn agent_config(args: RunArgs, paths: &StatePaths) -> crate::runtime::AgentConfig {
+    let hostname = args
+        .hostname
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok());
+    crate::runtime::AgentConfig {
+        state_dir: paths.root().to_path_buf(),
+        hostname,
+        ifname: args.ifname,
+        poll_secs: args.poll_secs,
+        metrics_bind: args.metrics_bind,
+        disable_gossip: args.disable_gossip,
+        recorder: args.recorder,
+        no_mdns: args.no_mdns,
+        relay_mode: args.relay_mode,
+        relay_urls: args.relay_urls,
+        keep_alive: args.keep_alive,
+        no_encrypt_state: args.no_encrypt_state,
+    }
+}
+
+async fn wait_for_host_shutdown(shutdown: Option<tokio_util::sync::CancellationToken>) {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        match crate::upgrade::UpgradeGuard::install() {
+            Ok(upgrade) => {
+                if let Some(token) = shutdown {
+                    tokio::select! {
+                        reason = upgrade.wait() => {
+                            tracing::info!(?reason, "shutdown signal; draining");
+                        }
+                        _ = token.cancelled() => {
+                            tracing::info!("shutdown token; draining");
+                        }
+                    }
+                } else {
+                    let reason = upgrade.wait().await;
+                    tracing::info!(?reason, "shutdown signal; draining");
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             }
+            Err(e) => {
+                tracing::warn!(error = %e, "upgrade guard unavailable; waiting for stop");
+                if let Some(token) = shutdown {
+                    token.cancelled().await;
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "android"))))]
+    {
+        if let Some(token) = shutdown {
+            token.cancelled().await;
+            tracing::info!("service stop, shutting down");
+        } else if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c listener failed");
         } else {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tracing::info!("ctrl-c, shutting down");
         }
     }
 }
