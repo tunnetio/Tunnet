@@ -1264,7 +1264,6 @@ fn authority_for(
     Ok(std::sync::Arc::new(crate::direct::DirectAuthority::load(
         &state.node.paths,
         direct.network_id,
-        direct.open,
         direct.genesis.clone(),
         direct.topic_hash.clone(),
     )?))
@@ -1274,6 +1273,7 @@ pub(crate) async fn direct_invite(
     state: &LocalApiState,
     network: Option<&str>,
     reusable: bool,
+    require_approval: bool,
     expires: &str,
 ) -> anyhow::Result<String> {
     let direct = require_direct_coord(state, network)?;
@@ -1284,8 +1284,14 @@ pub(crate) async fn direct_invite(
         anyhow::bail!("invite expiry must be positive");
     }
     let authority = authority_for(state, direct.network_id)?;
+    let require_approval = reusable || require_approval;
     let mut invite = authority
-        .issue_invite(&state.node.endpoint_id_hex(), reusable, expires)
+        .issue_invite(
+            &state.node.endpoint_id_hex(),
+            reusable,
+            require_approval,
+            expires,
+        )
         .await?;
     crate::direct::stamp_coordinator_addr(&mut invite, &state.node.endpoint);
     crate::direct::encode_invite(&invite)
@@ -1320,10 +1326,7 @@ pub(crate) async fn direct_accept(
         network_id: network_id.to_string(),
         endpoint_id: pending.endpoint_id.clone(),
     });
-    Ok(format!(
-        "Approved {}. Peer should re-run join while this agent is running.",
-        pending.endpoint_id
-    ))
+    Ok(format!("Approved {}.", pending.endpoint_id))
 }
 
 pub(crate) async fn direct_deny(

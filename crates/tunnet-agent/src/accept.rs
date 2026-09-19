@@ -258,7 +258,18 @@ impl ProtocolHandler for JoinHandler {
             .values()
             .map(|(a, d)| ((**a).clone(), d.clone()))
             .collect();
-        match tunnet_core::direct::run_join_server_dispatch(&conn, &nets).await {
+        match tunnet_core::direct::run_join_server_dispatch_with_pending(
+            &conn,
+            &nets,
+            |network_id, peer_id| {
+                let _ = self.events.send(LocalEvent::DirectJoinRequested {
+                    network_id: network_id.to_string(),
+                    peer_id: peer_id.to_string(),
+                });
+            },
+        )
+        .await
+        {
             Ok(resp) => {
                 if let (Some(auth), tunnet_core::direct::JoinStatus::Admitted, Some(adm)) =
                     (&self.auth, resp.status, resp.admission.as_ref())
@@ -266,14 +277,6 @@ impl ProtocolHandler for JoinHandler {
                 {
                     let policy = (**self.acl.bundle.load()).clone();
                     docs.project_runtime(auth, &self.routes, &self.acl, &policy);
-                }
-                if resp.status == tunnet_core::direct::JoinStatus::Pending
-                    && let Some(network_id) = resp.network_id
-                {
-                    let _ = self.events.send(LocalEvent::DirectJoinRequested {
-                        network_id: network_id.to_string(),
-                        peer_id: format!("{}", conn.remote_id()),
-                    });
                 }
                 conn.close(0u32.into(), b"join_done");
             }

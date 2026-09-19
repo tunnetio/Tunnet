@@ -20,6 +20,7 @@ fun Snapshot.headline(vpnConsentDenied: String?): String {
     if (vpnConsentDenied != null) return "Disconnected"
     return when (lifecycle) {
         Lifecycle.LIFECYCLE_JOINING -> "Joining"
+        Lifecycle.LIFECYCLE_PENDING_APPROVAL -> "Waiting for approval"
         Lifecycle.LIFECYCLE_ACTIVATING -> "Starting"
         Lifecycle.LIFECYCLE_STOPPING -> "Stopping"
         Lifecycle.LIFECYCLE_FAILED -> "Failed"
@@ -35,6 +36,7 @@ fun Snapshot.headline(vpnConsentDenied: String?): String {
 
 fun Snapshot.busy(): Boolean = when (lifecycle) {
     Lifecycle.LIFECYCLE_JOINING,
+    Lifecycle.LIFECYCLE_PENDING_APPROVAL,
     Lifecycle.LIFECYCLE_ACTIVATING,
     Lifecycle.LIFECYCLE_STOPPING,
     -> true
@@ -47,6 +49,7 @@ fun Snapshot.notificationText(): String = when {
     !isJoined() -> "Not joined to a network"
     dataPlaneUp() -> "Connected - ${networksList.joinToString { it.ip }}"
     lifecycle == Lifecycle.LIFECYCLE_JOINING -> "Joining…"
+    lifecycle == Lifecycle.LIFECYCLE_PENDING_APPROVAL -> "Waiting for approval…"
     lifecycle == Lifecycle.LIFECYCLE_ACTIVATING -> "Starting…"
     else -> "Connecting…"
 }

@@ -304,6 +304,7 @@ export interface DirectPeerRequest {
 export interface DirectInviteRequest {
   network?: string;
   reusable?: boolean;
+  require_approval?: boolean;
   expires?: string;
 }
 

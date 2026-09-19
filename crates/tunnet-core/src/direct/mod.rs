@@ -73,15 +73,17 @@ pub use grants::{
 };
 #[cfg(feature = "direct")]
 pub use invite::{
-    InviteCode, decode_invite, encode_invite, join_dial_addr, stamp_coordinator_addr,
+    InviteAdmission, InviteCode, decode_invite, encode_invite, join_dial_addr,
+    stamp_coordinator_addr,
 };
 #[cfg(feature = "direct")]
 pub use ip::network_id_from_topic;
 #[cfg(feature = "direct")]
 pub use join::{
     JOIN_ALPN, JoinAdmission, JoinPublisher, JoinRequest, JoinResponse, JoinStatus,
-    decode_and_preflight, preflight_invite, run_join_client, run_join_server,
-    run_join_server_dispatch, verify_admission,
+    decode_and_preflight, preflight_invite, run_join_client, run_join_client_notified,
+    run_join_server, run_join_server_dispatch, run_join_server_dispatch_with_pending,
+    verify_admission,
 };
 #[cfg(feature = "direct")]
 pub use mdns::apply_mdns;

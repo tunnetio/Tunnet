@@ -994,7 +994,6 @@ async fn bootstrap_one_direct_network(
         Some(Arc::new(DirectAuthority::load(
             args.paths,
             direct.network_id,
-            direct.open,
             direct.genesis.clone(),
             direct.topic_hash.clone(),
         )?))

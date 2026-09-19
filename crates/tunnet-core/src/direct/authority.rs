@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::addrplan::{AddressPlan, allocate_peer_ip};
 use super::grants::Genesis;
-use super::invite::{InviteCode, invite_secret_hash};
+use super::invite::{InviteAdmission, InviteCode, invite_secret_hash};
 use super::membership::MembershipEntry;
 use crate::state::StatePaths;
 
@@ -32,6 +32,8 @@ pub struct PendingJoin {
 struct InviteRecord {
     secret_hash: String,
     reusable: bool,
+    #[serde(default)]
+    admission: InviteAdmission,
     expires_at: Timestamp,
     revoked: bool,
     /// One-time: first presenter is bound so retries recover and other endpoints fail.
@@ -44,15 +46,18 @@ struct InviteRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AuthorityDisk {
     network_id: Uuid,
-    open: bool,
     invites: HashMap<String, InviteRecord>,
     pending: Vec<PendingJoin>,
     approved: HashSet<String>,
+    /// Invite hash → endpoint ids denied on that invite. Blocks reconnect re-pending.
+    #[serde(default)]
+    rejected: HashMap<String, HashSet<String>>,
 }
 
 struct Inner {
     disk: AuthorityDisk,
     path: PathBuf,
+    waiters: HashMap<String, tokio::sync::watch::Sender<u64>>,
 }
 
 /// Exclusive mutator of join/invite/admission state for one coordinator network.
@@ -87,7 +92,6 @@ impl DirectAuthority {
     pub fn load(
         paths: &StatePaths,
         network_id: Uuid,
-        open: bool,
         genesis: Genesis,
         topic_hash: String,
     ) -> anyhow::Result<Self> {
@@ -96,20 +100,23 @@ impl DirectAuthority {
         let disk = if path.exists() {
             let mut disk: AuthorityDisk =
                 serde_json::from_slice(&std::fs::read(&path)?).context("authority state")?;
-            disk.open = open;
             disk.network_id = network_id;
             disk
         } else {
             AuthorityDisk {
                 network_id,
-                open,
                 invites: HashMap::new(),
                 pending: Vec::new(),
                 approved: HashSet::new(),
+                rejected: HashMap::new(),
             }
         };
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner { disk, path })),
+            inner: Arc::new(Mutex::new(Inner {
+                disk,
+                path,
+                waiters: HashMap::new(),
+            })),
             network_id,
             genesis,
             topic_hash,
@@ -136,19 +143,29 @@ impl DirectAuthority {
         &self,
         _coordinator_endpoint_id: &str,
         reusable: bool,
+        require_approval: bool,
         expires: Span,
     ) -> anyhow::Result<InviteCode> {
+        if reusable && !require_approval {
+            anyhow::bail!("reusable invites always require approval");
+        }
         if !expires.is_positive() {
             anyhow::bail!("invite expiry must be positive");
         }
         let expires_at = Timestamp::now()
             .checked_add(expires)
             .context("invite expiry is outside the representable timestamp range")?;
+        let admission = if reusable || require_approval {
+            InviteAdmission::ApprovalRequired
+        } else {
+            InviteAdmission::Immediate
+        };
         let secret = hex::encode(rand::random::<[u8; 32]>());
         let secret_hash = invite_secret_hash(&secret);
         let rec = InviteRecord {
             secret_hash: secret_hash.clone(),
             reusable,
+            admission,
             expires_at,
             revoked: false,
             bound_endpoint: None,
@@ -166,7 +183,20 @@ impl DirectAuthority {
             invite_secret: secret,
             expires_at,
             coordinator_addr: None,
+            admission,
         })
+    }
+
+    pub async fn subscribe_admission(
+        &self,
+        endpoint_id: &str,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        let mut g = self.inner.lock().await;
+        let tx = g
+            .waiters
+            .entry(endpoint_id.to_string())
+            .or_insert_with(|| tokio::sync::watch::channel(0).0);
+        tx.subscribe()
     }
 
     pub async fn revoke_invite_secret(&self, invite_secret: &str) -> anyhow::Result<()> {
@@ -176,7 +206,19 @@ impl DirectAuthority {
             anyhow::bail!("unknown invite");
         };
         rec.revoked = true;
-        persist(&g)
+        let pending_ids: Vec<String> = g
+            .disk
+            .pending
+            .iter()
+            .filter(|p| p.invite_hash == hash)
+            .map(|p| p.endpoint_id.clone())
+            .collect();
+        g.disk.pending.retain(|p| p.invite_hash != hash);
+        persist(&g)?;
+        for id in pending_ids {
+            notify(&g, &id);
+        }
+        Ok(())
     }
 
     pub async fn approve(&self, endpoint_id: &str) -> anyhow::Result<PendingJoin> {
@@ -190,19 +232,35 @@ impl DirectAuthority {
         let pending = g.disk.pending.remove(idx);
         g.disk.approved.insert(pending.endpoint_id.clone());
         persist(&g)?;
+        notify(&g, &pending.endpoint_id);
         Ok(pending)
     }
 
     pub async fn deny(&self, endpoint_id: &str) -> anyhow::Result<()> {
         let mut g = self.inner.lock().await;
-        let before = g.disk.pending.len();
-        g.disk
+        let idx = g
+            .disk
             .pending
-            .retain(|p| p.endpoint_id != endpoint_id && p.hostname != endpoint_id);
-        if g.disk.pending.len() == before {
-            anyhow::bail!("pending peer not found");
+            .iter()
+            .position(|p| p.endpoint_id == endpoint_id || p.hostname == endpoint_id)
+            .context("pending peer not found")?;
+        let pending = g.disk.pending.remove(idx);
+        g.disk
+            .rejected
+            .entry(pending.invite_hash.clone())
+            .or_default()
+            .insert(pending.endpoint_id.clone());
+        if let Some(rec) = g.disk.invites.get_mut(&pending.invite_hash)
+            && !rec.reusable
+            && rec.bound_endpoint.as_deref() == Some(pending.endpoint_id.as_str())
+            && !rec.claimed
+        {
+            rec.bound_endpoint = None;
+            rec.allocated_ip = None;
         }
-        persist(&g)
+        persist(&g)?;
+        notify(&g, &pending.endpoint_id);
+        Ok(())
     }
 
     pub async fn has_invite_secret(&self, invite_secret: &str) -> bool {
@@ -254,6 +312,12 @@ fn persist(inner: &Inner) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn notify(inner: &Inner, endpoint_id: &str) {
+    if let Some(tx) = inner.waiters.get(endpoint_id) {
+        tx.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
 fn decide_locked(
     inner: &mut Inner,
     genesis: &Genesis,
@@ -264,30 +328,54 @@ fn decide_locked(
 ) -> Result<JoinDecision, &'static str> {
     let hash = invite_secret_hash(invite_secret);
     let now = Timestamp::now();
-    let open = inner.disk.open;
 
-    let rec = inner
-        .disk
-        .invites
-        .get_mut(&hash)
-        .ok_or("invalid_or_used_invite")?;
-    if rec.revoked {
+    let (reusable, admission, expired, revoked_invite) = {
+        let rec = inner
+            .disk
+            .invites
+            .get(&hash)
+            .ok_or("invalid_or_used_invite")?;
+        (
+            rec.reusable,
+            rec.admission,
+            rec.expires_at < now,
+            rec.revoked,
+        )
+    };
+    if revoked_invite {
         return Err("invite_revoked");
     }
-    if rec.expires_at < now {
+    if expired {
+        inner.disk.pending.retain(|p| p.invite_hash != hash);
+        persist(inner).map_err(|_| "persist_failed")?;
         return Err("invite_expired");
     }
     if snapshot.revoked.contains(endpoint_id) {
         return Err("revoked");
     }
+    if inner
+        .disk
+        .rejected
+        .get(&hash)
+        .is_some_and(|s| s.contains(endpoint_id))
+    {
+        return Err("rejected");
+    }
 
-    if !rec.reusable {
-        if let Some(bound) = rec.bound_endpoint.as_deref()
-            && bound != endpoint_id
-        {
-            return Err("invite_claimed");
+    {
+        let rec = inner
+            .disk
+            .invites
+            .get_mut(&hash)
+            .ok_or("invalid_or_used_invite")?;
+        if !reusable {
+            if let Some(bound) = rec.bound_endpoint.as_deref()
+                && bound != endpoint_id
+            {
+                return Err("invite_claimed");
+            }
+            rec.bound_endpoint = Some(endpoint_id.to_string());
         }
-        rec.bound_endpoint = Some(endpoint_id.to_string());
     }
 
     if let Some(existing) = snapshot
@@ -295,8 +383,10 @@ fn decide_locked(
         .iter()
         .find(|m| m.endpoint_id == endpoint_id && m.status != "kicked")
     {
-        rec.allocated_ip = Some(existing.ipv4);
-        rec.claimed = true;
+        if let Some(rec) = inner.disk.invites.get_mut(&hash) {
+            rec.allocated_ip = Some(existing.ipv4);
+            rec.claimed = true;
+        }
         persist(inner).map_err(|_| "persist_failed")?;
         let mut entry = existing.clone();
         entry.hostname = hostname;
@@ -306,11 +396,14 @@ fn decide_locked(
         });
     }
 
-    if !rec.reusable
-        && rec.claimed
-        && rec.bound_endpoint.as_deref() == Some(endpoint_id)
-        && let Some(ip) = rec.allocated_ip
-    {
+    let reserved = inner.disk.invites.get(&hash).and_then(|rec| {
+        if !rec.reusable && rec.claimed && rec.bound_endpoint.as_deref() == Some(endpoint_id) {
+            rec.allocated_ip
+        } else {
+            None
+        }
+    });
+    if let Some(ip) = reserved {
         persist(inner).map_err(|_| "persist_failed")?;
         return Ok(JoinDecision::Admit {
             entry: MembershipEntry {
@@ -328,7 +421,7 @@ fn decide_locked(
     }
 
     let approved = inner.disk.approved.contains(endpoint_id);
-    if !open && !approved {
+    if admission == InviteAdmission::ApprovalRequired && !approved {
         inner.disk.pending.retain(|p| p.endpoint_id != endpoint_id);
         inner.disk.pending.push(PendingJoin {
             endpoint_id: endpoint_id.to_string(),
@@ -339,10 +432,10 @@ fn decide_locked(
         return Ok(JoinDecision::Pending);
     }
 
-    let ipv4 = if let Some(ip) = rec.allocated_ip {
+    let occupied: HashSet<Ipv4Addr> = snapshot.members.iter().map(|m| m.ipv4).collect();
+    let ipv4 = if let Some(ip) = inner.disk.invites.get(&hash).and_then(|r| r.allocated_ip) {
         ip
     } else {
-        let occupied: HashSet<Ipv4Addr> = snapshot.members.iter().map(|m| m.ipv4).collect();
         allocate_peer_ip(
             &genesis.address_plan,
             &genesis.network_id,
@@ -351,7 +444,12 @@ fn decide_locked(
         )
         .map_err(|_| "pool_exhausted")?
     };
-    rec.allocated_ip = Some(ipv4);
+    if let Some(rec) = inner.disk.invites.get_mut(&hash) {
+        rec.allocated_ip = Some(ipv4);
+        if !reusable {
+            rec.claimed = true;
+        }
+    }
     persist(inner).map_err(|_| "persist_failed")?;
 
     Ok(JoinDecision::Admit {
@@ -405,12 +503,11 @@ mod tests {
         .unwrap()
     }
 
-    fn tmp_auth(open: bool) -> (tempfile::TempDir, DirectAuthority, Genesis) {
+    fn tmp_auth() -> (tempfile::TempDir, DirectAuthority, Genesis) {
         let dir = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_dir(dir.path().to_path_buf());
         let g = genesis();
-        let auth =
-            DirectAuthority::load(&paths, g.network_id, open, g.clone(), "tt".into()).unwrap();
+        let auth = DirectAuthority::load(&paths, g.network_id, g.clone(), "tt".into()).unwrap();
         (dir, auth, g)
     }
 
@@ -421,13 +518,32 @@ mod tests {
         }
     }
 
+    async fn issue_now(
+        auth: &DirectAuthority,
+        reusable: bool,
+        require_approval: bool,
+    ) -> InviteCode {
+        auth.issue_invite("c", reusable, require_approval, Span::new().hours(24))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_time_invite_auto_admits() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
+        assert_eq!(inv.admission, InviteAdmission::Immediate);
+        let d = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d, JoinDecision::Admit { recover: false, .. }));
+        assert!(auth.pending().await.is_empty());
+    }
+
     #[tokio::test]
     async fn one_time_retry_same_endpoint_reuses_ip() {
-        let (_d, auth, _) = tmp_auth(true);
-        let inv = auth
-            .issue_invite("aa".repeat(32).as_str(), false, Span::new().hours(24))
-            .await
-            .unwrap();
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
         let d1 = auth
             .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
             .await;
@@ -457,11 +573,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_time_replay_other_endpoint_denied() {
-        let (_d, auth, _) = tmp_auth(true);
-        let inv = auth
-            .issue_invite("c", false, Span::new().hours(24))
-            .await
-            .unwrap();
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
         let JoinDecision::Admit { entry, .. } = auth
             .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
             .await
@@ -481,19 +594,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_one_time_redemption_admits_once() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
+        let snap = empty_snap();
+        let a = auth.decide("endpoint-a", "a".into(), &inv.invite_secret, &snap);
+        let b = auth.decide("endpoint-b", "b".into(), &inv.invite_secret, &snap);
+        let (da, db) = tokio::join!(a, b);
+        let admits = [&da, &db]
+            .iter()
+            .filter(|d| matches!(d, JoinDecision::Admit { .. }))
+            .count();
+        let claimed = [&da, &db]
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    JoinDecision::Denied {
+                        reason: "invite_claimed"
+                    }
+                )
+            })
+            .count();
+        assert_eq!(admits, 1);
+        assert_eq!(claimed, 1);
+    }
+
+    #[tokio::test]
     async fn lost_response_before_confirm_reuses_reserved_ip() {
-        let (_d, auth, _) = tmp_auth(true);
-        let inv = auth
-            .issue_invite("c", false, Span::new().hours(24))
-            .await
-            .unwrap();
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
         let JoinDecision::Admit { entry: e1, .. } = auth
             .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
             .await
         else {
             panic!("admit");
         };
-        // Crash: membership unpublished, invite reserved. Retry must not allocate a new IP.
         let d2 = auth
             .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
             .await;
@@ -504,12 +640,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_then_approve_then_join() {
-        let (_d, auth, _) = tmp_auth(false);
-        let inv = auth
-            .issue_invite("c", false, Span::new().hours(24))
-            .await
-            .unwrap();
+    async fn approval_required_creates_pending() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, true).await;
+        assert_eq!(inv.admission, InviteAdmission::ApprovalRequired);
         let d1 = auth
             .decide(
                 "endpoint-a",
@@ -519,6 +653,9 @@ mod tests {
             )
             .await;
         assert!(matches!(d1, JoinDecision::Pending));
+        let pending = auth.pending().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].endpoint_id, "endpoint-a");
         auth.approve("endpoint-a").await.unwrap();
         let d2 = auth
             .decide(
@@ -532,12 +669,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_twice_fails() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, true).await;
+        let _ = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        auth.approve("endpoint-a").await.unwrap();
+        assert!(auth.approve("endpoint-a").await.is_err());
+    }
+
+    #[tokio::test]
     async fn pending_binds_one_time_invite() {
-        let (_d, auth, _) = tmp_auth(false);
-        let inv = auth
-            .issue_invite("c", false, Span::new().hours(24))
-            .await
-            .unwrap();
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, true).await;
         let _ = auth
             .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
             .await;
@@ -553,12 +698,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_and_revoked() {
-        let (_d, auth, _) = tmp_auth(true);
-        let inv = auth
-            .issue_invite("c", true, Span::new().hours(1))
+    async fn reusable_always_creates_pending() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, true, true).await;
+        let d = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d, JoinDecision::Pending));
+        let d2 = auth
+            .decide("endpoint-b", "b".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d2, JoinDecision::Pending));
+        assert_eq!(auth.pending().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reusable_auto_admit_cannot_be_requested() {
+        let (_d, auth, _) = tmp_auth();
+        let err = auth
+            .issue_invite("c", true, false, Span::new().hours(24))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reusable invites always require approval")
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_propagates_and_unbinds_one_time() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, true).await;
+        let _ = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        auth.deny("endpoint-a").await.unwrap();
+        let d = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d, JoinDecision::Denied { reason: "rejected" }));
+        let d2 = auth
+            .decide("endpoint-b", "b".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d2, JoinDecision::Pending));
+    }
+
+    #[tokio::test]
+    async fn expired_and_revoked() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, true, true).await;
         {
             let mut g = auth.inner.lock().await;
             let hash = crate::direct::invite::invite_secret_hash(&inv.invite_secret);
@@ -576,10 +764,7 @@ mod tests {
             }
         ));
 
-        let inv2 = auth
-            .issue_invite("c", true, Span::new().hours(1))
-            .await
-            .unwrap();
+        let inv2 = issue_now(&auth, true, true).await;
         auth.revoke_invite_secret(&inv2.invite_secret)
             .await
             .unwrap();
@@ -596,11 +781,8 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_peer_cannot_rejoin() {
-        let (_d, auth, _) = tmp_auth(true);
-        let inv = auth
-            .issue_invite("c", true, Span::new().hours(1))
-            .await
-            .unwrap();
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, false).await;
         let snap = JoinSnapshot {
             members: vec![],
             revoked: HashSet::from(["kicked-peer".into()]),
@@ -609,5 +791,24 @@ mod tests {
             .decide("kicked-peer", "h".into(), &inv.invite_secret, &snap)
             .await;
         assert!(matches!(d, JoinDecision::Denied { reason: "revoked" }));
+    }
+
+    #[tokio::test]
+    async fn pending_waiter_completes_on_approve() {
+        let (_d, auth, _) = tmp_auth();
+        let inv = issue_now(&auth, false, true).await;
+        let mut rx = auth.subscribe_admission("endpoint-a").await;
+        let _ = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        auth.approve("endpoint-a").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.changed())
+            .await
+            .expect("waiter notified")
+            .unwrap();
+        let d = auth
+            .decide("endpoint-a", "a".into(), &inv.invite_secret, &empty_snap())
+            .await;
+        assert!(matches!(d, JoinDecision::Admit { .. }));
     }
 }

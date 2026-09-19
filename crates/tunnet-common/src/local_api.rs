@@ -698,6 +698,8 @@ pub struct DirectInviteRequest {
     pub network: Option<String>,
     #[serde(default)]
     pub reusable: bool,
+    #[serde(default)]
+    pub require_approval: bool,
     #[serde(default = "default_invite_expires")]
     pub expires: String,
 }

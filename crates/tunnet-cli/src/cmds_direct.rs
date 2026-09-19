@@ -41,6 +41,8 @@ pub struct InviteArgs {
     pub network: Option<String>,
     #[arg(long)]
     pub reusable: bool,
+    #[arg(long)]
+    pub require_approval: bool,
     #[arg(long, default_value = "24h")]
     pub expires: String,
 }
@@ -183,6 +185,7 @@ pub async fn run_invite(args: InviteArgs, state_dir: Option<&str>) -> anyhow::Re
     let body = DirectInviteRequest {
         network: args.network.clone(),
         reusable: args.reusable,
+        require_approval: args.reusable || args.require_approval,
         expires: args.expires,
     };
     let resp = client.direct_invite(&body).await?;

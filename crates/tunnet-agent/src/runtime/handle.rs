@@ -50,6 +50,7 @@ pub struct JoinOutcome {
 pub(crate) enum Phase {
     Idle,
     Joining,
+    PendingApproval,
     Activating,
     Mesh(Box<MeshSession>),
     Stopping,
@@ -88,6 +89,7 @@ impl AgentHandle {
             Ok(phase) => match &*phase {
                 Phase::Idle => self.base_snapshot(AgentLifecycle::Idle),
                 Phase::Joining => self.transition_snapshot(AgentLifecycle::Joining),
+                Phase::PendingApproval => self.transition_snapshot(AgentLifecycle::PendingApproval),
                 Phase::Activating => self.transition_snapshot(AgentLifecycle::Activating),
                 Phase::Stopping => self.transition_snapshot(AgentLifecycle::Stopping),
                 Phase::Stopped => self.base_snapshot(AgentLifecycle::Stopped),
@@ -148,10 +150,12 @@ impl AgentHandle {
             ));
         }
 
-        let mut phase = self.inner.phase.write().await;
-        self.require_idle(&phase)?;
-        *phase = Phase::Joining;
-        self.publish(self.transition_snapshot(AgentLifecycle::Joining));
+        {
+            let mut phase = self.inner.phase.write().await;
+            self.require_idle(&phase)?;
+            *phase = Phase::Joining;
+            self.publish(self.transition_snapshot(AgentLifecycle::Joining));
+        }
 
         let hostname = request
             .hostname
@@ -160,22 +164,49 @@ impl AgentHandle {
             .map(sanitize_hostname)
             .or_else(|| self.inner.config.hostname.clone());
 
+        let pending_handle = self.clone();
+        let on_pending = std::sync::Arc::new(move || {
+            let handle = pending_handle.clone();
+            tokio::spawn(async move {
+                let mut phase = handle.inner.phase.write().await;
+                if matches!(*phase, Phase::Joining | Phase::PendingApproval) {
+                    *phase = Phase::PendingApproval;
+                    handle.publish(handle.transition_snapshot(AgentLifecycle::PendingApproval));
+                }
+            });
+        });
         let args = crate::cmds_direct::JoinArgs {
             invite_code: invite.to_string(),
             hostname,
             auto_accept_firewall: request.auto_accept_firewall,
             no_encrypt_state: request.no_encrypt_state || self.inner.config.no_encrypt_state,
+            on_pending: Some(on_pending),
+            cancel: Some(self.inner.shutdown.clone()),
         };
         let state_dir = self.inner.paths.root().to_string_lossy().into_owned();
         let outcome = match crate::cmds_direct::persist_direct_join(args, Some(&state_dir)).await {
             Ok(o) => o,
             Err(e) => {
                 let err = AgentError::new(AgentErrorKind::JoinFailed, format!("{e:#}"));
+                let mut phase = self.inner.phase.write().await;
+                if matches!(*phase, Phase::Stopping | Phase::Stopped) {
+                    return Err(AgentError::new(
+                        AgentErrorKind::Stopped,
+                        "runtime is stopped",
+                    ));
+                }
                 self.fail_locked(&mut phase, err.clone());
                 return Err(err);
             }
         };
 
+        let mut phase = self.inner.phase.write().await;
+        if matches!(*phase, Phase::Stopping | Phase::Stopped) {
+            return Err(AgentError::new(
+                AgentErrorKind::Stopped,
+                "runtime is stopped",
+            ));
+        }
         *phase = Phase::Activating;
         self.publish(self.transition_snapshot(AgentLifecycle::Activating));
 
@@ -245,7 +276,7 @@ impl AgentHandle {
         let mut phase = self.inner.phase.write().await;
         match &*phase {
             Phase::Mesh(_) => return Ok(()),
-            Phase::Joining | Phase::Activating | Phase::Stopping => {
+            Phase::Joining | Phase::PendingApproval | Phase::Activating | Phase::Stopping => {
                 return Err(AgentError::new(
                     AgentErrorKind::Busy,
                     "runtime is already changing state",
@@ -280,7 +311,7 @@ impl AgentHandle {
                         "mesh supervisor stopped",
                     ));
                 }
-                Phase::Idle | Phase::Joining | Phase::Activating => {
+                Phase::Idle | Phase::Joining | Phase::PendingApproval | Phase::Activating => {
                     return Err(AgentError::new(
                         AgentErrorKind::NotJoined,
                         "not joined to a network",
@@ -308,6 +339,7 @@ impl AgentHandle {
                 Phase::Mesh(mesh) if mesh.is_alive() => mesh.dataplane.clone(),
                 Phase::Idle
                 | Phase::Joining
+                | Phase::PendingApproval
                 | Phase::Activating
                 | Phase::Stopping
                 | Phase::Stopped => {
@@ -343,10 +375,9 @@ impl AgentHandle {
                 AgentErrorKind::AlreadyJoined,
                 "already joined to a network",
             )),
-            Phase::Joining | Phase::Activating | Phase::Stopping => Err(AgentError::new(
-                AgentErrorKind::Busy,
-                "runtime is already changing state",
-            )),
+            Phase::Joining | Phase::PendingApproval | Phase::Activating | Phase::Stopping => Err(
+                AgentError::new(AgentErrorKind::Busy, "runtime is already changing state"),
+            ),
             Phase::Stopped => Err(AgentError::new(
                 AgentErrorKind::Stopped,
                 "runtime is stopped",

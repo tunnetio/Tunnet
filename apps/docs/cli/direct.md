@@ -10,13 +10,12 @@ Create a new Direct network and become the coordinator. Safe to run again to add
 
 ```bash
 sudo tunnet create --name <name> --secret <passphrase>
-sudo tunnet create --name <name> --open          # auto-admit valid invites
 sudo tunnet create --name <name>                 # random secret is printed
 ```
 
 ## tunnet join
 
-Join an existing Direct network with an invite code. Can be used while already in other Direct networks.
+Join an existing Direct network with an invite code. Can be used while already in other Direct networks. A normal invite admits immediately. Approval-required and reusable invites wait until the coordinator accepts.
 
 ```bash
 sudo tunnet join <INVITE_CODE>
@@ -25,10 +24,11 @@ sudo tunnet join <INVITE_CODE> --auto-accept-firewall
 
 ## tunnet invite
 
-Generate an invite code for others to join.
+Generate an invite code for others to join. A one-time invite is an admission capability. `--require-approval` holds redemption until `tunnet accept`. `--reusable` always requires approval.
 
 ```bash
 tunnet invite [<network>]
+tunnet invite homelab --require-approval --expires 24h
 tunnet invite homelab --reusable --expires 24h
 ```
 

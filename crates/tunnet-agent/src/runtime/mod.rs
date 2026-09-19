@@ -132,6 +132,7 @@ impl AgentRuntime {
             Phase::Mesh(mesh) => (*mesh).drain().await,
             Phase::Idle
             | Phase::Joining
+            | Phase::PendingApproval
             | Phase::Activating
             | Phase::Stopping
             | Phase::Failed(_)

@@ -71,6 +71,7 @@ pub struct AgentErrorInfo {
 pub enum AgentLifecycle {
     Idle,
     Joining,
+    PendingApproval,
     Activating,
     Running,
     Stopping,

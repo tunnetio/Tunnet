@@ -18,7 +18,7 @@ use tunnet_core::direct::{
     AUTH_ALPN, AuthCache, DirectAuthority, JOIN_ALPN, JoinAdmission, JoinPublisher, JoinSnapshot,
     JoinStatus, MEMBER_SCHEMA_VERSION, MemberRole, MembershipEntry, NetworkGrant,
     decode_and_preflight, grant_expiry, preflight_invite, run_auth_client, run_auth_server,
-    run_join_client, verify_admission,
+    run_join_client, run_join_client_notified, verify_admission,
 };
 use tunnet_core::direct::{AuthServerContext, SharedAuthServerContext};
 use tunnet_core::state::StatePaths;
@@ -207,7 +207,7 @@ struct Harness {
     disco: MemoryLookup,
 }
 
-async fn harness(open: bool) -> Harness {
+async fn harness() -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let paths = StatePaths::from_dir(tmp.path().to_path_buf());
     let (sk, vk) = generate_coordinator_keypair();
@@ -234,14 +234,9 @@ async fn harness(open: bool) -> Harness {
         },
     )
     .unwrap();
-    let authority = DirectAuthority::load(
-        &paths,
-        genesis.network_id,
-        open,
-        genesis.clone(),
-        "ab".repeat(32),
-    )
-    .unwrap();
+    let authority =
+        DirectAuthority::load(&paths, genesis.network_id, genesis.clone(), "ab".repeat(32))
+            .unwrap();
     let auth = AuthCache::new();
     let net = MemNet::new(genesis, sk, auth.clone());
     let vk_for_ctx = vk;
@@ -314,11 +309,12 @@ async fn join_once(
 
 #[tokio::test]
 async fn one_time_join_then_same_endpoint_retry() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             false,
             jiff::Span::new().hours(24),
         )
@@ -340,11 +336,12 @@ async fn one_time_join_then_same_endpoint_retry() {
 
 #[tokio::test]
 async fn one_time_replay_other_endpoint_denied() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             false,
             jiff::Span::new().hours(24),
         )
@@ -365,11 +362,12 @@ async fn one_time_replay_other_endpoint_denied() {
 
 #[tokio::test]
 async fn expired_and_revoked_invite() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            true,
             true,
             jiff::Span::new().hours(24),
         )
@@ -387,11 +385,12 @@ async fn expired_and_revoked_invite() {
 
 #[tokio::test]
 async fn local_cidr_conflict_before_admission() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            true,
             true,
             jiff::Span::new().hours(24),
         )
@@ -408,11 +407,12 @@ async fn local_cidr_conflict_before_admission() {
 
 #[tokio::test]
 async fn response_loss_retry_recovers_same_ip() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             false,
             jiff::Span::new().hours(24),
         )
@@ -428,34 +428,139 @@ async fn response_loss_retry_recovers_same_ip() {
 }
 
 #[tokio::test]
-async fn pending_approval_then_retry() {
-    let h = harness(false).await;
+async fn pending_approval_completes_waiting_join() {
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
             false,
+            true,
             jiff::Span::new().hours(24),
         )
         .await
         .unwrap();
     let a = peer_endpoint(&h.disco).await;
-    let r1 = join_once(&a, &h.coord, &invite.invite_secret, "wait").await;
-    assert_eq!(r1.status, JoinStatus::Pending);
+    let eid = format!("{}", a.id());
+    let coord = h.coord.clone();
+    let secret = invite.invite_secret.clone();
+    let join = tokio::spawn(async move { join_once(&a, &coord, &secret, "wait").await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if h.authority
+                .pending()
+                .await
+                .iter()
+                .any(|p| p.endpoint_id == eid)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending request");
     assert_eq!(h.net.member_count(), 0);
-    h.authority.approve(&format!("{}", a.id())).await.unwrap();
-    let r2 = join_once(&a, &h.coord, &invite.invite_secret, "wait").await;
-    assert_eq!(r2.status, JoinStatus::Admitted);
+    h.authority.approve(&eid).await.unwrap();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("join finished")
+        .expect("join task");
+    assert_eq!(r.status, JoinStatus::Admitted);
+    assert_eq!(h.net.member_count(), 1);
 }
 
 #[tokio::test]
-async fn revoked_peer_cannot_rejoin_or_auth() {
-    let h = harness(true).await;
+async fn reject_completes_waiting_join() {
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             true,
+            jiff::Span::new().hours(24),
+        )
+        .await
+        .unwrap();
+    let a = peer_endpoint(&h.disco).await;
+    let eid = format!("{}", a.id());
+    let coord = h.coord.clone();
+    let secret = invite.invite_secret.clone();
+    let join = tokio::spawn(async move { join_once(&a, &coord, &secret, "wait").await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if h.authority
+                .pending()
+                .await
+                .iter()
+                .any(|p| p.endpoint_id == eid)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("pending request");
+    h.authority.deny(&eid).await.unwrap();
+    let r = tokio::time::timeout(std::time::Duration::from_secs(10), join)
+        .await
+        .expect("join finished")
+        .expect("join task");
+    assert_eq!(r.status, JoinStatus::Denied);
+    assert_eq!(r.reason.as_deref(), Some("rejected"));
+}
+
+#[tokio::test]
+async fn reconnect_after_approval_admits_without_new_invite() {
+    let h = harness().await;
+    let invite = h
+        .authority
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            true,
+            jiff::Span::new().hours(24),
+        )
+        .await
+        .unwrap();
+    let a = peer_endpoint(&h.disco).await;
+    let _ = auth_pending_once(&h, &a, &invite.invite_secret).await;
+    h.authority.approve(&format!("{}", a.id())).await.unwrap();
+    let r = join_once(&a, &h.coord, &invite.invite_secret, "wait").await;
+    assert_eq!(r.status, JoinStatus::Admitted);
+}
+
+async fn auth_pending_once(h: &Harness, peer: &Endpoint, secret: &str) -> () {
+    // Create the pending request, then drop the JOIN session.
+    let conn = peer.connect(h.coord.id(), JOIN_ALPN).await.expect("dial");
+    let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = pending.clone();
+    let join = run_join_client_notified(&conn, secret, "wait", move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    tokio::select! {
+        _ = join => {}
+        _ = async {
+            while !pending.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            conn.close(0u32.into(), b"drop");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        } => {}
+    }
+}
+
+#[tokio::test]
+async fn revoked_peer_cannot_rejoin_or_auth() {
+    let h = harness().await;
+    let invite = h
+        .authority
+        .issue_invite(
+            &format!("{}", h.coord.id()),
+            false,
+            false,
             jiff::Span::new().hours(24),
         )
         .await
@@ -468,7 +573,8 @@ async fn revoked_peer_cannot_rejoin_or_auth() {
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
-            true,
+            false,
+            false,
             jiff::Span::new().hours(24),
         )
         .await
@@ -484,11 +590,12 @@ async fn revoked_peer_cannot_rejoin_or_auth() {
 
 #[tokio::test]
 async fn membership_publish_failure_then_retry() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             false,
             jiff::Span::new().hours(24),
         )
@@ -507,11 +614,12 @@ async fn membership_publish_failure_then_retry() {
 
 #[tokio::test]
 async fn create_invite_join_verified_membership_and_auth() {
-    let h = harness(true).await;
+    let h = harness().await;
     let invite = h
         .authority
         .issue_invite(
             &format!("{}", h.coord.id()),
+            false,
             false,
             jiff::Span::new().hours(24),
         )
@@ -561,6 +669,7 @@ async fn decode_rejects_unsigned_genesis_in_invite() {
         invite_secret: hex::encode([1u8; 32]),
         expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_hours(1),
         coordinator_addr: None,
+        admission: tunnet_core::direct::InviteAdmission::Immediate,
     };
     let code = tunnet_core::direct::encode_invite(&invite).unwrap();
     assert!(tunnet_core::direct::decode_invite(&code).is_err());

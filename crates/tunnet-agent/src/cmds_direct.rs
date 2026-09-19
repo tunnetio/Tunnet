@@ -7,8 +7,8 @@ use tunnet_core::direct::{
     AddressPlan, ConnectivityOptions, GENESIS_SCHEMA_VERSION, Genesis, JOIN_ALPN, JoinStatus,
     MEMBER_SCHEMA_VERSION, MemberRole, NetworkGrant, allocate_peer_ip, apply_connectivity,
     decode_and_preflight, endpoint_builder, generate_coordinator_keypair, grant_expiry,
-    network_id_from_topic, relay_auth_denied_detail, run_join_client, sign_genesis, sign_grant,
-    sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
+    network_id_from_topic, relay_auth_denied_detail, run_join_client_notified, sign_genesis,
+    sign_grant, sign_member_record, topic_from_name_secret, validate_peer_cidr, verify_admission,
 };
 use tunnet_core::{
     DirectState, PersistedState, SealPolicy, StatePaths, TunnetConfig, load_agent, persist_agent,
@@ -49,12 +49,13 @@ pub struct CreateArgs {
     pub no_encrypt_state: bool,
 }
 
-#[derive(Debug)]
 pub struct JoinArgs {
     pub invite_code: String,
     pub hostname: Option<String>,
     pub auto_accept_firewall: bool,
     pub no_encrypt_state: bool,
+    pub on_pending: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[cfg(feature = "local-api")]
@@ -327,8 +328,6 @@ pub async fn persist_direct_join(
             (id, networks)
         }
         None => {
-            // Persist the join key immediately. Pending approval must retry the
-            // same endpoint id the coordinator just saw.
             let (secrets, _) = tunnet_core::secret_store::load_or_create_secrets(&paths, policy)?;
             (secrets.identity(), Vec::new())
         }
@@ -389,6 +388,7 @@ pub async fn persist_direct_join(
     }
     let endpoint = builder.bind().await.context("bind join endpoint")?;
 
+    let saw_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let join_result = async {
         match tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await {
             Ok(()) => tracing::info!("join endpoint online"),
@@ -411,30 +411,77 @@ pub async fn persist_direct_join(
             ?ip_v6,
             "connecting to coordinator"
         );
-        let conn = endpoint
-            .connect(dial, JOIN_ALPN)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect to coordinator: {e:#}"))?;
-        log_join_paths(&conn);
-        let resp = run_join_client(&conn, &invite.invite_secret, &hostname)
-            .await
-            .context("direct join")?;
-        conn.close(0u32.into(), b"join_done");
-        match resp.status {
-            JoinStatus::Pending => anyhow::bail!(
-                "join pending approval; retry the same invite after the coordinator accepts this endpoint"
-            ),
-            JoinStatus::Denied => {
-                anyhow::bail!(
-                    "join denied: {}",
-                    resp.reason.as_deref().unwrap_or("denied")
+        let mut delay = std::time::Duration::from_millis(400);
+        loop {
+            if args
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled())
+            {
+                anyhow::bail!("join cancelled");
+            }
+            let connect = async {
+                let conn = endpoint
+                    .connect(dial.clone(), JOIN_ALPN)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect to coordinator: {e:#}"))?;
+                log_join_paths(&conn);
+                let pending_flag = saw_pending.clone();
+                let on_pending_hook = args.on_pending.clone();
+                let resp = run_join_client_notified(
+                    &conn,
+                    &invite.invite_secret,
+                    &hostname,
+                    move || {
+                        pending_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(cb) = &on_pending_hook {
+                            cb();
+                        }
+                    },
                 )
+                .await
+                .context("direct join")?;
+                conn.close(0u32.into(), b"join_done");
+                Ok::<_, anyhow::Error>(resp)
+            };
+            let resp = if let Some(cancel) = &args.cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => anyhow::bail!("join cancelled"),
+                    r = connect => r,
+                }
+            } else {
+                connect.await
+            };
+            match resp {
+                Ok(resp) => match resp.status {
+                    JoinStatus::Admitted => {
+                        let admission = resp.admission.context("missing admission")?;
+                        verify_admission(&invite, &my_id, &hostname, &admission)?;
+                        break Ok(admission);
+                    }
+                    JoinStatus::Denied => {
+                        anyhow::bail!(
+                            "join denied: {}",
+                            resp.reason.as_deref().unwrap_or("denied")
+                        )
+                    }
+                    JoinStatus::Expired => {
+                        anyhow::bail!(
+                            "join expired: {}",
+                            resp.reason.as_deref().unwrap_or("expired")
+                        )
+                    }
+                    JoinStatus::Pending => {
+                        saw_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+                Err(e) if saw_pending.load(std::sync::atomic::Ordering::SeqCst) => {
+                    tracing::warn!(?e, "join session dropped while pending; reconnecting");
+                }
+                Err(e) => return Err(e),
             }
-            JoinStatus::Admitted => {
-                let admission = resp.admission.context("missing admission")?;
-                verify_admission(&invite, &my_id, &hostname, &admission)?;
-                Ok(admission)
-            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(5));
         }
     }
     .await;

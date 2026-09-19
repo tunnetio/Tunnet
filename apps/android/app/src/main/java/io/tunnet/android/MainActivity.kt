@@ -342,6 +342,8 @@ private fun JoinCard(
                 Text(
                     when {
                         snapshot.lifecycle == Lifecycle.LIFECYCLE_JOINING -> "Joining…"
+                        snapshot.lifecycle == Lifecycle.LIFECYCLE_PENDING_APPROVAL ->
+                            "Waiting for approval…"
                         stopped -> "Start and join"
                         else -> "Join"
                     },

@@ -1,8 +1,7 @@
 //! Coordinator-issued Direct join capabilities.
 //!
-//! An invite is a bearer secret plus the signed [`Genesis`]. Policy (expiry,
-//! reusable/one-time, revocation, claim) lives on the coordinator and is not
-//! taken from the joining client.
+//! An invite is a bearer secret plus the signed [`Genesis`]. The coordinator
+//! enforces [`InviteAdmission`]; the copy in the token is informational.
 
 use anyhow::Context;
 use iroh::{EndpointAddr, EndpointId};
@@ -10,6 +9,17 @@ use serde::{Deserialize, Serialize};
 
 use super::connectivity::strip_overlay_addrs;
 use super::grants::{Genesis, verify_genesis, verifying_key_from_hex};
+
+/// How redeeming this invite admits an endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteAdmission {
+    /// Single-use capability: valid redemption admits immediately.
+    #[default]
+    Immediate,
+    /// Redemption creates a pending request bound to the presenting EndpointId.
+    ApprovalRequired,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteCode {
@@ -22,6 +32,9 @@ pub struct InviteCode {
     /// Coordinator [`EndpointAddr`] at issue time. Bootstrap hints, not transport policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_addr: Option<EndpointAddr>,
+    /// Informational copy of coordinator admission policy.
+    #[serde(default)]
+    pub admission: InviteAdmission,
 }
 
 /// Address used to open JOIN_ALPN.
@@ -151,6 +164,7 @@ mod tests {
             invite_secret: hex::encode([7u8; 32]),
             expires_at: jiff::Timestamp::now() + jiff::SignedDuration::from_hours(24),
             coordinator_addr: None,
+            admission: InviteAdmission::Immediate,
         }
     }
 

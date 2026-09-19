@@ -180,9 +180,7 @@ pub async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
         out.writeln(format!("  network    {}", out.dim("not connected")));
         print_daemon_lines(&out, daemon_up, &service);
         if daemon_up {
-            out.writeln(out.dim(
-                "  Idle - run `tunnet create` / `enroll` / `join` (daemon reloads automatically).",
-            ));
+            out.writeln(out.dim("  Idle - run `tunnet create` / `enroll` / `join`"));
         } else {
             out.writeln(out.dim(
                 "  Start the daemon with `tunnet service start` (or `tunnetd` for foreground).",

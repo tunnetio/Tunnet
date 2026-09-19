@@ -131,6 +131,7 @@ fn lifecycle(value: AgentLifecycle) -> Lifecycle {
     match value {
         AgentLifecycle::Idle => Lifecycle::Idle,
         AgentLifecycle::Joining => Lifecycle::Joining,
+        AgentLifecycle::PendingApproval => Lifecycle::PendingApproval,
         AgentLifecycle::Activating => Lifecycle::Activating,
         AgentLifecycle::Running => Lifecycle::Running,
         AgentLifecycle::Stopping => Lifecycle::Stopping,

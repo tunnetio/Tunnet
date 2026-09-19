@@ -24,6 +24,16 @@ class SnapshotUiTest {
     }
 
     @Test
+    fun pendingApprovalIsBusy() {
+        val snap = Snapshot.newBuilder()
+            .setLifecycle(Lifecycle.LIFECYCLE_PENDING_APPROVAL)
+            .build()
+        assertTrue(snap.busy())
+        assertEquals("Waiting for approval", snap.headline(null))
+        assertEquals("Waiting for approval…", snap.notificationText())
+    }
+
+    @Test
     fun joiningIsBusyAndHeadlineJoining() {
         val snap = Snapshot.newBuilder()
             .setLifecycle(Lifecycle.LIFECYCLE_JOINING)

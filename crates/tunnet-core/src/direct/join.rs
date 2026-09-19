@@ -1,9 +1,12 @@
-//! Single-shot Direct join protocol (ALPN [`JOIN_ALPN`]).
+//! Direct join protocol (ALPN [`JOIN_ALPN`]).
 //!
-//! One request, one response, then close. AUTH is not used. Idempotent retries
-//! are handled by [`super::authority::DirectAuthority`].
+//! The joiner sends one [`JoinRequest`]. Immediate admission replies with a
+//! single [`JoinResponse`]. Approval-required redemption writes `pending`,
+//! keeps the stream open, and writes a final admitted/denied/expired frame
+//! when the coordinator decides. AUTH is not used.
 
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use anyhow::Context;
 use ipnet::Ipv4Net;
@@ -20,7 +23,7 @@ use super::grants::{
 use super::invite::{InviteCode, decode_invite};
 use super::membership::MembershipEntry;
 
-pub const JOIN_ALPN: &[u8] = b"tunnet/direct-join/1";
+pub const JOIN_ALPN: &[u8] = b"tunnet/direct-join/2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
@@ -34,6 +37,7 @@ pub enum JoinStatus {
     Admitted,
     Pending,
     Denied,
+    Expired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +88,23 @@ impl JoinResponse {
             admission: None,
             network_id: None,
         }
+    }
+
+    pub fn expired(reason: &str) -> Self {
+        Self {
+            status: JoinStatus::Expired,
+            reason: Some(reason.to_string()),
+            admission: None,
+            network_id: None,
+        }
+    }
+}
+
+fn response_from_denied(reason: &str) -> JoinResponse {
+    if reason == "invite_expired" {
+        JoinResponse::expired(reason)
+    } else {
+        JoinResponse::denied(reason)
     }
 }
 
@@ -136,11 +157,22 @@ pub fn decode_and_preflight(
     Ok(invite)
 }
 
-/// Client: one request / one response / caller closes.
+/// Client: send the join request and wait for a terminal response.
+///
+/// `on_pending` runs once if the coordinator first reports pending approval.
 pub async fn run_join_client(
     conn: &Connection,
     invite_secret: &str,
     hostname: &str,
+) -> anyhow::Result<JoinResponse> {
+    run_join_client_notified(conn, invite_secret, hostname, || {}).await
+}
+
+pub async fn run_join_client_notified(
+    conn: &Connection,
+    invite_secret: &str,
+    hostname: &str,
+    mut on_pending: impl FnMut(),
 ) -> anyhow::Result<JoinResponse> {
     let (mut send, mut recv) = conn.open_bi().await.context("open join stream")?;
     let req = JoinRequest {
@@ -149,9 +181,20 @@ pub async fn run_join_client(
     };
     write_frame(&mut send, &serde_json::to_vec(&req)?).await?;
     send.finish()?;
-    let frame = read_frame(&mut recv, 256 * 1024).await?;
-    let resp: JoinResponse = serde_json::from_slice(&frame).context("join response json")?;
-    Ok(resp)
+    let mut pending = false;
+    loop {
+        let frame = read_frame(&mut recv, 256 * 1024).await?;
+        let resp: JoinResponse = serde_json::from_slice(&frame).context("join response json")?;
+        match resp.status {
+            JoinStatus::Pending => {
+                if !pending {
+                    pending = true;
+                    on_pending();
+                }
+            }
+            JoinStatus::Admitted | JoinStatus::Denied | JoinStatus::Expired => return Ok(resp),
+        }
+    }
 }
 
 pub fn verify_admission(
@@ -200,12 +243,25 @@ pub trait JoinPublisher: Send + Sync {
     ) -> impl std::future::Future<Output = anyhow::Result<JoinAdmission>> + Send;
 }
 
-/// Server: one request / one response / caller closes.
+/// Server: admit immediately or hold the stream until the coordinator decides.
 pub async fn run_join_server<P: JoinPublisher>(
     conn: &Connection,
     authority: &DirectAuthority,
     publisher: &P,
 ) -> anyhow::Result<JoinResponse> {
+    run_join_server_with_pending(conn, authority, publisher, |_| {}).await
+}
+
+pub async fn run_join_server_with_pending<P, F>(
+    conn: &Connection,
+    authority: &DirectAuthority,
+    publisher: &P,
+    on_pending: F,
+) -> anyhow::Result<JoinResponse>
+where
+    P: JoinPublisher,
+    F: Fn(Uuid),
+{
     let (mut send, mut recv) = conn.accept_bi().await.context("accept join stream")?;
     let remote_id = format!("{}", conn.remote_id());
     let req = match read_join_request(&mut recv).await {
@@ -216,10 +272,10 @@ pub async fn run_join_server<P: JoinPublisher>(
             return Err(e);
         }
     };
-    let resp = process_join_request(&remote_id, req, authority, publisher).await;
-    write_frame(&mut send, &serde_json::to_vec(&resp)?).await?;
-    send.finish()?;
-    let _ = send.stopped().await;
+    let resp = serve_join(
+        conn, &mut send, &remote_id, req, authority, publisher, on_pending,
+    )
+    .await?;
     Ok(resp)
 }
 
@@ -227,6 +283,18 @@ pub async fn run_join_server_dispatch<P: JoinPublisher>(
     conn: &Connection,
     networks: &[(DirectAuthority, P)],
 ) -> anyhow::Result<JoinResponse> {
+    run_join_server_dispatch_with_pending(conn, networks, |_, _| {}).await
+}
+
+pub async fn run_join_server_dispatch_with_pending<P, F>(
+    conn: &Connection,
+    networks: &[(DirectAuthority, P)],
+    on_pending: F,
+) -> anyhow::Result<JoinResponse>
+where
+    P: JoinPublisher,
+    F: Fn(Uuid, &str),
+{
     let (mut send, mut recv) = conn.accept_bi().await.context("accept join stream")?;
     let remote_id = format!("{}", conn.remote_id());
     let req = match read_join_request(&mut recv).await {
@@ -251,11 +319,11 @@ pub async fn run_join_server_dispatch<P: JoinPublisher>(
         return Ok(resp);
     };
     let (authority, publisher) = &networks[i];
-    let resp = process_join_request(&remote_id, req, authority, publisher).await;
-    write_frame(&mut send, &serde_json::to_vec(&resp)?).await?;
-    send.finish()?;
-    let _ = send.stopped().await;
-    Ok(resp)
+    let on_pending = |nid: Uuid| on_pending(nid, &remote_id);
+    serve_join(
+        conn, &mut send, &remote_id, req, authority, publisher, on_pending,
+    )
+    .await
 }
 
 async fn read_join_request(recv: &mut RecvStream) -> anyhow::Result<JoinRequest> {
@@ -263,23 +331,111 @@ async fn read_join_request(recv: &mut RecvStream) -> anyhow::Result<JoinRequest>
     serde_json::from_slice(&frame).context("join request json")
 }
 
-async fn process_join_request<P: JoinPublisher>(
+async fn serve_join<P, F>(
+    conn: &Connection,
+    send: &mut SendStream,
     remote_id: &str,
     req: JoinRequest,
     authority: &DirectAuthority,
     publisher: &P,
-) -> JoinResponse {
+    on_pending: F,
+) -> anyhow::Result<JoinResponse>
+where
+    P: JoinPublisher,
+    F: Fn(Uuid),
+{
     let hostname = if req.hostname.trim().is_empty() {
         "peer".into()
     } else {
         req.hostname
     };
+    let mut watch = authority.subscribe_admission(remote_id).await;
+    let first = resolve_once(
+        remote_id,
+        hostname.clone(),
+        &req.invite_secret,
+        authority,
+        publisher,
+    )
+    .await;
+    match first.status {
+        JoinStatus::Pending => {
+            on_pending(authority.network_id);
+            write_frame(send, &serde_json::to_vec(&first)?).await?;
+            let resp = wait_until_terminal(
+                conn,
+                &mut watch,
+                remote_id,
+                hostname,
+                &req.invite_secret,
+                authority,
+                publisher,
+            )
+            .await?;
+            write_frame(send, &serde_json::to_vec(&resp)?).await?;
+            send.finish()?;
+            let _ = send.stopped().await;
+            Ok(resp)
+        }
+        _ => {
+            write_frame(send, &serde_json::to_vec(&first)?).await?;
+            send.finish()?;
+            let _ = send.stopped().await;
+            Ok(first)
+        }
+    }
+}
+
+async fn wait_until_terminal<P: JoinPublisher>(
+    conn: &Connection,
+    watch: &mut tokio::sync::watch::Receiver<u64>,
+    remote_id: &str,
+    hostname: String,
+    invite_secret: &str,
+    authority: &DirectAuthority,
+    publisher: &P,
+) -> anyhow::Result<JoinResponse> {
+    loop {
+        let next = resolve_once(
+            remote_id,
+            hostname.clone(),
+            invite_secret,
+            authority,
+            publisher,
+        )
+        .await;
+        if next.status != JoinStatus::Pending {
+            return Ok(next);
+        }
+        tokio::select! {
+            _ = conn.closed() => anyhow::bail!("join connection closed"),
+            _ = watch.changed() => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+async fn resolve_once<P: JoinPublisher>(
+    remote_id: &str,
+    hostname: String,
+    invite_secret: &str,
+    authority: &DirectAuthority,
+    publisher: &P,
+) -> JoinResponse {
     let snap = publisher.snapshot();
     let decision = authority
-        .decide(remote_id, hostname, &req.invite_secret, &snap)
+        .decide(remote_id, hostname, invite_secret, &snap)
         .await;
+    apply_decision(decision, authority, publisher).await
+}
+
+async fn apply_decision<P: JoinPublisher>(
+    decision: JoinDecision,
+    authority: &DirectAuthority,
+    publisher: &P,
+) -> JoinResponse {
     match decision {
-        JoinDecision::Denied { reason } => JoinResponse::denied(reason),
+        JoinDecision::Denied { reason } => response_from_denied(reason),
         JoinDecision::Pending => JoinResponse::pending(authority.network_id),
         JoinDecision::Admit { entry, recover } => {
             let published = if recover {

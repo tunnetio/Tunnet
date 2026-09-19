@@ -918,6 +918,7 @@ async fn direct_invite(
         &state,
         body.network.as_deref(),
         body.reusable,
+        body.require_approval,
         &body.expires,
     )
     .await
