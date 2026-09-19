@@ -148,9 +148,9 @@ impl RouteActor {
         #[cfg(target_os = "android")]
         {
             let _ = self;
-            return Err(RouteError::List(
+            Err(RouteError::List(
                 "OS route reconciliation is not used on Android".into(),
-            ));
+            ))
         }
         #[cfg(not(target_os = "android"))]
         {

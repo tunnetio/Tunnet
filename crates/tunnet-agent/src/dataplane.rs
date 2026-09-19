@@ -4,7 +4,6 @@
 //! module keeps only high-throughput task constructors that must stay plain
 //! Tokio: the outbound TUN loop and underlay helpers.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use tun_rs::AsyncDevice;
@@ -57,7 +56,8 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
 }
 
 /// Resolve IPv4 underlay pins from a control-plane URL (host literal or hostname skip).
-pub fn underlay_hosts_from_url(control_url: &str) -> Vec<Ipv4Addr> {
+#[cfg(not(target_os = "android"))]
+pub fn underlay_hosts_from_url(control_url: &str) -> Vec<std::net::Ipv4Addr> {
     let host = control_url
         .trim()
         .trim_start_matches("https://")
@@ -67,7 +67,7 @@ pub fn underlay_hosts_from_url(control_url: &str) -> Vec<Ipv4Addr> {
         .unwrap_or("");
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let mut out = Vec::new();
-    if let Ok(ip) = host.parse::<Ipv4Addr>()
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>()
         && !ip.is_loopback()
         && !ip.is_unspecified()
     {

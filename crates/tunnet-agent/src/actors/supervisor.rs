@@ -679,7 +679,9 @@ mod tests {
                     dns_cfg: tunnet_common::DnsConfig::default(),
                     dns: None,
                     is_direct: true,
+                    #[cfg(not(target_os = "android"))]
                     network_id: uuid::Uuid::nil(),
+                    #[cfg(not(target_os = "android"))]
                     underlay_hosts: vec![],
                 },
                 node,

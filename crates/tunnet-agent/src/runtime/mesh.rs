@@ -99,6 +99,7 @@ pub(crate) async fn start_mesh(
     let config_store = tunnet_core::EffectiveConfigStore::new();
     let _ = config_store.recompute(&agent_cfg, Default::default());
 
+    #[cfg(not(target_os = "android"))]
     let underlay_hosts = {
         let mut hosts = Vec::new();
         if let Ok(managed) = persisted.require_managed() {
@@ -324,7 +325,9 @@ pub(crate) async fn start_mesh(
         dns_cfg: dns_cfg.clone(),
         dns: dns_controller.clone(),
         is_direct,
+        #[cfg(not(target_os = "android"))]
         network_id,
+        #[cfg(not(target_os = "android"))]
         underlay_hosts: underlay_hosts.clone(),
     };
 

@@ -16,6 +16,7 @@ use tunnet_common::DnsConfig;
 use tunnet_common::local_api::LocalEvent;
 use tunnet_core::CoreNode;
 use tunnet_core::local_api::{DataPlaneControl, DataPlaneStatusSnapshot};
+#[cfg(not(target_os = "android"))]
 use uuid::Uuid;
 
 use super::routes::RouteActor;
@@ -25,10 +26,6 @@ use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
 #[cfg(not(target_os = "android"))]
 use crate::system_routes::desired_from_membership;
-
-// ---------------------------------------------------------------------------
-// Published hot-path view
-// ---------------------------------------------------------------------------
 
 /// Immutable generation published by `DataPlaneActor`.
 ///
@@ -64,7 +61,9 @@ pub struct DataPlaneActorConfig {
     pub dns_cfg: DnsConfig,
     pub dns: Option<Arc<DnsController>>,
     pub is_direct: bool,
+    #[cfg(not(target_os = "android"))]
     pub network_id: Uuid,
+    #[cfg(not(target_os = "android"))]
     pub underlay_hosts: Vec<Ipv4Addr>,
 }
 
@@ -72,6 +71,7 @@ pub struct DataPlaneActorConfig {
 pub enum DataPlaneError {
     #[error("TUN build failed: {0}")]
     Tun(String),
+    #[cfg(not(target_os = "android"))]
     #[error("route reconcile failed: {0}")]
     Routes(String),
     #[error("PeerDNS failed: {0}")]
@@ -455,6 +455,7 @@ impl DataPlaneActor {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn route_snapshot(
     node: &CoreNode,
     is_direct: bool,
@@ -578,11 +579,11 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
         if self.up {
             #[cfg(not(target_os = "android"))]
             {
-                return self.reconcile_routes().await;
+                self.reconcile_routes().await
             }
             #[cfg(target_os = "android")]
             {
-                return Ok(());
+                Ok(())
             }
         } else {
             self.do_bring_up(ctx.actor_ref().downgrade()).await
@@ -695,7 +696,9 @@ mod tests {
                 dns_cfg: tunnet_common::DnsConfig::default(),
                 dns: None,
                 is_direct: true,
+                #[cfg(not(target_os = "android"))]
                 network_id: Uuid::nil(),
+                #[cfg(not(target_os = "android"))]
                 underlay_hosts: vec![],
             },
             node,
@@ -843,7 +846,9 @@ mod tests {
                 dns_cfg: tunnet_common::DnsConfig::default(),
                 dns: None,
                 is_direct: true,
+                #[cfg(not(target_os = "android"))]
                 network_id: Uuid::nil(),
+                #[cfg(not(target_os = "android"))]
                 underlay_hosts: vec![],
             },
             node,
