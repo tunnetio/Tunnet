@@ -31,25 +31,8 @@ mod wintun;
 #[cfg(feature = "host-dns")]
 mod system_dns;
 #[cfg(not(feature = "host-dns"))]
-mod system_dns {
-    use std::net::Ipv4Addr;
-
-    pub struct DnsController;
-
-    impl DnsController {
-        pub fn restore(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        pub fn is_active(&self) -> bool {
-            false
-        }
-
-        pub fn apply(&self, _: &str, _: Ipv4Addr, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-}
+#[path = "system_dns_disabled.rs"]
+mod system_dns;
 
 #[cfg(feature = "ssh")]
 mod recorder;

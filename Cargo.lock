@@ -6625,9 +6625,9 @@ dependencies = [
 
 [[package]]
 name = "osdns"
-version = "0.2.2"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f7e801e2069218b89fd2fad620b5050f18471f3cef69271e4782d33f74eea5d"
+checksum = "b01e9501bf67374e59d1f11765de1d985f542f4614cfec43bf768131200dffaa"
 dependencies = [
  "atomic-write-file",
  "core-foundation 0.10.1",

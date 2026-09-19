@@ -285,7 +285,14 @@ pub(crate) async fn start_mesh(
             match tokio::task::spawn_blocking(DnsController::create).await {
                 Ok(Ok(controller)) => Some(controller),
                 Ok(Err(e)) => {
-                    tracing::error!(error = %e, "osdns DNS integration unavailable");
+                    if matches!(e, osdns::Error::UnsupportedPlatform { .. }) {
+                        tracing::info!(
+                            error = %e,
+                            "host OS DNS overlay skipped (no OS DNS backend on this platform)"
+                        );
+                    } else {
+                        tracing::error!(error = %e, "osdns DNS integration unavailable");
+                    }
                     None
                 }
                 Err(e) => {

@@ -64,6 +64,8 @@ impl DnsController {
     /// Blocking; call via `spawn_blocking` from async code. Enforce needs no
     /// public watcher from Tunnet: osdns observes natively once a lease is
     /// active, and returns typed `Unsupported` where Enforce is unavailable.
+    /// Targets with no OS DNS backend (including Android) fail with
+    /// [`osdns::Error::UnsupportedPlatform`].
     pub fn create() -> osdns::Result<Arc<Self>> {
         Self::wrap(
             DnsManager::builder()
@@ -399,6 +401,9 @@ fn log_apply_failure(e: &osdns::Error) {
         osdns::Error::RequiresPrivilege(_) => {
             tracing::error!(error = %e, "PeerDNS OS configuration needs elevated privileges")
         }
+        osdns::Error::UnsupportedPlatform { .. } => {
+            tracing::error!(error = %e, "PeerDNS OS configuration is not available on this platform")
+        }
         osdns::Error::Unsupported { .. } => {
             tracing::error!(error = %e, "PeerDNS OS configuration unsupported on this backend")
         }
@@ -431,6 +436,13 @@ mod tests {
 
     fn selector() -> InterfaceSelector {
         InterfaceSelector::Name(OsString::from("tunnet0"))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn create_fails_on_unsupported_platform() {
+        let err = DnsController::create().unwrap_err();
+        assert!(matches!(err, osdns::Error::UnsupportedPlatform { .. }));
     }
 
     #[test]
