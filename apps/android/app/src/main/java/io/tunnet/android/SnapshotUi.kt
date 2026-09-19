@@ -46,11 +46,11 @@ fun Snapshot.busy(): Boolean = when (lifecycle) {
 fun Snapshot.notificationText(): String = when {
     lifecycle == Lifecycle.LIFECYCLE_FAILED ->
         if (hasError() && error.message.isNotEmpty()) error.message else "Agent failed"
+    lifecycle == Lifecycle.LIFECYCLE_PENDING_APPROVAL -> "Waiting for approval…"
+    lifecycle == Lifecycle.LIFECYCLE_JOINING -> "Joining…"
+    lifecycle == Lifecycle.LIFECYCLE_ACTIVATING -> "Starting…"
     !isJoined() -> "Not joined to a network"
     dataPlaneUp() -> "Connected - ${networksList.joinToString { it.ip }}"
-    lifecycle == Lifecycle.LIFECYCLE_JOINING -> "Joining…"
-    lifecycle == Lifecycle.LIFECYCLE_PENDING_APPROVAL -> "Waiting for approval…"
-    lifecycle == Lifecycle.LIFECYCLE_ACTIVATING -> "Starting…"
     else -> "Connecting…"
 }
 

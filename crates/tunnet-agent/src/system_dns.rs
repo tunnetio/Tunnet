@@ -1185,7 +1185,18 @@ mod tests {
 
         #[test]
         fn reincarnated_resource_fails_closed_without_rebinding() {
-            let (manager, fake, _dir) = enforce_manager(full_caps());
+            // Cooperative: Enforce would race the journal on ResourceRemoved
+            // while this lease is still live (Windows ERROR_ACCESS_DENIED).
+            let dir = tempfile::tempdir().unwrap();
+            let fake = FakeDns::with_capabilities(full_caps());
+            let manager = manager_for_testing_with_policy(
+                "io.tunnet.agent",
+                dir.path(),
+                &fake,
+                Duration::from_secs(5),
+                ConflictPolicy::Cooperative,
+            )
+            .unwrap();
             let dns = DnsController::wrap(manager).unwrap();
             dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
 

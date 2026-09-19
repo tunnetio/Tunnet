@@ -42,6 +42,7 @@ pub(crate) enum ControlVersion {
     Snapshot(u64),
     /// Explicit local intent (e.g. dataplane BringUp, direct operator
     /// commands): always applies, never touches the watermark.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     Local,
 }
 
