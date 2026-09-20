@@ -19,8 +19,8 @@ use jni::{Env, EnvUnowned, JavaVM, jni_sig, jni_str};
 use tunnet_agent::android_tun::{self, TunProvider, TunRequest};
 use tunnet_agent::{
     AgentError, AgentErrorKind, JoinRequest, LatestSlot, MulticastHost, PlatformSealer, SealError,
-    SealErrorKind, UnderlayProtect, WireNativeResult, clear_multicast_host, clear_underlay_protect,
-    sanitize_hostname, set_multicast_host, set_platform_sealer, set_underlay_protect,
+    SealErrorKind, WireNativeResult, clear_multicast_host, sanitize_hostname, set_multicast_host,
+    set_platform_sealer,
 };
 
 use crate::session::AgentSession;
@@ -303,12 +303,12 @@ fn read_string(env: &Env, value: &JString<'_>) -> jni::errors::Result<String> {
     value.try_to_string(env)
 }
 
-fn with_session<T>(f: impl FnOnce(&AgentSession) -> Result<T>) -> Result<T> {
+fn command_runtime() -> Result<(tunnet_agent::AgentHandle, tokio::runtime::Handle)> {
     let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let session = guard
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("agent session is missing; call nativeStart first"))?;
-    f(session)
+    Ok((session.handle().clone(), session.runtime_handle()))
 }
 
 fn install_provider(env: &mut Env, service: &JObject) -> Result<()> {
@@ -357,45 +357,9 @@ fn install_multicast_host(env: &mut Env, service: &JObject) -> Result<()> {
     Ok(())
 }
 
-struct JvmUnderlayProtect {
-    vm: JavaVM,
-    service: Global<JObject<'static>>,
-}
-
-impl UnderlayProtect for JvmUnderlayProtect {
-    fn protect_fd(&self, fd: i32) {
-        let result = self
-            .vm
-            .attach_current_thread(|env| -> jni::errors::Result<()> {
-                env.call_method(
-                    &self.service,
-                    jni_str!("protectSocket"),
-                    jni_sig!("(I)V"),
-                    &[JValue::Int(fd)],
-                )?;
-                Ok(())
-            });
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "protectSocket failed");
-        }
-    }
-}
-
-fn install_underlay_protect(env: &mut Env, service: &JObject) -> Result<()> {
-    let host = JvmUnderlayProtect {
-        vm: env.get_java_vm().context("obtain JavaVM")?,
-        service: env
-            .new_global_ref(service)
-            .context("pin VpnService underlay protect")?,
-    };
-    set_underlay_protect(Box::new(host));
-    Ok(())
-}
-
 fn drop_host_bridges() {
     android_tun::clear_provider();
     clear_multicast_host();
-    clear_underlay_protect();
 }
 
 /// Contract: one agent per process. A second call rebinds the TUN provider to
@@ -409,7 +373,6 @@ fn attach_or_start(
     init_android_context(env, service)?;
     install_provider(env, service)?;
     install_multicast_host(env, service)?;
-    install_underlay_protect(env, service)?;
     install_sealer(env)?;
 
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -434,12 +397,14 @@ fn attach_or_start(
 }
 
 fn stop_session() {
-    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(session) = guard.take() {
+    let session = {
+        let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take()
+    };
+    drop_host_bridges();
+    if let Some(session) = session {
         session.stop();
     }
-    drop_host_bridges();
-    drop(guard);
     stop_delivery();
 }
 
@@ -546,8 +511,7 @@ fn replace_listener(env: &mut Env, listener: &JObject) -> jni::errors::Result<()
 
 /// Start or attach the embedded agent.
 ///
-/// `service` must implement
-/// `int establishTun(...)` and `void protectSocket(int fd)`.
+/// `service` must implement `int establishTun(...)`.
 ///
 /// Idempotent: a second start in this process rebinds the TUN provider to the
 /// new Service and does not create a second runtime.
@@ -654,12 +618,22 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeJoin<'local>(
                 auto_accept_firewall: true,
                 no_encrypt_state: false,
             };
-            let bytes = match with_session(|session| {
-                Ok(session.block_on(session.handle().join(request)))
-            }) {
+            let bytes = match command_runtime() {
                 Err(e) => err_anyhow(&e),
-                Ok(Ok(_)) => ok_bytes(),
-                Ok(Err(e)) => err_agent(&e),
+                Ok((handle, rt)) => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    rt.spawn(async move {
+                        let _ = tx.send(handle.join(request).await);
+                    });
+                    match rx.blocking_recv() {
+                        Ok(Ok(_)) => ok_bytes(),
+                        Ok(Err(e)) => err_agent(&e),
+                        Err(_) => err_agent(&AgentError::new(
+                            AgentErrorKind::Stopped,
+                            "runtime is stopped",
+                        )),
+                    }
+                }
             };
             env.byte_array_from_slice(&bytes)
         })

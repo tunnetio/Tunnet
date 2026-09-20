@@ -106,6 +106,31 @@ class VpnTunnelSpecTest {
     }
 
     @Test
+    fun defaultRouteIsRejected() {
+        val spec = parse(
+            addrs = arrayOf("10.1.2.3"),
+            routes = arrayOf("0.0.0.0/0"),
+        )
+        assertTrue(spec is VpnTunnelSpec.Invalid)
+    }
+
+    @Test
+    fun publicUnderlayIsNotCapturedByMeshRoutes() {
+        val spec = parse(
+            addrs = arrayOf("10.38.150.60"),
+            routes = arrayOf("10.38.0.0/16", "192.0.2.53/32"),
+            dns = arrayOf("192.0.2.53"),
+        ) as VpnTunnelSpec.Ready
+        assertFalse(spec.routes.any { it.second == 0 })
+        val captured = spec.routes.map { (ip, prefix) -> "$ip/$prefix" }
+        assertTrue(captured.contains("10.38.0.0/16"))
+        assertTrue(captured.contains("192.0.2.53/32"))
+        assertFalse(spec.routes.any { (ip, prefix) ->
+            containsIpv4(ip, prefix, "1.1.1.1") || containsIpv4(ip, prefix, "192.168.1.20")
+        })
+    }
+
+    @Test
     fun meshDnsServerIsAppliedMechanically() {
         val spec = parse(
             addrs = arrayOf("10.1.2.3"),
@@ -135,5 +160,15 @@ class VpnTunnelSpecTest {
             routes = arrayOf("10.1.0.0/16"),
         ) as VpnTunnelSpec.Ready
         assertTrue(spec.dns.isEmpty())
+    }
+
+    private fun containsIpv4(network: String, prefix: Int, ip: String): Boolean {
+        val parsed = VpnTunnelSpec.parseCidr("$network/$prefix") ?: return false
+        val route = parsed.first.split(".").map { it.toInt() }
+        val addr = ip.split(".").map { it.toInt() }
+        val routeVal = (route[0] shl 24) or (route[1] shl 16) or (route[2] shl 8) or route[3]
+        val ipVal = (addr[0] shl 24) or (addr[1] shl 16) or (addr[2] shl 8) or addr[3]
+        val mask = if (prefix == 0) 0 else (-1 shl (32 - prefix))
+        return (routeVal and mask) == (ipVal and mask)
     }
 }

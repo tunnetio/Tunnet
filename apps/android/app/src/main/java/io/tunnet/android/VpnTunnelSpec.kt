@@ -71,7 +71,7 @@ sealed class VpnTunnelSpec {
             val parts = cidr.split("/")
             if (parts.size != 2) return null
             val prefix = parts[1].toIntOrNull() ?: return null
-            if (prefix !in 0..32) return null
+            if (prefix !in 1..32) return null
             val ip = parseIpv4(parts[0]) ?: return null
             val octets = ip.split(".").map { it.toInt() }
             val value = (octets[0] shl 24) or (octets[1] shl 16) or (octets[2] shl 8) or octets[3]

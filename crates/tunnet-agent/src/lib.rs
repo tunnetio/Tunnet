@@ -78,11 +78,6 @@ pub use multicast_demand::{
 };
 #[cfg(any(target_os = "android", all(test, unix)))]
 pub use platform::tun as android_tun;
-#[cfg(any(target_os = "android", all(test, unix)))]
-pub use platform::underlay::{
-    UnderlayProtect, clear_underlay_protect, protect_existing as protect_underlay_sockets,
-    set_underlay_protect,
-};
 pub use runtime::{
     AgentConfig, AgentError, AgentErrorInfo, AgentErrorKind, AgentHandle, AgentLifecycle,
     AgentMode, AgentNetwork, AgentPeer, AgentRole, AgentRuntime, AgentSnapshot, CreateRequest,

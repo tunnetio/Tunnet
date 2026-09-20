@@ -37,8 +37,10 @@ import kotlin.coroutines.coroutineContext
 /**
  * Android owner of the embedded agent.
  *
- * Commands run on one serial coroutine. Snapshot observation is independent:
- * detaching the listener does not stop the runtime.
+ * Start and stop take [ops]. Join runs off that mutex so Disconnect, revoke,
+ * and destroy can cancel a pending join immediately.
+ * Snapshot observation is independent: detaching the listener does not stop
+ * the runtime.
  */
 class TunnetVpnService : VpnService() {
 
@@ -122,7 +124,13 @@ class TunnetVpnService : VpnService() {
             }
             VpnHostPolicy.Command.Attach -> {
                 goForeground("Starting…")
-                enqueue { attachLocked(decision.invite) }
+                val invite = decision.invite
+                scope.launch {
+                    val ready = ops.withLock { startAgentLocked() }
+                    if (ready) {
+                        joinNetwork(invite)
+                    }
+                }
                 return START_STICKY
             }
         }
@@ -134,8 +142,8 @@ class TunnetVpnService : VpnService() {
         }
     }
 
-    private suspend fun attachLocked(invite: String?) {
-        if (!alive) return
+    private suspend fun startAgentLocked(): Boolean {
+        if (!alive) return false
         syncLanLocked()
         val result = TunnetNative.start(
             stateDir(this),
@@ -143,14 +151,12 @@ class TunnetVpnService : VpnService() {
             this,
         )
         if (!alive || !coroutineContext.isActive) {
-            return
+            return false
         }
-        when (result) {
+        return when (result) {
             TunnetNative.Result.Ok -> {
                 Log.i(TAG, "agent attached")
-                if (!invite.isNullOrBlank()) {
-                    joinNetwork(invite)
-                }
+                true
             }
             is TunnetNative.Result.Err -> {
                 Log.e(TAG, "agent failed to start: ${result.message}")
@@ -161,12 +167,14 @@ class TunnetVpnService : VpnService() {
                     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 }
                 stopSelf()
+                false
             }
         }
     }
 
-    private suspend fun joinNetwork(invite: String) {
-        if (!alive || !coroutineContext.isActive) return
+    private suspend fun joinNetwork(invite: String?) {
+        if (invite.isNullOrBlank()) return
+        if (!alive || !desired.wanted || !coroutineContext.isActive) return
         when (val result = TunnetNative.join(invite, Build.MODEL ?: "android")) {
             TunnetNative.Result.Ok -> Log.i(TAG, "join issued")
             is TunnetNative.Result.Err -> Log.e(TAG, "join failed: ${result.message}")
@@ -260,10 +268,6 @@ class TunnetVpnService : VpnService() {
         return TunnelFd.detachOrClose(pfd)
     }
 
-    fun protectSocket(fd: Int) {
-        protect(fd)
-    }
-
     override fun onRevoke() {
         Log.i(TAG, "VPN permission revoked")
         desired.wanted = false
@@ -281,11 +285,7 @@ class TunnetVpnService : VpnService() {
         runBlocking {
             withContext(Dispatchers.IO) {
                 ops.withLock {
-                    if (desired.wanted) {
-                        TunnetNative.releaseHost()
-                    } else {
-                        TunnetNative.stop()
-                    }
+                    TunnetNative.stop()
                 }
             }
         }
@@ -352,7 +352,7 @@ class TunnetVpnService : VpnService() {
 
     /**
      * Called from the native multicast host. Do not take [ops]: this runs on
-     * the agent thread while [attachLocked] may already hold that mutex.
+     * the agent thread while [startAgentLocked] may already hold that mutex.
      */
     @Synchronized
     fun setMulticastDemand(needed: Boolean) {

@@ -40,7 +40,9 @@ pub struct TunRequest {
     /// `VpnService.Builder.addAddress(addr, 32)`.
     pub addrs: Vec<Ipv4Addr>,
     /// Destinations to capture, from `VpnService.Builder.addRoute`. These are
-    /// the joined networks' peer ranges, not anything derived from `addrs`.
+    /// the joined networks' peer ranges plus the in-TUN DNS host route, not
+    /// anything derived from `addrs`, and never a default route. iroh
+    /// relay/direct underlay therefore stays on the OS table.
     pub routes: Vec<Ipv4Net>,
     /// Resolvers to advertise, from `VpnService.Builder.addDnsServer`.
     ///

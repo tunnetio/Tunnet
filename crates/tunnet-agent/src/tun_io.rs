@@ -42,7 +42,6 @@ pub fn build_tun_multi(
     use std::os::fd::AsRawFd;
 
     use crate::platform::tun::{self, TunRequest};
-    use crate::platform::underlay;
 
     anyhow::ensure!(!addrs.is_empty(), "at least one local address required");
     anyhow::ensure!(
@@ -54,10 +53,9 @@ pub fn build_tun_multi(
         "mtu {mtu} is outside 576..=9000"
     );
 
-    underlay::protect_existing();
     let fd = tun::establish(TunRequest {
         addrs: addrs.to_vec(),
-        routes: with_virtual_dns_route(routes),
+        routes: android_vpn_capture_routes(routes),
         dns: vec![tunnet_common::VirtualResolverEndpoint::IP],
         mtu,
         allow_ipv6_passthrough: true,
@@ -80,11 +78,18 @@ pub fn build_tun_multi(
     Ok(dev)
 }
 
-#[cfg(target_os = "android")]
-fn with_virtual_dns_route(routes: &[ipnet::Ipv4Net]) -> Vec<ipnet::Ipv4Net> {
+/// Split-tunnel destinations for Android `VpnService`: overlay peer CIDRs
+/// plus the in-TUN resolver host route. Default routes are dropped so iroh
+/// relay/direct underlay stays on the OS table (no `VpnService.protect`).
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn android_vpn_capture_routes(peer_cidrs: &[ipnet::Ipv4Net]) -> Vec<ipnet::Ipv4Net> {
     let dns = tunnet_common::VirtualResolverEndpoint::IP;
     let host = tunnet_common::VirtualResolverEndpoint::host_route();
-    let mut out = routes.to_vec();
+    let mut out: Vec<_> = peer_cidrs
+        .iter()
+        .copied()
+        .filter(|net| net.prefix_len() != 0)
+        .collect();
     if !out.iter().any(|r| r.contains(&dns)) {
         out.push(host);
     }
@@ -433,4 +438,40 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
     }
     metrics.active_conns_dec();
     tracing::info!(%remote_id, "peer disconnected");
+}
+
+#[cfg(test)]
+mod android_vpn_route_tests {
+    use super::android_vpn_capture_routes;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn capture_routes_are_overlay_plus_virtual_dns_not_default() {
+        let overlay: ipnet::Ipv4Net = "10.38.0.0/16".parse().unwrap();
+        let routes = android_vpn_capture_routes(&[overlay]);
+        assert!(routes.contains(&overlay));
+        assert!(routes.contains(&tunnet_common::VirtualResolverEndpoint::host_route()));
+        assert!(
+            routes.iter().all(|r| r.prefix_len() != 0),
+            "default route would swallow iroh underlay"
+        );
+        let public = Ipv4Addr::new(1, 1, 1, 1);
+        let lan = Ipv4Addr::new(192, 168, 1, 20);
+        assert!(!routes.iter().any(|r| r.contains(&public)));
+        assert!(!routes.iter().any(|r| r.contains(&lan)));
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.contains(&tunnet_common::VirtualResolverEndpoint::IP))
+        );
+    }
+
+    #[test]
+    fn default_peer_cidr_is_stripped() {
+        let default: ipnet::Ipv4Net = "0.0.0.0/0".parse().unwrap();
+        let overlay: ipnet::Ipv4Net = "10.9.0.0/16".parse().unwrap();
+        let routes = android_vpn_capture_routes(&[default, overlay]);
+        assert!(!routes.iter().any(|r| r.prefix_len() == 0));
+        assert!(routes.contains(&overlay));
+    }
 }

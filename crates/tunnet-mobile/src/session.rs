@@ -95,6 +95,12 @@ impl AgentSession {
         &self.handle
     }
 
+    /// Executor handle for in-flight commands. Clone it and drop session
+    /// ownership before awaiting so stop can cancel immediately.
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
+
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
@@ -111,6 +117,7 @@ impl AgentSession {
     /// callback with a watchdog on it.
     pub fn stop(mut self) {
         self.latest.close();
+        self.handle.shutdown_token().cancel();
         if let Some(agent) = self.agent.take() {
             self.runtime.block_on(agent.shutdown());
         }
@@ -232,5 +239,27 @@ mod tests {
         latest.close();
         assert!(latest.is_closed());
         assert!(latest.wait_after(seq).is_none());
+    }
+
+    #[test]
+    fn stop_cancels_in_flight_work_without_runtime_block_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = AgentSession::start(dir.path(), "cancel-device").expect("start");
+        let token = session.handle().shutdown_token();
+        let rt = session.runtime_handle();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        rt.spawn(async move {
+            ready_tx.send(()).ok();
+            token.cancelled().await;
+            done_tx.send(()).ok();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("task started");
+        session.stop();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("pending join waiters must observe shutdown immediately");
     }
 }

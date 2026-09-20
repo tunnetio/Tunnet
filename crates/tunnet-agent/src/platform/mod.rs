@@ -2,5 +2,3 @@
 
 #[cfg(any(target_os = "android", all(test, unix)))]
 pub mod tun;
-#[cfg(any(target_os = "android", all(test, unix)))]
-pub mod underlay;

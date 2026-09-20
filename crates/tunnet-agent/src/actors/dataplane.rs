@@ -125,8 +125,6 @@ pub struct DataPlaneActor {
     dns_task: Option<tokio::task::JoinHandle<()>>,
     in_tun_dns: Option<std::sync::Arc<tunnet_core::dns::InTun>>,
     tun_if_index: Option<u32>,
-    #[cfg(target_os = "android")]
-    underlay_protect: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Actor for DataPlaneActor {
@@ -152,8 +150,6 @@ impl Actor for DataPlaneActor {
             dns_task: None,
             in_tun_dns: None,
             tun_if_index: None,
-            #[cfg(target_os = "android")]
-            underlay_protect: None,
         };
         if auto_up {
             // Reconstruct service after (re)start from durable state.
@@ -262,10 +258,6 @@ impl DataPlaneActor {
             dns_task.abort();
         }
         self.in_tun_dns = None;
-        #[cfg(target_os = "android")]
-        if let Some(protect) = self.underlay_protect.take() {
-            protect.abort();
-        }
         // Close tunnel connections so old ingress readers exit.
         self.node.tunnel_pool.close_all().await;
         #[cfg(not(target_os = "android"))]
@@ -350,19 +342,6 @@ impl DataPlaneActor {
             cancel: cancel.clone(),
         })));
         self.generation_cancel = Some(cancel);
-
-        #[cfg(target_os = "android")]
-        {
-            if let Some(protect) = self.underlay_protect.take() {
-                protect.abort();
-            }
-            self.underlay_protect = Some(tokio::spawn(async {
-                loop {
-                    crate::platform::underlay::protect_existing();
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }));
-        }
 
         // OS DNS work stays off the actor executor thread. Probe the
         // host-local endpoint before switching OS DNS toward it.
