@@ -19,9 +19,9 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
-    UpdateProcThreadAttribute,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::{LaunchRequest, SessionProcess, child_argv};
@@ -31,7 +31,8 @@ use crate::ssh::account::LocalAccount;
 struct ConptyKiller {
     process: HANDLE,
     thread: HANDLE,
-    hpcon: HPCON,
+    hpcon: std::sync::Arc<std::sync::Mutex<Option<HPCON>>>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for ConptyKiller {}
@@ -47,8 +48,13 @@ impl SessionKill for ConptyKiller {
 
 impl Drop for ConptyKiller {
     fn drop(&mut self) {
+        self.exited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         unsafe {
-            ClosePseudoConsole(self.hpcon);
+            windows_sys::Win32::System::Threading::TerminateProcess(self.process, 1);
+            if let Some(hpcon) = self.hpcon.lock().ok().and_then(|mut g| g.take()) {
+                ClosePseudoConsole(hpcon);
+            }
             CloseHandle(self.thread);
             CloseHandle(self.process);
         }
@@ -59,9 +65,11 @@ pub fn spawn_shell(req: &LaunchRequest) -> anyhow::Result<SessionProcess> {
     let token = user_token_for_sid(&req.account.sid)?;
     let shell = req.account.shell.display();
     let cmdline = if let Some(command) = &req.command {
-        wide_cmdline(&format!("{shell} -NoLogo -Command {command}"))
+        wide_cmdline(&format!(
+            "{shell} -NoLogo -NoProfile -NonInteractive -Command {command}"
+        ))
     } else {
-        wide_cmdline(&format!("{shell} -NoLogo"))
+        wide_cmdline(&format!("{shell} -NoLogo -NoProfile"))
     };
     spawn_conpty(
         token,
@@ -179,16 +187,35 @@ fn spawn_conpty(
     let reader = unsafe { File::from_raw_handle(output_read.into_raw()) };
     let writer = unsafe { File::from_raw_handle(input_write.into_raw()) };
     let (resize_tx, resize_rx) = std::sync::mpsc::channel::<(u16, u16)>();
-    let hpcon_for_resize = hpcon;
+    let hpcon_slot = std::sync::Arc::new(std::sync::Mutex::new(Some(hpcon)));
+    let hpcon_for_resize = hpcon_slot.clone();
     std::thread::spawn(move || {
         while let Ok((cols, rows)) = resize_rx.recv() {
+            let Some(hpcon) = hpcon_for_resize.lock().ok().and_then(|g| *g) else {
+                break;
+            };
             let size = COORD {
                 X: cols.max(1) as i16,
                 Y: rows.max(1) as i16,
             };
             unsafe {
-                ResizePseudoConsole(hpcon_for_resize, size);
+                ResizePseudoConsole(hpcon, size);
             }
+        }
+    });
+    let hpcon_for_exit = hpcon_slot.clone();
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited_flag = exited.clone();
+    let process_bits = pi.hProcess as usize;
+    std::thread::spawn(move || {
+        unsafe {
+            WaitForSingleObject(process_bits as HANDLE, INFINITE);
+        }
+        if exited_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        if let Some(hpcon) = hpcon_for_exit.lock().ok().and_then(|mut g| g.take()) {
+            unsafe { ClosePseudoConsole(hpcon) };
         }
     });
     Ok(SessionProcess {
@@ -197,7 +224,8 @@ fn spawn_conpty(
         killer: Box::new(ConptyKiller {
             process: pi.hProcess,
             thread: pi.hThread,
-            hpcon,
+            hpcon: hpcon_slot,
+            exited,
         }),
         resize: Some(resize_tx),
     })
