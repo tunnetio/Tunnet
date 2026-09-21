@@ -23,7 +23,7 @@ use tunnet_agent::{
     set_platform_sealer,
 };
 
-use crate::session::AgentSession;
+use crate::session::{AgentSession, CommandExecutor};
 
 static SESSION: Mutex<Option<AgentSession>> = Mutex::new(None);
 static LISTENER: Mutex<Option<PinnedListener>> = Mutex::new(None);
@@ -303,7 +303,7 @@ fn read_string(env: &Env, value: &JString<'_>) -> jni::errors::Result<String> {
     value.try_to_string(env)
 }
 
-fn command_runtime() -> Result<(tunnet_agent::AgentHandle, tokio::runtime::Handle)> {
+fn command_runtime() -> Result<(tunnet_agent::AgentHandle, CommandExecutor)> {
     let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let session = guard
         .as_ref()
@@ -622,13 +622,13 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeJoin<'local>(
                 Err(e) => err_anyhow(&e),
                 Ok((handle, rt)) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
-                    rt.spawn(async move {
+                    let spawned = rt.spawn(async move {
                         let _ = tx.send(handle.join(request).await);
                     });
-                    match rx.blocking_recv() {
-                        Ok(Ok(_)) => ok_bytes(),
-                        Ok(Err(e)) => err_agent(&e),
-                        Err(_) => err_agent(&AgentError::new(
+                    match (spawned, rx.blocking_recv()) {
+                        (Some(_), Ok(Ok(_))) => ok_bytes(),
+                        (Some(_), Ok(Err(e))) => err_agent(&e),
+                        _ => err_agent(&AgentError::new(
                             AgentErrorKind::Stopped,
                             "runtime is stopped",
                         )),

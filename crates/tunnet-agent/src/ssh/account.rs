@@ -129,7 +129,7 @@ mod unix {
         }
         groups.truncate(n as usize);
         #[cfg(target_os = "macos")]
-        let groups = groups
+        let groups: Vec<u32> = groups
             .into_iter()
             .filter_map(|group| u32::try_from(group).ok())
             .collect();

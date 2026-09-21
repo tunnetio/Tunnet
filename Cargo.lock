@@ -11325,6 +11325,7 @@ dependencies = [
  "ndk-context",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-android",
  "tracing-subscriber",

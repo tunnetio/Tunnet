@@ -5,12 +5,14 @@
 //! of the mobile edge, so the host test run covers it (the JNI bridge is
 //! Android-only and cannot be tested off-device).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::runtime::Runtime;
+use tokio_util::task::TaskTracker;
 use tunnet_agent::{AgentConfig, AgentHandle, AgentRuntime, LatestSlot, encode_snapshot};
 
 /// How long stop() will wait for the agent to drain.
@@ -21,8 +23,33 @@ pub struct AgentSession {
     runtime: Runtime,
     agent: Option<AgentRuntime>,
     handle: AgentHandle,
+    commands: Arc<Mutex<CommandTasks>>,
     state_dir: PathBuf,
     latest: Arc<LatestSlot>,
+}
+
+#[derive(Clone)]
+pub struct CommandExecutor {
+    runtime: tokio::runtime::Handle,
+    commands: Arc<Mutex<CommandTasks>>,
+}
+
+struct CommandTasks {
+    accepting: bool,
+    tracker: TaskTracker,
+}
+
+impl CommandExecutor {
+    pub fn spawn<F>(&self, future: F) -> Option<tokio::task::JoinHandle<F::Output>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let commands = self.commands.lock().unwrap_or_else(|e| e.into_inner());
+        commands
+            .accepting
+            .then(|| commands.tracker.spawn_on(future, &self.runtime))
+    }
 }
 
 impl AgentSession {
@@ -53,6 +80,10 @@ impl AgentSession {
             .block_on(AgentRuntime::start(config, None))
             .context("start embedded agent")?;
         let handle = agent.handle();
+        let commands = Arc::new(Mutex::new(CommandTasks {
+            accepting: true,
+            tracker: TaskTracker::new(),
+        }));
         let latest = std::sync::Arc::new(LatestSlot::new());
         {
             let handle = handle.clone();
@@ -81,6 +112,7 @@ impl AgentSession {
             runtime,
             agent: Some(agent),
             handle,
+            commands,
             state_dir,
             latest,
         })
@@ -97,8 +129,11 @@ impl AgentSession {
 
     /// Executor handle for in-flight commands. Clone it and drop session
     /// ownership before awaiting so stop can cancel immediately.
-    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
-        self.runtime.handle().clone()
+    pub fn runtime_handle(&self) -> CommandExecutor {
+        CommandExecutor {
+            runtime: self.runtime.handle().clone(),
+            commands: self.commands.clone(),
+        }
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -118,6 +153,20 @@ impl AgentSession {
     pub fn stop(mut self) {
         self.latest.close();
         self.handle.shutdown_token().cancel();
+        let commands = {
+            let mut commands = self.commands.lock().unwrap_or_else(|e| e.into_inner());
+            commands.accepting = false;
+            commands.tracker.close();
+            commands.tracker.clone()
+        };
+        self.runtime.block_on(async {
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, commands.wait())
+                .await
+                .is_err()
+            {
+                tracing::warn!("mobile command ignored shutdown; dropping it with the runtime");
+            }
+        });
         if let Some(agent) = self.agent.take() {
             self.runtime.block_on(agent.shutdown());
         }
@@ -253,7 +302,8 @@ mod tests {
             ready_tx.send(()).ok();
             token.cancelled().await;
             done_tx.send(()).ok();
-        });
+        })
+        .expect("session accepts commands before stop");
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("task started");
@@ -261,5 +311,16 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("pending join waiters must observe shutdown immediately");
+    }
+
+    #[test]
+    fn stop_rejects_commands_that_race_with_runtime_teardown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = AgentSession::start(dir.path(), "stop-race-device").expect("start");
+        let commands = session.runtime_handle();
+
+        session.stop();
+
+        assert!(commands.spawn(async {}).is_none());
     }
 }
