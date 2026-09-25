@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "undici": "^7.28.0"
+    "undici": "^8.11.2"
   },
   "scripts": {
     "check-api-version": "bun run scripts/check-api-version.ts"

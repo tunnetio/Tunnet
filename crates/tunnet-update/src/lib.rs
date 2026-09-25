@@ -107,9 +107,10 @@ pub async fn verify_artifact(
     let root = sigstore_verify::trust_root::TrustedRoot::production()
         .await
         .context("load Sigstore production trust root")?;
-    let policy = sigstore_verify::VerificationPolicy::default()
-        .require_identity(&workflow)
-        .require_issuer("https://token.actions.githubusercontent.com");
+    let policy = sigstore_verify::VerificationPolicy::new(
+        workflow.as_str(),
+        "https://token.actions.githubusercontent.com",
+    );
     let bundles = fetch_attestation_bundles(&actual, user_agent).await?;
     let mut errors = Vec::new();
     for bundle_json in bundles {
@@ -121,17 +122,7 @@ pub async fn verify_artifact(
             }
         };
         match sigstore_verify::verify(digest, &bundle, &policy, &root) {
-            Ok(result)
-                if result.identity.as_deref() == Some(workflow.as_str())
-                    && result.issuer.as_deref()
-                        == Some("https://token.actions.githubusercontent.com") =>
-            {
-                return Ok(());
-            }
-            Ok(result) => errors.push(format!(
-                "identity mismatch: identity={:?}, issuer={:?}",
-                result.identity, result.issuer
-            )),
+            Ok(_) => return Ok(()),
             Err(error) => errors.push(error.to_string()),
         }
     }

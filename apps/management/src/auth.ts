@@ -385,9 +385,6 @@ function buildAuth(license: LicenseManager) {
         ...(stripeEnabled ? { subscription: schema.subscription } : {}),
       },
     }),
-    account: {
-      identityStrategy: "provider-id",
-    },
     emailAndPassword: {
       enabled: true,
       disableSignUp: disablePublicSignUp,
@@ -638,7 +635,7 @@ export async function ensureTrustedOAuthClients() {
         `${dashboardOrigin}/api/auth/callback/tunnet`,
         `${dashboardOrigin}/consent`,
       ],
-      type: "web" as const,
+      applicationType: "web" as const,
     },
     {
       clientId: process.env.TUNNET_OAUTH_CLI_CLIENT_ID || OAUTH_CLIENT_CLI,
@@ -648,7 +645,7 @@ export async function ensureTrustedOAuthClients() {
         "http://127.0.0.1:3847/callback",
         "http://localhost:3847/callback",
       ],
-      type: "native" as const,
+      applicationType: "native" as const,
     },
   ];
 
@@ -674,8 +671,8 @@ export async function ensureTrustedOAuthClients() {
         grantTypes: ["authorization_code", "refresh_token"],
         responseTypes: ["code"],
         tokenEndpointAuthMethod: "none",
-        public: true,
-        type: client.type,
+        applicationType: client.applicationType,
+        clientCredentialsScopes: [],
         requirePKCE: true,
         scopes: [
           "openid",

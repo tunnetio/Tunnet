@@ -69,6 +69,7 @@ function getAgent(connectPath: string): Agent {
   let agent = agents.get(connectPath);
   if (!agent) {
     agent = new Agent({
+      allowH2: false,
       connect: { socketPath: connectPath },
     });
     agents.set(connectPath, agent);

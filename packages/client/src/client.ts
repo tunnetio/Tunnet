@@ -29,6 +29,7 @@ import type {
   DirectInviteResponse,
   DirectKeepAliveRequest,
   DirectNetworkRequest,
+  DirectOverrideIpRequest,
   DirectPendingResponse,
   DirectPolicyResponse,
   DirectPolicySetRequest,

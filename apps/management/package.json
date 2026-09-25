@@ -9,9 +9,9 @@
     "start": "portless api.tunnet bun run src/index.ts"
   },
   "dependencies": {
-    "@better-auth/oauth-provider": "^1.7.2",
-    "@better-auth/sso": "^1.7.2",
-    "@better-auth/stripe": "^1.7.2",
+    "@better-auth/oauth-provider": "^1.7.6",
+    "@better-auth/sso": "^1.7.6",
+    "@better-auth/stripe": "^1.7.6",
     "@elysiajs/cors": "^1.4.2",
     "@peculiar/x509": "^2.1.0",
     "@tunnet/api": "workspace:*",
@@ -21,13 +21,13 @@
     "@tunnet/license": "workspace:*",
     "@tunnet/policy-engine": "workspace:*",
     "argon2": "^0.45.1",
-    "better-auth": "^1.7.2",
-    "drizzle-orm": "^0.45.2",
+    "better-auth": "^1.7.6",
+    "drizzle-orm": "^0.45.3",
     "elysia": "^1.4.30",
     "hash-wasm": "^4.12.0",
     "ky": "^2.1.0",
     "reflect-metadata": "^0.2.2",
-    "stripe": "^22.6.1",
-    "zod": "^4.5.4"
+    "stripe": "^22.6.2",
+    "zod": "^4.6.5"
   }
 }

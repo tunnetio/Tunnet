@@ -27,7 +27,7 @@
     "cli": "bun ./packages/cli/src/cli.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.13",
+    "@biomejs/biome": "2.5.14",
     "@types/bun": "^1.4.2",
     "lefthook": "^2.1.14",
     "portless": "^0.15.6",

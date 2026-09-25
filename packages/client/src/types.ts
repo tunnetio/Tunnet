@@ -351,6 +351,12 @@ export interface DirectKeepAliveRequest {
   enable?: boolean;
 }
 
+export interface DirectOverrideIpRequest {
+  network?: string;
+  peer: string;
+  ip: string;
+}
+
 export interface DirectConnectRequest {
   contact_id: string;
 }

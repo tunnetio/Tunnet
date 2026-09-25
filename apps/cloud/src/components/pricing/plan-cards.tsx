@@ -182,15 +182,10 @@ export function PlanCards(): ReactNode {
         </div>
 
         {ENTERPRISE ? (
-          <div className="mt-5 xl:mt-6">
+          <div>
             <EnterpriseBand plan={ENTERPRISE} />
           </div>
         ) : null}
-
-        <p className="l1-reveal mt-8 text-center text-[13px] text-[var(--l1-muted-2)]">
-          Full limits and feature matrix below - no per-device tax, no egress
-          fees.
-        </p>
       </div>
     </section>
   );

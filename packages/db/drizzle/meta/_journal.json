@@ -120,6 +120,13 @@
       "when": 1788443866774,
       "tag": "0017_big_tyger_tiger",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790337121527,
+      "tag": "0018_adorable_the_hand",
+      "breakpoints": true
     }
   ]
 }
