@@ -6,6 +6,7 @@ on:
     paths:
       - "**/*.rs"
       - "**/Cargo.toml"
+      - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
@@ -13,27 +14,60 @@ on:
       - "apps/mobile/**"
       - "package.json"
       - "bun.lock"
-      - "bunfig.toml"
+      - "biome.json"
       - ".github/workflows/ci.yml"
 
   pull_request:
     branches: ["main"]
-    paths:
-      - "**/*.rs"
-      - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "proto/**"
-      - "apps/mobile/**"
-      - "package.json"
-      - "bun.lock"
-      - "bunfig.toml"
-      - ".github/workflows/ci.yml"
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      mobile: ${{ steps.filter.outputs.mobile }}
+      rust: ${{ steps.filter.outputs.rust }}
+      android: ${{ steps.filter.outputs.android }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Filter changed files
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            mobile:
+              - 'apps/mobile/**'
+              - 'proto/**'
+              - 'Cargo.toml'
+              - 'package.json'
+              - 'bun.lock'
+              - 'biome.json'
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+            android:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - 'apps/mobile/**'
+              - 'proto/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'biome.json'
+
   mobile:
     name: Mobile foundation
+    needs: changes
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -63,22 +97,14 @@ jobs:
       - name: Export Android JavaScript bundle
         run: bun run --cwd apps/mobile export:android
 
-      - name: Generate Android native project
-        run: bun run --cwd apps/mobile prebuild
-
-  rust:
-    name: Rust + Android
+  rust-check:
+    name: Rust checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     env:
-      ANDROID_API_LEVEL: "37.0"
-      ANDROID_BUILD_TOOLS_VERSION: "36.0.0"
-      # Must match android.cmakeVersion in apps/mobile/app.config.ts. CMake 3.22.1
-      # bundles Ninja 1.10.2, which cannot complete a React Native native build
-      # from the deeply nested paths Bun's isolated linker produces.
-      ANDROID_CMAKE_VERSION: "4.1.2"
       ANDROID_NDK_VERSION: "30.0.16248370"
       ANDROID_MIN_SDK: "26"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -86,7 +112,7 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          cache-key: rust-android
+          cache-key: rust-check
 
       - name: Install mold
         uses: rui314/setup-mold@v1
@@ -111,8 +137,62 @@ jobs:
       - name: Add Android Rust targets
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "ndk;${ANDROID_NDK_VERSION}"
+
+          NDK="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+          test -d "$NDK"
+
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Clippy (Android)
+        run: |
+          cargo ndk -t arm64-v8a --platform "${ANDROID_MIN_SDK}" clippy \
+            -p tunnet-mobile \
+            -p tunnet-agent \
+            -- -D warnings
+          cargo ndk -t x86_64 --platform "${ANDROID_MIN_SDK}" clippy \
+            -p tunnet-mobile \
+            -p tunnet-agent \
+            -- -D warnings
+
+  android:
+    name: Android build
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_API_LEVEL: "37.0"
+      ANDROID_BUILD_TOOLS_VERSION: "36.0.0"
+      ANDROID_CMAKE_VERSION: "4.1.2"
+      ANDROID_NDK_VERSION: "30.0.16248370"
+      ANDROID_MIN_SDK: "26"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-key: rust-android
+
+      - name: Add Android Rust targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -152,6 +232,9 @@ jobs:
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
       - name: Generate Android native project
         run: bun run --cwd apps/mobile prebuild
 
@@ -159,17 +242,6 @@ jobs:
         uses: gradle/actions/setup-gradle@v6
         with:
           cache-provider: basic
-
-      - name: Clippy (Android)
-        run: |
-          cargo ndk -t arm64-v8a --platform "${ANDROID_MIN_SDK}" clippy \
-            -p tunnet-mobile \
-            -p tunnet-agent \
-            -- -D warnings
-          cargo ndk -t x86_64 --platform "${ANDROID_MIN_SDK}" clippy \
-            -p tunnet-mobile \
-            -p tunnet-agent \
-            -- -D warnings
 
       - name: Build and check Android app
         working-directory: apps/mobile/android
@@ -218,3 +290,24 @@ jobs:
 
       - name: Run workspace doctests
         run: cargo test --workspace --exclude tunnet-desktop --all-features --doc
+
+  CI:
+    name: CI
+    if: always()
+    needs: [changes, mobile, rust-check, android, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              failure|cancelled)
+                echo "::error::A required job reported $result"
+                exit 1
+                ;;
+            esac
+          done
+          echo "All required jobs passed or were skipped."
