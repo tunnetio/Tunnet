@@ -1,0 +1,200 @@
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.provider.ListProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.TaskAction
+
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+  id 'com.google.protobuf' version '0.10.0'
+}
+
+group = 'expo.modules.tunnetnative'
+version = '0.9.1'
+
+expoModule {
+  canBePublished = false
+}
+
+abstract class CargoNdkBuild extends DefaultTask {
+  @Input abstract Property<String> getCargoExecutable()
+  @Input abstract Property<String> getCrate()
+  @Input abstract Property<Boolean> getCargoRelease()
+  @Input abstract Property<Integer> getPlatform()
+  @Input abstract Property<String> getNdkHome()
+  @Input abstract Property<String> getNdkVersion()
+  @Input abstract Property<String> getCargoNdkVersion()
+  @Input abstract ListProperty<String> getAbis()
+  @Internal abstract DirectoryProperty getRepoRoot()
+  @InputFiles abstract ConfigurableFileCollection getRustSources()
+  @OutputDirectory abstract DirectoryProperty getOutDir()
+
+  @TaskAction
+  void buildRust() {
+    def ndk = new File(ndkHome.get())
+    def expectedRevision = ndkVersion.get()
+    def revisionFile = new File(ndk, 'source.properties')
+    def revision = revisionFile.isFile() ? revisionFile.readLines().find {
+      it.startsWith('Pkg.Revision')
+    }?.split('=', 2)?.last()?.trim() : null
+    if (!ndk.isDirectory() || revision != expectedRevision) {
+      throw new GradleException(
+        "NDK ${expectedRevision} is required at ${ndk.path}. " +
+        'Install it with sdkmanager "ndk;${expectedRevision}".'
+      )
+    }
+
+    def cargo = cargoExecutable.get()
+    def probe = new ProcessBuilder([cargo, 'ndk', '--version'])
+      .directory(repoRoot.get().asFile)
+      .redirectErrorStream(true)
+      .start()
+    def probeOutput = probe.inputStream.text.trim()
+    def probeExit = probe.waitFor()
+    if (probeExit != 0) {
+      throw new GradleException(
+        "cargo-ndk ${cargoNdkVersion.get()} is required. Install it with " +
+        "`cargo install cargo-ndk --version ${cargoNdkVersion.get()} --locked`."
+      )
+    }
+    def actualCargoNdkVersion = probeOutput.replaceFirst('^cargo-ndk\\s+', '')
+    if (actualCargoNdkVersion != cargoNdkVersion.get()) {
+      throw new GradleException(
+        "cargo-ndk ${cargoNdkVersion.get()} is required; found ${actualCargoNdkVersion}."
+      )
+    }
+
+    def output = outDir.get().asFile
+    output.deleteDir()
+    output.mkdirs()
+
+    def command = [cargoExecutable.get(), 'ndk', '--platform', platform.get().toString(), '-o', output.absolutePath]
+    abis.get().each { abi -> command += ['-t', abi] }
+    command += ['build', '-p', crate.get()]
+    if (cargoRelease.get()) command += '--release'
+
+    def processBuilder = new ProcessBuilder(command)
+      .directory(repoRoot.get().asFile)
+      .redirectErrorStream(true)
+    processBuilder.environment().put('ANDROID_NDK_HOME', ndk.absolutePath)
+    def process = processBuilder.start()
+    process.inputStream.eachLine { logger.lifecycle(it) }
+    def exitCode = process.waitFor()
+    if (exitCode != 0) {
+      throw new GradleException("cargo ndk failed with exit code ${exitCode}")
+    }
+  }
+}
+
+def workspaceRoot = rootProject.projectDir.parentFile.parentFile.parentFile
+def pinnedNdkVersion = '30.0.16248370'
+def ndkPlatform = 26
+def pinnedCargoNdkVersion = '4.1.2'
+def debugAbis = ['arm64-v8a', 'x86_64']
+def releaseAbis = ['arm64-v8a']
+
+def androidSdkDir = {
+  def fromEnvironment = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+  if (fromEnvironment != null) return file(fromEnvironment)
+  def localProperties = rootProject.file('local.properties')
+  if (localProperties.isFile()) {
+    def sdkDir = localProperties.readLines().find { it.trim().startsWith('sdk.dir=') }
+      ?.substringAfter('=')?.trim()?.replace('\\\\', '\\')
+    if (sdkDir != null) return file(sdkDir)
+  }
+  throw new GradleException('ANDROID_HOME / ANDROID_SDK_ROOT is not set and local.properties has no sdk.dir')
+}()
+
+def rustInputs = files(fileTree(workspaceRoot) {
+  include(
+    'Cargo.toml',
+    'Cargo.lock',
+    'rust-toolchain.toml',
+    '.cargo/**',
+    'crates/**/*.rs',
+    'crates/**/Cargo.toml',
+    'proto/**/*.proto',
+  )
+  exclude('**/build/**', '**/target/**')
+})
+
+android {
+  namespace 'expo.modules.tunnetnative'
+  compileSdk rootProject.ext.compileSdkVersion
+  ndkVersion rootProject.ext.ndkVersion
+
+  defaultConfig {
+    minSdk rootProject.ext.minSdkVersion
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+
+  lint {
+    abortOnError true
+    disable += 'ChromeOsAbiSupport'
+  }
+
+  sourceSets {
+    main {
+      proto.srcDir new File(workspaceRoot, 'proto')
+    }
+  }
+}
+
+protobuf {
+  protoc {
+    artifact = 'com.google.protobuf:protoc:4.36.1'
+  }
+  generateProtoTasks {
+    all().forEach { task ->
+      task.builtins {
+        create('java') {
+          option 'lite'
+        }
+      }
+    }
+  }
+}
+
+androidComponents {
+  onVariants(selector().all()) { variant ->
+    def release = variant.buildType == 'release'
+    def abis = release ? releaseAbis : debugAbis
+    def capitalizedVariantName = variant.name.substring(0, 1).toUpperCase() + variant.name.substring(1)
+    def taskName = "cargoNdk${capitalizedVariantName}"
+    def cargoTask = tasks.register(taskName, CargoNdkBuild)
+    cargoTask.configure { task ->
+      task.group = 'rust'
+      task.description = "Build tunnet-mobile for the ${variant.name} variant via cargo-ndk."
+      task.cargoExecutable.set(System.getenv('CARGO') ?: 'cargo')
+      task.crate.set('tunnet-mobile')
+      task.cargoRelease.set(release)
+      task.platform.set(ndkPlatform)
+      task.ndkHome.set(new File(androidSdkDir, "ndk/${pinnedNdkVersion}").absolutePath)
+      task.ndkVersion.set(pinnedNdkVersion)
+      task.cargoNdkVersion.set(pinnedCargoNdkVersion)
+      task.abis.set(abis)
+      task.repoRoot.set(workspaceRoot)
+      task.outDir.set(layout.buildDirectory.dir("rustJniLibs/${variant.name}"))
+      task.rustSources.from(rustInputs)
+    }
+    variant.sources.jniLibs?.addGeneratedSourceDirectory(cargoTask) { task ->
+      task.outDir
+    }
+  }
+}
+
+dependencies {
+  implementation 'androidx.core:core-ktx:1.16.0'
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0'
+  implementation 'com.google.protobuf:protobuf-javalite:4.36.1'
+  testImplementation 'junit:junit:4.13.2'
+}
