@@ -15,13 +15,15 @@ Use `bunx` instead of `npx` if the project uses bun (`bun.lock` present).
 ```bash
 bunx expo install <package>  # ALWAYS use instead of npm/yarn/pnpm/bun add — resolves SDK-compatible versions
 bunx expo start              # start the dev server
-bunx expo lint               # lint
+bunx biome check             # lint and format
 bunx tsc --noEmit            # typecheck
 bunx expo-doctor             # diagnose dependency and config issues
 bunx expo install --fix      # fix incompatible package versions
 ```
 
-Run lint and typecheck before declaring any task done.
+Biome is the only linter and formatter in this app; there is no ESLint
+configuration. `bun run check` runs typecheck, Biome, and the Bun tests. Run
+those before declaring any task done.
 
 ## Navigation & Routing
 

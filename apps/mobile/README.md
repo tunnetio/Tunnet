@@ -136,26 +136,31 @@ Fast JavaScript/TypeScript checks:
 bun run --cwd apps/mobile check
 ```
 
-This runs typechecking, Expo ESLint, Bun tests, and `expo install --check`.
-`expo-doctor` is available separately:
+This runs typechecking, Biome, Bun tests, and `expo install --check`. `expo-doctor` is available separately:
 
 ```sh
 bun run --cwd apps/mobile doctor
 ```
 
-The `expo-doctor` duplicate-React warning is an accepted, intentional
-limitation of this repository's dependency layout, not a defect to fix:
+`expo-doctor` is not part of `check` because one of its checks fails by design
+here. The failing check is "no duplicate dependencies installed", which reports
+the repository's Bun isolated install rather than a real defect:
 
-- The rest of the Tunnet monorepo intentionally runs React 19.3.
-- Expo resolves the React version that is compatible with SDK 57 for the mobile
-  workspace, which is 19.2.3.
-- The two versions coexist because the mobile app is its own workspace. It is
-  not a second React copy inside the Android bundle, and Metro resolves the
-  mobile app's own copy.
+- `@expo/ui`, `expo-constants`, and `expo-linking` are each reported twice at
+  the same version. These are symlink-aliasing artifacts: both paths resolve to
+  one entry in the `node_modules/.bun` store, so there is no second copy in the
+  bundle.
+- `react-native-screens` is reported at `4.26.2` (this app's pin) and `4.28.0`
+  (pulled in by `expo-router`). Both exist in the store, but Gradle autolinks
+  and compiles exactly one, and the verified Android build contains a single
+  `react-native-screens` native library.
 
-Do not downgrade the rest of the monorepo, pin duplicate React versions, or
-otherwise contort the dependency graph to silence this warning. `expo install
---check`, which `check` runs, is the meaningful Expo SDK compatibility gate.
+Expo's suggested remedy is to reinstall or delete the lockfile. Do not do that,
+and do not downgrade, pin, or otherwise contort the dependency graph to satisfy
+this check. `expo install --check`, which `check` does run, is the meaningful
+Expo SDK compatibility gate. If a future dependency bump makes two versions of
+a native module actually autolink, that is a real problem and should be fixed
+then.
 
 Native module tests and APK builds run through the generated Gradle project:
 

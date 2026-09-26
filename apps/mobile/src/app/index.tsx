@@ -88,11 +88,9 @@ export default function FoundationDiagnosticsScreen() {
       Gesture.Pan()
         .onUpdate((event) => {
           // Reanimated worklets mutate shared values by design.
-          // eslint-disable-next-line react-hooks/immutability
           diagnosticOffset.value = event.translationX;
         })
         .onEnd(() => {
-          // eslint-disable-next-line react-hooks/immutability
           diagnosticOffset.value = withTiming(0, { duration: 150 });
         }),
     [diagnosticOffset],

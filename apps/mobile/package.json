@@ -37,8 +37,6 @@
     "@types/bun": "^1.4.2",
     "@types/node": "^26.6.2",
     "@types/react": "~19.2.2",
-    "eslint": "^9.0.0",
-    "eslint-config-expo": "~57.0.2",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -50,7 +48,7 @@
     "proto:generate": "buf generate && biome check --write src/generated",
     "uniwind:artifacts": "uniwind generate-artifacts --css ./src/global.css --dts ./src/uniwind-types.d.ts",
     "typecheck": "bun run uniwind:artifacts && tsc --noEmit",
-    "lint": "expo lint",
+    "lint": "biome check",
     "test": "bun test",
     "doctor": "bunx expo-doctor",
     "check": "bun run typecheck && bun run lint && bun run test && bunx expo install --check",
