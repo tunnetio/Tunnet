@@ -9,7 +9,11 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
-      - "apps/android/**"
+      - "proto/**"
+      - "apps/mobile/**"
+      - "package.json"
+      - "bun.lock"
+      - "bunfig.toml"
       - ".github/workflows/ci.yml"
 
   pull_request:
@@ -20,16 +24,58 @@ on:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
-      - "apps/android/**"
+      - "proto/**"
+      - "apps/mobile/**"
+      - "package.json"
+      - "bun.lock"
+      - "bunfig.toml"
       - ".github/workflows/ci.yml"
 
 jobs:
+  mobile:
+    name: Mobile foundation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck, lint, test, and verify SDK versions
+        run: bun run --cwd apps/mobile check
+
+      - name: Check generated TypeScript protobuf
+        run: |
+          bun run --cwd apps/mobile proto:generate
+          git diff --exit-code -- apps/mobile/src/generated
+
+      - name: Export Android JavaScript bundle
+        run: bun run --cwd apps/mobile export:android
+
+      - name: Generate Android native project
+        run: bun run --cwd apps/mobile prebuild
+
   rust:
     name: Rust + Android
     runs-on: ubuntu-latest
     env:
       ANDROID_API_LEVEL: "37.0"
       ANDROID_BUILD_TOOLS_VERSION: "36.0.0"
+      # Must match android.cmakeVersion in apps/mobile/app.config.ts. CMake 3.22.1
+      # bundles Ninja 1.10.2, which cannot complete a React Native native build
+      # from the deeply nested paths Bun's isolated linker produces.
+      ANDROID_CMAKE_VERSION: "4.1.2"
       ANDROID_NDK_VERSION: "30.0.16248370"
       ANDROID_MIN_SDK: "26"
 
@@ -66,18 +112,26 @@ jobs:
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version ^4.1 --locked
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
 
       - name: Set up JDK
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-provider: basic
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -89,12 +143,22 @@ jobs:
           sdkmanager --install \
             "platforms;android-${ANDROID_API_LEVEL}" \
             "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
-            "ndk;${ANDROID_NDK_VERSION}"
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${ANDROID_CMAKE_VERSION}"
 
           NDK="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
           test -d "$NDK"
+          test -x "$ANDROID_SDK_ROOT/cmake/${ANDROID_CMAKE_VERSION}/bin/cmake"
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Generate Android native project
+        run: bun run --cwd apps/mobile prebuild
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
 
       - name: Clippy (Android)
         run: |
@@ -108,18 +172,20 @@ jobs:
             -- -D warnings
 
       - name: Build and check Android app
-        working-directory: apps/android
+        working-directory: apps/mobile/android
         run: |
           ./gradlew \
-            :app:lintDebug \
-            :app:testDebugUnitTest \
+            :tunnet-native:testDebugUnitTest \
+            :app:lintVitalRelease \
             :app:assembleDebug \
+            :app:assembleRelease \
             --build-cache \
             --stacktrace
 
       - name: Verify packaged native libraries
-        working-directory: apps/android
-        run: ./check-apk-abis.sh
+        run: |
+          bash apps/mobile/scripts/check-apk.sh debug
+          bash apps/mobile/scripts/check-apk.sh release
 
   test:
     name: Rust tests (${{ matrix.os }})

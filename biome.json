@@ -36,6 +36,11 @@
       "quoteStyle": "double"
     }
   },
+  "json": {
+    "formatter": {
+      "indentStyle": "space"
+    }
+  },
   "assist": {
     "enabled": true,
     "actions": {

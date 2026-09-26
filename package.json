@@ -1,6 +1,7 @@
 {
   "name": "@tunnet/monorepo",
   "private": true,
+  "packageManager": "bun@1.4.2",
   "workspaces": [
     "apps/*",
     "packages/*",
@@ -24,6 +25,11 @@
     "check": "biome check",
     "desktop:dev": "bun run --filter @tunnet/desktop tauri dev",
     "desktop:build": "bun run --filter @tunnet/desktop tauri build",
+    "mobile:check": "bun run --cwd apps/mobile check",
+    "mobile:doctor": "bun run --cwd apps/mobile doctor",
+    "mobile:prebuild": "bun run --cwd apps/mobile prebuild",
+    "mobile:export:android": "bun run --cwd apps/mobile export:android",
+    "android": "bun run --cwd apps/mobile android",
     "cli": "bun ./packages/cli/src/cli.ts"
   },
   "devDependencies": {

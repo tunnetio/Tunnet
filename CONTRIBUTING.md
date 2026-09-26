@@ -9,7 +9,7 @@ Tunnet is under active development and is still pre-1.0. The project favors clea
 ### Required
 
 * **Rust 1.98.1**
-* **Bun 1.4.0**
+* **Bun 1.4.2**
 * **Git**
 * A platform-appropriate native build toolchain
 
@@ -55,7 +55,7 @@ Build the Rust workspace with:
 cargo build --workspace --exclude tunnet-desktop
 ```
 
-The repository also contains multiple applications and packages managed through the Bun workspace. See the root `package.json` for the available development and build commands.
+The repository also contains multiple applications and packages managed through the Bun workspace. See the root `package.json` for the available development and build commands. The mobile foundation is documented in [`apps/mobile/README.md`](apps/mobile/README.md)
 
 ## Testing
 
