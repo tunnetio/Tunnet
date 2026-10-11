@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 use tunnet_common::DnsConfig;
 use uuid::Uuid;
 
-use crate::acl::AclEngine;
 use crate::direct::auth::AuthCache;
 use crate::direct::grants::{
     EpochRecord, Genesis, MEMBER_METADATA_SCHEMA_VERSION, MEMBER_SCHEMA_VERSION, MemberRole,
@@ -45,6 +44,7 @@ use crate::direct::grants::{
     validate_member_against_genesis, verify_epoch, verify_genesis, verify_member_metadata,
     verify_member_record, verify_revocation, verifying_key_from_hex,
 };
+use crate::forward::ForwardingStore;
 use crate::routing::RoutingTable;
 use crate::state::{DirectState, StatePaths};
 
@@ -186,7 +186,7 @@ struct DocsInner {
     auto_accept_firewall: bool,
     self_endpoint_id: String,
     paths: StatePaths,
-    firewall: Option<crate::direct::FirewallEngine>,
+    forward: ForwardingStore,
     dns: Arc<ArcSwap<DnsConfig>>,
     /// Shared with [`crate::direct::spawn_seed_auth`] so membership updates refresh dials.
     seed_peers: Arc<Mutex<Vec<String>>>,
@@ -209,10 +209,8 @@ pub struct DocsBootstrap<'a> {
     pub content_key: String,
     pub blobs: FsStore,
     pub routes: RoutingTable,
-    pub acl: AclEngine,
+    pub forward: ForwardingStore,
     pub auth: AuthCache,
-    pub policy: tunnet_common::policy::PolicyBundle,
-    pub firewall: Option<crate::direct::FirewallEngine>,
     pub dns: DnsConfig,
     pub seed_peers: Arc<Mutex<Vec<String>>>,
 }
@@ -294,10 +292,8 @@ impl DocsMembership {
             content_key,
             blobs,
             routes,
-            acl,
+            forward,
             auth,
-            policy,
-            firewall,
             dns,
             seed_peers,
         } = cfg;
@@ -334,7 +330,7 @@ impl DocsMembership {
                 auto_accept_firewall: direct.auto_accept_firewall,
                 self_endpoint_id: self_endpoint_id.to_string(),
                 paths: paths.clone(),
-                firewall,
+                forward: forward.clone(),
                 dns: Arc::new(ArcSwap::from_pointee(dns)),
                 seed_peers: seed_peers.clone(),
                 coordinator_endpoint_id: direct.coordinator_endpoint_id.clone(),
@@ -355,9 +351,9 @@ impl DocsMembership {
             .context("publish admitted self record")?;
 
         membership.rebuild_from_doc().await?;
-        membership.apply_to_routes(&routes, &acl, &policy);
+        membership.apply_to_routes(&routes, &forward);
         membership.refresh_seed_peers();
-        if let Err(e) = membership.sync_firewall_policy().await {
+        if let Err(e) = membership.sync_firewall_policy(&routes).await {
             tracing::debug!(?e, "initial firewall policy sync");
         }
         if let Err(e) = membership.apply_pending_kicks().await {
@@ -366,9 +362,8 @@ impl DocsMembership {
 
         let bg = membership.clone();
         let routes_bg = routes.clone();
-        let acl_bg = acl.clone();
+        let forward_bg = forward.clone();
         let auth_bg = auth.clone();
-        let policy_bg = policy.clone();
         tokio::spawn(async move {
             let mut kick_tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tokio::pin!(events);
@@ -385,8 +380,8 @@ impl DocsMembership {
                                     tracing::debug!(?e, "docs membership rebuild");
                                     continue;
                                 }
-                                bg.project_runtime(&auth_bg, &routes_bg, &acl_bg, &policy_bg);
-                                if let Err(e) = bg.sync_firewall_policy().await {
+                                bg.project_runtime(&auth_bg, &routes_bg, &forward_bg);
+                                if let Err(e) = bg.sync_firewall_policy(&routes_bg).await {
                                     tracing::debug!(?e, "docs firewall policy sync");
                                 }
                             }
@@ -565,13 +560,12 @@ impl DocsMembership {
         self.publish_admission(entry.clone()).await
     }
 
-    /// Rebuild AuthCache, routes, ACL, and seed peers from authoritative membership.
+    /// Rebuild AuthCache, routes, and the forwarding snapshot from authoritative membership.
     pub fn project_runtime(
         &self,
         auth: &AuthCache,
         routes: &RoutingTable,
-        acl: &AclEngine,
-        policy: &tunnet_common::policy::PolicyBundle,
+        forward: &ForwardingStore,
     ) {
         let network_id = self.inner.network_id;
         for member in self.snapshot_members() {
@@ -580,7 +574,7 @@ impl DocsMembership {
             }
         }
         self.evict_revoked_from_auth(auth);
-        self.apply_to_routes(routes, acl, policy);
+        self.apply_to_routes(routes, forward);
         self.refresh_seed_peers();
     }
 
@@ -899,12 +893,7 @@ impl DocsMembership {
         Ok(())
     }
 
-    pub fn apply_to_routes(
-        &self,
-        routes: &RoutingTable,
-        acl: &AclEngine,
-        policy: &tunnet_common::policy::PolicyBundle,
-    ) {
+    pub fn apply_to_routes(&self, routes: &RoutingTable, forward: &ForwardingStore) {
         let members = self.snapshot_members();
         let peers: Vec<tunnet_common::PeerEntry> = members
             .iter()
@@ -934,7 +923,7 @@ impl DocsMembership {
             version,
             peer_cidr,
         );
-        acl.replace_bundle(policy.clone());
+        forward.republish(routes);
         self.fire_change_hook();
         if let Ok(json) = serde_json::to_vec_pretty(&members) {
             let _ = tunnet_common::persistence::atomic_write(
@@ -1002,7 +991,7 @@ impl DocsMembership {
         Ok(())
     }
 
-    pub async fn sync_firewall_policy(&self) -> anyhow::Result<()> {
+    pub async fn sync_firewall_policy(&self, routes: &RoutingTable) -> anyhow::Result<()> {
         let Some(suggested) = self.read_suggested_policy().await? else {
             return Ok(());
         };
@@ -1019,9 +1008,9 @@ impl DocsMembership {
             crate::direct::policy_docs::effective_suggested(&suggested, &self.inner.hostname);
 
         if self.inner.auto_accept_firewall {
-            if let Some(fw) = &self.inner.firewall {
-                fw.set_suggested(rules);
-            }
+            self.inner
+                .forward
+                .set_suggested(routes, self.inner.network_id, rules);
             let _ = std::fs::remove_file(
                 self.inner
                     .paths
@@ -1115,7 +1104,7 @@ impl DocsMembership {
         Ok(())
     }
 
-    pub async fn clear_firewall_policy(&self) -> anyhow::Result<()> {
+    pub async fn clear_firewall_policy(&self, routes: &RoutingTable) -> anyhow::Result<()> {
         use crate::direct::policy_docs::POLICY_BUNDLE_KEY;
 
         set_str(
@@ -1125,9 +1114,9 @@ impl DocsMembership {
             "",
         )
         .await?;
-        if let Some(fw) = &self.inner.firewall {
-            fw.clear_suggested();
-        }
+        self.inner
+            .forward
+            .set_suggested(routes, self.inner.network_id, Vec::new());
         Ok(())
     }
 

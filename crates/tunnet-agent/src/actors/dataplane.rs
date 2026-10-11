@@ -65,8 +65,6 @@ pub struct DataPlaneActorConfig {
     pub network_id: Uuid,
     #[cfg(not(target_os = "android"))]
     pub underlay_hosts: Vec<Ipv4Addr>,
-    #[cfg(feature = "ssh")]
-    pub ssh_intercept: crate::ssh::SshIntercept,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -92,9 +90,6 @@ pub struct DataPlaneActorArgs {
     pub route_actor: ActorRef<RouteActor>,
     pub published: PublishedPlane,
     pub status: DataPlaneStatusSnapshot,
-    /// Ingress reader registry: aborted on BringDown alongside generation
-    /// cancellation (defense in depth; readers also observe the token).
-    pub ingress: crate::ingress::IngressRegistry,
     /// Start in up state (initial plane already published by bootstrap).
     pub initially_up: bool,
     pub initial_generation: u64,
@@ -119,13 +114,13 @@ pub struct DataPlaneActor {
     route_actor: ActorRef<RouteActor>,
     published: PublishedPlane,
     status: DataPlaneStatusSnapshot,
-    ingress: crate::ingress::IngressRegistry,
     up: bool,
     generation: u64,
     outbound: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
     dns_task: Option<tokio::task::JoinHandle<()>>,
-    in_tun_dns: Option<std::sync::Arc<tunnet_core::dns::InTun>>,
+    dns_pool: Option<crate::tun_io::DnsPool>,
+    resolver: Option<Arc<tunnet_core::dns::Resolver>>,
     tun_if_index: Option<u32>,
 }
 
@@ -146,11 +141,11 @@ impl Actor for DataPlaneActor {
             route_actor: args.route_actor,
             published: args.published,
             status: args.status,
-            ingress: args.ingress,
             outbound: None,
             generation_cancel: None,
             dns_task: None,
-            in_tun_dns: None,
+            dns_pool: None,
+            resolver: None,
             tun_if_index: None,
         };
         if auto_up {
@@ -248,20 +243,19 @@ impl DataPlaneActor {
     }
 
     async fn teardown(&mut self) {
-        // Withdraw published generation first so new readers stop.
         self.published.store(None);
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
+        self.node.peers.deactivate();
         if let Some(outbound) = self.outbound.take() {
             outbound.abort();
         }
         if let Some(dns_task) = self.dns_task.take() {
             dns_task.abort();
         }
-        self.in_tun_dns = None;
-        // Close tunnel connections so old ingress readers exit.
-        self.node.tunnel_pool.close_all().await;
+        self.dns_pool = None;
+        self.resolver = None;
         #[cfg(not(target_os = "android"))]
         {
             let _ = tokio::time::timeout(
@@ -299,7 +293,7 @@ impl DataPlaneActor {
         }
         let resolver = tunnet_core::dns::Resolver::new(self.node.routes.clone(), &self.cfg.dns_cfg)
             .map_err(|error| DataPlaneError::Dns(format!("{error:#}")))?;
-        self.in_tun_dns = Some(tunnet_core::dns::InTun::new(resolver.clone()));
+        self.resolver = Some(resolver.clone());
         if self.cfg.dns.is_some() {
             match tunnet_core::dns::listen_udp(tunnet_core::dns::bind_addr(), resolver).await {
                 Ok(task) => self.dns_task = Some(task),
@@ -338,15 +332,7 @@ impl DataPlaneActor {
 
         let generation = self.generation.wrapping_add(1);
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.published.store(Some(Arc::new(PublishedDataPlane {
-            generation,
-            device: tun.clone(),
-            cancel: cancel.clone(),
-        })));
-        self.generation_cancel = Some(cancel);
 
-        // OS DNS work stays off the actor executor thread. Probe the
-        // host-local endpoint before switching OS DNS toward it.
         let dns_active = match self.cfg.dns.clone() {
             Some(dns) => {
                 let ifname = self.cfg.ifname.clone();
@@ -370,38 +356,54 @@ impl DataPlaneActor {
         };
         self.peer_dns_active.store(dns_active, Ordering::SeqCst);
 
-        // Reconcile routes via RouteActor (one-way ask, bounded timeout).
-        // Direct uses exact /32 peer routes; Managed uses subnet snapshots.
-        // Android captures those destinations on VpnService.Builder instead.
         #[cfg(not(target_os = "android"))]
         self.reconcile_routes().await?;
         crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
 
-        let firewalls: std::collections::HashMap<_, _> = self
-            .node
-            .direct
-            .iter()
-            .map(|(id, rt)| (*id, rt.firewall.clone()))
-            .collect();
-        // The outbound loop's unexpected end is abnormal: report it so
-        // supervision restarts us. Shutdown ends it via abort (the
-        // generation token is already cancelled then, so no report fires).
-        let exit_gen = self
-            .generation_cancel
-            .clone()
-            .expect("generation token published above");
+        self.node.peers.activate(generation, cancel.clone());
+        self.node
+            .forwarding
+            .set_mtu(&self.node.routes, self.cfg.mtu);
+        let dns_pool = match self.resolver.clone() {
+            Some(resolver) => {
+                let pool = crate::tun_io::DnsPool::new(
+                    tun.clone(),
+                    tunnet_core::dns::InTun::new(resolver),
+                );
+                self.dns_pool = Some(pool.clone());
+                pool
+            }
+            None => {
+                return Err(DataPlaneError::Dns("resolver not prepared".into()));
+            }
+        };
+        {
+            let inbound = crate::tun_io::SessionInbound {
+                tun: self.published.clone(),
+                peers: self.node.peers.clone(),
+                policy: self.node.policy.clone(),
+                forwarding: self.node.forwarding.clone(),
+                metrics: self.metrics.clone(),
+            };
+            self.node
+                .peers
+                .set_recv_hook(std::sync::Arc::new(move |peer, conn, ctl| {
+                    let inbound = inbound.clone();
+                    tokio::spawn(async move {
+                        crate::tun_io::serve_tunnel_connection(peer, conn, ctl, inbound).await;
+                    })
+                }));
+        }
+
+        let exit_gen = cancel.clone();
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
-            tun,
-            routes: self.node.routes.clone(),
-            pool: self.node.tunnel_pool.clone(),
-            acl: self.node.acl.clone(),
-            firewalls,
+            tun: tun.clone(),
+            peers: self.node.peers.clone(),
+            policy: self.node.policy.clone(),
+            forwarding: self.node.forwarding.clone(),
             metrics: self.metrics.clone(),
-            mtu: self.cfg.mtu,
-            in_tun_dns: self.in_tun_dns.clone(),
-            #[cfg(feature = "ssh")]
-            ssh_intercept: self.cfg.ssh_intercept.clone(),
+            dns: dns_pool,
             on_unexpected_end: Box::new(move || {
                 if !exit_gen.is_cancelled()
                     && let Some(actor) = exit_weak.upgrade()
@@ -411,6 +413,12 @@ impl DataPlaneActor {
             }),
         });
         self.outbound = Some(outbound);
+        self.generation_cancel = Some(cancel.clone());
+        self.published.store(Some(Arc::new(PublishedDataPlane {
+            generation,
+            device: tun,
+            cancel,
+        })));
         self.generation = generation;
         self.up = true;
         self.status.set_up(true);
@@ -423,14 +431,10 @@ impl DataPlaneActor {
         if !self.up
             && self.published.load().is_none()
             && self.dns_task.is_none()
-            && self.in_tun_dns.is_none()
+            && self.dns_pool.is_none()
         {
             return Ok(());
         }
-        // Stop ingress readers first (registry abort), then withdraw the
-        // generation (token cancellation) in teardown. Both are idempotent;
-        // readers also self-remove from the registry on exit.
-        self.ingress.abort_all();
         self.teardown().await;
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });
         tracing::info!("data plane down");
@@ -523,9 +527,6 @@ impl Message<BringDown> for DataPlaneActor {
         _msg: BringDown,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Ingress readers stop via the generation token (they hold that exact
-        // generation's cancellation) plus pool close; the registry self-cleans
-        // finished readers.
         self.do_bring_down().await
     }
 }
@@ -683,8 +684,6 @@ mod tests {
                 network_id: Uuid::nil(),
                 #[cfg(not(target_os = "android"))]
                 underlay_hosts: vec![],
-                #[cfg(feature = "ssh")]
-                ssh_intercept: crate::ssh::SshIntercept::new(),
             },
             node,
             metrics: test_metrics(),
@@ -693,7 +692,6 @@ mod tests {
             route_actor: route,
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
-            ingress: crate::ingress::IngressRegistry::new(),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.
@@ -835,8 +833,6 @@ mod tests {
                 network_id: Uuid::nil(),
                 #[cfg(not(target_os = "android"))]
                 underlay_hosts: vec![],
-                #[cfg(feature = "ssh")]
-                ssh_intercept: crate::ssh::SshIntercept::new(),
             },
             node,
             metrics: test_metrics(),
@@ -844,7 +840,6 @@ mod tests {
             events: events_tx,
             published: new_published_plane(),
             status: DataPlaneStatusSnapshot::new(false),
-            ingress: crate::ingress::IngressRegistry::new(),
             initially_up: false,
             initial_generation: 0,
             // Tests drive BringUp explicitly; no background reconstruction.

@@ -99,16 +99,17 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
 
     // Firewall from tunnet.toml
     let fw_cfg = cfg.firewall_for_network(&network);
-    if let Some(engine) = state.node.primary_firewall() {
-        engine.reload_local(&fw_cfg);
-    }
+    state.node.forwarding.set_firewall(
+        &state.node.routes,
+        network_id,
+        crate::forward::FirewallRules::from_config(&fw_cfg),
+    );
 
     // DNS into membership + routes
     let dns = cfg.dns_for_network(&network);
     if let Some(docs) = state.node.primary_docs() {
         docs.set_dns(dns.clone());
-        let policy = (**state.node.acl.bundle.load()).clone();
-        docs.apply_to_routes(&state.node.routes, &state.node.acl, &policy);
+        docs.apply_to_routes(&state.node.routes, &state.node.forwarding);
     } else {
         let peers: Vec<_> = state
             .node
@@ -136,6 +137,7 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
             &state.node.endpoint_id_hex(),
             version,
         );
+        state.node.forwarding.republish(&state.node.routes);
     }
 
     if let Some(net) = cfg.direct.get(&network) {
@@ -388,14 +390,9 @@ fn firewall_stats_for_network(
 ) -> (Option<u64>, Option<usize>) {
     state
         .node
-        .firewall_for(network_id)
-        .map(|fw| {
-            let s = fw.stats();
-            (
-                Some(s.packets_denied + s.packets_rejected),
-                Some(s.conntrack_entries),
-            )
-        })
+        .policy
+        .net_stats(network_id)
+        .map(|s| (Some(s.denied + s.rejected), Some(s.flows)))
         .unwrap_or((None, None))
 }
 
@@ -470,7 +467,7 @@ pub(crate) fn peer_summaries(
             None => peers,
         };
     }
-    let pool = &state.node.tunnel_pool;
+    let peers = &state.node.peers;
     let self_id = state.node.endpoint_id_hex();
     state
         .node
@@ -480,8 +477,8 @@ pub(crate) fn peer_summaries(
         .filter(|p| p.endpoint_hex != self_id)
         .filter(|p| network_id.is_none_or(|nid| p.network_id == nid))
         .map(|p| {
-            let snap = pool.peer_snapshot(p.endpoint);
-            let (bytes_in, bytes_out) = pool.peer_bytes(p.endpoint);
+            let snap = peers.peer_snapshot(p.endpoint);
+            let (bytes_in, bytes_out) = peers.peer_bytes(p.endpoint);
             let latency_ms = state.peer_rtt.get(&p.endpoint_hex).map(|v| *v);
             let presence_online = state.node.peer_presence_online(&p.endpoint_hex);
             let presence_last_seen = state.node.peer_presence_last_seen(&p.endpoint_hex);
@@ -490,7 +487,7 @@ pub(crate) fn peer_summaries(
             } else {
                 Some(snap.last_activity_secs_ago)
             };
-            let pool_online = snap.live || pool.has_live(p.endpoint);
+            let pool_online = snap.live || peers.has_live(p.endpoint);
             // None = unknown (cold start / no beacon yet); do not treat as offline.
             let online = if pool_online {
                 Some(true)
@@ -525,7 +522,7 @@ pub(crate) fn build_network_summary(
     let peers = peer_summaries(state, Some(network_id));
     let peers_total = peers.len();
     let peers_online = peers.iter().filter(|p| p.online.unwrap_or(false)).count();
-    let pool = &state.node.tunnel_pool;
+    let peers = &state.node.peers;
     let (expires_at, expires_in_secs) = expiry_fields(state);
     let control = control_plane_status(state);
 
@@ -555,7 +552,7 @@ pub(crate) fn build_network_summary(
             relay_status,
             expires_at,
             expires_in_secs,
-            keep_alive: Some(pool.keep_alive_global()),
+            keep_alive: Some(peers.keep_alive()),
             control: control.clone(),
         });
     }
@@ -588,7 +585,7 @@ pub(crate) fn build_network_summary(
         relay_status: "n/a".into(),
         expires_at,
         expires_in_secs,
-        keep_alive: Some(pool.keep_alive_global()),
+        keep_alive: Some(peers.keep_alive()),
         control: None,
     })
 }
@@ -637,8 +634,7 @@ pub(crate) fn node_summary_from_observation(
 }
 
 pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
-    let pool = &state.node.tunnel_pool;
-    let od = pool.on_demand_stats();
+    let od = state.node.peers.session_stats();
     let control = control_plane_status(state);
     let networks: Vec<NetworkSummary> = match &state.node.persisted {
         crate::state::PersistedState::Managed(m) => {
@@ -1390,9 +1386,8 @@ pub(crate) async fn direct_kick(
     let result = if let Some(rt) = state.node.direct.get(&network_id) {
         rt.docs.kick_peer(peer_id).await?;
         if let Some(auth) = &state.node.direct_auth {
-            let policy = (**state.node.acl.bundle.load()).clone();
             rt.docs
-                .project_runtime(auth, &state.node.routes, &state.node.acl, &policy);
+                .project_runtime(auth, &state.node.routes, &state.node.forwarding);
         }
         rt.docs.rebuild_from_doc().await.ok();
         format!("Kicked {peer_id}")
@@ -1415,12 +1410,18 @@ pub(crate) fn direct_firewall_show(
 
     let direct = state.node.persisted.require_direct_network(network)?;
     let cfg = crate::agent_config::load_firewall_for(&state.node.paths, &direct.network_name);
-    let stats = state
-        .node
-        .firewall_for(direct.network_id)
-        .map(|e| e.stats());
-    let rules = cfg
-        .rules
+    let snap = state.node.forwarding.load();
+    let stats = state.node.policy.net_stats(direct.network_id);
+    let (enabled, local, suggested) = match snap.policy_for(direct.network_id) {
+        Some(crate::forward::NetworkPolicy::Direct {
+            enabled,
+            local,
+            suggested,
+            ..
+        }) => (*enabled, local.clone(), suggested.clone()),
+        _ => (cfg.enabled, cfg.rules.clone(), Vec::new()),
+    };
+    let rules = local
         .iter()
         .enumerate()
         .map(|(index, r)| DirectFirewallRuleInfo {
@@ -1437,13 +1438,13 @@ pub(crate) fn direct_firewall_show(
         })
         .collect();
     Ok(DirectFirewallResponse {
-        enabled: stats.as_ref().map(|s| s.enabled).unwrap_or(cfg.enabled),
+        enabled,
         rules,
-        conntrack_entries: stats.as_ref().map(|s| s.conntrack_entries).unwrap_or(0),
-        packets_allowed: stats.as_ref().map(|s| s.packets_allowed).unwrap_or(0),
-        packets_denied: stats.as_ref().map(|s| s.packets_denied).unwrap_or(0),
-        packets_rejected: stats.as_ref().map(|s| s.packets_rejected).unwrap_or(0),
-        suggested_rules: stats.as_ref().map(|s| s.suggested_rules).unwrap_or(0),
+        conntrack_entries: stats.as_ref().map(|s| s.flows).unwrap_or(0),
+        packets_allowed: stats.as_ref().map(|s| s.allowed).unwrap_or(0),
+        packets_denied: stats.as_ref().map(|s| s.denied).unwrap_or(0),
+        packets_rejected: stats.as_ref().map(|s| s.rejected).unwrap_or(0),
+        suggested_rules: suggested.len(),
     })
 }
 
@@ -1452,9 +1453,11 @@ pub(crate) fn reload_firewall_engine(
     network_id: uuid::Uuid,
     cfg: &crate::direct::FirewallConfig,
 ) {
-    if let Some(fw) = state.node.firewall_for(network_id) {
-        fw.reload_local(cfg);
-    }
+    state.node.forwarding.set_firewall(
+        &state.node.routes,
+        network_id,
+        crate::forward::FirewallRules::from_config(cfg),
+    );
 }
 
 pub(crate) fn direct_firewall_off(
@@ -1549,9 +1552,7 @@ pub(crate) fn direct_firewall_flush(
     network: Option<&str>,
 ) -> anyhow::Result<String> {
     let direct = state.node.persisted.require_direct_network(network)?;
-    if let Some(fw) = state.node.firewall_for(direct.network_id) {
-        fw.flush_conntrack();
-    }
+    state.node.policy.flush_network(direct.network_id);
     Ok("Conntrack table flushed.".into())
 }
 
@@ -1581,9 +1582,10 @@ pub(crate) fn direct_firewall_accept(
         serde_json::from_slice(&std::fs::read(&path)?)?;
     let hostname = direct.hostname.clone();
     let rules = crate::direct::policy_docs::effective_suggested(&pending.policy, &hostname);
-    if let Some(fw) = state.node.firewall_for(direct.network_id) {
-        fw.set_suggested(rules);
-    }
+    state
+        .node
+        .forwarding
+        .set_suggested(&state.node.routes, direct.network_id, rules);
     let _ = std::fs::remove_file(&path);
     Ok("Accepted pending firewall suggestion.".into())
 }
@@ -1595,9 +1597,10 @@ pub(crate) fn direct_firewall_reject_suggestion(
     let direct = state.node.persisted.require_direct_network(network)?;
     let path = state.node.paths.firewall_pending_file(direct.network_id);
     let _ = std::fs::remove_file(&path);
-    if let Some(fw) = state.node.firewall_for(direct.network_id) {
-        fw.clear_suggested();
-    }
+    state
+        .node
+        .forwarding
+        .set_suggested(&state.node.routes, direct.network_id, Vec::new());
     Ok("Rejected pending firewall suggestion.".into())
 }
 
@@ -1647,7 +1650,7 @@ pub(crate) async fn direct_policy_clear(
     let Some(docs) = state.node.docs_for(direct.network_id) else {
         anyhow::bail!("docs membership not ready");
     };
-    docs.clear_firewall_policy().await?;
+    docs.clear_firewall_policy(&state.node.routes).await?;
     Ok("Cleared published firewall policy.".into())
 }
 
@@ -1658,15 +1661,13 @@ pub(crate) fn direct_keep_alive(
 ) -> anyhow::Result<String> {
     let _ = state.node.persisted.require_direct_network(None)?;
     if enable {
-        state.node.pool.add_keep_alive_host(hostname);
         if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
-            state.node.pool.set_peer_keep_alive(peer.endpoint, true);
+            state.node.peers.set_peer_keep_alive(peer.endpoint, true);
         }
         Ok(format!("Keep-alive enabled for {hostname}"))
     } else {
-        state.node.pool.remove_keep_alive_host(hostname);
         if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
-            state.node.pool.set_peer_keep_alive(peer.endpoint, false);
+            state.node.peers.set_peer_keep_alive(peer.endpoint, false);
         }
         Ok(format!("Keep-alive disabled for {hostname}"))
     }

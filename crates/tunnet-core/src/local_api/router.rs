@@ -592,7 +592,7 @@ async fn acl_denies(
 ) -> ApiResult<Json<serde_json::Value>> {
     peer.require_cap(DIAG_READ)?;
     Ok(Json(serde_json::json!({
-        "denies": state.node.acl.recent_denies(),
+        "denies": state.node.policy.recent_denies(),
     })))
 }
 

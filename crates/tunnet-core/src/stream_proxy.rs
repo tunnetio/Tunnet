@@ -6,16 +6,21 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tunnet_common::policy::{FlowContext, FlowEndpoint, Protocol};
 
-use crate::acl::AclEngine;
+use crate::forward::{Decision, ForwardingStore, PolicyEngine};
 use crate::routing::RoutingTable;
 use crate::stream::{AcceptedStream, StreamHandler, splice_bidirectional};
 
-pub fn stream_handler(routes: RoutingTable, acl: AclEngine) -> StreamHandler {
+pub fn stream_handler(
+    routes: RoutingTable,
+    forwarding: ForwardingStore,
+    policy: PolicyEngine,
+) -> StreamHandler {
     Arc::new(move |accepted| {
         let routes = routes.clone();
-        let acl = acl.clone();
+        let forwarding = forwarding.clone();
+        let policy = policy.clone();
         Box::pin(async move {
-            handle_accepted(accepted, &routes, &acl).await;
+            handle_accepted(accepted, &routes, &forwarding, &policy).await;
         })
     })
 }
@@ -25,22 +30,32 @@ pub fn stream_handler(routes: RoutingTable, acl: AclEngine) -> StreamHandler {
 /// attested by the initiating node on its own egress; the gateway authorizes
 /// the destination.
 fn authorize_stream(
-    acl: &AclEngine,
+    forwarding: &ForwardingStore,
+    policy: &PolicyEngine,
     peer_hex: &str,
     dst_ip: Option<std::net::Ipv4Addr>,
     dst_port: u16,
 ) -> bool {
+    let snap = forwarding.load();
+    let Ok(endpoint) = peer_hex.parse() else {
+        return false;
+    };
     let flow = FlowContext {
-        src: acl.peer_endpoint(peer_hex),
+        src: snap.peer_endpoint(endpoint),
         dst: FlowEndpoint::external(dst_ip),
         protocol: Protocol::Tcp,
         dst_port: Some(dst_port),
         src_posture_ok: true,
     };
-    acl.allow_flow(&flow, peer_hex)
+    matches!(policy.evaluate_flow(&snap, &flow), Decision::Allow)
 }
 
-async fn handle_accepted(accepted: AcceptedStream, routes: &RoutingTable, acl: &AclEngine) {
+async fn handle_accepted(
+    accepted: AcceptedStream,
+    routes: &RoutingTable,
+    forwarding: &ForwardingStore,
+    policy: &PolicyEngine,
+) {
     let host = accepted.header.host.clone();
     let port = accepted.header.dst_port;
     let peer_hex = accepted.peer_hex;
@@ -74,7 +89,7 @@ async fn handle_accepted(accepted: AcceptedStream, routes: &RoutingTable, acl: &
         return;
     };
 
-    if !authorize_stream(acl, &peer_hex, dst_ip, port) {
+    if !authorize_stream(forwarding, policy, &peer_hex, dst_ip, port) {
         tracing::warn!(%peer_hex, %host, port, "refusing stream: flow policy denies the destination");
         return;
     }
@@ -101,22 +116,20 @@ async fn handle_accepted(accepted: AcceptedStream, routes: &RoutingTable, acl: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::{ForwardingStore, SelfIdentity};
     use std::net::Ipv4Addr;
     use tunnet_common::policy::{
         Action, DefaultAction, IcmpPolicy, PolicyBundle, PolicyRule, PortRange,
         Protocol as PolProto, RuleScope, Selector,
     };
+    use uuid::Uuid;
 
-    fn engine_with(src: Selector, dst: Selector, rule_port: u16) -> AclEngine {
+    fn setup_with(src: Selector, dst: Selector, rule_port: u16) -> (ForwardingStore, PolicyEngine) {
         let routes = RoutingTable::new();
-        AclEngine::new(
-            crate::acl::SelfIdentity {
-                endpoint_hex: "aa".repeat(32),
-                ip: Ipv4Addr::new(100, 64, 0, 1),
-                tags: vec![],
-                network: "net".into(),
-            },
-            routes,
+        let forwarding = ForwardingStore::new();
+        forwarding.set_managed_bundle(
+            &routes,
+            Uuid::nil(),
             PolicyBundle {
                 rules: vec![PolicyRule {
                     src,
@@ -143,33 +156,42 @@ mod tests {
                 default_src_posture: vec![],
                 posture_enforcement: None,
             },
-        )
+            SelfIdentity {
+                endpoint_hex: "aa".repeat(32),
+                ip: Ipv4Addr::new(100, 64, 0, 1),
+                tags: vec![],
+                network: "net".into(),
+            },
+        );
+        (forwarding, PolicyEngine::new())
     }
 
     #[test]
     fn stream_authorize_enforces_destination_port() {
-        let acl = engine_with(Selector::Any, Selector::Any, 443);
+        let (forwarding, policy) = setup_with(Selector::Any, Selector::Any, 443);
         let peer = "bb".repeat(32);
         let lan = Some(Ipv4Addr::new(10, 8, 0, 7));
-        assert!(authorize_stream(&acl, &peer, lan, 443));
-        assert!(!authorize_stream(&acl, &peer, lan, 22));
-        assert!(!authorize_stream(&acl, &peer, lan, 80));
+        assert!(authorize_stream(&forwarding, &policy, &peer, lan, 443));
+        assert!(!authorize_stream(&forwarding, &policy, &peer, lan, 22));
+        assert!(!authorize_stream(&forwarding, &policy, &peer, lan, 80));
     }
 
     #[test]
     fn stream_authorize_evaluates_destination_entity_not_self() {
         use ipnet::IpNet;
         let lan: IpNet = "10.8.0.0/16".parse().unwrap();
-        let acl = engine_with(Selector::Any, Selector::Cidr(lan), 443);
+        let (forwarding, policy) = setup_with(Selector::Any, Selector::Cidr(lan), 443);
         let peer = "bb".repeat(32);
         assert!(authorize_stream(
-            &acl,
+            &forwarding,
+            &policy,
             &peer,
             Some(Ipv4Addr::new(10, 8, 0, 7)),
             443
         ));
         assert!(!authorize_stream(
-            &acl,
+            &forwarding,
+            &policy,
             &peer,
             Some(Ipv4Addr::new(192, 168, 1, 7)),
             443

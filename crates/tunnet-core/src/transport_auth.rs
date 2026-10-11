@@ -1,8 +1,7 @@
 //! Transport admission: authenticated membership only, never L3/L4 policy.
 //!
 //! Admission answers one question: is this peer currently a trusted member?
-//! Flow policy ([`AclEngine::allow_packet`], [`AclEngine::allow_flow`]) runs
-//! where real flow context exists, never here.
+//! Flow policy runs where real flow context exists, never here.
 
 use std::fmt;
 
@@ -162,7 +161,7 @@ impl EndpointHooks for TransportHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acl::{AclEngine, SelfIdentity};
+    use crate::forward::{ForwardingStore, PolicyEngine, SelfIdentity};
     use std::net::Ipv4Addr;
     use tunnet_common::policy::{
         Action, DefaultAction, FlowContext, FlowEndpoint, IcmpPolicy, PolicyBundle, PolicyRule,
@@ -183,14 +182,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn managed_admission_ignores_l3l4_default_deny() {
+    fn managed_setup(bundle: PolicyBundle) -> (ForwardingStore, PolicyEngine, RoutingTable) {
         let routes = RoutingTable::new();
-        let peer = "bb".repeat(32);
         routes.replace(
             &[tunnet_common::PeerEntry {
                 ip: Ipv4Addr::new(100, 64, 0, 2),
-                endpoint_id: peer.clone(),
+                endpoint_id: "bb".repeat(32),
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
@@ -205,17 +202,27 @@ mod tests {
             &"aa".repeat(32),
             1,
         );
-        // L3/L4 policy denies everything, yet the member must pass transport admission.
-        let _acl = AclEngine::new(
+        let forwarding = ForwardingStore::new();
+        forwarding.set_managed_bundle(
+            &routes,
+            uuid::Uuid::nil(),
+            bundle,
             SelfIdentity {
                 endpoint_hex: "aa".repeat(32),
                 ip: Ipv4Addr::new(100, 64, 0, 1),
                 tags: vec![],
                 network: "net".into(),
             },
-            routes.clone(),
-            deny_bundle(),
         );
+        let policy = PolicyEngine::new();
+        (forwarding, policy, routes)
+    }
+
+    #[test]
+    fn managed_admission_ignores_l3l4_default_deny() {
+        let (_, _, routes) = managed_setup(deny_bundle());
+        let peer = "bb".repeat(32);
+        // L3/L4 policy denies everything, yet the member must pass transport admission.
         let auth = TransportAuth::managed(&routes);
         assert!(auth.allows(&peer));
         assert!(!auth.allows(&"cc".repeat(32)));
@@ -223,30 +230,7 @@ mod tests {
 
     #[test]
     fn icmp_allow_with_deny_all_keeps_member_transport_authorized() {
-        let routes = RoutingTable::new();
-        let peer = "bb".repeat(32);
-        let self_id = "aa".repeat(32);
-        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
-        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
-        routes.replace(
-            &[tunnet_common::PeerEntry {
-                ip: peer_ip,
-                endpoint_id: peer.clone(),
-                hostname: "peer".into(),
-                tags: vec![],
-                ssh_host_key: None,
-            }],
-            &[],
-            &[],
-            &[],
-            &tunnet_common::DeviceProfile::default(),
-            &tunnet_common::DnsConfig::default(),
-            "net",
-            uuid::Uuid::nil(),
-            &self_id,
-            1,
-        );
-        let bundle = PolicyBundle {
+        let (forwarding, policy, _) = managed_setup(PolicyBundle {
             rules: vec![PolicyRule {
                 src: Selector::Any,
                 dst: Selector::Any,
@@ -263,28 +247,24 @@ mod tests {
             default_action: DefaultAction::Allow,
             icmp_policy: IcmpPolicy::Allow,
             ..PolicyBundle::default()
-        };
-        let acl = AclEngine::new(
-            SelfIdentity {
-                endpoint_hex: self_id.clone(),
-                ip: self_ip,
-                tags: vec![],
-                network: "net".into(),
-            },
-            routes.clone(),
-            bundle,
-        );
-        let auth = TransportAuth::managed(&routes);
-        assert!(auth.allows(&peer));
-        assert!(acl.allow_flow(
-            &FlowContext {
-                src: FlowEndpoint::member(self_id, vec![], "net".into(), Some(self_ip)),
-                dst: FlowEndpoint::member(peer.clone(), vec![], "net".into(), Some(peer_ip)),
-                protocol: Protocol::Icmp,
-                dst_port: None,
-                src_posture_ok: true,
-            },
-            &peer,
+        });
+        let peer = "bb".repeat(32);
+        let self_id = "aa".repeat(32);
+        let self_ip = Ipv4Addr::new(100, 64, 0, 1);
+        let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
+        let snap = forwarding.load();
+        assert!(matches!(
+            policy.evaluate_flow(
+                &snap,
+                &FlowContext {
+                    src: FlowEndpoint::member(self_id, vec![], "net".into(), Some(self_ip)),
+                    dst: FlowEndpoint::member(peer.clone(), vec![], "net".into(), Some(peer_ip)),
+                    protocol: Protocol::Icmp,
+                    dst_port: None,
+                    src_posture_ok: true,
+                },
+            ),
+            crate::forward::Decision::Allow
         ));
     }
 

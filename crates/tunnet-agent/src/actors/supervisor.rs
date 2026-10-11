@@ -52,7 +52,6 @@ pub struct DataPlaneSupervisorArgs {
     pub events: tokio::sync::broadcast::Sender<LocalEvent>,
     pub published: PublishedPlane,
     pub status: DataPlaneStatusSnapshot,
-    pub ingress: crate::ingress::IngressRegistry,
     pub initially_up: bool,
     pub initial_generation: u64,
     /// Reconstruct the up state after a supervised restart (see
@@ -89,7 +88,6 @@ impl Actor for DataPlaneSupervisor {
             route_actor: route_actor.clone(),
             published: args.published.clone(),
             status: args.status.clone(),
-            ingress: args.ingress.clone(),
             initially_up: args.initially_up,
             initial_generation: args.initial_generation,
             auto_up: args.auto_up,
@@ -683,8 +681,6 @@ mod tests {
                     network_id: uuid::Uuid::nil(),
                     #[cfg(not(target_os = "android"))]
                     underlay_hosts: vec![],
-                    #[cfg(feature = "ssh")]
-                    ssh_intercept: crate::ssh::SshIntercept::new(),
                 },
                 node,
                 metrics: test_metrics(),
@@ -692,7 +688,6 @@ mod tests {
                 events: events_tx,
                 published: published.clone(),
                 status: status.clone(),
-                ingress: crate::ingress::IngressRegistry::new(),
                 initially_up: false,
                 initial_generation: 0,
                 auto_up: false,

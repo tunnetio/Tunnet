@@ -9,8 +9,6 @@ pub mod grants;
 #[cfg(feature = "direct")]
 pub mod admin;
 #[cfg(feature = "direct")]
-pub mod antispoof;
-#[cfg(feature = "direct")]
 pub mod auth;
 #[cfg(feature = "direct")]
 pub mod authority;
@@ -44,8 +42,6 @@ pub use addrplan::{
 #[cfg(feature = "direct")]
 pub use admin::queue_kick;
 #[cfg(feature = "direct")]
-pub use antispoof::{SpoofTracker, source_matches_peer};
-#[cfg(feature = "direct")]
 pub use auth::{
     AUTH_ALPN, AuthCache, AuthServerContext, DirectAuthHook, SharedAuthServerContext,
     build_auth_server_context, run_auth_client, run_auth_server,
@@ -61,8 +57,8 @@ pub use contact::{contact_id_from_endpoint, contact_id_from_hex, is_contact_id, 
 #[cfg(feature = "direct")]
 pub use discovery::{DiscoveryHandle, spawn_discovery, spawn_seed_auth, topic_from_name_secret};
 pub use firewall::{
-    EvalResult, FirewallConfig, FirewallEngine, FirewallRule, FirewallStats, PacketDirection,
-    default_firewall,
+    FirewallAction, FirewallConfig, FirewallDirection, FirewallRule, PeerFilter, action_display,
+    default_firewall, direction_display, parse_peer_filter, parse_port_spec, peer_filter_display,
 };
 pub use grants::{
     EpochRecord, GENESIS_SCHEMA_VERSION, Genesis, MEMBER_METADATA_SCHEMA_VERSION,

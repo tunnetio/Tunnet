@@ -59,6 +59,75 @@ fn synthesize_icmp_unreach(packet: &Packet<'_>) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
+/// ICMP Fragmentation Needed for a raw IPv4 packet that exceeds the path MTU.
+/// Operates on raw bytes so the TUN loop can answer without a second parse.
+pub fn synthesize_frag_needed(raw: &[u8], next_hop_mtu: u16) -> Option<Bytes> {
+    let (ip, _) = Ipv4Header::from_slice(raw).ok()?;
+    let src = std::net::Ipv4Addr::from(ip.source);
+    let dst = std::net::Ipv4Addr::from(ip.destination);
+    if src.is_unspecified() || dst.is_unspecified() {
+        return None;
+    }
+    let header_len = usize::from(ip.ihl()) * 4;
+    let copy_len = raw.len().min(header_len + 8).min(28);
+    let quoted = &raw[..copy_len];
+    let builder = PacketBuilder::ipv4(dst.octets(), src.octets(), 64).icmpv4(
+        Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu },
+        ),
+    );
+    let mut out = Vec::with_capacity(builder.size(quoted.len()));
+    builder.write(&mut out, quoted).ok()?;
+    Some(Bytes::from(out))
+}
+
+/// Clamp the TCP MSS option on SYN packets to `max_mss`, in place.
+/// Returns true when an MSS option was present and rewritten.
+pub fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
+    let header_len = match packet.first() {
+        Some(b) if b >> 4 == 4 => usize::from(b & 0x0f) * 4,
+        _ => return false,
+    };
+    if packet.len() < header_len + TcpHeader::MIN_LEN || packet[9] != 6 {
+        return false;
+    }
+    let tcp = &packet[header_len..];
+    if tcp[13] & 0x02 == 0 {
+        return false;
+    }
+    let data_offset = usize::from(tcp[12] >> 4) * 4;
+    if data_offset <= TcpHeader::MIN_LEN || packet.len() < header_len + data_offset {
+        return false;
+    }
+    let mut i = header_len + TcpHeader::MIN_LEN;
+    let end = header_len + data_offset;
+    while i < end {
+        match packet[i] {
+            0 => break,
+            1 => i += 1,
+            2 => {
+                if i + 4 > end || packet[i + 1] != 4 {
+                    return false;
+                }
+                let current = u16::from_be_bytes([packet[i + 2], packet[i + 3]]);
+                if current <= max_mss {
+                    return false;
+                }
+                packet[i + 2..i + 4].copy_from_slice(&max_mss.to_be_bytes());
+                return set_tcp_ipv4_checksum(packet, header_len);
+            }
+            _ => {
+                let len = usize::from(packet[i + 1]);
+                if len < 2 || i + len > end {
+                    return false;
+                }
+                i += len;
+            }
+        }
+    }
+    false
+}
+
 /// Recompute IPv4 + TCP checksums after an in-place TCP port rewrite.
 pub fn set_tcp_ipv4_checksum(packet: &mut [u8], ip_header_len: usize) -> bool {
     if packet.len() < ip_header_len + TcpHeader::MIN_LEN {

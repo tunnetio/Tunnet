@@ -118,6 +118,7 @@ fn install_peer_route(
         .node
         .routes
         .replace_network(network_id, &peers, &dns, &network_name, &self_id, version);
+    state.node.forwarding.republish(&state.node.routes);
     if let Some(auth) = &state.node.direct_auth {
         auth.insert(hex, network_id);
     }
