@@ -311,7 +311,7 @@ pub(crate) fn peers_from_node(
     peer_rtt: &dashmap::DashMap<String, f64>,
     network_id: Option<Uuid>,
 ) -> Vec<AgentPeer> {
-    let pool = &node.tunnel_pool;
+    let peers = &node.peers;
     let self_id = node.endpoint_id_hex();
     node.routes
         .peers()
@@ -319,8 +319,8 @@ pub(crate) fn peers_from_node(
         .filter(|p| p.endpoint_hex != self_id)
         .filter(|p| network_id.is_none_or(|nid| p.network_id == nid))
         .map(|p| {
-            let snap = pool.peer_snapshot(p.endpoint);
-            let (bytes_in, bytes_out) = pool.peer_bytes(p.endpoint);
+            let snap = peers.peer_snapshot(p.endpoint);
+            let (bytes_in, bytes_out) = peers.peer_bytes(p.endpoint);
             let presence_online = node.peer_presence_online(&p.endpoint_hex);
             let presence_last_seen = node.peer_presence_last_seen(&p.endpoint_hex);
             let last_seen = if snap.last_activity_secs_ago == u64::MAX {
@@ -328,7 +328,7 @@ pub(crate) fn peers_from_node(
             } else {
                 Some(snap.last_activity_secs_ago)
             };
-            let pool_online = snap.live || pool.has_live(p.endpoint);
+            let pool_online = snap.live || peers.has_live(p.endpoint);
             let online = if pool_online {
                 Some(true)
             } else {

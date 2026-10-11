@@ -18,7 +18,7 @@ mod sftp;
 mod tee;
 
 pub use host_key::host_pubkey_openssh;
-pub use intercept::{SshIntercept, rewrite_inbound, rewrite_inbound_needed, rewrite_outbound};
+pub use intercept::SshIntercept;
 pub use listener::{SshBinding, spawn_ssh_listener};
 pub use server::SshServeDeps;
 pub use session_child::maybe_run;

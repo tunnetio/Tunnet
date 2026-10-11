@@ -33,6 +33,11 @@ impl AgentMetrics {
 
             describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
             describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_batches_total", "TUN/QUIC processing batches");
+            describe_counter!(
+                "tunnet_batch_packets_total",
+                "Packets across processing batches"
+            );
             describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
             describe_gauge!("tunnet_active_connections", "Live peer connections");
             describe_gauge!(
@@ -59,6 +64,11 @@ impl AgentMetrics {
         {
             describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
             describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_batches_total", "TUN/QUIC processing batches");
+            describe_counter!(
+                "tunnet_batch_packets_total",
+                "Packets across processing batches"
+            );
             describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
             describe_gauge!("tunnet_active_connections", "Live peer connections");
             describe_gauge!(
@@ -73,16 +83,25 @@ impl AgentMetrics {
         }
     }
 
-    pub fn packets_inc(&self, direction: &'static str) {
-        counter!("tunnet_packets_total", "direction" => direction).increment(1);
+    pub fn packets_add(&self, direction: &'static str, n: u64) {
+        counter!("tunnet_packets_total", "direction" => direction).increment(n);
+    }
+
+    pub fn batch_observe(&self, direction: &'static str, n: u64) {
+        counter!("tunnet_batch_packets_total", "direction" => direction).increment(n);
+        counter!("tunnet_batches_total", "direction" => direction).increment(1);
     }
 
     pub fn bytes_add(&self, direction: &'static str, n: u64) {
         counter!("tunnet_bytes_total", "direction" => direction).increment(n);
     }
 
+    pub fn dropped_add(&self, reason: &'static str, n: u64) {
+        counter!("tunnet_dropped_packets_total", "reason" => reason).increment(n);
+    }
+
     pub fn dropped_inc(&self, reason: &'static str) {
-        counter!("tunnet_dropped_packets_total", "reason" => reason).increment(1);
+        self.dropped_add(reason, 1);
     }
 
     pub fn active_conns_inc(&self) {

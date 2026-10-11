@@ -20,25 +20,21 @@ use tunnet_core::Docs;
 #[cfg(feature = "ssh")]
 use tunnet_core::SignedClient;
 use tunnet_core::direct::{
-    AUTH_ALPN, AuthCache, CONNECT_ALPN, DOCS_ALPN, DirectAuthority, DocsMembership, FirewallEngine,
-    GOSSIP_ALPN, JOIN_ALPN, SharedAuthServerContext, SpoofTracker, run_auth_server,
+    AUTH_ALPN, AuthCache, CONNECT_ALPN, DOCS_ALPN, DirectAuthority, DocsMembership, GOSSIP_ALPN,
+    JOIN_ALPN, SharedAuthServerContext, run_auth_server,
 };
 use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_ALPN};
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, SendManager, StatePaths};
+use tunnet_core::{ForwardingStore, PeerManager, RoutingTable, SendManager, StatePaths};
 use uuid::Uuid;
 
 use crate::actors::dataplane::PublishedPlane;
-use crate::ingress::IngressRegistry;
-use crate::metrics::AgentMetrics;
 #[cfg(feature = "ssh")]
 use crate::recorder::{RecordingStore, serve_recording_connection};
-use crate::tun_io::{InboundDeps, serve_tunnel_connection};
 
 pub struct AcceptDeps {
     pub endpoint: iroh::Endpoint,
     pub routes: RoutingTable,
-    pub acl: AclEngine,
-    pub metrics: AgentMetrics,
+    pub forwarding: ForwardingStore,
     pub tun: PublishedPlane,
     pub stream_handler: StreamHandler,
     #[cfg(feature = "ssh")]
@@ -55,31 +51,17 @@ pub struct AcceptDeps {
     pub auth_server_ctx: Option<SharedAuthServerContext>,
     pub paths: StatePaths,
     pub join_authorities: HashMap<Uuid, (Arc<DirectAuthority>, DocsMembership)>,
-    pub firewalls: HashMap<Uuid, FirewallEngine>,
-    pub spoofs: HashMap<Uuid, SpoofTracker>,
-    pub dgram_pool: ConnPool,
+    pub peers: PeerManager,
     pub agent_gossip: Option<iroh_gossip::net::Gossip>,
     pub shared_docs: Option<Docs>,
-    pub ingress: IngressRegistry,
     pub events: tokio::sync::broadcast::Sender<LocalEvent>,
-    #[cfg(feature = "ssh")]
-    pub ssh_intercept: crate::ssh::SshIntercept,
 }
 
 /// Spawn the unified ALPN router. Keep the returned [`Router`] alive for the process lifetime.
 pub fn spawn(deps: AcceptDeps) -> Router {
     let tunnel = TunnelHandler {
         tun: deps.tun,
-        routes: deps.routes.clone(),
-        acl: deps.acl.clone(),
-        firewalls: deps.firewalls,
-        spoofs: deps.spoofs,
-        dgram_pool: deps.dgram_pool,
-        metrics: deps.metrics,
-        direct_auth: deps.direct_auth.clone(),
-        ingress: deps.ingress,
-        #[cfg(feature = "ssh")]
-        ssh_intercept: deps.ssh_intercept,
+        peers: deps.peers,
     };
     let stream = StreamProtocolHandler::new(deps.stream_handler);
     let auth_server_ctx = deps.auth_server_ctx.clone();
@@ -92,7 +74,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
         authorities: deps.join_authorities,
         auth: deps.direct_auth.clone(),
         routes: deps.routes.clone(),
-        acl: deps.acl.clone(),
+        forwarding: deps.forwarding.clone(),
         events: deps.events,
     };
     let connect = ConnectHandler {
@@ -144,16 +126,7 @@ pub fn spawn(deps: AcceptDeps) -> Router {
 #[derive(Clone)]
 struct TunnelHandler {
     tun: PublishedPlane,
-    routes: RoutingTable,
-    acl: AclEngine,
-    firewalls: HashMap<Uuid, FirewallEngine>,
-    spoofs: HashMap<Uuid, SpoofTracker>,
-    dgram_pool: ConnPool,
-    metrics: AgentMetrics,
-    direct_auth: Option<AuthCache>,
-    ingress: IngressRegistry,
-    #[cfg(feature = "ssh")]
-    ssh_intercept: crate::ssh::SshIntercept,
+    peers: PeerManager,
 }
 
 impl fmt::Debug for TunnelHandler {
@@ -170,41 +143,11 @@ impl ProtocolHandler for TunnelHandler {
             return Ok(());
         }
         let peer = conn.remote_id();
-
-        if !self.dgram_pool.adopt(peer, conn.clone()).await {
-            tracing::debug!(%peer, "accept lost tie-break; closing");
+        if !self.peers.install(peer, conn.clone(), false) {
+            tracing::debug!(%peer, "accept lost tie-break or dataplane down; closing");
             conn.close(0u32.into(), b"tie_break");
             return Ok(());
         }
-        self.ingress.force_spawn(peer, {
-            let conn = conn.clone();
-            let tun = self.tun.clone();
-            let routes = self.routes.clone();
-            let acl = self.acl.clone();
-            let firewalls = self.firewalls.clone();
-            let spoofs = self.spoofs.clone();
-            let dgram_pool = self.dgram_pool.clone();
-            let metrics = self.metrics.clone();
-            let direct_auth = self.direct_auth.clone();
-            #[cfg(feature = "ssh")]
-            let ssh_intercept = self.ssh_intercept.clone();
-            async move {
-                serve_tunnel_connection(InboundDeps {
-                    conn,
-                    tun,
-                    routes,
-                    acl,
-                    firewalls,
-                    spoofs,
-                    pool: Some(dgram_pool),
-                    metrics,
-                    direct_auth,
-                    #[cfg(feature = "ssh")]
-                    ssh_intercept,
-                })
-                .await;
-            }
-        });
         Ok(())
     }
 }
@@ -246,7 +189,7 @@ struct JoinHandler {
     authorities: HashMap<Uuid, (Arc<DirectAuthority>, DocsMembership)>,
     auth: Option<AuthCache>,
     routes: RoutingTable,
-    acl: AclEngine,
+    forwarding: ForwardingStore,
     events: tokio::sync::broadcast::Sender<LocalEvent>,
 }
 
@@ -285,8 +228,7 @@ impl ProtocolHandler for JoinHandler {
                     (&self.auth, resp.status, resp.admission.as_ref())
                     && let Some((_, docs)) = self.authorities.get(&adm.genesis.network_id)
                 {
-                    let policy = (**self.acl.bundle.load()).clone();
-                    docs.project_runtime(auth, &self.routes, &self.acl, &policy);
+                    docs.project_runtime(auth, &self.routes, &self.forwarding);
                 }
                 conn.close(0u32.into(), b"join_done");
             }

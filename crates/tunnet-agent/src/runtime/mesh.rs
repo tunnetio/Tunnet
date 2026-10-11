@@ -29,7 +29,6 @@ use crate::actors::supervisor::{
     AgentSupervisor, AgentSupervisorArgs, DataPlaneSupervisorArgs, GetAgentChildren,
     GetDataPlaneChildren,
 };
-use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
 
@@ -103,12 +102,18 @@ pub(crate) async fn start_mesh(
 
     #[cfg(not(target_os = "android"))]
     let underlay_hosts = {
-        let mut hosts = Vec::new();
+        let mut seeds = Vec::new();
         if let Ok(managed) = persisted.require_managed() {
-            hosts.extend(crate::dataplane::underlay_hosts_from_url(
-                &managed.control_url,
-            ));
+            seeds.push(managed.control_url.clone());
         }
+        if let Some(urls) = args.relay_urls.as_deref() {
+            seeds.extend(
+                urls.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+        let mut hosts = crate::dataplane::resolve_underlay_hosts(&seeds).await;
         if let Some(info) = crate::underlay::UnderlayInfo::discover() {
             for dns in info.dns_servers {
                 if let std::net::IpAddr::V4(ip) = dns
@@ -333,8 +338,6 @@ pub(crate) async fn start_mesh(
         network_id,
         #[cfg(not(target_os = "android"))]
         underlay_hosts: underlay_hosts.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept: ssh_intercept.clone(),
     };
 
     // Managed control + posture (absent in Direct mode).
@@ -354,6 +357,7 @@ pub(crate) async fn start_mesh(
             agent_version: env!("CARGO_PKG_VERSION"),
             paths: paths.clone(),
             poll_secs: args.poll_secs,
+            underlay_hosts: underlay_hosts.clone(),
             // Late-bound by the supervisor after the dataplane tree starts.
             route_actor: None,
             dataplane_actor: None,
@@ -379,9 +383,6 @@ pub(crate) async fn start_mesh(
 
     // Single event bus shared by the actors, the updater, and the Local API.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    // Ingress reader registry: shared by the dialer pump, the accept router,
-    // and the DataPlaneActor (which aborts readers on BringDown).
-    let ingress = IngressRegistry::new();
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
     #[cfg(feature = "updater")]
     let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -400,7 +401,6 @@ pub(crate) async fn start_mesh(
                 events: events_tx.clone(),
                 published: published.clone(),
                 status: status_snapshot.clone(),
-                ingress: ingress.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
@@ -521,32 +521,10 @@ pub(crate) async fn start_mesh(
         });
     }
 
-    let stream_handler = tunnet_core::stream_handler(node.routes.clone(), node.acl.clone());
-    let dgram_pool = node.tunnel_pool.clone();
-
-    let firewalls: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.firewall.clone()))
-        .collect();
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-
-    crate::dgram_pump::install_dialer_datagram_pump(
-        &dgram_pool,
-        published.clone(),
+    let stream_handler = tunnet_core::stream_handler(
         node.routes.clone(),
-        node.acl.clone(),
-        firewalls.clone(),
-        spoofs.clone(),
-        metrics.clone(),
-        node.direct_auth.clone(),
-        ingress.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept.clone(),
+        node.forwarding.clone(),
+        node.policy.clone(),
     );
 
     let docs_map: HashMap<_, _> = node
@@ -558,15 +536,15 @@ pub(crate) async fn start_mesh(
     // Direct membership sync drives pool invalidation by event, never by timer.
     for docs in docs_map.values() {
         let stream_pool = node.pool.clone();
-        let dgram_pool = node.tunnel_pool.clone();
+        let peers = node.peers.clone();
         let dataplane = dataplane_ref.clone();
         docs.set_change_hook(Arc::new(move || {
             let stream_pool = stream_pool.clone();
-            let dgram_pool = dgram_pool.clone();
+            let peers = peers.clone();
             let dataplane = dataplane.clone();
             tokio::spawn(async move {
                 stream_pool.reconcile().await;
-                dgram_pool.reconcile().await;
+                peers.reconcile().await;
                 if let Err(error) = dataplane
                     .ask(crate::actors::dataplane::ReconcileDirectState)
                     .await
@@ -623,7 +601,7 @@ pub(crate) async fn start_mesh(
                 };
             let ssh_deps = crate::ssh::SshServeDeps {
                 routes: node.routes.clone(),
-                acl: node.acl.clone(),
+                forwarding: node.forwarding.clone(),
                 sessions: ssh_registry.clone(),
                 #[cfg(feature = "local-api")]
                 cp_tx: node.serves.client_tx(),
@@ -687,6 +665,8 @@ pub(crate) async fn start_mesh(
                 }
             }
             let _ = recording_store;
+            node.forwarding
+                .set_ssh_addrs(&node.routes, ssh_intercept.snapshot());
             ssh_handle
         }
         #[cfg(not(feature = "ssh"))]
@@ -698,8 +678,7 @@ pub(crate) async fn start_mesh(
     let router = crate::accept::spawn(AcceptDeps {
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
-        acl: node.acl.clone(),
-        metrics: metrics.clone(),
+        forwarding: node.forwarding.clone(),
         tun: published.clone(),
         stream_handler,
         #[cfg(feature = "ssh")]
@@ -725,15 +704,10 @@ pub(crate) async fn start_mesh(
         auth_server_ctx,
         paths: node.paths.clone(),
         join_authorities,
-        firewalls,
-        spoofs,
-        dgram_pool: dgram_pool.clone(),
+        peers: node.peers.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
-        ingress: ingress.clone(),
         events: events_tx.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept: ssh_intercept.clone(),
     });
 
     #[cfg(feature = "metrics-serve")]

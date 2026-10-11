@@ -10,14 +10,11 @@ mod actors;
 mod cmds_direct;
 mod conflict;
 mod dataplane;
-mod dgram_pump;
 mod forward;
 mod host_constraints;
-mod ingress;
 mod metrics;
 mod multicast_demand;
 mod platform;
-mod qos;
 pub mod runtime;
 mod system_firewall;
 #[cfg(feature = "local-api")]

@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tunnet_common::policy::Selector;
 use tunnet_common::recording::{RecordingMeta, asciinema_header_line, asciinema_output_event};
 use tunnet_core::recording::dial_recording;
-use tunnet_core::{AclEngine, ConnPool, RoutingTable};
+use tunnet_core::{ConnPool, ForwardingStore, RoutingTable};
 
 use crate::recorder::{ActiveCastWriter, FinalizedCast, RecordingStore};
 
@@ -23,10 +23,11 @@ pub enum RecorderTarget {
 /// Resolve where recordings should be sent for a policy selector.
 pub fn resolve_recorder_target(
     routes: &RoutingTable,
-    acl: &AclEngine,
+    forwarding: &ForwardingStore,
     selector: Option<&Selector>,
 ) -> Option<RecorderTarget> {
-    let self_id = acl.self_id.load();
+    let snap = forwarding.load();
+    let self_id = &snap.self_id;
     let sel = selector
         .cloned()
         .unwrap_or(Selector::Tag("recorder".into()));
