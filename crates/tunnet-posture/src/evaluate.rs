@@ -105,11 +105,11 @@ fn normalize_attribute_key(raw: &str) -> String {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
+    ['\'', '"']
+        .into_iter()
+        .find_map(|quote| s.strip_prefix(quote)?.strip_suffix(quote))
+        .unwrap_or(s)
+        .to_string()
 }
 
 fn parse_operator(s: &str) -> Result<PostureOp, PostureError> {
@@ -394,6 +394,30 @@ mod tests {
         assert_eq!(a.attribute, "device:fileExists:/etc/x");
         assert_eq!(a.operator, PostureOp::Eq);
         assert_eq!(a.value, Some(PostureValue::Bool(true)));
+    }
+
+    #[rstest]
+    #[case::lone_single_quote("device:x == '", "device:x", PostureValue::String("'".into()))]
+    #[case::lone_double_quote("device:x == \"", "device:x", PostureValue::String("\"".into()))]
+    #[case::empty_quoted("device:x == ''", "device:x", PostureValue::String(String::new()))]
+    #[case::lone_quote_list_item(
+        "device:x IN [']",
+        "device:x",
+        PostureValue::StringList(vec!["'".into()])
+    )]
+    #[case::lone_quote_function_arg(
+        "device:fileExists(') == true",
+        "device:fileExists:'",
+        PostureValue::Bool(true)
+    )]
+    fn parses_unbalanced_quotes_verbatim(
+        #[case] input: &str,
+        #[case] expected_attribute: &str,
+        #[case] expected_value: PostureValue,
+    ) {
+        let assertion = parse_assertion(input).unwrap();
+        assert_eq!(assertion.attribute, expected_attribute);
+        assert_eq!(assertion.value, Some(expected_value));
     }
 
     #[test]
