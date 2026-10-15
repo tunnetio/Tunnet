@@ -1,8 +1,6 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
 
-use super::{Fragmentation, Packet, TcpFlags, Transport};
+use super::{Packet, TcpFlags, Transport};
 use crate::policy::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,10 +13,6 @@ pub struct ResolvedL4 {
     pub icmp_id: Option<u16>,
     pub icmp_seq: Option<u16>,
 }
-
-/// Short TTL: fragments of one datagram should arrive quickly.
-pub const FRAGMENT_TTL: Duration = Duration::from_secs(2);
-pub const MAX_FRAGMENT_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FragKey {
@@ -149,115 +143,12 @@ impl ResolvedL4 {
     }
 }
 
-struct Entry {
-    transport: CachedTransport,
-    expires: Instant,
-}
-
-/// Bounded first-fragment cache. Not a reassembly buffer.
-pub struct FragmentTable {
-    map: HashMap<FragKey, Entry>,
-    ttl: Duration,
-    cap: usize,
-}
-
-impl Default for FragmentTable {
-    fn default() -> Self {
-        Self::new(MAX_FRAGMENT_ENTRIES, FRAGMENT_TTL)
-    }
-}
-
-impl FragmentTable {
-    pub fn new(cap: usize, ttl: Duration) -> Self {
-        Self {
-            map: HashMap::with_capacity(cap.min(64)),
-            ttl,
-            cap,
-        }
-    }
-
-    pub fn key_for(packet: &Packet<'_>) -> Option<FragKey> {
-        let identification = packet.fragmentation.identification()?;
-        Some(FragKey {
-            src: packet.ip.src(),
-            dst: packet.ip.dst(),
-            protocol: packet.ip.ip_protocol(),
-            identification,
-        })
-    }
-
-    pub fn remember(&mut self, packet: &Packet<'_>) {
-        if !matches!(packet.fragmentation, Fragmentation::First { .. }) {
-            return;
-        }
-        let Some(key) = Self::key_for(packet) else {
-            return;
-        };
-        let Some(transport) = CachedTransport::from_transport(packet.transport) else {
-            return;
-        };
-        self.evict_expired();
-        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
-            self.evict_oldest();
-        }
-        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
-            return;
-        }
-        self.map.insert(
-            key,
-            Entry {
-                transport,
-                expires: Instant::now() + self.ttl,
-            },
-        );
-    }
-
-    /// Later-fragment lookup. `None` means fail-closed (no trustworthy state).
-    pub fn lookup(&mut self, packet: &Packet<'_>) -> Option<CachedTransport> {
-        let key = Self::key_for(packet)?;
-        self.evict_expired();
-        let entry = self.map.get(&key)?;
-        if Instant::now() >= entry.expires {
-            self.map.remove(&key);
-            return None;
-        }
-        Some(entry.transport)
-    }
-
-    /// First fragments are cached; later fragments require a cache hit (fail-closed).
-    pub fn resolve(&mut self, packet: &Packet<'_>) -> Option<ResolvedL4> {
-        if packet.transport.is_later_fragment() {
-            return self.lookup(packet).map(CachedTransport::to_resolved);
-        }
-        self.remember(packet);
-        ResolvedL4::from_transport(packet.transport)
-    }
-
-    pub fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    pub fn evict_expired(&mut self) {
-        let now = Instant::now();
-        self.map.retain(|_, e| e.expires > now);
-    }
-
-    fn evict_oldest(&mut self) {
-        let oldest = self
-            .map
-            .iter()
-            .min_by_key(|(_, e)| e.expires)
-            .map(|(k, _)| *k);
-        if let Some(k) = oldest {
-            self.map.remove(&k);
-        }
-    }
+pub fn frag_key(packet: &Packet<'_>) -> Option<FragKey> {
+    let identification = packet.fragmentation.identification()?;
+    Some(FragKey {
+        src: packet.ip.src(),
+        dst: packet.ip.dst(),
+        protocol: packet.ip.ip_protocol(),
+        identification,
+    })
 }

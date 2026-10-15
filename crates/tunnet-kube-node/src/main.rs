@@ -221,7 +221,11 @@ async fn main() -> anyhow::Result<()> {
     let node = Arc::new(node);
 
     let stream_handler = match &mode {
-        Mode::Connector(_) => stream_handler(node.routes.clone(), node.acl.clone()),
+        Mode::Connector(_) => stream_handler(
+            node.routes.clone(),
+            node.forwarding.clone(),
+            node.policy.clone(),
+        ),
         _ => noop_stream_handler(),
     };
     let _router = spawn_unified_acceptor(node.clone(), stream_handler);

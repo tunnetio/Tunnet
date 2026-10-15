@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use tunnet_common::ws::ClientMsg;
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, SignedClient};
+use tunnet_core::{ConnPool, ForwardingStore, RoutingTable, SignedClient};
 use uuid::Uuid;
 
 use super::authorize::{
@@ -32,7 +32,7 @@ type PtyResizeMap = HashMap<ChannelId, PtyResizeTx>;
 #[derive(Clone)]
 pub struct SshServeDeps {
     pub routes: RoutingTable,
-    pub acl: AclEngine,
+    pub forwarding: ForwardingStore,
     pub sessions: kameo::actor::ActorRef<SshRegistryActor>,
     pub cp_tx: Option<tokio::sync::mpsc::Sender<ClientMsg>>,
     pub pool: ConnPool,
@@ -102,15 +102,15 @@ impl SshHandler {
                 allowed_users,
             ),
             BindingPolicy::Managed => {
-                let self_id = self.deps.acl.self_id.load();
+                let snap = self.deps.forwarding.load();
                 super::authorize::authorize_managed(
                     &source,
                     self.binding.network_id,
                     &self.binding.network_name,
-                    &self_id.endpoint_hex,
-                    &self_id.tags,
+                    &snap.self_id.endpoint_hex,
+                    &snap.self_id.tags,
                     user,
-                    &self.deps.acl.bundle.load().ssh_rules,
+                    &snap.ssh_rules(),
                 )
             }
         }
@@ -171,7 +171,7 @@ impl SshHandler {
         if recorded {
             let target = resolve_recorder_target(
                 &self.deps.routes,
-                &self.deps.acl,
+                &self.deps.forwarding,
                 recorder_selector.as_ref(),
             );
             match target {
@@ -316,7 +316,7 @@ impl SshHandler {
         let cp_tx = self.deps.cp_tx.clone();
         let store = self.deps.store.clone();
         let signed = self.deps.signed.clone();
-        let acl = self.deps.acl.clone();
+        let forwarding = self.deps.forwarding.clone();
         let peer_hex = authorized.source_endpoint.clone();
         let pty_in = self.pty_in.clone();
         let pty_resize = self.pty_resize.clone();
@@ -357,7 +357,11 @@ impl SshHandler {
                         if let Some(tx) = &cp_tx {
                             let _ = tx.try_send(ClientMsg::SshRecordingSaved {
                                 session_id: meta.session_id.clone(),
-                                recorder_endpoint_id: acl.self_id.load().endpoint_hex.clone(),
+                                recorder_endpoint_id: forwarding
+                                    .load()
+                                    .self_id
+                                    .endpoint_hex
+                                    .clone(),
                                 duration_ms: Some(duration_ms),
                                 byte_size: finalized.byte_size,
                                 content_sha256: finalized.sha256_hex.clone(),

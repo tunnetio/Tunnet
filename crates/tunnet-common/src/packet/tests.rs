@@ -156,28 +156,73 @@ fn first_fragment_keeps_tcp() {
 }
 
 #[test]
-fn fragment_table_fail_closed_and_capacity() {
-    let mut table = FragmentTable::new(2, FRAGMENT_TTL);
+fn fragment_key_distinguishes_identity() {
     let mut first = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 9, 80, &[]);
     first[6] |= 0x20;
     first[4..6].copy_from_slice(&1u16.to_be_bytes());
     let pkt = parse(&first).unwrap();
-    table.remember(&pkt);
+    let key = frag_key(&pkt).unwrap();
 
     let mut later = first.clone();
     later[6] = 0;
     later[7] = 8;
     let later_pkt = parse(&later).unwrap();
     assert!(later_pkt.transport.is_later_fragment());
-    let cached = table.lookup(&later_pkt).unwrap();
-    assert_eq!(cached.dst_port(), Some(80));
+    assert_eq!(frag_key(&later_pkt).unwrap(), key);
 
     let mut orphan = first.clone();
     orphan[4..6].copy_from_slice(&99u16.to_be_bytes());
     orphan[6] = 0;
     orphan[7] = 8;
     let orphan_pkt = parse(&orphan).unwrap();
-    assert!(table.lookup(&orphan_pkt).is_none());
+    assert_ne!(frag_key(&orphan_pkt).unwrap(), key);
+}
+
+#[test]
+fn mss_clamp_rewrites_syn_option() {
+    let mut p = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 80, &[]);
+    p[33] |= 0x02;
+    p.splice(40..40, [2, 4, 0x05, 0xb4]);
+    p[20 + 12] = (p[20 + 12] & 0x0f) | 0x60;
+    let total = p.len() as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    assert!(clamp_tcp_mss(&mut p, 1104));
+    assert_eq!(&p[42..44], &1104u16.to_be_bytes());
+    let parsed = parse(&p).unwrap();
+    match parsed.transport {
+        Transport::Tcp { dst_port, .. } => assert_eq!(dst_port, 80),
+        other => panic!("{other:?}"),
+    }
+    assert!(tcp_ipv4_checksum_of(&p).is_some());
+}
+
+#[test]
+fn mss_clamp_leaves_small_mss_and_non_syn() {
+    let mut p = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 80, &[]);
+    p[33] |= 0x02;
+    p.splice(40..40, [2, 4, 0x02, 0x18]);
+    p[20 + 12] = (p[20 + 12] & 0x0f) | 0x60;
+    let total = p.len() as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    assert!(!clamp_tcp_mss(&mut p, 1104));
+    p[33] &= !0x02;
+    assert!(!clamp_tcp_mss(&mut p, 100));
+}
+
+#[test]
+fn frag_needed_quotes_header_and_mtu() {
+    let p = ipv4_tcp([10, 0, 0, 1], [10, 0, 0, 2], 40000, 80, &[0u8; 100]);
+    let reply = synthesize_frag_needed(&p, 1222).unwrap();
+    let parsed = parse(&reply).unwrap();
+    assert_eq!(parsed.ip.v4_src().unwrap().to_string(), "10.0.0.2");
+    assert_eq!(parsed.ip.v4_dst().unwrap().to_string(), "10.0.0.1");
+    match parsed.transport {
+        Transport::Icmpv4 { type_u8, code, .. } => {
+            assert_eq!((type_u8, code), (3, 4));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(reply.len() > 28);
 }
 
 #[test]

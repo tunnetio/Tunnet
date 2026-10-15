@@ -1,42 +1,26 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
 use bytes::Bytes;
+use iroh::EndpointId;
 use iroh::endpoint::Connection;
 use tun_rs::AsyncDevice;
 #[cfg(not(target_os = "android"))]
 use tun_rs::DeviceBuilder;
-use tunnet_common::packet::{self, Packet};
-use tunnet_common::policy::Direction;
-use tunnet_core::direct::{
-    AuthCache, EvalResult, FirewallEngine, PacketDirection, SpoofTracker, source_matches_peer,
+use tunnet_core::forward::{
+    FRAME_OVERHEAD, InDecision, OutDecision, frame, inbound_frame, outbound,
 };
-use tunnet_core::{AclEngine, ConnPool, RoutingTable, iroh_pool::send_datagram};
-use uuid::Uuid;
+use tunnet_core::peer::{SessionCtl, send_datagram};
+use tunnet_core::{ForwardingStore, PeerManager, PolicyEngine};
 
 use crate::actors::dataplane::PublishedPlane;
 use crate::metrics::AgentMetrics;
-use crate::qos::{self, OutboundScheduler};
 
-/// Datagrams taken from the connection per read.
-///
-/// `read_many_datagrams` drains its whole argument under one connection lock
-/// hold, so an ingress burst costs one lock instead of one per packet. Sized to
-/// hold a forwarding window at tunnel MTU without parking a large buffer on
-/// every reader.
 const INGRESS_BATCH: usize = 32;
+const OUTBOUND_DRAIN_MAX: usize = 64;
+const DNS_QUEUE: usize = 64;
+const DNS_WORKERS: usize = 4;
 
-/// Ask the app's `VpnService` to establish a tunnel, then adopt its descriptor.
-///
-/// The interface name is meaningless on Android (the framework names it `tunN`)
-/// and addressing is applied by `VpnService.Builder`, so those parameters are
-/// forwarded to the app rather than applied here.
-///
-/// `routes` matters here in a way it does not on other platforms. Desktop
-/// installs per-peer routes into the kernel table itself, but on Android the
-/// framework owns routing and accepts it only at `establish()` time, so the
-/// destinations to capture must be declared up front.
 #[cfg(target_os = "android")]
 pub fn build_tun_multi(
     ifname: &str,
@@ -67,11 +51,6 @@ pub fn build_tun_multi(
         allow_ipv6_passthrough: true,
         inherit_underlying_metered: true,
     })?;
-    // SAFETY: the descriptor is owned (detachFd on the JVM side) and valid;
-    // Borrow for the call and only give up ownership once it succeeded: on
-    // failure `fd` still owns the descriptor and closes on drop, where
-    // `into_raw_fd()` up front would leak it and leave the framework tunnel
-    // established with nothing reading it.
     let raw = fd.as_raw_fd();
     let dev = match unsafe { AsyncDevice::from_fd(raw) } {
         Ok(dev) => {
@@ -84,9 +63,6 @@ pub fn build_tun_multi(
     Ok(dev)
 }
 
-/// Split-tunnel destinations for Android `VpnService`: overlay peer CIDRs
-/// plus the in-TUN resolver host route. Default routes are dropped so iroh
-/// relay/direct underlay stays on the OS table (no `VpnService.protect`).
 #[cfg(any(target_os = "android", test))]
 pub(crate) fn android_vpn_capture_routes(peer_cidrs: &[ipnet::Ipv4Net]) -> Vec<ipnet::Ipv4Net> {
     let dns = tunnet_common::VirtualResolverEndpoint::IP;
@@ -102,8 +78,6 @@ pub(crate) fn android_vpn_capture_routes(peer_cidrs: &[ipnet::Ipv4Net]) -> Vec<i
     out
 }
 
-/// `routes` is unused here: desktop platforms install peer routes into the
-/// kernel routing table separately, rather than declaring them on the device.
 #[cfg(not(target_os = "android"))]
 pub fn build_tun_multi(
     ifname: &str,
@@ -136,320 +110,316 @@ pub fn build_tun_multi(
     Ok(dev)
 }
 
+#[derive(Clone)]
+pub struct DnsPool {
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+}
+
+impl DnsPool {
+    pub fn new(device: Arc<AsyncDevice>, dns: Arc<tunnet_core::dns::InTun>) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(DNS_QUEUE);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        for _ in 0..DNS_WORKERS {
+            let rx = rx.clone();
+            let device = device.clone();
+            let dns = dns.clone();
+            tokio::spawn(async move {
+                loop {
+                    let query: Option<Bytes> = rx.lock().await.recv().await;
+                    let Some(query) = query else { break };
+                    for reply in dns.handle(&query).await {
+                        if device.send(&reply).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        Self { tx }
+    }
+
+    pub fn submit(&self, query: Bytes) -> bool {
+        self.tx.try_send(query).is_ok()
+    }
+}
+
 pub struct OutboundDeps {
     pub tun: Arc<AsyncDevice>,
-    pub routes: RoutingTable,
-    pub pool: ConnPool,
-    pub acl: AclEngine,
-    pub firewalls: HashMap<Uuid, FirewallEngine>,
+    pub peers: PeerManager,
+    pub policy: PolicyEngine,
+    pub forwarding: ForwardingStore,
     pub metrics: AgentMetrics,
-    pub mtu: u16,
-    pub in_tun_dns: Option<std::sync::Arc<tunnet_core::dns::InTun>>,
-    #[cfg(feature = "ssh")]
-    pub ssh_intercept: crate::ssh::SshIntercept,
-}
-
-fn drop_parse(metrics: &AgentMetrics, err: packet::ParseError) {
-    metrics.dropped_inc(err.drop_reason());
-}
-
-fn require_ipv4<'a>(metrics: &AgentMetrics, pkt: Packet<'a>, inbound: bool) -> Option<Packet<'a>> {
-    if pkt.ip.v4_src().is_none() {
-        metrics.dropped_inc(if inbound {
-            "ipv6_unsupported_in"
-        } else {
-            "ipv6_unsupported"
-        });
-        return None;
-    }
-    Some(pkt)
+    pub dns: DnsPool,
 }
 
 pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     let OutboundDeps {
         tun,
-        routes,
-        pool,
-        acl,
-        firewalls,
+        peers,
+        policy,
+        forwarding,
         metrics,
-        mtu,
-        in_tun_dns,
-        #[cfg(feature = "ssh")]
-        ssh_intercept,
+        dns,
     } = deps;
 
-    let scheduler = OutboundScheduler::new(pool.clone(), metrics.clone(), mtu);
-
     let mut buf = vec![0u8; 65_536];
-    tracing::info!("outbound TUN→iroh Byte-DRR loop started");
+    let mut pool: Vec<Vec<u8>> = Vec::new();
+    let mut batch: Vec<Vec<u8>> = Vec::with_capacity(OUTBOUND_DRAIN_MAX);
+    let mut by_peer: std::collections::HashMap<EndpointId, Vec<Bytes>> =
+        std::collections::HashMap::new();
+    tracing::info!("outbound TUN→iroh loop started");
     loop {
-        let n = tun.recv(&mut buf).await?;
-        if n == 0 {
-            continue;
-        }
-        let self_ip = acl.self_id.load().ip;
-        #[cfg(feature = "ssh")]
-        let _ = crate::ssh::rewrite_outbound(&mut buf[..n], &ssh_intercept);
-        let packet = &buf[..n];
-        let pkt = match packet::parse(packet) {
-            Ok(p) => p,
-            Err(e) => {
-                drop_parse(&metrics, e);
-                continue;
+        batch.clear();
+        drain_tun(&tun, &mut buf, &mut pool, &mut batch);
+        if batch.is_empty() {
+            let n = tun.recv(&mut buf).await?;
+            if n > 0 {
+                batch.push(take_packet(&mut pool, &buf[..n]));
             }
-        };
-        let Some(pkt) = require_ipv4(&metrics, pkt, false) else {
+            drain_tun(&tun, &mut buf, &mut pool, &mut batch);
+        }
+        if batch.is_empty() {
             continue;
-        };
-
-        if let Some(dns) = &in_tun_dns
-            && tunnet_core::dns::targets_virtual_resolver(&pkt)
-        {
-            let dns = dns.clone();
-            let tun = tun.clone();
-            let raw = packet.to_vec();
-            tokio::spawn(async move {
-                for reply in dns.handle(&raw).await {
-                    let _ = tun.send(&reply).await;
+        }
+        metrics.batch_observe("tun_read", batch.len() as u64);
+        let snap = forwarding.load();
+        let tun_mtu = snap.tun_mtu;
+        by_peer.clear();
+        let mut admitted = 0u64;
+        let mut admitted_bytes = 0u64;
+        for mut raw in batch.drain(..) {
+            let decision = loop {
+                match outbound(&snap, &policy, &raw) {
+                    OutDecision::RewriteSsh(rewrite) => {
+                        raw[rewrite.port_offset] = (rewrite.port >> 8) as u8;
+                        raw[rewrite.port_offset + 1] = (rewrite.port & 0xff) as u8;
+                        tunnet_common::packet::set_tcp_ipv4_checksum(
+                            &mut raw,
+                            rewrite.ip_header_len,
+                        );
+                    }
+                    d => break d,
                 }
-            });
-            continue;
-        }
-
-        let dst = pkt.ip.v4_dst().unwrap();
-
-        if routes.is_advertised_destination(&dst) {
-            metrics.dropped_inc("local_subnet");
-            continue;
-        }
-
-        let Some(peer) = routes.lookup_ip(&dst) else {
-            metrics.dropped_inc("no_route");
-            continue;
-        };
-
-        if peer.ip == self_ip {
-            metrics.dropped_inc("self");
-            continue;
-        }
-
-        if !acl.allow_packet(&peer.endpoint_hex, Direction::Outbound, &pkt) {
-            metrics.dropped_inc("policy_deny");
-            continue;
-        }
-
-        if let Some(fw) = firewalls.get(&peer.network_id) {
-            match fw.evaluate(
-                PacketDirection::Outbound,
-                &pkt,
-                Some(&peer.endpoint_hex),
-                Some(&peer.hostname),
-                Some(peer.network_id),
-            ) {
-                EvalResult::Allow => {}
-                EvalResult::Deny => {
-                    metrics.dropped_inc("fw_deny_out");
-                    continue;
+            };
+            match decision {
+                OutDecision::Forward { peer, network } => {
+                    let framed_len = raw.len() + FRAME_OVERHEAD;
+                    let max_dg = peers.conn_max_datagram_size(peer);
+                    if let Some(max) = max_dg
+                        && framed_len > max
+                    {
+                        let mtu = (max.saturating_sub(FRAME_OVERHEAD).max(576) as u16).min(tun_mtu);
+                        metrics.dropped_inc("datagram_too_large");
+                        if let Some(reply) =
+                            tunnet_common::packet::synthesize_frag_needed(&raw, mtu)
+                        {
+                            let _ = tun.send(&reply).await;
+                        }
+                    } else {
+                        let budget = max_dg
+                            .map(|m| m.saturating_sub(FRAME_OVERHEAD + 40))
+                            .unwrap_or(tun_mtu as usize - 58);
+                        let mss = budget.clamp(536, 9000) as u16;
+                        tunnet_common::packet::clamp_tcp_mss(&mut raw, mss);
+                        by_peer.entry(peer).or_default().push(frame(network, &raw));
+                    }
                 }
-                EvalResult::Reject { reply } => {
+                OutDecision::LocalDns => {
+                    if !dns.submit(Bytes::copy_from_slice(&raw)) {
+                        metrics.dropped_inc("dns_queue_full");
+                    }
+                }
+                OutDecision::RewriteSsh(_) => {}
+                OutDecision::Reject { reply } => {
                     metrics.dropped_inc("fw_reject_out");
                     if !reply.is_empty() {
                         let _ = tun.send(&reply).await;
                     }
-                    continue;
                 }
+                OutDecision::Drop { reason } => metrics.dropped_inc(reason),
+            }
+            pool.push(raw);
+        }
+        let mut queue_full = 0u64;
+        for (peer, packets) in by_peer.drain() {
+            let outcome = peers.send_batch(peer, packets);
+            admitted += outcome.admitted as u64;
+            admitted_bytes += outcome.admitted_bytes;
+            queue_full += outcome.queue_full as u64;
+            if outcome.blocked {
+                metrics.dropped_inc("policy_deny");
+            }
+            if outcome.closed {
+                metrics.dropped_inc("dataplane_down");
             }
         }
-
-        let class = qos::classify(&pkt, mtu);
-        let payload = Bytes::copy_from_slice(packet);
-        scheduler.enqueue(peer.endpoint, class, payload);
+        if queue_full > 0 {
+            metrics.dropped_add("queue_full", queue_full);
+        }
+        if admitted > 0 {
+            metrics.packets_add("out", admitted);
+            metrics.bytes_add("out", admitted_bytes);
+        }
+        tokio::task::yield_now().await;
     }
 }
 
-pub struct InboundDeps {
-    pub conn: Connection,
-    pub tun: PublishedPlane,
-    pub routes: RoutingTable,
-    pub acl: AclEngine,
-    pub firewalls: HashMap<Uuid, FirewallEngine>,
-    pub spoofs: HashMap<Uuid, SpoofTracker>,
-    pub pool: Option<ConnPool>,
-    pub metrics: AgentMetrics,
-    pub direct_auth: Option<AuthCache>,
-    #[cfg(feature = "ssh")]
-    pub ssh_intercept: crate::ssh::SshIntercept,
+fn take_packet(pool: &mut Vec<Vec<u8>>, data: &[u8]) -> Vec<u8> {
+    let mut owned = pool.pop().unwrap_or_default();
+    owned.clear();
+    owned.extend_from_slice(data);
+    owned
 }
 
-pub async fn serve_tunnel_connection(deps: InboundDeps) {
-    let InboundDeps {
-        conn,
+fn drain_tun(
+    tun: &Arc<AsyncDevice>,
+    buf: &mut [u8],
+    pool: &mut Vec<Vec<u8>>,
+    batch: &mut Vec<Vec<u8>>,
+) {
+    while batch.len() < OUTBOUND_DRAIN_MAX {
+        match tun.try_recv(buf) {
+            Ok(m) if m > 0 => batch.push(take_packet(pool, &buf[..m])),
+            _ => break,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionInbound {
+    pub tun: PublishedPlane,
+    pub peers: PeerManager,
+    pub policy: PolicyEngine,
+    pub forwarding: ForwardingStore,
+    pub metrics: AgentMetrics,
+}
+
+pub async fn serve_tunnel_connection(
+    peer: EndpointId,
+    conn: Connection,
+    ctl: SessionCtl,
+    deps: SessionInbound,
+) {
+    serve_tunnel_connection_inner(peer, conn, &ctl, deps).await;
+    ctl.finished();
+}
+
+async fn serve_tunnel_connection_inner(
+    peer: EndpointId,
+    conn: Connection,
+    ctl: &SessionCtl,
+    deps: SessionInbound,
+) {
+    let SessionInbound {
         tun,
-        routes,
-        acl,
-        firewalls,
-        spoofs,
-        pool,
+        peers,
+        policy,
+        forwarding,
         metrics,
-        direct_auth,
-        #[cfg(feature = "ssh")]
-        ssh_intercept,
     } = deps;
     let remote_id = conn.remote_id();
-    let remote_hex = format!("{remote_id}");
+    debug_assert_eq!(peer, remote_id);
     tracing::info!(%remote_id, "peer connected");
     metrics.active_conns_inc();
-    if let Some(p) = &pool {
-        p.touch_peer(remote_id);
-        if !p.adopt(remote_id, conn.clone()).await {
-            tracing::debug!(%remote_id, "ingress conn lost tie-break; exiting reader");
-            metrics.active_conns_dec();
-            return;
-        }
-        if let Some(max) = conn.max_datagram_size() {
-            tracing::debug!(%remote_id, max_datagram_size = max, "quic datagram limit");
-        }
+    if let Some(max) = conn.max_datagram_size() {
+        tracing::debug!(%remote_id, max_datagram_size = max, "quic datagram limit");
     }
-    let inbound_network = direct_auth
-        .as_ref()
-        .and_then(|a| a.networks_for(&remote_hex).into_iter().next())
-        .or_else(|| routes.lookup_endpoint(&remote_hex).map(|p| p.network_id));
 
-    // Load the published generation once. Retain the device + its exact
-    // cancellation token; never reacquire a global lock per packet and never
-    // observe a newer generation.
     let Some(plane) = tun.load_full() else {
+        metrics.active_conns_dec();
         return;
     };
     let device = plane.device.clone();
     let generation_cancel = plane.cancel.clone();
-    // Pinned at reader start: this task never observes a newer generation.
     tracing::debug!(generation = plane.generation, %remote_id, "ingress reader pinned");
 
     let mut batch: [Bytes; INGRESS_BATCH] = std::array::from_fn(|_| Bytes::new());
+    let mut scratch: Vec<u8> = Vec::new();
     'read: loop {
         if generation_cancel.is_cancelled() {
             break;
         }
-        // Cancellation first so BringDown promptly stops old readers.
         let received = tokio::select! {
             biased;
             _ = generation_cancel.cancelled() => break,
+            _ = async {
+                match ctl.cancel() {
+                    Some(cancel) => cancel.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => break,
             res = conn.read_many_datagrams(&mut batch) => match res {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::debug!(?e, "read_datagram closed");
-                    break;
+                    break 'read;
                 }
             },
         };
         if generation_cancel.is_cancelled() {
             break;
         }
-        // Release the previous round's datagrams before holding the new ones.
         batch[received..].fill(Bytes::new());
+        if received > 0 {
+            metrics.batch_observe("quic_read", received as u64);
+        }
+        let snap = forwarding.load();
+        let mut admitted = 0u64;
+        let mut admitted_bytes = 0u64;
         for dg in &batch[..received] {
-            #[allow(clippy::collapsible_if)]
-            if let Some(p) = &pool {
-                p.touch_peer(remote_id);
-            }
-
-            let pkt = match packet::parse(dg) {
-                Ok(p) => p,
-                Err(e) => {
-                    drop_parse(&metrics, e);
-                    continue;
-                }
-            };
-            let Some(pkt) = require_ipv4(&metrics, pkt, true) else {
-                continue;
-            };
-            let src = pkt.ip.v4_src().unwrap();
-
-            let peer_info = inbound_network
-                .and_then(|nid| routes.lookup_network_ip(nid, &src))
-                .or_else(|| routes.lookup_endpoint(&remote_hex));
-
-            if let Some(peer_info) = &peer_info
-                && !source_matches_peer(src, peer_info.ip)
-            {
-                metrics.dropped_inc("antispoof");
-                if let Some(nid) = inbound_network.or(Some(peer_info.network_id))
-                    && let Some(tracker) = spoofs.get(&nid)
-                    && tracker.record(&remote_hex)
-                {
-                    let counts = tracker.drain_window_counts();
-                    for (peer, n) in counts {
-                        tracing::warn!(
-                            peer = %peer,
-                            spoofed_packets = n,
-                            "ingress anti-spoof drops in last window"
-                        );
+            match inbound_frame(&snap, &policy, dg, remote_id) {
+                InDecision::ToTun { ip, ssh } => {
+                    let n = ip.len() as u64;
+                    if generation_cancel.is_cancelled() {
+                        break 'read;
                     }
-                }
-                continue;
-            }
-
-            if !acl.allow_packet(&remote_hex, Direction::Inbound, &pkt) {
-                metrics.dropped_inc("policy_deny_in");
-                continue;
-            }
-
-            let peer_net = peer_info.as_ref().map(|p| p.network_id).or(inbound_network);
-            if let Some(nid) = peer_net
-                && let Some(fw) = firewalls.get(&nid)
-            {
-                match fw.evaluate(
-                    PacketDirection::Inbound,
-                    &pkt,
-                    Some(&remote_hex),
-                    peer_info.as_ref().map(|p| p.hostname.as_str()),
-                    Some(nid),
-                ) {
-                    EvalResult::Allow => {}
-                    EvalResult::Deny => {
-                        metrics.dropped_inc("fw_deny_in");
-                        continue;
-                    }
-                    EvalResult::Reject { reply } => {
-                        metrics.dropped_inc("fw_reject_in");
-                        if !reply.is_empty() {
-                            let _ = send_datagram(&conn, reply).await;
+                    let payload: &[u8] = match ssh {
+                        Some(rewrite) => {
+                            scratch.clear();
+                            scratch.extend_from_slice(ip);
+                            scratch[rewrite.port_offset] = (rewrite.port >> 8) as u8;
+                            scratch[rewrite.port_offset + 1] = (rewrite.port & 0xff) as u8;
+                            tunnet_common::packet::set_tcp_ipv4_checksum(
+                                &mut scratch,
+                                rewrite.ip_header_len,
+                            );
+                            &scratch
                         }
+                        None => ip,
+                    };
+                    if device.send(payload).await.is_err() {
+                        tracing::debug!("tun send failed");
+                        metrics.dropped_inc("tun_send_failed");
                         continue;
                     }
+                    admitted += 1;
+                    admitted_bytes += n;
                 }
+                InDecision::Reject { reply } => {
+                    metrics.dropped_inc("fw_reject_in");
+                    if !reply.is_empty() {
+                        let _ = send_datagram(&conn, reply).await;
+                    }
+                }
+                InDecision::Spoof { network } => {
+                    metrics.dropped_inc("antispoof");
+                    if policy.record_spoof(network, &remote_id.to_string()) {
+                        for (p, n) in policy.drain_spoof(network) {
+                            tracing::warn!(
+                                peer = %p,
+                                spoofed_packets = n,
+                                "ingress anti-spoof drops in last window"
+                            );
+                        }
+                    }
+                }
+                InDecision::Drop { reason } => metrics.dropped_inc(reason),
             }
-
-            let n = dg.len() as u64;
-            #[cfg(feature = "ssh")]
-            // Generation already verified: device + token belong to the
-            // generation loaded at reader start. Recheck cancellation
-            // (not a lock) before the send so BringDown wins races.
-            if generation_cancel.is_cancelled() {
-                break 'read;
-            }
-            #[cfg(feature = "ssh")]
-            let send_result = if crate::ssh::rewrite_inbound_needed(dg, &ssh_intercept) {
-                let mut packet = dg.to_vec();
-                let _ = crate::ssh::rewrite_inbound(&mut packet, &ssh_intercept);
-                device.send(&packet).await
-            } else {
-                device.send(dg.as_ref()).await
-            };
-            #[cfg(not(feature = "ssh"))]
-            let send_result = device.send(dg.as_ref()).await;
-            if let Err(e) = send_result {
-                tracing::warn!(?e, "tun send failed");
-                metrics.dropped_inc("tun_send_failed");
-                break 'read;
-            }
-            metrics.packets_inc("in");
-            metrics.bytes_add("in", n);
-            if let Some(p) = &pool {
-                p.record_bytes_in(remote_id, n);
-            }
+        }
+        if admitted > 0 {
+            metrics.packets_add("in", admitted);
+            metrics.bytes_add("in", admitted_bytes);
+            peers.record_bytes_in(remote_id, admitted_bytes);
         }
     }
     metrics.active_conns_dec();
@@ -459,10 +429,11 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
 #[cfg(test)]
 mod android_vpn_route_tests {
     use super::android_vpn_capture_routes;
-    use std::net::Ipv4Addr;
 
     #[test]
     fn capture_routes_are_overlay_plus_virtual_dns_not_default() {
+        use std::net::Ipv4Addr;
+
         let overlay: ipnet::Ipv4Net = "10.38.0.0/16".parse().unwrap();
         let routes = android_vpn_capture_routes(&[overlay]);
         assert!(routes.contains(&overlay));

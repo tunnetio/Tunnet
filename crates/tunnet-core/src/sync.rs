@@ -9,8 +9,8 @@ use tunnet_common::ws::{ClientMsg, ServerMsg};
 use tunnet_common::{EndpointSnapshot, NetworkMembershipSnapshot};
 use uuid::Uuid;
 
-use crate::acl::AclEngine;
 use crate::control::SignedClient;
+use crate::forward::{ForwardingStore, SelfIdentity};
 use crate::routing::RoutingTable;
 use crate::state::{StatePaths, save_snapshot_cache};
 
@@ -98,22 +98,22 @@ fn parse_policy_vk(hex_key: Option<&str>) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).ok()
 }
 
-/// Verify org + network bundle signatures, then merge into the effective ACL.
-/// On bad signature: keep last-good routes and ACL (do not replace).
+/// Verify org + network bundle signatures, then merge into the effective forwarding policy.
+/// On bad signature: keep last-good routes and policy (do not replace).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_membership(
     membership: &NetworkMembershipSnapshot,
     org_policy: &PolicyBundle,
     policy_verifying_key: Option<&str>,
     routes: &RoutingTable,
-    acl: &AclEngine,
+    forward: &ForwardingStore,
     revisions: &Arc<ManagedRevisions>,
     org_version: u64,
     self_endpoint_id: &str,
     self_hostname: &str,
     known_hosts_file: Option<&std::path::Path>,
 ) -> bool {
-    // Verify policy signatures BEFORE mutating routes/ACL.
+    // Verify policy signatures BEFORE mutating routes/forwarding state.
     if let Some(vk) = parse_policy_vk(policy_verifying_key) {
         if let Err(e) = verify_policy_bundle_signature(&membership.policy, &vk) {
             tracing::warn!(
@@ -171,8 +171,17 @@ pub fn apply_membership(
                 self_endpoint_id,
                 membership.version,
             );
-            acl.replace_bundle(merged);
-            acl.replace_self_tags(membership.self_tags.clone());
+            forward.set_managed_bundle(
+                routes,
+                membership.network_id,
+                merged,
+                SelfIdentity {
+                    endpoint_hex: self_endpoint_id.to_string(),
+                    ip: membership.assigned_ipv4,
+                    tags: membership.self_tags.clone(),
+                    network: membership.network_name.clone(),
+                },
+            );
         },
     );
     if !applied {
@@ -215,7 +224,7 @@ pub fn apply_delta(
 /// Agent daemons use `ControlPlaneActor` instead; SDK/kube-node use this.
 pub struct ManagedDriverCtx {
     pub routes: RoutingTable,
-    pub acl: AclEngine,
+    pub forward: ForwardingStore,
     pub revisions: Arc<ManagedRevisions>,
     pub paths: StatePaths,
     pub network_id: Uuid,
@@ -231,7 +240,7 @@ pub struct ManagedDriverCtx {
     pub tunnels: Option<crate::tunnel::TunnelManager>,
     #[cfg(feature = "send")]
     pub send: Option<crate::send::SendManager>,
-    pub tunnel_pool: Option<crate::iroh_pool::ConnPool>,
+    pub peers: Option<crate::peer::PeerManager>,
     pub pool: Option<crate::iroh_pool::ConnPool>,
     pub effective_config: Option<crate::EffectiveConfigStore>,
 }
@@ -248,7 +257,7 @@ impl ManagedDriverCtx {
     ) -> Self {
         Self {
             routes: node.routes.clone(),
-            acl: node.acl.clone(),
+            forward: node.forwarding.clone(),
             revisions: node.revisions.clone(),
             paths: node.paths.clone(),
             network_id,
@@ -263,7 +272,7 @@ impl ManagedDriverCtx {
             tunnels: Some(node.tunnels.clone()),
             #[cfg(feature = "send")]
             send: Some(node.send.clone()),
-            tunnel_pool: Some(node.tunnel_pool.clone()),
+            peers: Some(node.peers.clone()),
             pool: Some(node.pool.clone()),
             effective_config: Some(node.effective_config.clone()),
         }
@@ -277,7 +286,7 @@ pub fn spawn_managed_driver(
     tokio::spawn(async move {
         let ManagedDriverCtx {
             routes,
-            acl,
+            forward,
             revisions,
             paths,
             network_id,
@@ -292,7 +301,7 @@ pub fn spawn_managed_driver(
             tunnels,
             #[cfg(feature = "send")]
             send,
-            tunnel_pool,
+            peers,
             pool,
             effective_config,
         } = ctx;
@@ -318,8 +327,7 @@ pub fn spawn_managed_driver(
                 known_version: revisions.load().org.0,
             })
             .await;
-        let pools: Vec<crate::iroh_pool::ConnPool> =
-            pool.into_iter().chain(tunnel_pool.clone()).collect();
+        let pools: Vec<crate::iroh_pool::ConnPool> = pool.into_iter().collect();
 
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -337,7 +345,7 @@ pub fn spawn_managed_driver(
                             client,
                             &revisions,
                             &routes,
-                            &acl,
+                            &forward,
                             network_id,
                             &self_endpoint_id,
                             &self_hostname,
@@ -356,7 +364,7 @@ pub fn spawn_managed_driver(
                                     &snap.org_policy,
                                     snap.policy_verifying_key.as_deref(),
                                     &routes,
-                                    &acl,
+                                    &forward,
                                     &revisions,
                                     snap.version,
                                     &self_endpoint_id,
@@ -365,8 +373,8 @@ pub fn spawn_managed_driver(
                                 ) {
                                     continue;
                                 }
-                                if let Some(pool) = tunnel_pool.as_ref() {
-                                    pool.set_cloud_relay_urls(
+                                if let Some(peers) = peers.as_ref() {
+                                    peers.set_cloud_relay_urls(
                                         snap.connectivity_relays
                                             .iter()
                                             .filter(|r| r.metering)
@@ -375,6 +383,9 @@ pub fn spawn_managed_driver(
                                 }
                                 for p in &pools {
                                     p.reconcile().await;
+                                }
+                                if let Some(peers) = peers.as_ref() {
+                                    peers.reconcile().await;
                                 }
                                 save_snapshot_cache(&paths, &snap).ok();
                                 tracing::info!(
@@ -406,9 +417,14 @@ pub fn spawn_managed_driver(
                                 .is_some_and(|network| revisions.accept_absence(snap.version, *network))
                             {
                                 routes.clear_managed(network_id, &self_endpoint_id);
+                                forward.clear_managed(&routes, network_id);
                                 for p in &pools {
                                     p.reconcile().await;
                                     p.close_all().await;
+                                }
+                                if let Some(peers) = peers.as_ref() {
+                                    peers.reconcile().await;
+                                    peers.close_all().await;
                                 }
                                 save_snapshot_cache(&paths, &snap).ok();
                                 if let Some(store) = &effective_config {
@@ -448,6 +464,10 @@ pub fn spawn_managed_driver(
                             for p in &pools {
                                 p.reconcile().await;
                             }
+                            forward.republish(&routes);
+                            if let Some(peers) = peers.as_ref() {
+                                peers.reconcile().await;
+                            }
                         }
                         ServerMsg::MembershipRevoked {
                             network_id: revoked_network_id,
@@ -459,9 +479,14 @@ pub fn spawn_managed_driver(
                                 && revisions.accept_absence(org_revision, network_revision)
                             {
                                 routes.clear_managed(network_id, &self_endpoint_id);
+                                forward.clear_managed(&routes, network_id);
                                 for pool in &pools {
                                     pool.reconcile().await;
                                     pool.close_all().await;
+                                }
+                                if let Some(peers) = peers.as_ref() {
+                                    peers.reconcile().await;
+                                    peers.close_all().await;
                                 }
                                 tracing::warn!(%network_id, %reason, "managed membership revoked");
                             }
@@ -484,7 +509,7 @@ pub fn spawn_managed_driver(
                                                 &snap.org_policy,
                                                 snap.policy_verifying_key.as_deref(),
                                                 &routes,
-                                                &acl,
+                                                &forward,
                                                 &revisions,
                                                 snap.version,
                                                 &self_endpoint_id,
@@ -495,6 +520,9 @@ pub fn spawn_managed_driver(
                                             }
                                             for p in &pools {
                                                 p.reconcile().await;
+                                            }
+                                            if let Some(peers) = peers.as_ref() {
+                                                peers.reconcile().await;
                                             }
                                             save_snapshot_cache(&paths, &snap).ok();
                                             tracing::info!(
@@ -824,7 +852,7 @@ pub fn spawn_managed_driver(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    let (active_conns, bytes_tx, bytes_rx) = tunnel_pool
+                    let (active_conns, bytes_tx, bytes_rx) = peers
                         .as_ref()
                         .map(|p| p.heartbeat_counters())
                         .unwrap_or((0, 0, 0));
@@ -833,8 +861,8 @@ pub fn spawn_managed_driver(
                         bytes_tx,
                         bytes_rx,
                     }).await;
-                    if let Some(pool) = tunnel_pool.as_ref() {
-                        let bytes = pool.cloud_relay_meter().take();
+                    if let Some(peers) = peers.as_ref() {
+                        let bytes = peers.cloud_relay_meter().take();
                         if bytes > 0 {
                             let _ = client_tx.send(ClientMsg::CloudRelayUsage { bytes }).await;
                         }
@@ -859,7 +887,7 @@ pub async fn poll_once(
     client: &SignedClient,
     revisions: &Arc<ManagedRevisions>,
     routes: &RoutingTable,
-    acl: &AclEngine,
+    forward: &ForwardingStore,
     network_id: Uuid,
     self_endpoint_id: &str,
     self_hostname: &str,
@@ -874,7 +902,7 @@ pub async fn poll_once(
                     &snap.org_policy,
                     snap.policy_verifying_key.as_deref(),
                     routes,
-                    acl,
+                    forward,
                     revisions,
                     snap.version,
                     self_endpoint_id,
@@ -906,6 +934,7 @@ pub async fn poll_once(
                 .is_some_and(|network| revisions.accept_absence(snap.version, *network))
             {
                 routes.clear_managed(network_id, self_endpoint_id);
+                forward.clear_managed(routes, network_id);
                 for pool in pools {
                     pool.reconcile().await;
                     pool.close_all().await;
@@ -913,7 +942,7 @@ pub async fn poll_once(
             }
         }
         Err(e) => {
-            acl.mark_stale();
+            forward.set_stale(true);
             tracing::warn!(?e, "poll failed");
         }
     }
@@ -972,16 +1001,7 @@ mod tests {
 
         let routes = RoutingTable::new();
         let self_id = "a".repeat(64);
-        let acl = AclEngine::new(
-            crate::acl::SelfIdentity {
-                endpoint_hex: self_id.clone(),
-                ip: "10.7.0.1".parse().unwrap(),
-                tags: vec![],
-                network: "office".into(),
-            },
-            routes.clone(),
-            PolicyBundle::default(),
-        );
+        let forward = ForwardingStore::new();
         let revisions = Arc::new(ManagedRevisions::new(7, 100));
         for (network_revision, default_action) in [
             (101, DefaultAction::Deny),
@@ -999,14 +1019,20 @@ mod tests {
                 &PolicyBundle::default(),
                 None,
                 &routes,
-                &acl,
+                &forward,
                 &revisions,
                 8,
                 &self_id,
                 "self",
                 None,
             ));
-            assert_eq!(acl.policy_version(), network_revision);
+            let snap = forward.load();
+            let crate::forward::NetworkPolicy::Managed { bundle } =
+                snap.policy_for(Uuid::nil()).expect("managed policy")
+            else {
+                panic!("expected managed policy");
+            };
+            assert_eq!(bundle.version, network_revision);
         }
         assert_eq!(revisions.load().org, OrgRevision(8));
         assert_eq!(revisions.load().network, NetworkRevision(103));
@@ -1017,23 +1043,14 @@ mod tests {
         let routes = RoutingTable::new();
         let self_id = "a".repeat(64);
         let peer = "b".repeat(64);
-        let acl = AclEngine::new(
-            crate::acl::SelfIdentity {
-                endpoint_hex: self_id.clone(),
-                ip: "10.7.0.1".parse().unwrap(),
-                tags: vec![],
-                network: "office".into(),
-            },
-            routes.clone(),
-            PolicyBundle::default(),
-        );
+        let forward = ForwardingStore::new();
         let revisions = Arc::new(ManagedRevisions::new(1, 1));
         assert!(apply_membership(
             &membership(2, PolicyBundle::default()),
             &PolicyBundle::default(),
             None,
             &routes,
-            &acl,
+            &forward,
             &revisions,
             2,
             &self_id,

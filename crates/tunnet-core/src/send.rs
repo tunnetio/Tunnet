@@ -23,7 +23,7 @@ use tunnet_common::send::{
 use tunnet_common::ws::ClientMsg;
 use uuid::Uuid;
 
-use crate::acl::AclEngine;
+use crate::forward::ForwardingStore;
 use crate::iroh_pool::ConnPool;
 use crate::routing::RoutingTable;
 use crate::transport_auth::TransportAuth;
@@ -115,7 +115,7 @@ struct SendInner {
     blobs: BlobsProtocol,
     pool: ConnPool,
     routes: RoutingTable,
-    acl: AclEngine,
+    forwarding: ForwardingStore,
     /// Membership gate for inbound offer/blob connections (never L3/L4 policy).
     transport: Mutex<TransportAuth>,
     self_endpoint_id: String,
@@ -142,7 +142,7 @@ impl SendManager {
         blobs_dir: PathBuf,
         pool: ConnPool,
         routes: RoutingTable,
-        acl: AclEngine,
+        forwarding: ForwardingStore,
         self_endpoint_id: String,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&blobs_dir)
@@ -150,14 +150,14 @@ impl SendManager {
         let store = FsStore::load(&blobs_dir)
             .await
             .map_err(|e| anyhow::anyhow!("open FsStore: {e}"))?;
-        Self::from_store(store, pool, routes, acl, self_endpoint_id).await
+        Self::from_store(store, pool, routes, forwarding, self_endpoint_id).await
     }
 
     pub async fn from_store(
         store: FsStore,
         pool: ConnPool,
         routes: RoutingTable,
-        acl: AclEngine,
+        forwarding: ForwardingStore,
         self_endpoint_id: String,
     ) -> anyhow::Result<Self> {
         let blobs = BlobsProtocol::new(store.as_ref(), None);
@@ -168,7 +168,7 @@ impl SendManager {
                 blobs,
                 pool,
                 routes,
-                acl,
+                forwarding,
                 transport: Mutex::new(transport),
                 self_endpoint_id,
                 content_key: Mutex::new(None),
@@ -690,7 +690,7 @@ impl SendManager {
 
     /// True when this machine and the peer share at least one mesh tag.
     pub fn peer_shares_tag(&self, peer_hex: &str) -> bool {
-        let self_tags = self.inner.acl.self_id.load().tags.clone();
+        let self_tags = self.inner.forwarding.load().self_id.tags.clone();
         if self_tags.is_empty() {
             return false;
         }

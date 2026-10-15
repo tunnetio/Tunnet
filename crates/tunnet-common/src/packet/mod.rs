@@ -9,18 +9,20 @@
 //! IPv4 (and IPv6) later fragments do **not** contain a transport header. Port
 //! policy must never invent ports from fragment payload bytes.
 //!
-//! [`FragmentTable`] remembers the first fragment's transport metadata, keyed by
-//! IP fragment identity, with a bounded capacity and short TTL. Later fragments
-//! reuse that metadata when present; otherwise policy is fail-closed.
-//! Packets themselves are forwarded as original fragments - this is not a
-//! reassembly pool (`IpDefragPool` is intentionally unused).
+//! [`frag_key`] derives the first-fragment identity key used by the policy
+//! engine's fragment metadata cache. Later fragments reuse that metadata when
+//! present; otherwise policy is fail-closed. Fragments are forwarded as-is,
+//! never reassembled.
 
 mod build;
 mod frag;
 mod parse;
 
-pub use build::{set_tcp_ipv4_checksum, synthesize_reject, tcp_ipv4_checksum_of};
-pub use frag::{CachedTransport, FRAGMENT_TTL, FragmentTable, MAX_FRAGMENT_ENTRIES, ResolvedL4};
+pub use build::{
+    clamp_tcp_mss, set_tcp_ipv4_checksum, synthesize_frag_needed, synthesize_reject,
+    tcp_ipv4_checksum_of,
+};
+pub use frag::{CachedTransport, FragKey, ResolvedL4, frag_key};
 pub use parse::{ParseError, parse};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

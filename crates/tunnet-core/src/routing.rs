@@ -12,6 +12,7 @@ use tunnet_common::{
 };
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct PeerInfo {
     pub endpoint: EndpointId,
     pub endpoint_hex: String,
@@ -24,6 +25,7 @@ pub struct PeerInfo {
 }
 
 /// Resolved hostname route (exact or wildcard).
+#[derive(Clone)]
 pub struct HostnameRouteInfo {
     pub peer: Arc<PeerInfo>,
     pub is_wildcard: bool,
@@ -45,6 +47,7 @@ struct NetworkSlice {
     peer_cidr: Option<Ipv4Net>,
 }
 
+#[derive(Clone)]
 pub struct Tables {
     pub by_ip: std::collections::HashMap<Ipv4Addr, Arc<PeerInfo>>,
     /// All memberships including same IP across networks.
@@ -130,6 +133,18 @@ impl RoutingTable {
         self.changes.subscribe()
     }
 
+    pub fn tables(&self) -> Arc<Tables> {
+        self.inner.load().clone()
+    }
+
+    pub fn slice_subnets(&self) -> Vec<(Uuid, Vec<Ipv4Net>)> {
+        self.slices
+            .lock()
+            .iter()
+            .map(|(id, slice)| (*id, slice.subnet_routes.iter().map(|r| r.cidr).collect()))
+            .collect()
+    }
+
     /// Look up peer by (network, ip) for inbound / firewall context.
     pub fn lookup_network_ip(&self, network_id: Uuid, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
         self.inner
@@ -150,23 +165,15 @@ impl RoutingTable {
 
     /// Direct peer IP, subnet LPM, then selected exit node for internet.
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
-        // Multicast and broadcast are never routable across the mesh.
-        //
-        // This MUST come before the subnet lookup and the exit-node catch-all.
-        // `is_mesh_or_link_local` covers broadcast but not multicast, so with an
-        // exit node configured multicast passes the internet catch-all and is
-        // tunneled to the exit peer; broadcast leaks the same way via the
-        // `0.0.0.0/0` an exit node contributes to the subnet table. LAN
-        // discovery apps (mDNS, SSDP, Ableton Link) beacon on every interface
-        // including ours, continuously, so this pushes local service
-        // announcements through the tunnel and out of the exit node.
-        //
-        // The mDNS relay is unaffected: it republishes over its own mesh topic
-        // rather than tunneling raw multicast frames.
+        Self::route_in(&self.inner.load(), ip)
+    }
+
+    pub(crate) fn route_in(tables: &Tables, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
+        // Multicast and broadcast are never routable across the mesh, even
+        // with an exit node configured (its 0.0.0.0/0 would otherwise leak them).
         if ip.is_multicast() || ip.is_broadcast() {
             return None;
         }
-        let tables = self.inner.load();
         if let Some(peer) = tables.by_ip.get(ip).cloned() {
             return Some(peer);
         }

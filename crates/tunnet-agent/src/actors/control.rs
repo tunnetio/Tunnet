@@ -39,6 +39,8 @@ pub struct ControlPlaneActorArgs {
     pub paths: StatePaths,
     /// Periodic snapshot poll interval (fallback when WS stalls).
     pub poll_secs: u64,
+    /// Underlay pins captured at startup; control-plane snapshots must not wipe them.
+    pub underlay_hosts: Vec<std::net::Ipv4Addr>,
     /// Late-bound by the supervisor (`SetRouteActor`); `None` until wired.
     pub route_actor: Option<ActorRef<RouteActor>>,
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
@@ -276,7 +278,7 @@ impl ControlPlaneActor {
                         &snap.org_policy,
                         snap.policy_verifying_key.as_deref(),
                         &node.routes,
-                        &node.acl,
+                        &node.forwarding,
                         &self.revisions,
                         snap.version,
                         &self.cfg.transport.endpoint_id,
@@ -286,14 +288,14 @@ impl ControlPlaneActor {
                     if !applied {
                         return;
                     }
-                    node.tunnel_pool.set_cloud_relay_urls(
+                    node.peers.set_cloud_relay_urls(
                         snap.connectivity_relays
                             .iter()
                             .filter(|r| r.metering)
                             .map(|r| r.url.clone()),
                     );
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
+                    node.peers.reconcile().await;
                     // Typed dispatch: routes via RouteActor (bounded ask with timeout).
                     let desired = membership_desired(
                         &node,
@@ -306,6 +308,7 @@ impl ControlPlaneActor {
                             .map(|r| r.cidr)
                             .collect::<Vec<_>>(),
                         m.device_profile.exit_node_endpoint_id.is_some(),
+                        &self.cfg.underlay_hosts,
                     );
                     let network_version = m.version;
                     let client_tx = self.client_tx.clone();
@@ -387,10 +390,12 @@ impl ControlPlaneActor {
                 {
                     node.routes
                         .clear_managed(self.cfg.network_id, &self.cfg.transport.endpoint_id);
+                    node.forwarding
+                        .clear_managed(&node.routes, self.cfg.network_id);
                     node.pool.reconcile().await;
-                    node.tunnel_pool.reconcile().await;
+                    node.peers.reconcile().await;
                     node.pool.close_all().await;
-                    node.tunnel_pool.close_all().await;
+                    node.peers.close_all().await;
                     if let Some(route_actor) = &self.cfg.route_actor {
                         let _ = route_actor.ask(ClearRoutes).await;
                     }
@@ -414,7 +419,8 @@ impl ControlPlaneActor {
                     return;
                 }
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
+                node.peers.reconcile().await;
+                node.forwarding.republish(&node.routes);
                 tracing::info!(
                     v = delta.version,
                     added = delta.added.len(),
@@ -437,10 +443,11 @@ impl ControlPlaneActor {
                 }
                 node.routes
                     .clear_managed(network_id, &self.cfg.transport.endpoint_id);
+                node.forwarding.clear_managed(&node.routes, network_id);
                 node.pool.reconcile().await;
-                node.tunnel_pool.reconcile().await;
+                node.peers.reconcile().await;
                 node.pool.close_all().await;
-                node.tunnel_pool.close_all().await;
+                node.peers.close_all().await;
                 if let Some(route_actor) = &self.cfg.route_actor {
                     let _ = route_actor.ask(ClearRoutes).await;
                 }
@@ -811,6 +818,7 @@ fn membership_desired(
     prefix: u8,
     remote_subnets: &[ipnet::Ipv4Net],
     has_exit: bool,
+    underlay_hosts: &[std::net::Ipv4Addr],
 ) -> crate::system_routes::DesiredRoutes {
     // ifname resolved fromControlPlaneActor cfg at call site; use tunnet0 default here
     // and let RouteActor resolve the real index via DesiredRoutes.tun_if_index.
@@ -822,7 +830,7 @@ fn membership_desired(
         prefix,
         remote_subnets,
         has_exit,
-        &[],
+        underlay_hosts,
     )
 }
 
@@ -845,13 +853,13 @@ struct SendHeartbeat;
 impl Message<SendHeartbeat> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, _msg: SendHeartbeat, _ctx: &mut Context<Self, Self::Reply>) {
-        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.tunnel_pool.heartbeat_counters();
+        let (active_conns, bytes_tx, bytes_rx) = self.cfg.node.peers.heartbeat_counters();
         self.send_client(ClientMsg::Heartbeat {
             active_conns,
             bytes_tx,
             bytes_rx,
         });
-        let bytes = self.cfg.node.tunnel_pool.cloud_relay_meter().take();
+        let bytes = self.cfg.node.peers.cloud_relay_meter().take();
         if bytes > 0 {
             self.send_client(ClientMsg::CloudRelayUsage { bytes });
         }
@@ -886,7 +894,7 @@ impl Message<PollCompleted> for ControlPlaneActor {
                     .await
             }
             Err(error) => {
-                self.cfg.node.acl.mark_stale();
+                self.cfg.node.forwarding.set_stale(true);
                 tracing::warn!(?error, "poll failed");
             }
         }
@@ -1034,6 +1042,7 @@ mod tests {
             agent_version: env!("CARGO_PKG_VERSION"),
             paths,
             poll_secs: 30,
+            underlay_hosts: Vec::new(),
             route_actor: Some(route),
             dataplane_actor: None,
             #[cfg(feature = "posture")]
