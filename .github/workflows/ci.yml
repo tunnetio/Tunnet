@@ -12,6 +12,8 @@ on:
       - ".cargo/**"
       - "proto/**"
       - "apps/mobile/**"
+      - "apps/management/**"
+      - "packages/db/**"
       - "package.json"
       - "bun.lock"
       - "biome.json"
@@ -67,6 +69,24 @@ jobs:
               - 'package.json'
               - 'bun.lock'
               - 'biome.json'
+
+  management-auth:
+    name: Management auth regression
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test management auth
+        run: bun test apps/management/src/auth.test.ts
 
   mobile:
     name: Mobile foundation
@@ -298,7 +318,7 @@ jobs:
   CI:
     name: CI
     if: always()
-    needs: [changes, mobile, rust-check, android, test]
+    needs: [changes, management-auth, mobile, rust-check, android, test]
     runs-on: ubuntu-latest
     steps:
       - name: Aggregate job results
