@@ -299,12 +299,11 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
     let remote_id = conn.remote_id();
     let remote_hex = format!("{remote_id}");
     tracing::info!(%remote_id, "peer connected");
-    metrics.active_conns_inc();
+    let _active = metrics.active_conn();
     if let Some(p) = &pool {
         p.touch_peer(remote_id);
         if !p.adopt(remote_id, conn.clone()).await {
             tracing::debug!(%remote_id, "ingress conn lost tie-break; exiting reader");
-            metrics.active_conns_dec();
             return;
         }
         if let Some(max) = conn.max_datagram_size() {
@@ -452,7 +451,6 @@ pub async fn serve_tunnel_connection(deps: InboundDeps) {
             }
         }
     }
-    metrics.active_conns_dec();
     tracing::info!(%remote_id, "peer disconnected");
 }
 
