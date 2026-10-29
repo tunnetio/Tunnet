@@ -416,7 +416,6 @@ pub struct ConnPool {
 struct PoolPolicy {
     keep_alive: AtomicBool,
     idle_timeout: Mutex<Duration>,
-    keep_alive_hosts: DashMap<String, ()>,
     keep_alive_peers: DashMap<EndpointId, ()>,
 }
 
@@ -430,7 +429,6 @@ impl ConnPool {
             policy: Arc::new(PoolPolicy {
                 keep_alive: AtomicBool::new(true),
                 idle_timeout: Mutex::new(Duration::from_secs(DEFAULT_IDLE_SECS)),
-                keep_alive_hosts: DashMap::new(),
                 keep_alive_peers: DashMap::new(),
             }),
             metrics: Arc::new(PoolMetrics::default()),
@@ -947,18 +945,6 @@ impl ConnPool {
 
     pub fn set_idle_timeout(&self, d: Duration) {
         *self.policy.idle_timeout.lock() = d;
-    }
-
-    pub fn add_keep_alive_host(&self, hostname: &str) {
-        self.policy
-            .keep_alive_hosts
-            .insert(hostname.to_ascii_lowercase(), ());
-    }
-
-    pub fn remove_keep_alive_host(&self, hostname: &str) {
-        self.policy
-            .keep_alive_hosts
-            .remove(&hostname.to_ascii_lowercase());
     }
 
     pub fn set_peer_keep_alive(&self, peer: EndpointId, enabled: bool) {
