@@ -16,9 +16,6 @@ use tunnet_common::TUNNEL_ALPN;
 #[cfg(feature = "direct")]
 use uuid::Uuid;
 
-use crate::acl::AclEngine;
-#[cfg(any(feature = "managed", feature = "direct"))]
-use crate::acl::SelfIdentity;
 #[cfg(feature = "managed")]
 use crate::control::{SignedClient, basic_metadata};
 #[cfg(feature = "direct")]
@@ -26,17 +23,20 @@ use crate::direct::PresenceTable;
 #[cfg(feature = "direct")]
 use crate::direct::{
     AUTH_ALPN, AuthCache, CONNECT_ALPN, DirectAuthHook, DirectAuthority, DocsBootstrap,
-    DocsMembership, JOIN_ALPN, NetworkGrant, signing_key_from_hex, spawn_discovery,
-    spawn_seed_auth, validate_member_against_genesis, verify_genesis, verify_member_record,
-    verifying_key_from_hex,
+    DocsMembership, JOIN_ALPN, signing_key_from_hex, spawn_discovery, spawn_seed_auth,
+    validate_member_against_genesis, verify_genesis, verify_member_record, verifying_key_from_hex,
 };
 #[cfg(any(feature = "managed", feature = "direct"))]
 use crate::direct::{
     ConnectivityOptions, apply_connectivity, apply_overlay_addr_filter, endpoint_builder,
     relay_auth_denied_detail,
 };
+#[cfg(feature = "direct")]
+use crate::forward::SelfIdentity;
+use crate::forward::{ForwardingStore, PolicyEngine};
 use crate::identity::AgentIdentity;
 use crate::iroh_pool::ConnPool;
+use crate::peer::PeerManager;
 use crate::routing::RoutingTable;
 #[cfg(feature = "send")]
 use crate::send::SendManager;
@@ -56,13 +56,11 @@ use crate::tunnel::TunnelManager;
 #[cfg(feature = "direct")]
 use iroh_docs::protocol::Docs;
 
-/// Per-Direct-network runtime (docs + firewall + state).
+/// Per-Direct-network runtime (docs + state).
 #[cfg(feature = "direct")]
 #[derive(Clone)]
 pub struct DirectNetworkRuntime {
     pub docs: DocsMembership,
-    pub firewall: crate::direct::FirewallEngine,
-    pub spoof_tracker: crate::direct::SpoofTracker,
     pub state: DirectState,
     pub discovery: crate::direct::DiscoveryHandle,
     pub presence: Option<Arc<PresenceTable>>,
@@ -72,6 +70,8 @@ pub struct DirectNetworkRuntime {
 
 #[derive(Clone)]
 pub struct CoreNodeConfig {
+    pub bindings: Vec<(std::net::SocketAddr, iroh::endpoint::BindOpts)>,
+    pub relay_tcp_config: Option<[Option<iroh::endpoint::TcpSocketConfig>; 2]>,
     pub hostname: String,
     pub agent_version: &'static str,
     pub advertise_datagram_alpn: bool,
@@ -94,6 +94,8 @@ pub struct CoreNodeConfig {
 impl Default for CoreNodeConfig {
     fn default() -> Self {
         Self {
+            bindings: Vec::new(),
+            relay_tcp_config: None,
             hostname: "tunnet-node".into(),
             agent_version: env!("CARGO_PKG_VERSION"),
             advertise_datagram_alpn: false,
@@ -111,17 +113,21 @@ impl Default for CoreNodeConfig {
 
 #[derive(Clone)]
 pub struct CoreNode {
+    #[cfg(feature = "dns")]
+    pub external_dns: Option<Arc<crate::dns::HickoryLookup>>,
     pub identity: AgentIdentity,
     pub persisted: PersistedState,
     pub endpoint: Endpoint,
+    pub candidate_updates: Option<Arc<tokio_util::task::AbortOnDropHandle<()>>>,
     /// Stream pool (`TUNNEL_STREAM_ALPN`).
     pub pool: ConnPool,
-    /// Datagram tunnel pool (`TUNNEL_ALPN`), shares keep-alive policy with [`Self::pool`].
-    pub tunnel_pool: ConnPool,
+    /// Tunnel datagram sessions (`TUNNEL_ALPN`).
+    pub peers: PeerManager,
     /// Live effective agent config (local TOML + remote org policy).
     pub effective_config: crate::EffectiveConfigStore,
     pub routes: RoutingTable,
-    pub acl: AclEngine,
+    pub forwarding: ForwardingStore,
+    pub policy: PolicyEngine,
     #[cfg(feature = "managed")]
     pub revisions: Arc<crate::sync::ManagedRevisions>,
     pub self_ipv4: std::net::Ipv4Addr,
@@ -154,6 +160,23 @@ pub struct CoreNode {
     pub presence_tables: Arc<Mutex<HashMap<Uuid, Arc<PresenceTable>>>>,
 }
 
+#[cfg(feature = "dns")]
+impl CoreNodeConfig {
+    fn external_dns(&self) -> anyhow::Result<Option<Arc<crate::dns::HickoryLookup>>> {
+        let Some(tcp) = self.relay_tcp_config else {
+            return Ok(None);
+        };
+        let mut udp = [None; 2];
+        for (address, options) in &self.bindings {
+            if options.is_default_route() {
+                udp[usize::from(address.is_ipv6())] = Some(options.socket_config());
+            }
+        }
+        let runtime = crate::dns::NativeHickoryRuntimeProvider::new(udp, tcp);
+        crate::dns::HickoryLookup::with_system_runtime(runtime).map(|lookup| Some(Arc::new(lookup)))
+    }
+}
+
 impl CoreNode {
     pub fn snapshot_version(&self) -> u64 {
         #[cfg(feature = "managed")]
@@ -162,11 +185,6 @@ impl CoreNode {
         }
 
         0
-    }
-
-    #[cfg(feature = "direct")]
-    pub fn firewall_for(&self, network_id: Uuid) -> Option<&crate::direct::FirewallEngine> {
-        self.direct.get(&network_id).map(|r| &r.firewall)
     }
 
     #[cfg(feature = "direct")]
@@ -231,12 +249,6 @@ impl CoreNode {
     pub fn primary_docs(&self) -> Option<&DocsMembership> {
         let nid = self.persisted.primary_network_id()?;
         self.docs_for(nid)
-    }
-
-    #[cfg(feature = "direct")]
-    pub fn primary_firewall(&self) -> Option<&crate::direct::FirewallEngine> {
-        let nid = self.persisted.primary_network_id()?;
-        self.firewall_for(nid)
     }
 
     /// Bootstrap based on persisted mode.
@@ -325,7 +337,8 @@ impl CoreNode {
             managed.control_url.clone(),
             my_id_hex.clone(),
             identity.signing_key.clone(),
-        )?;
+        )?
+        .with_tcp_config(cfg.relay_tcp_config)?;
 
         let meta = basic_metadata(&cfg.hostname, cfg.agent_version, cfg.kind);
         let snapshot = match signed
@@ -344,40 +357,21 @@ impl CoreNode {
 
         let membership = membership_for_network(&snapshot, managed.network_id)?.clone();
         let routes = RoutingTable::new();
+        let forwarding = ForwardingStore::new();
+        if let Some(flag) = cfg.src_posture_ok.clone() {
+            forwarding.adopt_posture(flag);
+        }
+        let policy = PolicyEngine::new();
         let revisions = Arc::new(crate::sync::ManagedRevisions::new(
             snapshot.version,
             membership.version,
         ));
-        let acl = if let Some(flag) = cfg.src_posture_ok.clone() {
-            AclEngine::with_posture_flag(
-                SelfIdentity {
-                    endpoint_hex: my_id_hex.clone(),
-                    ip: membership.assigned_ipv4,
-                    tags: membership.self_tags.clone(),
-                    network: managed.network_name.clone(),
-                },
-                routes.clone(),
-                membership.policy.clone(),
-                flag,
-            )
-        } else {
-            AclEngine::new(
-                SelfIdentity {
-                    endpoint_hex: my_id_hex.clone(),
-                    ip: membership.assigned_ipv4,
-                    tags: membership.self_tags.clone(),
-                    network: managed.network_name.clone(),
-                },
-                routes.clone(),
-                membership.policy.clone(),
-            )
-        };
         apply_membership(
             &membership,
             &snapshot.org_policy,
             snapshot.policy_verifying_key.as_deref(),
             &routes,
-            &acl,
+            &forwarding,
             &revisions,
             snapshot.version,
             &my_id_hex,
@@ -398,16 +392,40 @@ impl CoreNode {
         let builder = endpoint_builder(&connectivity)
             .secret_key(secret)
             .alpns(alpns)
-            .hooks(crate::transport_auth::TransportHook::managed(&routes));
-        let overlay = [
-            ipnet::Ipv4Net::new(membership.assigned_ipv4, 32).expect("/32 is valid"),
-            tunnet_common::VirtualResolverEndpoint::host_route(),
-        ];
-        let endpoint =
-            apply_overlay_addr_filter(apply_connectivity(builder, &connectivity), &overlay)
-                .bind()
-                .await
-                .context("bind iroh endpoint")?;
+            .hooks(crate::transport_auth::TransportHook::managed_with_gate(
+                &routes,
+                forwarding.authorization_gate(),
+            ));
+        let mut builder = builder;
+        #[cfg(feature = "dns")]
+        let external_dns = cfg.external_dns()?;
+        #[cfg(feature = "dns")]
+        if let Some(lookup) = &external_dns {
+            builder = builder.dns_resolver(iroh::dns::DnsResolver::custom(
+                crate::dns::IrohResolver(lookup.clone()),
+            ));
+        }
+        if let Some(config) = cfg.relay_tcp_config {
+            builder = builder.relay_tcp_config(config);
+        }
+        if !cfg.bindings.is_empty() {
+            builder = builder.clear_ip_transports();
+            for (address, options) in &cfg.bindings {
+                builder = builder.bind_addr_with_opts(*address, options.clone())?;
+            }
+        }
+        let endpoint = apply_overlay_addr_filter(
+            apply_connectivity(builder, &connectivity),
+            &forwarding,
+            snapshot
+                .memberships
+                .iter()
+                .map(|m| m.assigned_ipv4)
+                .collect(),
+        )
+        .bind()
+        .await
+        .context("bind iroh endpoint")?;
 
         debug_assert_eq!(format!("{}", endpoint.id()), my_id_hex);
 
@@ -432,9 +450,17 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(membership.assigned_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
-        pool.set_transport_auth(crate::transport_auth::TransportAuth::managed(&routes));
-        pool.set_cloud_relay_urls(
+        let peers = PeerManager::new(endpoint.clone(), TUNNEL_ALPN);
+        pool.set_transport_auth(crate::transport_auth::TransportAuth::managed_with_gate(
+            &routes,
+            forwarding.authorization_gate(),
+        ));
+        peers.set_forwarding(forwarding.clone());
+        peers.set_transport_auth(crate::transport_auth::TransportAuth::managed_with_gate(
+            &routes,
+            forwarding.authorization_gate(),
+        ));
+        peers.set_cloud_relay_urls(
             snapshot
                 .connectivity_relays
                 .iter()
@@ -449,7 +475,7 @@ impl CoreNode {
             paths.blobs_dir(),
             pool.clone(),
             routes.clone(),
-            acl.clone(),
+            forwarding.clone(),
             my_id_hex.clone(),
         )
         .await
@@ -457,11 +483,7 @@ impl CoreNode {
 
         // Unowned transport: no task spawned. The owner runs
         // `PendingControl::transport.run(...)` explicitly.
-        let pending = crate::ws_client::PendingControl::new(
-            managed.control_url.clone(),
-            my_id_hex.clone(),
-            identity.signing_key.clone(),
-        );
+        let pending = crate::ws_client::PendingControl::new(&signed);
         let control_link = Some(pending.link());
         #[cfg(feature = "serve")]
         serves.set_client_tx(pending.client_tx.clone());
@@ -470,6 +492,7 @@ impl CoreNode {
 
         let _ = persisted;
         pool.set_keep_alive(cfg.keep_alive);
+        peers.set_keep_alive(cfg.keep_alive);
 
         let gossip = if cfg.enable_gossip {
             tracing::info!("Managed shared Gossip enabled");
@@ -482,12 +505,16 @@ impl CoreNode {
             Self {
                 identity,
                 persisted: PersistedState::Managed(managed),
+                candidate_updates: Some(spawn_candidate_updates(&endpoint, &forwarding)),
                 endpoint,
+                #[cfg(feature = "dns")]
+                external_dns,
                 pool,
-                tunnel_pool,
+                peers,
                 effective_config,
                 routes,
-                acl,
+                forwarding,
+                policy,
                 revisions,
                 self_ipv4: membership.assigned_ipv4,
                 paths,
@@ -569,38 +596,56 @@ impl CoreNode {
         let routes = RoutingTable::new();
         #[cfg(feature = "managed")]
         let revisions = Arc::new(crate::sync::ManagedRevisions::new(0, 0));
-        // ACL/self identity uses primary network name; per-network policy applied via docs.
-        let policy0 = tunnet_common::policy::PolicyBundle::default();
-        let acl = AclEngine::new(
+        let forwarding = ForwardingStore::new();
+        if let Some(flag) = cfg.src_posture_ok.clone() {
+            forwarding.adopt_posture(flag);
+        }
+        let policy = PolicyEngine::new();
+        forwarding.set_self(
+            &routes,
             SelfIdentity {
                 endpoint_hex: my_id_hex.clone(),
                 ip: self_ipv4,
                 tags: vec![],
                 network: primary.network_name.clone(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
-            routes.clone(),
-            policy0,
         );
 
-        let auth = AuthCache::new();
-        for d in &networks {
-            auth.insert(my_id_hex.clone(), d.network_id);
-        }
+        let auth = AuthCache::with_gate(forwarding.authorization_gate());
+        forwarding.set_direct_auth(auth.clone());
 
         let secret = SecretKey::from_bytes(&identity.secret_bytes);
         let builder = endpoint_builder(&cfg.connectivity)
             .secret_key(secret)
             .alpns(alpns)
             .hooks(DirectAuthHook::new(auth.clone()));
-        let overlay: Vec<_> = networks
-            .iter()
-            .map(|d| d.genesis.address_plan.peer_cidr)
-            .collect();
-        let endpoint =
-            apply_overlay_addr_filter(apply_connectivity(builder, &cfg.connectivity), &overlay)
-                .bind()
-                .await
-                .context("bind iroh endpoint (direct)")?;
+        let mut builder = builder;
+        #[cfg(feature = "dns")]
+        let external_dns = cfg.external_dns()?;
+        #[cfg(feature = "dns")]
+        if let Some(lookup) = &external_dns {
+            builder = builder.dns_resolver(iroh::dns::DnsResolver::custom(
+                crate::dns::IrohResolver(lookup.clone()),
+            ));
+        }
+        if let Some(config) = cfg.relay_tcp_config {
+            builder = builder.relay_tcp_config(config);
+        }
+        if !cfg.bindings.is_empty() {
+            builder = builder.clear_ip_transports();
+            for (address, options) in &cfg.bindings {
+                builder = builder.bind_addr_with_opts(*address, options.clone())?;
+            }
+        }
+        let endpoint = apply_overlay_addr_filter(
+            apply_connectivity(builder, &cfg.connectivity),
+            &forwarding,
+            networks.iter().map(|network| network.self_ipv4()).collect(),
+        )
+        .bind()
+        .await
+        .context("bind iroh endpoint (direct)")?;
 
         {
             let ep = endpoint.clone();
@@ -622,10 +667,13 @@ impl CoreNode {
         #[cfg(feature = "serve")]
         let serves = ServeManager::new(self_ipv4, routes.clone());
         let pool = ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-        let tunnel_pool = ConnPool::with_shared_policy(endpoint.clone(), TUNNEL_ALPN, &pool);
+        let peers = PeerManager::new(endpoint.clone(), TUNNEL_ALPN);
         pool.set_transport_auth(crate::transport_auth::TransportAuth::direct(&auth));
+        peers.set_forwarding(forwarding.clone());
+        peers.set_transport_auth(crate::transport_auth::TransportAuth::direct(&auth));
         let effective_config = cfg.effective_config.clone().unwrap_or_default();
         pool.set_keep_alive(cfg.keep_alive);
+        peers.set_keep_alive(cfg.keep_alive);
         #[cfg(feature = "tunnel")]
         let tunnels = TunnelManager::new(pool.clone());
 
@@ -649,7 +697,7 @@ impl CoreNode {
                 blobs.clone(),
                 pool.clone(),
                 routes.clone(),
-                acl.clone(),
+                forwarding.clone(),
                 my_id_hex.clone(),
             )
             .await
@@ -677,7 +725,7 @@ impl CoreNode {
                     gossip: &gossip,
                     blobs: &blobs,
                     routes: &routes,
-                    acl: &acl,
+                    forward: &forwarding,
                     auth: &auth,
                     endpoint: &endpoint,
                     endpoint_signing_key: &identity.signing_key,
@@ -694,8 +742,6 @@ impl CoreNode {
                         direct.network_id,
                         DirectNetworkRuntime {
                             docs: parts.docs,
-                            firewall: parts.firewall,
-                            spoof_tracker: parts.spoof_tracker,
                             state: direct.clone(),
                             discovery: parts.discovery,
                             presence: None,
@@ -755,12 +801,16 @@ impl CoreNode {
             persisted: PersistedState::Direct {
                 networks: persisted_networks,
             },
+            candidate_updates: Some(spawn_candidate_updates(&endpoint, &forwarding)),
             endpoint,
+            #[cfg(feature = "dns")]
+            external_dns,
             pool,
-            tunnel_pool,
+            peers,
             effective_config,
             routes,
-            acl,
+            forwarding,
+            policy,
             #[cfg(feature = "managed")]
             revisions,
             self_ipv4,
@@ -800,7 +850,105 @@ impl CoreNode {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(updates) = &self.candidate_updates {
+            updates.abort();
+        }
+        #[cfg(feature = "send")]
+        self.send.shutdown().await;
+        self.pool.shutdown().await;
+        #[cfg(feature = "direct")]
+        for network in self.direct.values() {
+            network.discovery.shutdown().await;
+            network.docs.shutdown().await;
+        }
         self.endpoint.close().await;
+    }
+}
+
+#[cfg(any(feature = "managed", feature = "direct"))]
+fn spawn_candidate_updates(
+    endpoint: &Endpoint,
+    forwarding: &ForwardingStore,
+) -> Arc<tokio_util::task::AbortOnDropHandle<()>> {
+    let endpoint = endpoint.clone();
+    let forwarding = forwarding.clone();
+    let mut changes = forwarding.subscribe_changes();
+    Arc::new(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        async move {
+            let mut previous = std::collections::BTreeSet::new();
+            loop {
+                let snapshot = forwarding.load();
+                let addresses: std::collections::BTreeSet<_> = snapshot
+                    .tables
+                    .local_ips
+                    .values()
+                    .copied()
+                    .chain(std::iter::once(snapshot.self_id.ip))
+                    .collect();
+                if addresses != previous {
+                    endpoint.force_network_change().await;
+                    if endpoint.is_closed() {
+                        break;
+                    }
+                    previous = addresses;
+                }
+                tokio::select! {
+                    _ = endpoint.closed() => break,
+                    changed = changes.changed() => if changed.is_err() { break },
+                }
+            }
+        },
+    )))
+}
+
+#[cfg(all(test, any(feature = "managed", feature = "direct")))]
+mod candidate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn forwarding_changes_refresh_endpoint_candidates() {
+        let forwarding = ForwardingStore::new();
+        let routes = RoutingTable::new();
+        let endpoint = apply_overlay_addr_filter(
+            Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .bind_addr("127.0.0.1:0")
+                .unwrap(),
+            &forwarding,
+            vec![],
+        )
+        .bind()
+        .await
+        .unwrap();
+        assert!(
+            endpoint
+                .addr()
+                .ip_addrs()
+                .any(|address| address.ip().is_loopback())
+        );
+        let updates = spawn_candidate_updates(&endpoint, &forwarding);
+        forwarding.set_self(
+            &routes,
+            crate::SelfIdentity {
+                endpoint_hex: endpoint.id().to_string(),
+                ip: "127.0.0.1".parse().unwrap(),
+                tags: vec![],
+                network: "test".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while endpoint
+                .addr()
+                .ip_addrs()
+                .any(|address| address.ip().is_loopback())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(updates);
+        endpoint.close().await;
     }
 }
 
@@ -844,7 +992,7 @@ struct BootstrapOneArgs<'a> {
     gossip: &'a iroh_gossip::net::Gossip,
     blobs: &'a iroh_blobs::store::fs::FsStore,
     routes: &'a RoutingTable,
-    acl: &'a AclEngine,
+    forward: &'a ForwardingStore,
     auth: &'a AuthCache,
     endpoint: &'a Endpoint,
     endpoint_signing_key: &'a ed25519_dalek::SigningKey,
@@ -853,8 +1001,6 @@ struct BootstrapOneArgs<'a> {
 #[cfg(feature = "direct")]
 struct BootstrappedNetwork {
     docs: DocsMembership,
-    firewall: crate::direct::FirewallEngine,
-    spoof_tracker: crate::direct::SpoofTracker,
     discovery: crate::direct::DiscoveryHandle,
     secret_updated: bool,
     authority: Option<Arc<DirectAuthority>>,
@@ -865,14 +1011,14 @@ async fn bootstrap_one_direct_network(
     args: BootstrapOneArgs<'_>,
     direct: &mut DirectState,
 ) -> anyhow::Result<BootstrappedNetwork> {
-    let net_ipv4 = direct.self_record.ipv4;
     validate_member_against_genesis(&direct.genesis, &direct.self_record)?;
 
     let fw_cfg = crate::agent_config::load_firewall_for(args.paths, &direct.network_name);
-    let policy = tunnet_common::policy::PolicyBundle::default();
-    let firewall =
-        crate::direct::FirewallEngine::from_config(&fw_cfg, net_ipv4, args.my_id_hex.to_string());
-    let spoof_tracker = crate::direct::SpoofTracker::new();
+    args.forward.set_firewall(
+        args.routes,
+        direct.network_id,
+        crate::forward::FirewallRules::from_config(&fw_cfg),
+    );
 
     let coordinator_signing_key = direct
         .coordinator_signing_key
@@ -887,34 +1033,6 @@ async fn bootstrap_one_direct_network(
         })?;
     let coordinator_verifying_key = direct.coordinator_verifying_key.clone().unwrap_or_default();
     let content_key = direct.content_key.clone().unwrap_or_default();
-    let network_grant: Option<NetworkGrant> = match &direct.network_grant {
-        Some(g) => match serde_json::from_str(g) {
-            Ok(grant) => Some(grant),
-            Err(e) => {
-                if direct.coordinator {
-                    tracing::error!(
-                        network = %direct.network_name,
-                        ?e,
-                        "failed to parse network_grant; Grant AUTH disabled for this network"
-                    );
-                    None
-                } else {
-                    anyhow::bail!("corrupt network_grant ({e}); re-join with a fresh invite");
-                }
-            }
-        },
-        None => {
-            if !direct.coordinator {
-                anyhow::bail!("missing network_grant; re-join with a fresh invite");
-            }
-            tracing::warn!(
-                network = %direct.network_name,
-                "coordinator missing network_grant; seed AUTH will not run"
-            );
-            None
-        }
-    };
-
     let mut seeds = Vec::new();
     if let Some(coord) = &direct.coordinator_endpoint_id
         && coord != args.my_id_hex
@@ -937,10 +1055,8 @@ async fn bootstrap_one_direct_network(
         content_key: content_key.clone(),
         blobs: args.blobs.clone(),
         routes: args.routes.clone(),
-        acl: args.acl.clone(),
+        forward: args.forward.clone(),
         auth: args.auth.clone(),
-        policy,
-        firewall: Some(firewall.clone()),
         dns: crate::load_dns(args.paths),
         seed_peers: seed_peers.clone(),
     })
@@ -970,14 +1086,18 @@ async fn bootstrap_one_direct_network(
         args.my_id_hex.to_string(),
         discovery_seeds,
     );
-    spawn_seed_auth(
+    discovery.set_task(spawn_seed_auth(
         args.endpoint.clone(),
         args.auth.clone(),
         direct.network_id,
-        network_grant,
+        crate::direct::build_auth_server_context(&HashMap::from([(
+            direct.network_id,
+            docs.clone(),
+        )])),
+        discovery.shutdown_receiver(),
         args.my_id_hex.to_string(),
         seed_peers,
-    );
+    ));
 
     let authority = if direct.coordinator {
         Some(Arc::new(DirectAuthority::load(
@@ -992,8 +1112,6 @@ async fn bootstrap_one_direct_network(
 
     Ok(BootstrappedNetwork {
         docs,
-        firewall,
-        spoof_tracker,
         discovery,
         secret_updated,
         authority,

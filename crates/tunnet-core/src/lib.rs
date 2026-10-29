@@ -1,4 +1,3 @@
-pub mod acl;
 pub mod agent_config;
 pub mod cloud_relay_meter;
 #[cfg(feature = "managed")]
@@ -8,6 +7,7 @@ pub mod direct;
 #[cfg(feature = "dns")]
 pub mod dns;
 pub mod effective_config;
+pub mod forward;
 pub mod identity;
 #[cfg(feature = "tunnel")]
 pub mod inspect;
@@ -18,6 +18,7 @@ pub mod local_api;
 #[cfg(feature = "direct")]
 pub mod mdns_relay;
 pub mod node;
+pub mod peer;
 pub mod ping;
 #[cfg(feature = "recording")]
 pub mod recording;
@@ -41,13 +42,16 @@ pub mod ws_client;
 pub use agent_config::{TunnetConfig, load_dns, load_firewall};
 pub use cloud_relay_meter::CloudRelayMeter;
 pub use effective_config::{EffectiveAgentConfigState, EffectiveConfigStore};
+pub use forward::{
+    FRAME_OVERHEAD, FirewallRules, ForwardingSnapshot, ForwardingStore, InDecision, NetworkPolicy,
+    OutDecision, PeerBinding, PolicyEngine, SelfIdentity, frame, inbound_frame, outbound,
+};
 pub use secret_store::{
     AgentSecrets, NetworkSecrets, PlatformSealer, SealError, SealErrorKind, SealPolicy, SealTier,
     clear_platform_sealer, load_agent, load_relay_auth, persist_agent, set_platform_sealer,
     store_relay_auth,
 };
 
-pub use acl::{AclEngine, SelfIdentity};
 #[cfg(feature = "managed")]
 pub use control::{ManagementClient, SignedClient, UnauthedClient};
 pub use identity::AgentIdentity;
@@ -58,6 +62,10 @@ pub use leave::leave_direct_network;
 #[cfg(feature = "direct")]
 pub use node::DirectNetworkRuntime;
 pub use node::{CoreNode, CoreNodeConfig};
+pub use peer::{
+    PeerConnSnapshot, PeerManager, PeerTransportStats, RecvHook, SendBatchOutcome, SendOutcome,
+    SessionCtl, SessionStats, WeakPeerManager,
+};
 pub use routing::{PeerInfo, RoutingTable};
 #[cfg(feature = "send")]
 pub use send::{SendConfig, SendManager, TransferDirection, TransferRecord, TransferStatus};

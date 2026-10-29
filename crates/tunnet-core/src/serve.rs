@@ -604,6 +604,7 @@ mod tests {
             hostname: String::new(),
             tags: vec![],
             ssh_host_key: None,
+            posture: tunnet_common::PeerPosture::Unknown,
         }
     }
 

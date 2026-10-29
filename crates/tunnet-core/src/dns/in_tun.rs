@@ -316,6 +316,7 @@ mod tests {
             hostname: hostname.to_string(),
             tags: vec![],
             ssh_host_key: None,
+            posture: tunnet_common::PeerPosture::Unknown,
         }
     }
 

@@ -4,8 +4,8 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use iroh::endpoint::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tunnet_core::stream::AuthorizedStream;
 
 /// A bidirectional byte stream to a mesh peer.
 ///
@@ -16,10 +16,7 @@ pub struct TunnetStream {
 }
 
 enum StreamInner {
-    Iroh {
-        send: SendStream,
-        recv: RecvStream,
-    },
+    Mesh(AuthorizedStream),
     #[cfg(unix)]
     Local {
         sock: tokio::net::UnixStream,
@@ -33,9 +30,9 @@ enum StreamInner {
 }
 
 impl TunnetStream {
-    pub(crate) fn from_iroh(send: SendStream, recv: RecvStream) -> Self {
+    pub(crate) fn from_authorized(stream: AuthorizedStream) -> Self {
         Self {
-            inner: StreamInner::Iroh { send, recv },
+            inner: StreamInner::Mesh(stream),
         }
     }
 
@@ -57,10 +54,6 @@ impl TunnetStream {
     }
 }
 
-fn map_write_err(e: iroh::endpoint::WriteError) -> io::Error {
-    io::Error::other(e)
-}
-
 impl AsyncRead for TunnetStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -68,7 +61,7 @@ impl AsyncRead for TunnetStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            StreamInner::Iroh { recv, .. } => Pin::new(recv).poll_read(cx, buf),
+            StreamInner::Mesh(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(any(unix, windows))]
             StreamInner::Local { sock, leftover } => {
                 if !leftover.is_empty() {
@@ -90,9 +83,7 @@ impl AsyncWrite for TunnetStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         match &mut self.inner {
-            StreamInner::Iroh { send, .. } => {
-                Pin::new(send).poll_write(cx, buf).map_err(map_write_err)
-            }
+            StreamInner::Mesh(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(any(unix, windows))]
             StreamInner::Local { sock, .. } => Pin::new(sock).poll_write(cx, buf),
         }
@@ -100,7 +91,7 @@ impl AsyncWrite for TunnetStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            StreamInner::Iroh { send, .. } => Pin::new(send).poll_flush(cx),
+            StreamInner::Mesh(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(any(unix, windows))]
             StreamInner::Local { sock, .. } => Pin::new(sock).poll_flush(cx),
         }
@@ -108,10 +99,7 @@ impl AsyncWrite for TunnetStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.inner {
-            StreamInner::Iroh { send, .. } => {
-                let _ = send.finish();
-                Pin::new(send).poll_shutdown(cx)
-            }
+            StreamInner::Mesh(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(any(unix, windows))]
             StreamInner::Local { sock, .. } => Pin::new(sock).poll_shutdown(cx),
         }

@@ -158,7 +158,7 @@ fn error_kind(value: AgentErrorKind) -> ErrorKind {
         AgentErrorKind::DataPlane => ErrorKind::DataPlane,
         AgentErrorKind::Busy => ErrorKind::Busy,
         AgentErrorKind::Stopped => ErrorKind::Stopped,
-        AgentErrorKind::Failed => ErrorKind::Failed,
+        AgentErrorKind::Failed | AgentErrorKind::CleanupFailed => ErrorKind::Failed,
         AgentErrorKind::Internal => ErrorKind::Internal,
     }
 }

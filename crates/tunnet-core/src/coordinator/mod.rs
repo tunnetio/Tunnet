@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use uuid::Uuid;
 
 use crate::node::CoreNode;
-use crate::stream::{dial_stream, splice_bidirectional};
+use crate::stream::dial_stream;
 
 #[cfg(unix)]
 mod unix;
@@ -120,26 +120,35 @@ where
         ClientReq::OpenStream { host, port } => {
             let peer = resolve_peer(&node, &host)
                 .ok_or_else(|| anyhow::anyhow!("no peer matches host {host}"))?;
-            let (send, recv) =
-                match dial_stream(&node.pool, peer.endpoint, port, host.clone()).await {
-                    Ok(x) => x,
-                    Err(e) => {
-                        let resp = CoordResp::Error {
-                            message: e.to_string(),
-                        };
-                        let mut txt = serde_json::to_vec(&resp)?;
-                        txt.push(b'\n');
-                        let _ = writer.write_all(&txt).await;
-                        return Err(e);
-                    }
-                };
+            let mut stream = match dial_stream(
+                &node,
+                peer.endpoint,
+                peer.network_id,
+                port,
+                host.clone(),
+            )
+            .await
+            {
+                Ok(x) => x,
+                Err(e) => {
+                    let resp = CoordResp::Error {
+                        message: e.to_string(),
+                    };
+                    let mut txt = serde_json::to_vec(&resp)?;
+                    txt.push(b'\n');
+                    let _ = writer.write_all(&txt).await;
+                    return Err(e);
+                }
+            };
             let resp = CoordResp::Ready;
             let mut txt = serde_json::to_vec(&resp)?;
             txt.push(b'\n');
             writer.write_all(&txt).await?;
 
             let local_read = reader.into_inner();
-            splice_bidirectional(recv, send, local_read, writer).await
+            let mut local = tokio::io::join(local_read, writer);
+            tokio::io::copy_bidirectional(&mut stream, &mut local).await?;
+            Ok(())
         }
     }
 }

@@ -396,10 +396,11 @@ impl TunnetNode {
             NodeInner::Coordinator { node, .. } => {
                 let peer = resolve_peer(node, host)
                     .ok_or_else(|| Error::PeerNotFound(host.to_string()))?;
-                let (send, recv) = dial_stream(&node.pool, peer.endpoint, port, host.to_string())
-                    .await
-                    .map_err(Error::stream)?;
-                Ok(TunnetStream::from_iroh(send, recv))
+                let stream =
+                    dial_stream(node, peer.endpoint, peer.network_id, port, host.to_string())
+                        .await
+                        .map_err(Error::stream)?;
+                Ok(TunnetStream::from_authorized(stream))
             }
             #[cfg(any(unix, windows))]
             NodeInner::Client { sock_path, .. } => {
@@ -501,7 +502,8 @@ impl TunnetNode {
         let node = self.require_coordinator()?;
         let record = node
             .send
-            .accept_pending(transfer_id)
+            .begin_accept_pending(transfer_id)
+            .map_err(Error::from_anyhow)?
             .await
             .map_err(Error::from_anyhow)?;
         Ok(crate::Transfer::from(record))
@@ -613,17 +615,26 @@ fn spawn_stream_acceptor(
     use iroh::protocol::Router;
     use tunnet_core::StreamProtocolHandler;
 
-    let routes = node.routes.clone();
+    let handler_node = node.clone();
     let handler: tunnet_core::stream::StreamHandler = Arc::new(move |accepted| {
         let tx = inbound_tx.clone();
-        let routes = routes.clone();
+        let node = handler_node.clone();
         Box::pin(async move {
-            let peer = routes
-                .lookup_endpoint(&accepted.peer_hex)
-                .map(|p| Peer::from_peer_info(&p))
-                .unwrap_or_else(|| Peer::from_endpoint_hex(accepted.peer_hex.clone()));
+            let Ok(accepted) = tunnet_core::stream::accept_stream(&node, accepted) else {
+                return;
+            };
+            let snapshot = node.forwarding.load();
+            let Some(binding) = snapshot.binding(accepted.header.network, accepted.peer) else {
+                return;
+            };
+            let peer = Peer {
+                ip: binding.ip.to_string(),
+                hostname: binding.hostname.clone(),
+                endpoint_id: binding.endpoint_hex.clone(),
+                tags: binding.tags.clone(),
+            };
             let header = StreamHeader::from(accepted.header);
-            let stream = TunnetStream::from_iroh(accepted.send, accepted.recv);
+            let stream = TunnetStream::from_authorized(accepted.stream);
             let _ = tx
                 .send(InboundConnection {
                     stream,

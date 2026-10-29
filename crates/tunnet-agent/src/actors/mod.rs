@@ -32,13 +32,10 @@ pub(crate) const SSH_REGISTRY_MAILBOX: usize = 32;
 pub(crate) const SUPERVISOR_MAILBOX: usize = 32;
 
 /// Control-plane generation attached to snapshot-derived updates.
-///
-/// The control actor fans snapshot work out to spawned tasks that can
-/// complete out of order; the version lets owners reject stale state so an
-/// older snapshot can never become authoritative after a newer one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlVersion {
     /// Snapshot-derived state with the snapshot's monotonic version.
+    #[cfg(any(not(target_os = "android"), feature = "posture", test))]
     Snapshot(u64),
     /// Explicit local intent (e.g. dataplane BringUp, direct operator
     /// commands): always applies, never touches the watermark.
@@ -49,14 +46,15 @@ pub(crate) enum ControlVersion {
 /// Returns true if `incoming` may be applied, recording it when versioned.
 /// Equal versions are accepted (idempotent retry); only strictly older
 /// snapshot state is rejected.
-pub(crate) fn accept_version(last: &mut Option<u64>, incoming: ControlVersion) -> bool {
+pub(crate) fn accept_version(_last: &mut Option<u64>, incoming: ControlVersion) -> bool {
     match incoming {
         ControlVersion::Local => true,
+        #[cfg(any(not(target_os = "android"), feature = "posture", test))]
         ControlVersion::Snapshot(v) => {
-            if last.is_some_and(|last| v < last) {
+            if _last.is_some_and(|last| v < last) {
                 return false;
             }
-            *last = Some(v);
+            *_last = Some(v);
             true
         }
     }
@@ -99,6 +97,11 @@ impl OwnedTask {
             cancel,
             handle: Some(handle),
         }
+    }
+
+    #[cfg(feature = "local-api")]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
     /// Spawn `fut`; if it completes while `cancel` is not cancelled, deliver

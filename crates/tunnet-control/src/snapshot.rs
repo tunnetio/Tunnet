@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tunnet_common::{
     ActiveServe, DeviceProfile, DnsConfig, EndpointSnapshot, ExitNodeInfo, HostnameRoute,
     Ipv6PeerEntry, NetworkMembershipSnapshot, PeerEntry, RelayPolicy, SplitTunnelMode, SubnetRoute,
@@ -16,6 +16,20 @@ type RelayDbRow = (String, String, Option<String>, Option<String>, String);
 
 pub async fn build_endpoint_snapshot(
     pool: &PgPool,
+    policy_key: &ed25519_dalek::SigningKey,
+    endpoint_id: &str,
+) -> anyhow::Result<EndpointSnapshot> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await?;
+    let snapshot = build_snapshot(&mut transaction, policy_key, endpoint_id).await?;
+    transaction.commit().await?;
+    Ok(snapshot)
+}
+
+async fn build_snapshot(
+    pool: &mut PgConnection,
     policy_key: &ed25519_dalek::SigningKey,
     endpoint_id: &str,
 ) -> anyhow::Result<EndpointSnapshot> {
@@ -46,7 +60,7 @@ pub async fn build_endpoint_snapshot(
          WHERE e.endpoint_id = $1",
     )
     .bind(endpoint_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?;
 
     let (organization_id, ipv6_enabled, org_version, labels_value, expires_at_micros) =
@@ -67,7 +81,7 @@ pub async fn build_endpoint_snapshot(
          WHERE nm.endpoint_id = $1 AND nm.status = 'active'",
     )
     .bind(endpoint_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let network_revision_rows: Vec<(Uuid, i64)> = sqlx::query_as(
@@ -75,7 +89,7 @@ pub async fn build_endpoint_snapshot(
          JOIN networks n ON n.id = nm.network_id WHERE nm.endpoint_id = $1",
     )
     .bind(endpoint_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
     let network_revisions = network_revision_rows
         .into_iter()
@@ -87,18 +101,6 @@ pub async fn build_endpoint_snapshot(
     {
         let assigned_ipv4 = pg_inet::to_ipv4_addr(assigned_ip)?;
         let prefix = network_prefix(pool, network_id).await?;
-        let ipv4_peers = load_ipv4_peers(pool, network_id, endpoint_id, &network_name).await?;
-        let subnet_routes = load_subnet_routes(pool, network_id).await?;
-        let hostname_routes = load_hostname_routes(pool, network_id).await?;
-        let exit_nodes = load_exit_nodes(pool, network_id).await?;
-        let device_profile = load_device_profile(pool, endpoint_id, network_id).await?;
-        let active_serves = load_active_serves(pool, network_id)
-            .await
-            .unwrap_or_default();
-        let tunnel_config = load_tunnel_config(pool, endpoint_id, network_id)
-            .await
-            .unwrap_or_default();
-        let self_tags = load_device_tags(pool, endpoint_id).await?;
         let policy = crate::policy_store::load_network_bundle(
             pool,
             policy_key,
@@ -106,15 +108,37 @@ pub async fn build_endpoint_snapshot(
             network_version as u64,
         )
         .await?;
+        let ipv4_peers = load_ipv4_peers(
+            pool,
+            &organization_id,
+            network_id,
+            endpoint_id,
+            &policy.postures,
+        )
+        .await?;
+        let self_posture = crate::posture::claims_for_network(
+            pool,
+            &organization_id,
+            &policy.postures,
+            &[endpoint_id.to_string()],
+        )
+        .await?
+        .remove(endpoint_id)
+        .unwrap_or_default();
+        let subnet_routes = load_subnet_routes(pool, network_id).await?;
+        let hostname_routes = load_hostname_routes(pool, network_id).await?;
+        let exit_nodes = load_exit_nodes(pool, network_id).await?;
+        let device_profile = load_device_profile(pool, endpoint_id, network_id).await?;
+        let active_serves = load_active_serves(pool, network_id).await?;
+        let tunnel_config = load_tunnel_config(pool, endpoint_id, network_id).await?;
+        let self_tags = load_device_tags(pool, endpoint_id).await?;
         let bootstrap = ipv4_peers
             .iter()
             .take(5)
             .map(|p| p.endpoint_id.clone())
             .collect();
         let gossip_topic_hex = hex::encode(blake3::hash(network_id.as_bytes()).as_bytes());
-        let agent_policy = load_merged_agent_policy(pool, &organization_id, network_id)
-            .await
-            .unwrap_or_default();
+        let agent_policy = load_merged_agent_policy(pool, &organization_id, network_id).await?;
         memberships.push(NetworkMembershipSnapshot {
             network_id,
             network_name,
@@ -131,6 +155,7 @@ pub async fn build_endpoint_snapshot(
             tunnel_config,
             self_tags,
             self_hostname,
+            self_posture,
             policy,
             gossip_bootstrap: bootstrap,
             gossip_topic_hex,
@@ -153,18 +178,12 @@ pub async fn build_endpoint_snapshot(
     )
     .await?;
 
-    let org_ca_pem = load_org_ca_pem(pool, &organization_id).await.ok().flatten();
-    let org_agent_policy = load_org_agent_policy(pool, &organization_id)
-        .await
-        .unwrap_or_default();
+    let org_ca_pem = load_org_ca_pem(pool, &organization_id).await?;
+    let org_agent_policy = load_org_agent_policy(pool, &organization_id).await?;
 
-    let relay_policy = load_org_relay_policy(pool, &organization_id)
-        .await
-        .unwrap_or(RelayPolicy::Inherit);
-    let deployment_relays = load_deployment_relays(pool).await.unwrap_or_default();
-    let org_relays = load_org_relays(pool, &organization_id)
-        .await
-        .unwrap_or_default();
+    let relay_policy = load_org_relay_policy(pool, &organization_id).await?;
+    let deployment_relays = load_deployment_relays(pool).await?;
+    let org_relays = load_org_relays(pool, &organization_id).await?;
     let connectivity_relays =
         relay_map::build_effective_relays(relay_policy, &deployment_relays, &org_relays);
     let connectivity_relay_fallback = relay_map::connectivity_relay_fallback(&connectivity_relays);
@@ -191,13 +210,13 @@ pub async fn build_endpoint_snapshot(
 }
 
 async fn load_org_relay_policy(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     organization_id: &str,
 ) -> anyhow::Result<RelayPolicy> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT policy FROM organization_relay_settings WHERE organization_id = $1")
             .bind(organization_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *pool)
             .await?;
     Ok(match row.as_ref().map(|(p,)| p.as_str()) {
         Some("augment") => RelayPolicy::Augment,
@@ -206,7 +225,7 @@ async fn load_org_relay_policy(
     })
 }
 
-async fn load_deployment_relays(pool: &PgPool) -> anyhow::Result<Vec<RelayRow>> {
+async fn load_deployment_relays(pool: &mut PgConnection) -> anyhow::Result<Vec<RelayRow>> {
     let rows: Vec<RelayDbRow> = sqlx::query_as(
         "SELECT url, region, \
             NULLIF(COALESCE(identity->>'authToken', identity->>'auth_token'), ''), \
@@ -214,7 +233,7 @@ async fn load_deployment_relays(pool: &PgPool) -> anyhow::Result<Vec<RelayRow>> 
          FROM relays \
          WHERE organization_id IS NULL AND status = 'healthy'",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
     Ok(rows
         .into_iter()
@@ -230,7 +249,10 @@ async fn load_deployment_relays(pool: &PgPool) -> anyhow::Result<Vec<RelayRow>> 
         .collect())
 }
 
-async fn load_org_relays(pool: &PgPool, organization_id: &str) -> anyhow::Result<Vec<RelayRow>> {
+async fn load_org_relays(
+    pool: &mut PgConnection,
+    organization_id: &str,
+) -> anyhow::Result<Vec<RelayRow>> {
     let rows: Vec<RelayDbRow> = sqlx::query_as(
         "SELECT url, region, \
             NULLIF(COALESCE(identity->>'authToken', identity->>'auth_token'), ''), \
@@ -239,7 +261,7 @@ async fn load_org_relays(pool: &PgPool, organization_id: &str) -> anyhow::Result
          WHERE organization_id = $1 AND status = 'healthy'",
     )
     .bind(organization_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
     Ok(rows
         .into_iter()
@@ -256,14 +278,14 @@ async fn load_org_relays(pool: &PgPool, organization_id: &str) -> anyhow::Result
 }
 
 async fn load_org_agent_policy(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     organization_id: &str,
 ) -> anyhow::Result<tunnet_common::RemoteAgentPolicy> {
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         "SELECT COALESCE(settings->'agentPolicy', '{}'::jsonb) FROM organization WHERE id = $1",
     )
     .bind(organization_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?;
     let Some((value,)) = row else {
         return Ok(tunnet_common::RemoteAgentPolicy::default());
@@ -272,14 +294,14 @@ async fn load_org_agent_policy(
 }
 
 async fn load_network_agent_policy(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     network_id: Uuid,
 ) -> anyhow::Result<tunnet_common::RemoteAgentPolicy> {
     let row: Option<(serde_json::Value,)> = sqlx::query_as(
         "SELECT COALESCE(settings->'agentPolicy', '{}'::jsonb) FROM networks WHERE id = $1",
     )
     .bind(network_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?;
     let Some((value,)) = row else {
         return Ok(tunnet_common::RemoteAgentPolicy::default());
@@ -288,7 +310,7 @@ async fn load_network_agent_policy(
 }
 
 async fn load_merged_agent_policy(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     organization_id: &str,
     network_id: Uuid,
 ) -> anyhow::Result<tunnet_common::RemoteAgentPolicy> {
@@ -297,25 +319,31 @@ async fn load_merged_agent_policy(
     Ok(tunnet_common::inherit_remote_policy(&org, &network))
 }
 
-async fn load_org_ca_pem(pool: &PgPool, organization_id: &str) -> anyhow::Result<Option<String>> {
+async fn load_org_ca_pem(
+    pool: &mut PgConnection,
+    organization_id: &str,
+) -> anyhow::Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT certificate_pem FROM organization_cas \
          WHERE organization_id = $1 AND status = 'active'",
     )
     .bind(organization_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?;
     Ok(row.map(|(pem,)| pem))
 }
 
-async fn load_active_serves(pool: &PgPool, network_id: Uuid) -> anyhow::Result<Vec<ActiveServe>> {
+async fn load_active_serves(
+    pool: &mut PgConnection,
+    network_id: Uuid,
+) -> anyhow::Result<Vec<ActiveServe>> {
     let rows: Vec<(Uuid, String, i32, String, String)> = sqlx::query_as(
         "SELECT id, endpoint_id, local_port, protocol, internal_hostname \
          FROM serves \
          WHERE network_id = $1 AND status = 'active'",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     Ok(rows
@@ -339,7 +367,7 @@ async fn load_active_serves(pool: &PgPool, network_id: Uuid) -> anyhow::Result<V
 
 #[allow(clippy::type_complexity)]
 async fn load_tunnel_config(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     endpoint_id: &str,
     network_id: Uuid,
 ) -> anyhow::Result<Vec<TunnelConfig>> {
@@ -362,7 +390,7 @@ async fn load_tunnel_config(
     )
     .bind(endpoint_id)
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     Ok(rows
@@ -395,10 +423,10 @@ async fn load_tunnel_config(
         .collect())
 }
 
-async fn network_prefix(pool: &PgPool, network_id: Uuid) -> anyhow::Result<u8> {
+async fn network_prefix(pool: &mut PgConnection, network_id: Uuid) -> anyhow::Result<u8> {
     let (cidr,): (PgIp,) = sqlx::query_as("SELECT cidr FROM networks WHERE id = $1")
         .bind(network_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await?;
     match pg_inet::to_ipnet(cidr)? {
         ipnet::IpNet::V4(n) => Ok(n.prefix_len()),
@@ -406,7 +434,10 @@ async fn network_prefix(pool: &PgPool, network_id: Uuid) -> anyhow::Result<u8> {
     }
 }
 
-async fn load_exit_nodes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<Vec<ExitNodeInfo>> {
+async fn load_exit_nodes(
+    pool: &mut PgConnection,
+    network_id: Uuid,
+) -> anyhow::Result<Vec<ExitNodeInfo>> {
     let rows: Vec<(String, PgIp, Vec<PgIp>)> = sqlx::query_as(
         "SELECT e.endpoint_id, nm.assigned_ip::inet, e.allowed_cidrs \
          FROM exit_node_config e \
@@ -415,7 +446,7 @@ async fn load_exit_nodes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<Vec<
          WHERE e.network_id = $1 AND e.enabled = true AND nm.status = 'active'",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let mut nodes = Vec::with_capacity(rows.len());
@@ -443,7 +474,7 @@ async fn load_exit_nodes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<Vec<
 }
 
 async fn load_device_profile(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     endpoint_id: &str,
     network_id: Uuid,
 ) -> anyhow::Result<DeviceProfile> {
@@ -454,7 +485,7 @@ async fn load_device_profile(
     )
     .bind(endpoint_id)
     .bind(network_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *pool)
     .await?;
 
     let Some((exit_node, mode, cidrs)) = row else {
@@ -481,7 +512,7 @@ async fn load_device_profile(
 }
 
 async fn load_hostname_routes(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     network_id: Uuid,
 ) -> anyhow::Result<Vec<HostnameRoute>> {
     let rows: Vec<(String, String, bool, Option<PgIp>, PgIp)> = sqlx::query_as(
@@ -497,7 +528,7 @@ async fn load_hostname_routes(
          WHERE hr.network_id = $1 AND hr.enabled = true AND nm.status = 'active'",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let mut routes = Vec::with_capacity(rows.len());
@@ -524,7 +555,10 @@ async fn load_hostname_routes(
     Ok(routes)
 }
 
-async fn load_subnet_routes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<Vec<SubnetRoute>> {
+async fn load_subnet_routes(
+    pool: &mut PgConnection,
+    network_id: Uuid,
+) -> anyhow::Result<Vec<SubnetRoute>> {
     // When the advertising machine is in an HA group, peers see the active member as via.
     let rows: Vec<(String, PgIp, PgIp)> = sqlx::query_as(
         "SELECT COALESCE(ng.active_endpoint_id, sr.endpoint_id) AS via_endpoint_id, \
@@ -539,7 +573,7 @@ async fn load_subnet_routes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<V
          WHERE sr.network_id = $1 AND sr.enabled = true AND nm.status = 'active'",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let mut routes = Vec::with_capacity(rows.len());
@@ -561,10 +595,11 @@ async fn load_subnet_routes(pool: &PgPool, network_id: Uuid) -> anyhow::Result<V
 }
 
 async fn load_ipv4_peers(
-    pool: &PgPool,
+    pool: &mut PgConnection,
+    organization_id: &str,
     network_id: Uuid,
     self_endpoint_id: &str,
-    _network_name: &str,
+    definitions: &std::collections::HashMap<String, Vec<String>>,
 ) -> anyhow::Result<Vec<PeerEntry>> {
     // Mesh routing must include every active member. Dashboard presence
     // (`agent_connected`) is separate - gating peers on WS heartbeat made one
@@ -581,9 +616,13 @@ async fn load_ipv4_peers(
     )
     .bind(network_id)
     .bind(self_endpoint_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
+    let endpoint_ids: Vec<String> = peer_rows.iter().map(|(eid, ..)| eid.clone()).collect();
+    let claims =
+        crate::posture::claims_for_network(pool, organization_id, definitions, &endpoint_ids)
+            .await?;
     let mut peers = Vec::with_capacity(peer_rows.len());
     for (eid, host, assigned_ip, ssh_host_key) in peer_rows {
         let ip = match pg_inet::to_ipv4_addr(assigned_ip) {
@@ -593,21 +632,23 @@ async fn load_ipv4_peers(
         let tag_rows: Vec<(String,)> =
             sqlx::query_as("SELECT tag FROM device_tags WHERE endpoint_id = $1")
                 .bind(&eid)
-                .fetch_all(pool)
+                .fetch_all(&mut *pool)
                 .await?;
+        let posture = claims.get(&eid).cloned().unwrap_or_default();
         peers.push(PeerEntry {
             ip,
             endpoint_id: eid,
             hostname: host,
             tags: tag_rows.into_iter().map(|(t,)| t).collect(),
             ssh_host_key,
+            posture,
         });
     }
     Ok(peers)
 }
 
 async fn load_ipv6_peers(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     organization_id: &str,
     self_endpoint_id: &str,
 ) -> anyhow::Result<Vec<Ipv6PeerEntry>> {
@@ -619,7 +660,7 @@ async fn load_ipv6_peers(
     )
     .bind(organization_id)
     .bind(self_endpoint_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let mut peers = Vec::with_capacity(rows.len());
@@ -628,23 +669,27 @@ async fn load_ipv6_peers(
         let tag_rows: Vec<(String,)> =
             sqlx::query_as("SELECT tag FROM device_tags WHERE endpoint_id = $1")
                 .bind(&eid)
-                .fetch_all(pool)
+                .fetch_all(&mut *pool)
                 .await?;
         peers.push(Ipv6PeerEntry {
             ip,
             endpoint_id: eid,
             hostname: host,
             tags: tag_rows.into_iter().map(|(t,)| t).collect(),
+            posture: tunnet_common::PeerPosture::Unknown,
         });
     }
     Ok(peers)
 }
 
-async fn load_device_tags(pool: &PgPool, endpoint_id: &str) -> anyhow::Result<Vec<String>> {
+async fn load_device_tags(
+    pool: &mut PgConnection,
+    endpoint_id: &str,
+) -> anyhow::Result<Vec<String>> {
     let tag_rows: Vec<(String,)> =
         sqlx::query_as("SELECT tag FROM device_tags WHERE endpoint_id = $1")
             .bind(endpoint_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *pool)
             .await?;
     Ok(tag_rows.into_iter().map(|(t,)| t).collect())
 }

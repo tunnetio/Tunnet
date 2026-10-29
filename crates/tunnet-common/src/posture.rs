@@ -1,5 +1,84 @@
 use serde::{Deserialize, Serialize};
 
+pub const POSTURE_RECEIPT_BOUND_SECS: u64 = 600;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PeerPosture {
+    #[default]
+    Unknown,
+    Verified {
+        passed_named_checks: Vec<String>,
+        valid_until: jiff::Timestamp,
+    },
+}
+
+impl PeerPosture {
+    pub fn verified(
+        names: impl IntoIterator<Item = impl Into<String>>,
+        valid_until: jiff::Timestamp,
+    ) -> Self {
+        let mut passed_named_checks: Vec<String> = names.into_iter().map(Into::into).collect();
+        passed_named_checks.sort();
+        passed_named_checks.dedup();
+        Self::Verified {
+            passed_named_checks,
+            valid_until,
+        }
+    }
+
+    pub fn valid_until(&self) -> Option<jiff::Timestamp> {
+        match self {
+            Self::Unknown => None,
+            Self::Verified { valid_until, .. } => Some(*valid_until),
+        }
+    }
+
+    pub fn expired(&self, now: jiff::Timestamp) -> bool {
+        match self {
+            Self::Unknown => false,
+            Self::Verified { valid_until, .. } => now >= *valid_until,
+        }
+    }
+
+    pub fn satisfies(&self, required: &[String], now: jiff::Timestamp) -> bool {
+        if required.is_empty() {
+            return true;
+        }
+        let Self::Verified {
+            passed_named_checks,
+            valid_until,
+        } = self
+        else {
+            return false;
+        };
+        if now >= *valid_until {
+            return false;
+        }
+        required
+            .iter()
+            .any(|name| passed_named_checks.iter().any(|passed| passed == name))
+    }
+
+    // Freshness renewal preserves authorization identity.
+    pub fn fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        match self {
+            Self::Unknown => 0u8.hash(&mut hasher),
+            Self::Verified {
+                passed_named_checks,
+                ..
+            } => {
+                1u8.hash(&mut hasher);
+                passed_named_checks.hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+}
+
 /// Custom script collector configuration pushed from control plane.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomScriptConfig {

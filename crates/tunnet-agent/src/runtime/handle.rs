@@ -63,12 +63,26 @@ pub(crate) struct HandleInner {
     pub(crate) paths: StatePaths,
     pub(crate) shutdown: tokio_util::sync::CancellationToken,
     pub(crate) started_at: Instant,
+    pub(crate) src_posture_ok: Arc<arc_swap::ArcSwap<bool>>,
     pub(crate) phase: tokio::sync::RwLock<Phase>,
     pub(crate) published: arc_swap::ArcSwap<AgentSnapshot>,
     pub(crate) watch: tokio::sync::watch::Sender<Arc<AgentSnapshot>>,
+    #[cfg(not(target_os = "android"))]
+    underlay_monitor: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(not(target_os = "android"))]
+    pub(super) underlay_recovery: parking_lot::Mutex<Option<UnderlayRecovery>>,
     #[cfg(feature = "local-api")]
     pub(crate) api_watch:
         tokio::sync::watch::Sender<Option<std::sync::Arc<tunnet_core::local_api::LocalApiState>>>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone)]
+pub(super) struct UnderlayRecovery {
+    desired_up: bool,
+    observed: Arc<crate::underlay::TransportUnderlay>,
+    retry_at: Instant,
+    delay: std::time::Duration,
 }
 
 /// Cloneable handle for commands and snapshots.
@@ -78,6 +92,15 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
+    pub(crate) async fn managed_client(&self) -> anyhow::Result<Option<tunnet_core::SignedClient>> {
+        let phase = self.inner.phase.read().await;
+        match &*phase {
+            Phase::Idle => Ok(None),
+            Phase::Mesh(mesh) if mesh.is_alive() => Ok(Some(mesh.node.require_signed()?.clone())),
+            _ => anyhow::bail!("managed client unavailable during lifecycle transition"),
+        }
+    }
+
     /// Point-in-time view. Never waits on join/activate/shutdown.
     ///
     /// While a command holds the exclusive phase lock, this returns the last
@@ -370,6 +393,9 @@ impl AgentHandle {
 
     fn require_idle(&self, phase: &Phase) -> Result<(), AgentError> {
         match phase {
+            Phase::Failed(error) if error.kind == AgentErrorKind::CleanupFailed => {
+                Err(error.clone())
+            }
             Phase::Idle | Phase::Failed(_) => Ok(()),
             Phase::Mesh(_) => Err(AgentError::new(
                 AgentErrorKind::AlreadyJoined,
@@ -418,6 +444,10 @@ impl AgentHandle {
     }
 
     fn fail_locked(&self, phase: &mut Phase, err: AgentError) {
+        #[cfg(not(target_os = "android"))]
+        if err.kind == AgentErrorKind::CleanupFailed {
+            *self.inner.underlay_recovery.lock() = None;
+        }
         *phase = Phase::Failed(err.clone());
         self.publish(with_error(self.base_snapshot(AgentLifecycle::Failed), &err));
     }
@@ -432,11 +462,188 @@ impl AgentHandle {
         }
         let err = AgentError::new(AgentErrorKind::Failed, "mesh supervisor stopped");
         let old = std::mem::replace(&mut *phase, Phase::Failed(err.clone()));
+        #[cfg(feature = "local-api")]
+        self.inner.api_watch.send_replace(None);
+        #[cfg(not(target_os = "android"))]
+        {
+            *self.inner.underlay_recovery.lock() = None;
+        }
         self.publish(with_error(self.base_snapshot(AgentLifecycle::Failed), &err));
+        if let Phase::Mesh(mesh) = old
+            && let Err(error) = mesh.drain().await
+        {
+            self.fail_locked(
+                &mut phase,
+                AgentError::new(
+                    AgentErrorKind::CleanupFailed,
+                    format!("failed mesh cleanup: {error:#}"),
+                ),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+impl AgentHandle {
+    fn monitor_underlay(&self) {
+        let mut task = self.inner.underlay_monitor.lock();
+        if task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let owner = Arc::downgrade(&self.inner);
+        let shutdown = self.inner.shutdown.clone();
+        *task = Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {},
+                }
+                let Some(inner) = owner.upgrade() else { break };
+                let handle = AgentHandle { inner };
+                handle.check_underlay().await;
+            }
+        }));
+    }
+
+    async fn check_underlay(&self) {
+        let dead = {
+            let phase = self.inner.phase.read().await;
+            matches!(&*phase, Phase::Mesh(mesh) if !mesh.is_alive())
+        };
+        if dead {
+            self.record_dead_mesh().await;
+            return;
+        }
+        let (current, overlay, recovery) = {
+            let phase = self.inner.phase.read().await;
+            match &*phase {
+                Phase::Mesh(mesh) => {
+                    let snapshot = mesh.node.forwarding.load();
+                    let ips = snapshot
+                        .tables
+                        .local_ips
+                        .values()
+                        .copied()
+                        .chain(std::iter::once(snapshot.self_id.ip))
+                        .filter(|ip| !ip.is_unspecified())
+                        .map(std::net::IpAddr::V4)
+                        .collect::<Vec<_>>();
+                    (Some(mesh.underlay.clone()), ips, None)
+                }
+                Phase::Failed(_) => {
+                    let Some(recovery) = self.inner.underlay_recovery.lock().clone() else {
+                        return;
+                    };
+                    (None, Vec::new(), Some(recovery))
+                }
+                _ => return,
+            }
+        };
+        let discovered = tokio::select! {
+            biased;
+            _ = self.inner.shutdown.cancelled() => return,
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), crate::underlay::discover_transport(&self.inner.config.ifname, &overlay)) => result,
+        };
+        let observed = match discovered {
+            Ok(Ok(observed)) => Arc::new(observed),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "underlay observation unavailable");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("underlay observation timed out");
+                return;
+            }
+        };
+        if current
+            .as_ref()
+            .is_some_and(|current| current.same_network(&observed))
+            || recovery.as_ref().is_some_and(|recovery| {
+                recovery.observed.same_network(&observed) && Instant::now() < recovery.retry_at
+            })
+        {
+            return;
+        }
+        self.refresh_underlay(current, observed).await;
+    }
+
+    async fn refresh_underlay(
+        &self,
+        expected: Option<Arc<crate::underlay::TransportUnderlay>>,
+        observed: Arc<crate::underlay::TransportUnderlay>,
+    ) {
+        let mut phase = self.inner.phase.write().await;
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
+        let desired_up = match (&*phase, expected) {
+            (Phase::Mesh(mesh), Some(expected)) if Arc::ptr_eq(&mesh.underlay, &expected) => {
+                mesh.desired_up.load(std::sync::atomic::Ordering::Acquire)
+            }
+            (Phase::Failed(_), None) => {
+                let Some(recovery) = self.inner.underlay_recovery.lock().clone() else {
+                    return;
+                };
+                recovery.desired_up
+            }
+            _ => return,
+        };
+        {
+            let mut recovery = self.inner.underlay_recovery.lock();
+            if recovery
+                .as_ref()
+                .is_none_or(|recovery| !recovery.observed.same_network(&observed))
+            {
+                *recovery = Some(UnderlayRecovery {
+                    desired_up,
+                    observed,
+                    retry_at: Instant::now(),
+                    delay: std::time::Duration::from_secs(5),
+                });
+            }
+        }
+        #[cfg(feature = "local-api")]
+        self.inner.api_watch.send_replace(None);
+        let old = std::mem::replace(&mut *phase, Phase::Activating);
+        self.publish(self.transition_snapshot(AgentLifecycle::Activating));
         if let Phase::Mesh(mesh) = old {
-            tokio::spawn(async move {
-                mesh.drain().await;
-            });
+            tracing::info!("underlay changed; rebuilding protected networking resources");
+            if let Err(error) = mesh.drain().await {
+                *self.inner.underlay_recovery.lock() = None;
+                self.fail_locked(
+                    &mut phase,
+                    AgentError::new(
+                        AgentErrorKind::CleanupFailed,
+                        format!("underlay teardown failed: {error:#}"),
+                    ),
+                );
+                return;
+            }
+        }
+        if self.inner.shutdown.is_cancelled() {
+            *phase = Phase::Stopped;
+            self.publish(self.base_snapshot(AgentLifecycle::Stopped));
+            return;
+        }
+        if let Err(error) = activate_locked(self, &mut phase).await {
+            if let Some(recovery) = self.inner.underlay_recovery.lock().as_mut() {
+                recovery.retry_at = Instant::now() + recovery.delay;
+                recovery.delay = (recovery.delay * 2).min(std::time::Duration::from_secs(300));
+            }
+            tracing::warn!(%error, "protected networking recovery pending");
+            self.fail_locked(&mut phase, error);
+        }
+    }
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        #[cfg(not(target_os = "android"))]
+        if let Some(task) = self.underlay_monitor.get_mut().take() {
+            task.abort();
         }
     }
 }
@@ -455,9 +662,14 @@ pub(crate) fn new_inner(
         paths,
         shutdown,
         started_at,
+        src_posture_ok: Arc::new(arc_swap::ArcSwap::from_pointee(false)),
         phase: tokio::sync::RwLock::new(Phase::Idle),
         published: arc_swap::ArcSwap::from(initial),
         watch,
+        #[cfg(not(target_os = "android"))]
+        underlay_monitor: parking_lot::Mutex::new(None),
+        #[cfg(not(target_os = "android"))]
+        underlay_recovery: parking_lot::Mutex::new(None),
         #[cfg(feature = "local-api")]
         api_watch: tokio::sync::watch::channel(None).0,
     }
@@ -484,15 +696,33 @@ async fn activate_locked(handle: &AgentHandle, phase: &mut Phase) -> Result<(), 
     let policy = SealPolicy::from_env_and_flag(inner.config.no_encrypt_state);
     let (identity, persisted, _) = load_agent(&inner.paths, policy)
         .map_err(|e| AgentError::new(AgentErrorKind::ActivateFailed, format!("{e:#}")))?;
+    let desired_up = {
+        #[cfg(not(target_os = "android"))]
+        {
+            inner
+                .underlay_recovery
+                .lock()
+                .as_ref()
+                .is_none_or(|recovery| recovery.desired_up)
+        }
+        #[cfg(target_os = "android")]
+        {
+            true
+        }
+    };
     let mesh = start_mesh(
         identity,
         persisted,
         inner.paths.clone(),
         &inner.config,
         handle.clone(),
+        desired_up,
     )
     .await
-    .map_err(|e| AgentError::new(AgentErrorKind::ActivateFailed, format!("{e:#}")))?;
+    .map_err(|error| match error.downcast::<AgentError>() {
+        Ok(error) => error,
+        Err(error) => AgentError::new(AgentErrorKind::ActivateFailed, format!("{error:#}")),
+    })?;
     #[cfg(feature = "local-api")]
     {
         inner.api_watch.send_replace(Some(mesh.api_state.clone()));
@@ -500,6 +730,11 @@ async fn activate_locked(handle: &AgentHandle, phase: &mut Phase) -> Result<(), 
     let snap = snapshot_from_mesh(&mesh, inner.started_at);
     *phase = Phase::Mesh(Box::new(mesh));
     handle.publish(snap);
+    #[cfg(not(target_os = "android"))]
+    {
+        *inner.underlay_recovery.lock() = None;
+        handle.monitor_underlay();
+    }
     Ok(())
 }
 
@@ -507,5 +742,36 @@ async fn activate_locked(handle: &AgentHandle, phase: &mut Phase) -> Result<(), 
 impl AgentHandle {
     pub(crate) fn observe_mesh(&self) -> tunnet_core::local_api::MeshObservation {
         crate::runtime::observe::from_snapshot(&self.snapshot_now())
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unresolved_cleanup_blocks_new_network_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = super::super::AgentRuntime::start(AgentConfig::new(dir.path()), None)
+            .await
+            .unwrap();
+        let handle = runtime.handle();
+        *handle.inner.phase.write().await = Phase::Failed(AgentError::new(
+            AgentErrorKind::CleanupFailed,
+            "DNS restoration failed",
+        ));
+        let error = handle.create(CreateRequest::default()).await.unwrap_err();
+        assert_eq!(error.kind, AgentErrorKind::CleanupFailed);
+        let error = handle
+            .join(JoinRequest {
+                invite_code: "invite".into(),
+                hostname: None,
+                auto_accept_firewall: false,
+                no_encrypt_state: false,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, AgentErrorKind::CleanupFailed);
+        runtime.shutdown().await;
     }
 }

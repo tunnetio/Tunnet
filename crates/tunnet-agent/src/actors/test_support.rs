@@ -16,22 +16,20 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         .expect("bind test endpoint");
     let routes = tunnet_core::RoutingTable::new();
     let revisions = Arc::new(tunnet_core::sync::ManagedRevisions::new(1, 1));
-    let acl = tunnet_core::AclEngine::new(
+    let forwarding = tunnet_core::ForwardingStore::new();
+    forwarding.set_self(
+        &routes,
         tunnet_core::SelfIdentity {
             endpoint_hex: identity.endpoint_id_hex(),
             ip: "10.9.0.1".parse().unwrap(),
             tags: vec![],
             network: "test".into(),
+            posture: tunnet_common::PeerPosture::Unknown,
         },
-        routes.clone(),
-        tunnet_common::policy::PolicyBundle::default(),
     );
+    let policy = tunnet_core::PolicyEngine::new();
     let pool = tunnet_core::ConnPool::new(endpoint.clone(), TUNNEL_STREAM_ALPN);
-    let tunnel_pool = tunnet_core::ConnPool::with_shared_policy(
-        endpoint.clone(),
-        tunnet_common::TUNNEL_ALPN,
-        &pool,
-    );
+    let peers = tunnet_core::PeerManager::new(endpoint.clone(), tunnet_common::TUNNEL_ALPN);
     let tmp = tempfile::tempdir().expect("tempdir");
     let paths = tunnet_core::StatePaths::resolve(Some(tmp.path().to_str().expect("utf8")));
     let _ = paths.ensure();
@@ -39,20 +37,29 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
         paths.blobs_dir(),
         pool.clone(),
         routes.clone(),
-        acl.clone(),
+        forwarding.clone(),
         identity.endpoint_id_hex(),
     )
     .await
     .expect("open send manager");
     let node = tunnet_core::CoreNode {
+        external_dns: Some(Arc::new(
+            tunnet_core::dns::HickoryLookup::with_runtime(
+                &tunnet_common::DnsConfig::default(),
+                tunnet_core::dns::NativeHickoryRuntimeProvider::new([None; 2], [None; 2]),
+            )
+            .expect("test external DNS"),
+        )),
         identity,
         persisted: tunnet_core::PersistedState::Direct { networks: vec![] },
         endpoint,
+        candidate_updates: None,
         pool: pool.clone(),
-        tunnel_pool,
+        peers,
         effective_config: tunnet_core::EffectiveConfigStore::new(),
         routes: routes.clone(),
-        acl,
+        forwarding,
+        policy,
         revisions,
         self_ipv4: "10.9.0.1".parse().unwrap(),
         paths,

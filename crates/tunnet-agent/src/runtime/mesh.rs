@@ -19,7 +19,7 @@ use tunnet_core::{CoreNode, CoreNodeConfig};
 use uuid::Uuid;
 
 use crate::accept::AcceptDeps;
-use crate::actors::control::{ControlPlaneActorArgs, TransportConfig};
+use crate::actors::control::ControlPlaneActorArgs;
 use crate::actors::dataplane::{ActorDataPlaneControl, DataPlaneActorConfig, new_published_plane};
 use crate::actors::presence::PresenceActorArgs;
 use crate::actors::routes::RouteActorArgs;
@@ -29,7 +29,6 @@ use crate::actors::supervisor::{
     AgentSupervisor, AgentSupervisorArgs, DataPlaneSupervisorArgs, GetAgentChildren,
     GetDataPlaneChildren,
 };
-use crate::ingress::IngressRegistry;
 use crate::metrics::AgentMetrics;
 use crate::system_dns::DnsController;
 
@@ -40,6 +39,11 @@ use crate::ssh::bindings_from_runtime;
 
 /// Live mesh: actor tree, node, and the pieces a host needs to observe or drain.
 pub(crate) struct MeshSession {
+    background: MeshBackground,
+    #[cfg(not(target_os = "android"))]
+    pub(crate) desired_up: Arc<AtomicBool>,
+    #[cfg(not(target_os = "android"))]
+    pub(crate) underlay: Arc<crate::underlay::TransportUnderlay>,
     supervisor: kameo::actor::ActorRef<AgentSupervisor>,
     ssh_handle: Option<tokio::task::JoinHandle<()>>,
     dns_controller: Option<Arc<DnsController>>,
@@ -60,15 +64,45 @@ impl MeshSession {
         self.supervisor.is_alive()
     }
 
-    pub(crate) async fn drain(self) {
+    pub(crate) async fn drain(self) -> anyhow::Result<()> {
+        self.background.shutdown().await;
         drain(
             self.supervisor,
             self.ssh_handle,
             self.dns_controller,
-            self.router,
+            Some(self.router),
             &self.node,
         )
-        .await;
+        .await
+    }
+}
+
+struct MeshBackground {
+    cancel: tokio_util::sync::CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl MeshBackground {
+    async fn shutdown(mut self) {
+        self.cancel.cancel();
+        for mut task in self.tasks.drain(..) {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+impl Drop for MeshBackground {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 }
 
@@ -78,7 +112,13 @@ pub(crate) async fn start_mesh(
     paths: tunnet_core::StatePaths,
     args: &AgentConfig,
     handle: AgentHandle,
+    desired_up: bool,
 ) -> anyhow::Result<MeshSession> {
+    anyhow::ensure!(!handle.shutdown_token().is_cancelled(), "agent is stopping");
+    let mut background = MeshBackground {
+        cancel: tokio_util::sync::CancellationToken::new(),
+        tasks: Vec::new(),
+    };
     let metrics = AgentMetrics::new().context("metrics")?;
     #[cfg(feature = "local-api")]
     let started_at = Instant::now();
@@ -94,8 +134,7 @@ pub(crate) async fn start_mesh(
     let is_direct = persisted.is_direct();
     let network_id = persisted.primary_network_id().unwrap_or(Uuid::nil());
 
-    // Shared posture flag: written by PostureActor, read by the ACL engine.
-    let src_posture_ok = Arc::new(arc_swap::ArcSwap::from_pointee(true));
+    let src_posture_ok = handle.inner.src_posture_ok.clone();
 
     let agent_cfg = tunnet_core::TunnetConfig::load(&paths).unwrap_or_default();
     let config_store = tunnet_core::EffectiveConfigStore::new();
@@ -103,13 +142,19 @@ pub(crate) async fn start_mesh(
 
     #[cfg(not(target_os = "android"))]
     let underlay_hosts = {
-        let mut hosts = Vec::new();
+        let mut seeds = Vec::new();
         if let Ok(managed) = persisted.require_managed() {
-            hosts.extend(crate::dataplane::underlay_hosts_from_url(
-                &managed.control_url,
-            ));
+            seeds.push(managed.control_url.clone());
         }
-        if let Some(info) = crate::underlay::UnderlayInfo::discover() {
+        if let Some(urls) = args.relay_urls.as_deref() {
+            seeds.extend(
+                urls.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            );
+        }
+        let mut hosts = crate::dataplane::resolve_underlay_hosts(&seeds).await;
+        if let Some(info) = crate::underlay::UnderlayInfo::discover(&args.ifname) {
             for dns in info.dns_servers {
                 if let std::net::IpAddr::V4(ip) = dns
                     && !ip.is_loopback()
@@ -163,11 +208,60 @@ pub(crate) async fn start_mesh(
     let need_multicast = connectivity.enable_mdns || (agent_cfg.effective_service_relay() && lan);
     let multicast = crate::multicast_demand::MulticastLease::request(need_multicast);
 
+    #[cfg(not(target_os = "android"))]
+    let underlay = {
+        let overlay_ips = match &persisted {
+            tunnet_core::PersistedState::Direct { networks } => networks
+                .iter()
+                .map(|network| std::net::IpAddr::V4(network.self_ipv4()))
+                .collect::<Vec<_>>(),
+            tunnet_core::PersistedState::Managed(_) => {
+                tunnet_core::state::load_snapshot_cache(&paths)
+                    .map(|snapshot| {
+                        snapshot
+                            .memberships
+                            .iter()
+                            .map(|m| std::net::IpAddr::V4(m.assigned_ipv4))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        Arc::new(crate::underlay::discover_transport(&args.ifname, &overlay_ips).await?)
+    };
+    #[cfg(not(target_os = "android"))]
+    let bindings = underlay.bindings.clone();
     let (node, _pending_control) = CoreNode::bootstrap(
         identity.clone(),
         persisted,
         paths.clone(),
         CoreNodeConfig {
+            #[cfg(not(target_os = "android"))]
+            relay_tcp_config: Some(crate::underlay::relay_tcp_config(&bindings)),
+            #[cfg(target_os = "android")]
+            relay_tcp_config: Some(
+                [Some(iroh::endpoint::TcpSocketConfig {
+                    interface: None,
+                    initialize: Some(crate::android_tun::protect_tcp_socket),
+                }); 2],
+            ),
+            #[cfg(not(target_os = "android"))]
+            bindings,
+            #[cfg(target_os = "android")]
+            bindings: ["0.0.0.0:0", "[::]:0"]
+                .into_iter()
+                .map(|address| {
+                    (
+                        address.parse().expect("static address"),
+                        iroh::endpoint::BindOpts::default().set_socket_config(
+                            iroh::endpoint::SocketConfig {
+                                interface: None,
+                                initialize: Some(crate::android_tun::protect_udp_socket),
+                            },
+                        ),
+                    )
+                })
+                .collect(),
             hostname: hostname.clone(),
             agent_version: env!("CARGO_PKG_VERSION"),
             advertise_datagram_alpn: true,
@@ -186,6 +280,25 @@ pub(crate) async fn start_mesh(
     )
     .await?;
     drop(_pending_control);
+    if handle.shutdown_token().is_cancelled() {
+        node.shutdown().await;
+        anyhow::bail!("agent stopped during network bootstrap");
+    }
+    let service_relay_sockets =
+        if agent_cfg.effective_service_relay() && lan && node.shared_gossip().is_some() {
+            match (
+                node.endpoint.udp_socket_config(),
+                node.endpoint.tcp_socket_config(),
+            ) {
+                (Some(udp), Some(tcp)) => Some((udp, tcp)),
+                _ => {
+                    node.shutdown().await;
+                    anyhow::bail!("service relay requires protected UDP and TCP sockets");
+                }
+            }
+        } else {
+            None
+        };
 
     let config_store = node.effective_config.clone();
 
@@ -215,20 +328,10 @@ pub(crate) async fn start_mesh(
             .filter(|t| !t.is_empty())
             .collect();
         if !wanted.is_empty()
-            && let Ok(managed) = node.persisted.require_managed()
+            && let Some(client) = &node.signed
+            && let Err(e) = client.patch_device_tags(&wanted, &[]).await
         {
-            match tunnet_core::control::SignedClient::new(
-                managed.control_url.clone(),
-                node.endpoint_id_hex(),
-                node.identity.signing_key.clone(),
-            ) {
-                Ok(client) => {
-                    if let Err(e) = client.patch_device_tags(&wanted, &[]).await {
-                        tracing::warn!(?e, "failed to apply tunnet.toml self tags");
-                    }
-                }
-                Err(e) => tracing::warn!(?e, "signed client for self tags"),
-            }
+            tracing::warn!(?e, "failed to apply tunnet.toml self tags");
         }
     }
 
@@ -255,13 +358,18 @@ pub(crate) async fn start_mesh(
         };
         (addrs, cidrs, 1280u16, tunnet_core::load_dns(&node.paths))
     } else {
-        let membership_snap = tunnet_core::state::load_snapshot_cache(&node.paths)
-            .and_then(|s| {
+        let membership_snap =
+            match tunnet_core::state::load_snapshot_cache(&node.paths).and_then(|s| {
                 s.memberships
                     .into_iter()
                     .find(|m| m.network_id == network_id)
-            })
-            .context("cached snapshot missing enrolled network")?;
+            }) {
+                Some(snapshot) => snapshot,
+                None => {
+                    node.shutdown().await;
+                    anyhow::bail!("cached snapshot missing enrolled network");
+                }
+            };
         let effective_mtu = config_store.load().effective.tunnel_mtu.value.max(576);
         // Managed enrolment has no Direct address plan; peer reachability is
         // driven by the coordinator's routes rather than a declared range.
@@ -321,7 +429,9 @@ pub(crate) async fn start_mesh(
     let ssh_intercept = crate::ssh::SshIntercept::new();
     #[cfg(feature = "metrics-serve")]
     let metrics_bind = local_addrs[0];
+    let desired_up = Arc::new(AtomicBool::new(desired_up));
     let dataplane_cfg = DataPlaneActorConfig {
+        desired_up: desired_up.clone(),
         ifname: args.ifname.clone(),
         local_addrs,
         peer_cidrs,
@@ -333,21 +443,18 @@ pub(crate) async fn start_mesh(
         network_id,
         #[cfg(not(target_os = "android"))]
         underlay_hosts: underlay_hosts.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept: ssh_intercept.clone(),
     };
 
     // Managed control + posture (absent in Direct mode).
     let control_args = if is_direct {
         None
     } else {
-        let managed = node.persisted.require_managed().ok().cloned();
-        managed.map(|m| ControlPlaneActorArgs {
-            transport: TransportConfig {
-                control_url: m.control_url.clone(),
-                endpoint_id: node.endpoint_id_hex(),
-                signing_key: node.identity.signing_key.clone(),
-            },
+        Some(ControlPlaneActorArgs {
+            client: Arc::new(node.require_signed()?.clone()),
+            link: node
+                .control_link
+                .clone()
+                .context("Managed control link unavailable")?,
             node: node.clone(),
             network_id,
             hostname: hostname.clone(),
@@ -355,7 +462,6 @@ pub(crate) async fn start_mesh(
             paths: paths.clone(),
             poll_secs: args.poll_secs,
             // Late-bound by the supervisor after the dataplane tree starts.
-            route_actor: None,
             dataplane_actor: None,
             #[cfg(feature = "posture")]
             posture_actor: None,
@@ -370,6 +476,8 @@ pub(crate) async fn start_mesh(
         Some(PostureSpawnConfig {
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
             src_posture_ok: src_posture_ok.clone(),
+            authorization_gate: node.forwarding.authorization_gate(),
+            forwarding: node.forwarding.clone(),
         })
     };
 
@@ -379,9 +487,6 @@ pub(crate) async fn start_mesh(
 
     // Single event bus shared by the actors, the updater, and the Local API.
     let (events_tx, _) = tokio::sync::broadcast::channel(256);
-    // Ingress reader registry: shared by the dialer pump, the accept router,
-    // and the DataPlaneActor (which aborts readers on BringDown).
-    let ingress = IngressRegistry::new();
     // Update scheduler state (read model for status; bytes stay in CoreUpdater).
     #[cfg(feature = "updater")]
     let update_state = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -389,6 +494,10 @@ pub(crate) async fn start_mesh(
     ));
     #[cfg(feature = "updater")]
     let updater = crate::core_update::CoreUpdater::shared(paths.clone(), events_tx.clone());
+    if handle.shutdown_token().is_cancelled() {
+        node.shutdown().await;
+        anyhow::bail!("agent stopped before actor startup");
+    }
     let supervisor = AgentSupervisor::spawn_with_mailbox(
         AgentSupervisorArgs {
             dataplane: DataPlaneSupervisorArgs {
@@ -400,12 +509,11 @@ pub(crate) async fn start_mesh(
                 events: events_tx.clone(),
                 published: published.clone(),
                 status: status_snapshot.clone(),
-                ingress: ingress.clone(),
                 initially_up: false,
                 initial_generation: 0,
                 // Recover service across supervised restarts; BringUp failure
                 // is logged, never a crash.
-                auto_up: true,
+                auto_up: desired_up.load(std::sync::atomic::Ordering::Acquire),
             },
             control: control_args,
             #[cfg(feature = "posture")]
@@ -423,26 +531,52 @@ pub(crate) async fn start_mesh(
     );
     supervisor.wait_for_startup().await;
 
-    // Resolve the dataplane + control actors for outer wiring.
-    let children: crate::actors::supervisor::AgentChildren =
-        supervisor.ask(GetAgentChildren).await?;
-    let (route_ref, dataplane_ref) = if let Some(dp_sup) = &children.dataplane_sup {
-        let dc: crate::actors::supervisor::DataPlaneChildren =
-            dp_sup.ask(GetDataPlaneChildren).await?;
-        (dc.route_actor, dc.dataplane_actor)
-    } else {
-        (None, None)
-    };
-    let _ = route_ref;
-    let dataplane_ref = dataplane_ref.context("dataplane actor missing")?;
-    if let Some(control) = &children.control_actor {
-        control.wait_for_startup().await;
+    let resolved = async {
+        let children: crate::actors::supervisor::AgentChildren =
+            supervisor.ask(GetAgentChildren).await?;
+        let dataplane = if let Some(dp_sup) = &children.dataplane_sup {
+            let children: crate::actors::supervisor::DataPlaneChildren =
+                dp_sup.ask(GetDataPlaneChildren).await?;
+            children
+                .dataplane_actor
+                .context("dataplane actor missing")?
+        } else {
+            anyhow::bail!("dataplane supervisor missing")
+        };
+        #[cfg(feature = "ssh")]
+        anyhow::ensure!(children.ssh_registry.is_some(), "ssh registry missing");
+        if let Some(control) = &children.control_actor {
+            control.wait_for_startup().await;
+        }
+        anyhow::ensure!(
+            !handle.shutdown_token().is_cancelled(),
+            "agent stopped during actor startup"
+        );
+        Ok::<_, anyhow::Error>((children, dataplane))
     }
+    .await;
+    let (children, dataplane_ref) = match resolved {
+        Ok(actors) => actors,
+        Err(error) => {
+            background.shutdown().await;
+            if let Err(cleanup) = drain(supervisor, None, dns_controller, None, &node).await {
+                #[cfg(not(target_os = "android"))]
+                {
+                    *handle.inner.underlay_recovery.lock() = None;
+                }
+                return Err(super::AgentError::new(
+                    super::AgentErrorKind::CleanupFailed,
+                    format!("actor startup failed: {error:#}; cleanup: {cleanup:#}"),
+                )
+                .into());
+            }
+            return Err(error);
+        }
+    };
     #[cfg(feature = "ssh")]
-    let ssh_registry = children
-        .ssh_registry
-        .clone()
-        .context("ssh registry missing")?;
+    let ssh_registry = children.ssh_registry.clone().expect("validated SSH actor");
+    #[cfg(not(feature = "ssh"))]
+    let _ = children;
 
     let data_plane_control = Arc::new(ActorDataPlaneControl::new(
         status_snapshot.clone(),
@@ -491,63 +625,69 @@ pub(crate) async fn start_mesh(
     // Dataplane up via the owning actor (builds TUN, DNS, routes).
     // Kameo flattens `Result` replies into the `ask` error channel.
     // A Direct address conflict degrades bring-up instead of reporting healthy.
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        dataplane_ref.ask(crate::actors::dataplane::BringUp),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "dataplane degraded at startup");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "dataplane bring-up timed out; degraded");
+    if desired_up.load(std::sync::atomic::Ordering::Acquire) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            dataplane_ref.ask(crate::actors::dataplane::BringUp),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "dataplane degraded at startup");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "dataplane bring-up timed out; degraded");
+            }
         }
     }
+    if handle.shutdown_token().is_cancelled() {
+        background.shutdown().await;
+        if let Err(cleanup) = drain(supervisor, None, dns_controller, None, &node).await {
+            #[cfg(not(target_os = "android"))]
+            {
+                *handle.inner.underlay_recovery.lock() = None;
+            }
+            return Err(super::AgentError::new(
+                super::AgentErrorKind::CleanupFailed,
+                format!("agent stopped during dataplane startup; cleanup: {cleanup:#}"),
+            )
+            .into());
+        }
+        anyhow::bail!("agent stopped during dataplane startup");
+    }
+    let membership_changed = Arc::new(tokio::sync::Notify::new());
     {
         let dataplane_bg = dataplane_ref.clone();
-        tokio::spawn(async move {
+        let cancel = background.cancel.clone();
+        let changed = membership_changed.clone();
+        let peers = node.peers.clone();
+        let pool = node.pool.clone();
+        background.tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
-                tick.tick().await;
-                if let Err(error) = dataplane_bg
-                    .ask(crate::actors::dataplane::ReconcileDirectState)
-                    .await
-                {
-                    tracing::warn!(%error, "Direct lifecycle reconciliation degraded");
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = changed.notified() => {},
+                    _ = tick.tick() => {},
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = async {
+                        pool.reconcile().await;
+                        peers.reconcile().await;
+                        if let Err(error) = dataplane_bg.ask(crate::actors::dataplane::ReconcileState).await {
+                            tracing::warn!(%error, "dataplane lifecycle reconciliation degraded");
+                        }
+                    } => {},
                 }
             }
-        });
+        }));
     }
 
-    let stream_handler = tunnet_core::stream_handler(node.routes.clone(), node.acl.clone());
-    let dgram_pool = node.tunnel_pool.clone();
-
-    let firewalls: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.firewall.clone()))
-        .collect();
-    let spoofs: HashMap<_, _> = node
-        .direct
-        .iter()
-        .map(|(id, rt)| (*id, rt.spoof_tracker.clone()))
-        .collect();
-
-    crate::dgram_pump::install_dialer_datagram_pump(
-        &dgram_pool,
-        published.clone(),
-        node.routes.clone(),
-        node.acl.clone(),
-        firewalls.clone(),
-        spoofs.clone(),
-        metrics.clone(),
-        node.direct_auth.clone(),
-        ingress.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept.clone(),
-    );
+    let stream_handler = tunnet_core::stream_handler(node.forwarding.clone(), node.policy.clone());
 
     let docs_map: HashMap<_, _> = node
         .direct
@@ -557,23 +697,9 @@ pub(crate) async fn start_mesh(
 
     // Direct membership sync drives pool invalidation by event, never by timer.
     for docs in docs_map.values() {
-        let stream_pool = node.pool.clone();
-        let dgram_pool = node.tunnel_pool.clone();
-        let dataplane = dataplane_ref.clone();
+        let changed = membership_changed.clone();
         docs.set_change_hook(Arc::new(move || {
-            let stream_pool = stream_pool.clone();
-            let dgram_pool = dgram_pool.clone();
-            let dataplane = dataplane.clone();
-            tokio::spawn(async move {
-                stream_pool.reconcile().await;
-                dgram_pool.reconcile().await;
-                if let Err(error) = dataplane
-                    .ask(crate::actors::dataplane::ReconcileDirectState)
-                    .await
-                {
-                    tracing::warn!(%error, "membership route reconciliation degraded");
-                }
-            });
+            changed.notify_one();
         }));
     }
 
@@ -623,7 +749,7 @@ pub(crate) async fn start_mesh(
                 };
             let ssh_deps = crate::ssh::SshServeDeps {
                 routes: node.routes.clone(),
-                acl: node.acl.clone(),
+                forwarding: node.forwarding.clone(),
                 sessions: ssh_registry.clone(),
                 #[cfg(feature = "local-api")]
                 cp_tx: node.serves.client_tx(),
@@ -687,6 +813,8 @@ pub(crate) async fn start_mesh(
                 }
             }
             let _ = recording_store;
+            node.forwarding
+                .set_ssh_addrs(&node.routes, ssh_intercept.snapshot());
             ssh_handle
         }
         #[cfg(not(feature = "ssh"))]
@@ -698,9 +826,7 @@ pub(crate) async fn start_mesh(
     let router = crate::accept::spawn(AcceptDeps {
         endpoint: node.endpoint.clone(),
         routes: node.routes.clone(),
-        acl: node.acl.clone(),
-        metrics: metrics.clone(),
-        tun: published.clone(),
+        forwarding: node.forwarding.clone(),
         stream_handler,
         #[cfg(feature = "ssh")]
         cp_tx: {
@@ -725,38 +851,66 @@ pub(crate) async fn start_mesh(
         auth_server_ctx,
         paths: node.paths.clone(),
         join_authorities,
-        firewalls,
-        spoofs,
-        dgram_pool: dgram_pool.clone(),
+        peers: node.peers.clone(),
         agent_gossip: node.gossip.clone(),
         shared_docs: node.docs_engine.clone(),
-        ingress: ingress.clone(),
         events: events_tx.clone(),
-        #[cfg(feature = "ssh")]
-        ssh_intercept: ssh_intercept.clone(),
     });
 
     #[cfg(feature = "metrics-serve")]
-    crate::metrics::spawn_listeners(metrics.clone(), &args.metrics_bind, metrics_bind);
+    background.tasks.extend(crate::metrics::spawn_listeners(
+        metrics.clone(),
+        &args.metrics_bind,
+        metrics_bind,
+    ));
 
     if agent_cfg.effective_service_relay() && lan {
         if let Some(gossip) = node.shared_gossip() {
-            let peers: Vec<iroh::EndpointId> = node
-                .routes
-                .peers()
-                .iter()
+            let snapshot = node.forwarding.load();
+            let peers = snapshot
+                .bindings
+                .values()
+                .filter(|binding| {
+                    binding.network == network_id
+                        && snapshot.allows_network(network_id, binding.endpoint)
+                })
+                .map(|binding| binding.endpoint)
                 .take(5)
-                .filter_map(|p| p.endpoint_hex.parse().ok())
                 .collect();
-            let topic = tunnet_common::mdns_relay_topic_hex(&network_id);
-            let _mdns_task = tunnet_core::mdns_relay::spawn(tunnet_core::mdns_relay::SpawnConfig {
-                gossip,
-                topic_hex: topic,
-                bootstrap: peers,
-                mesh_ip: node.self_ipv4,
-                endpoint_id: node.endpoint_id_hex(),
-                routes: node.routes.clone(),
-            });
+            let (socket_config, tcp_config) =
+                service_relay_sockets.expect("preflighted service relay sockets");
+            let Some(mesh_ip) = snapshot.local_ip(network_id) else {
+                background.shutdown().await;
+                if let Err(cleanup) =
+                    drain(supervisor, ssh_handle, dns_controller, Some(router), &node).await
+                {
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        *handle.inner.underlay_recovery.lock() = None;
+                    }
+                    return Err(super::AgentError::new(
+                        super::AgentErrorKind::CleanupFailed,
+                        format!("service relay startup failed; cleanup: {cleanup:#}"),
+                    )
+                    .into());
+                }
+                anyhow::bail!("service relay network has no local address");
+            };
+            background.tasks.push(tunnet_core::mdns_relay::spawn(
+                tunnet_core::mdns_relay::SpawnConfig {
+                    gossip,
+                    network: network_id,
+                    bootstrap: peers,
+                    mesh_ip,
+                    endpoint_id: node.endpoint_id_hex(),
+                    forwarding: node.forwarding.clone(),
+                    policy: node.policy.clone(),
+                    identity: node.identity.clone(),
+                    socket_config,
+                    tcp_config,
+                    cancel: background.cancel.clone(),
+                },
+            ));
         } else {
             tracing::warn!("mDNS service relay skipped (no shared Gossip)");
         }
@@ -764,14 +918,20 @@ pub(crate) async fn start_mesh(
         tracing::info!("mDNS service relay skipped (LAN unavailable)");
     }
 
-    spawn_view_pump(
+    background.tasks.push(spawn_view_pump(
         handle,
         node.routes.clone(),
         events_tx.clone(),
         supervisor.clone(),
-    );
+        background.cancel.clone(),
+    ));
 
     Ok(MeshSession {
+        background,
+        #[cfg(not(target_os = "android"))]
+        desired_up,
+        #[cfg(not(target_os = "android"))]
+        underlay,
         supervisor,
         ssh_handle,
         dns_controller,
@@ -791,16 +951,22 @@ fn spawn_view_pump(
     routes: tunnet_core::RoutingTable,
     events: tokio::sync::broadcast::Sender<tunnet_common::local_api::LocalEvent>,
     supervisor: kameo::actor::ActorRef<crate::actors::supervisor::AgentSupervisor>,
-) {
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     let shutdown = handle.shutdown_token();
+    let handle = Arc::downgrade(&handle.inner);
     tokio::spawn(async move {
         let mut routes_rx = routes.subscribe_changes();
         let mut events_rx = events.subscribe();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = cancel.cancelled() => break,
                 _ = supervisor.wait_for_shutdown() => {
-                    handle.record_dead_mesh().await;
+                    if let Some(inner) = handle.upgrade() {
+                        let handle = AgentHandle { inner };
+                        handle.publish(handle.snapshot_now());
+                    }
                     break;
                 }
                 r = routes_rx.changed() => {
@@ -819,43 +985,51 @@ fn spawn_view_pump(
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
                 _ = shutdown.cancelled() => break,
+                _ = cancel.cancelled() => break,
             }
+            let Some(inner) = handle.upgrade() else { break };
+            let handle = AgentHandle { inner };
             let snap = handle.snapshot_now();
             handle.publish(snap);
         }
-    });
+    })
 }
 
-/// Graceful drain with bounded waits; abort only as a final fallback.
 async fn drain(
     supervisor: kameo::actor::ActorRef<AgentSupervisor>,
     ssh_handle: Option<tokio::task::JoinHandle<()>>,
     dns_controller: Option<Arc<DnsController>>,
-    router: iroh::protocol::Router,
+    router: Option<iroh::protocol::Router>,
     node: &CoreNode,
-) {
+) -> anyhow::Result<()> {
     use crate::actors::supervisor::ShutdownAgent;
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let _ = supervisor.tell(ShutdownAgent).send().await;
-        let _ = supervisor.stop_gracefully().await;
-        supervisor.wait_for_shutdown().await;
-    })
-    .await;
+    node.peers.deactivate().await;
+    node.endpoint.close().await;
+    let _ = supervisor.tell(ShutdownAgent).send().await;
+    let _ = supervisor.stop_gracefully().await;
+    supervisor.wait_for_shutdown().await;
     if let Some(handle) = ssh_handle {
         handle.abort();
+        let _ = handle.await;
     }
-    if let Some(dns) = dns_controller {
+    let dns_result = if let Some(dns) = dns_controller {
         match tokio::task::spawn_blocking(move || dns.restore()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "DNS shutdown restore failed"),
-            Err(e) => tracing::warn!(error = %e, "DNS shutdown task failed"),
+            Ok(result) => result.context("DNS restoration failed"),
+            Err(error) => Err(anyhow::Error::new(error).context("DNS restoration task failed")),
         }
-    }
-    if let Err(e) = router.shutdown().await {
-        tracing::warn!(error = %e, "iroh accept router shutdown failed");
-    }
+    } else {
+        Ok(())
+    };
+    let router_result = if let Some(router) = router {
+        router.shutdown().await
+    } else {
+        Ok(())
+    };
     node.shutdown().await;
+    dns_result?;
+    router_result.context("iroh accept router shutdown failed")?;
+    Ok(())
 }
 
 /// Build presence args (no tasks spawned here; `PresenceActor` owns them).

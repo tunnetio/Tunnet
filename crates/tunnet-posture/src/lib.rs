@@ -10,7 +10,7 @@ pub mod value;
 
 pub use collector::{PostureAttributes, PostureCollector};
 pub use engine::{
-    CollectorStatus, PostureChangeEvent, PostureEngine, PostureEngineConfig, PostureState,
+    CollectorStatus, PostureCollection, PostureEngine, PostureEngineConfig, PostureState,
     compute_state_hash,
 };
 pub use error::PostureError;

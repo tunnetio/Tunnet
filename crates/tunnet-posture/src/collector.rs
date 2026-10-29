@@ -4,7 +4,6 @@ use crate::value::PostureValue;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Result of a single collector run.
 #[derive(Debug, Clone)]
@@ -50,8 +49,4 @@ pub trait PostureCollector: Send + Sync {
     }
 
     async fn collect(&self) -> Result<PostureAttributes, PostureError>;
-
-    fn min_interval(&self) -> Duration {
-        Duration::from_secs(300)
-    }
 }

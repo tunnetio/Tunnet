@@ -3,19 +3,14 @@
 //! Relay selection is [`EffectiveRelayPolicy`] only. DHT, mDNS, and LAN discovery
 //! are separate and never implied by a connectivity "profile".
 
-use std::borrow::Cow;
-use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::pin::Pin;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use ipnet::Ipv4Net;
 use iroh::Endpoint;
 use iroh::RelayMode;
-use iroh::address_lookup::AddrFilter;
-use iroh::dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData};
-use iroh::endpoint::Builder;
 use iroh::endpoint::presets;
+use iroh::endpoint::{Builder, DirectAddrFilter};
 use iroh::{EndpointAddr, RelayConfig, RelayMap, TransportAddr};
 #[cfg(feature = "direct")]
 use iroh_mainline_address_lookup::DhtAddressLookup;
@@ -143,95 +138,6 @@ fn apply_relay_policy(builder: Builder, policy: &EffectiveRelayPolicy) -> Builde
     }
 }
 
-/// DNS that omits AAAA when A exists.
-///
-/// iroh picks the relay TCP family from `udp_v6` in net report (IPv6 first when
-/// IPv6 STUN works). n0's IPv4 and IPv6 frontends do not share QUIC-over-relay
-/// sessions, so a dual-stack coordinator never sees an IPv4-only joiner. Direct
-/// UDP IPv6 is unchanged: magicsock still binds `[::]` and holepunches.
-fn ipv4_preferred_dns() -> DnsResolver {
-    DnsResolver::custom(Ipv4PreferredDns {
-        inner: DnsResolver::new(),
-    })
-}
-
-#[derive(Debug, Clone)]
-struct Ipv4PreferredDns {
-    inner: DnsResolver,
-}
-
-impl Ipv4PreferredDns {
-    fn lookup_v4(
-        &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv4Addr>, DnsError>> + Send>> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let addrs = inner.lookup_ipv4(host, DNS_TIMEOUT).await?;
-            let v4: Vec<Ipv4Addr> = addrs
-                .filter_map(|ip| match ip {
-                    IpAddr::V4(v) => Some(v),
-                    IpAddr::V6(_) => None,
-                })
-                .collect();
-            Ok(Box::new(v4.into_iter()) as BoxIter<Ipv4Addr>)
-        })
-    }
-}
-
-impl Resolver for Ipv4PreferredDns {
-    fn lookup_ipv4(
-        &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv4Addr>, DnsError>> + Send>> {
-        self.lookup_v4(host)
-    }
-
-    fn lookup_ipv6(
-        &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<Ipv6Addr>, DnsError>> + Send>> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            if let Ok(mut v4) = inner.lookup_ipv4(host.clone(), DNS_TIMEOUT).await
-                && v4.any(|ip| ip.is_ipv4())
-            {
-                return Ok(Box::new(std::iter::empty()) as BoxIter<Ipv6Addr>);
-            }
-            let addrs = inner.lookup_ipv6(host, DNS_TIMEOUT).await?;
-            let v6: Vec<Ipv6Addr> = addrs
-                .filter_map(|ip| match ip {
-                    IpAddr::V6(v) => Some(v),
-                    IpAddr::V4(_) => None,
-                })
-                .collect();
-            Ok(Box::new(v6.into_iter()) as BoxIter<Ipv6Addr>)
-        })
-    }
-
-    fn lookup_txt(
-        &self,
-        host: String,
-    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<TxtRecordData>, DnsError>> + Send>> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            let recs: Vec<TxtRecordData> = inner.lookup_txt(host, DNS_TIMEOUT).await?.collect();
-            Ok(Box::new(recs.into_iter()) as BoxIter<TxtRecordData>)
-        })
-    }
-
-    fn clear_cache(&self) {
-        self.inner.clear_cache();
-    }
-
-    fn reset(&self) -> Box<dyn Resolver> {
-        self.inner.reset();
-        Box::new(Self {
-            inner: self.inner.clone(),
-        })
-    }
-}
-
 /// Start an endpoint builder from the resolved relay policy.
 ///
 /// N0 uses the n0 preset (relays + n0 DNS lookup). Custom and Disabled use
@@ -243,7 +149,7 @@ pub fn endpoint_builder(opts: &ConnectivityOptions) -> Builder {
             Endpoint::builder(presets::Minimal)
         }
     };
-    apply_relay_policy(builder.dns_resolver(ipv4_preferred_dns()), &opts.relay)
+    apply_relay_policy(builder, &opts.relay)
 }
 
 /// True when an IPv4 address belongs to a Tunnet overlay or the in-TUN resolver.
@@ -263,30 +169,38 @@ pub fn strip_overlay_addrs(mut addr: EndpointAddr, overlay_nets: &[Ipv4Net]) -> 
     addr
 }
 
-/// Do not publish overlay interface addresses as iroh underlay candidates.
-///
-/// `AddrFilter` applies to address *publish*. It does not filter
-/// QNT/handshake candidates on an existing connection (n0-computer/iroh#4399).
-pub fn apply_overlay_addr_filter(builder: Builder, overlay_nets: &[Ipv4Net]) -> Builder {
-    if overlay_nets.is_empty() {
-        return builder;
+struct OverlayCandidateFilter {
+    forwarding: crate::ForwardingStore,
+    initial: Vec<std::net::Ipv4Addr>,
+}
+
+impl std::fmt::Debug for OverlayCandidateFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayCandidateFilter")
+            .finish_non_exhaustive()
     }
-    let nets = overlay_nets.to_vec();
-    builder.addr_filter(AddrFilter::new(move |addrs| {
-        Cow::Owned(
-            addrs
-                .iter()
-                .filter(|a| match a {
-                    TransportAddr::Ip(sa) => match sa.ip() {
-                        IpAddr::V4(v4) => !is_overlay_underlay_ip(v4, &nets),
-                        IpAddr::V6(_) => true,
-                    },
-                    _ => true,
-                })
-                .cloned()
-                .collect(),
-        )
-    }))
+}
+
+impl DirectAddrFilter for OverlayCandidateFilter {
+    fn use_nat_candidate(&self, ip: IpAddr) -> bool {
+        let IpAddr::V4(ip) = ip else { return true };
+        let snapshot = self.forwarding.load();
+        ip != VirtualResolverEndpoint::IP
+            && ip != snapshot.self_id.ip
+            && !snapshot.tables.local_ips.values().any(|local| *local == ip)
+            && !(snapshot.tables.local_ips.is_empty() && self.initial.contains(&ip))
+    }
+}
+
+pub fn apply_overlay_addr_filter(
+    builder: Builder,
+    forwarding: &crate::ForwardingStore,
+    initial: Vec<std::net::Ipv4Addr>,
+) -> Builder {
+    builder.direct_addr_filter(OverlayCandidateFilter {
+        forwarding: forwarding.clone(),
+        initial,
+    })
 }
 
 /// Attach address-lookup services independently of relay policy.
@@ -330,6 +244,30 @@ pub fn relay_auth_denied_detail(endpoint: &Endpoint) -> Option<(String, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_filter_tracks_owned_addresses_without_excluding_routed_subnets() {
+        let forwarding = crate::ForwardingStore::new();
+        let routes = crate::RoutingTable::new();
+        let filter = OverlayCandidateFilter {
+            forwarding: forwarding.clone(),
+            initial: vec![],
+        };
+        let identity = |ip: &str| crate::SelfIdentity {
+            endpoint_hex: String::new(),
+            ip: ip.parse().unwrap(),
+            tags: vec![],
+            network: "test".into(),
+            posture: tunnet_common::PeerPosture::Unknown,
+        };
+        forwarding.set_self(&routes, identity("10.0.0.1"));
+        assert!(!filter.use_nat_candidate("10.0.0.1".parse().unwrap()));
+        assert!(filter.use_nat_candidate("10.0.0.2".parse().unwrap()));
+        assert!(!filter.use_nat_candidate(VirtualResolverEndpoint::IP.into()));
+        forwarding.set_self(&routes, identity("10.0.0.2"));
+        assert!(filter.use_nat_candidate("10.0.0.1".parse().unwrap()));
+        assert!(!filter.use_nat_candidate("10.0.0.2".parse().unwrap()));
+    }
 
     #[test]
     fn managed_default_is_disabled_until_snapshot() {

@@ -149,6 +149,7 @@ mod tests {
             hostname: "db".into(),
             tags: vec![],
             ssh_host_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest".into()),
+            posture: tunnet_common::PeerPosture::Unknown,
         }];
         sync_known_hosts(&dir.path().join("known_hosts"), &peers, "tunnet").unwrap();
         let body = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();

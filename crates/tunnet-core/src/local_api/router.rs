@@ -592,7 +592,7 @@ async fn acl_denies(
 ) -> ApiResult<Json<serde_json::Value>> {
     peer.require_cap(DIAG_READ)?;
     Ok(Json(serde_json::json!({
-        "denies": state.node.acl.recent_denies(),
+        "denies": state.node.policy.recent_denies(),
     })))
 }
 
@@ -842,7 +842,12 @@ async fn transfers_accept(
     Json(_body): Json<Option<SendAcceptRequest>>,
 ) -> ApiResult<Json<tunnet_common::local_api::TransferInfo>> {
     peer.require_cap(SEND)?;
-    let r = state.send.accept_pending(&id).await.map_err(map_anyhow)?;
+    let r = state
+        .send
+        .begin_accept_pending(&id)
+        .map_err(map_anyhow)?
+        .await
+        .map_err(map_anyhow)?;
     Ok(Json(handlers::transfer_info(r)))
 }
 

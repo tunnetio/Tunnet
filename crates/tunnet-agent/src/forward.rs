@@ -1,264 +1,352 @@
-//! IP forwarding + NAT (MASQUERADE) for exit-node / subnet gateways.
-
-// Every NAT backend shells out; Android is the only target with no backend arm.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use anyhow::Context;
+use anyhow::{Result, bail};
+use ipnet::Ipv4Net;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::process::Command;
-use std::sync::Mutex;
 
-static NAT_STATE: Mutex<Option<NatGuardInner>> = Mutex::new(None);
-
-struct NatGuardInner {
-    uplink: String,
+pub struct GatewayGuard {
     #[cfg(target_os = "linux")]
-    used_nft: bool,
+    forwarding: Vec<(std::path::PathBuf, String)>,
+    #[cfg(target_os = "linux")]
+    table: Option<String>,
+    #[cfg(target_os = "windows")]
+    forwarding: Vec<(String, String)>,
+    #[cfg(target_os = "windows")]
+    nat: Option<String>,
+    #[cfg(target_os = "macos")]
+    forwarding: Option<String>,
+    #[cfg(target_os = "macos")]
+    anchor: Option<String>,
+    #[cfg(target_os = "macos")]
+    pf_token: Option<String>,
 }
 
-/// Enable forwarding + MASQUERADE when this node advertises an exit / subnet gateway.
-pub fn ensure_exit_nat(advertise: bool) {
-    if !advertise {
-        teardown_exit_nat();
-        return;
+pub fn prepare(
+    ifname: &str,
+    source_networks: &[Ipv4Net],
+    advertised: bool,
+) -> Result<Option<GatewayGuard>> {
+    if !advertised {
+        return Ok(None);
     }
-    let Some(uplink) = crate::underlay::default_uplink_name() else {
-        tracing::warn!("exit NAT: could not detect uplink interface");
-        return;
-    };
-    enable_forwarding();
-    if install_masquerade(&uplink) {
-        let mut g = NAT_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        *g = Some(NatGuardInner {
-            uplink,
+    #[cfg(target_os = "windows")]
+    if source_networks.is_empty() || source_networks.iter().any(|net| net.prefix_len() == 0) {
+        bail!("gateway requires explicit non-default mesh source prefixes");
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    {
+        let uplink =
+            crate::underlay::default_uplink_name(ifname).context("gateway uplink unavailable")?;
+        if uplink == ifname {
+            bail!("gateway uplink is the Tunnet interface");
+        }
+        #[cfg(target_os = "windows")]
+        if [ifname, uplink.as_str()]
+            .iter()
+            .any(|name| name.contains(['*', '?', '[', ']']))
+        {
+            bail!("Windows gateway requires exact interface aliases");
+        }
+        let mut guard = GatewayGuard::new();
+        if let Err(error) = guard.install(ifname, &uplink, source_networks) {
+            if let Err(rollback) = guard.teardown() {
+                return Err(error.context(format!("gateway rollback failed: {rollback:#}")));
+            }
+            return Err(error);
+        }
+        Ok(Some(guard))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (ifname, source_networks);
+        bail!("native gateway configuration is unsupported on this platform")
+    }
+}
+
+impl GatewayGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn new() -> Self {
+        Self {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            forwarding: Vec::new(),
             #[cfg(target_os = "linux")]
-            used_nft: prefer_nft(),
-        });
-        tracing::info!("exit NAT (MASQUERADE) enabled");
-    }
-}
-
-pub fn teardown_exit_nat() {
-    let mut g = NAT_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(state) = g.take() else {
-        return;
-    };
-    remove_masquerade(&state.uplink, cfg_nft(&state));
-    tracing::info!(uplink = %state.uplink, "exit NAT torn down");
-}
-
-#[cfg(target_os = "linux")]
-fn cfg_nft(state: &NatGuardInner) -> bool {
-    state.used_nft
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cfg_nft(_: &NatGuardInner) -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn prefer_nft() -> bool {
-    Command::new("nft")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn enable_forwarding() {
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", b"1") {
-            tracing::warn!(?e, "failed to enable net.ipv4.ip_forward");
-        } else {
-            tracing::info!("enabled net.ipv4.ip_forward");
+            table: None,
+            #[cfg(target_os = "windows")]
+            nat: None,
+            #[cfg(target_os = "macos")]
+            forwarding: None,
+            #[cfg(target_os = "macos")]
+            anchor: None,
+            #[cfg(target_os = "macos")]
+            pf_token: None,
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("sysctl")
-            .args(["-w", "net.inet.ip.forwarding=1"])
-            .status();
-        tracing::info!("enabled net.inet.ip.forwarding");
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue",
-            ])
-            .status();
-        tracing::info!("requested Windows IP forwarding");
-    }
-}
 
-fn install_masquerade(uplink: &str) -> bool {
     #[cfg(target_os = "linux")]
-    {
-        if prefer_nft() {
-            // Tunnet-owned table; replace on each enable.
-            let script = format!(
-                "table ip tunnet_nat {{\n  chain postrouting {{\n    type nat hook postrouting priority 100;\n    oifname \"{uplink}\" masquerade\n  }}\n}}\n"
-            );
-            let _ = Command::new("nft")
-                .args(["delete", "table", "ip", "tunnet_nat"])
-                .status();
-            let status = Command::new("nft")
-                .arg("-f")
-                .arg("-")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut child| {
-                    use std::io::Write;
-                    if let Some(mut stdin) = child.stdin.take() {
-                        stdin.write_all(script.as_bytes())?;
-                    }
-                    child.wait()
-                });
-            match status {
-                Ok(s) if s.success() => return true,
-                Ok(s) => tracing::warn!(?s, "nft masquerade failed; trying iptables"),
-                Err(e) => tracing::warn!(?e, "nft spawn failed; trying iptables"),
+    fn install(&mut self, ifname: &str, uplink: &str, _networks: &[Ipv4Net]) -> Result<()> {
+        for name in [ifname, uplink] {
+            validate_interface(name)?;
+            let path =
+                std::path::PathBuf::from(format!("/proc/sys/net/ipv4/conf/{name}/forwarding"));
+            let previous =
+                std::fs::read_to_string(&path).context("read IPv4 interface forwarding")?;
+            if previous.trim() != "1" {
+                std::fs::write(&path, b"1").context("enable IPv4 interface forwarding")?;
+                self.forwarding.push((path, previous));
             }
         }
-        // iptables fallback with Tunnet comment.
-        let _ = Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-C",
-                "POSTROUTING",
-                "-o",
-                uplink,
-                "-j",
-                "MASQUERADE",
-                "-m",
-                "comment",
-                "--comment",
-                "tunnet-exit",
-            ])
-            .status();
-        let ok = Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-A",
-                "POSTROUTING",
-                "-o",
-                uplink,
-                "-j",
-                "MASQUERADE",
-                "-m",
-                "comment",
-                "--comment",
-                "tunnet-exit",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            tracing::warn!(uplink, "iptables MASQUERADE failed");
-        }
-        return ok;
+        let table = format!("tunnet_{}", uuid::Uuid::new_v4().simple());
+        let script = format!(
+            "table ip {table} {{ chain postrouting {{ type nat hook postrouting priority srcnat; policy accept; iifname \"{ifname}\" oifname \"{uplink}\" masquerade; }} }}\n"
+        );
+        run_input("nft", &["-f", "-"], &script)?;
+        self.table = Some(table);
+        Ok(())
     }
+
+    #[cfg(target_os = "windows")]
+    fn install(&mut self, ifname: &str, uplink: &str, _networks: &[Ipv4Net]) -> Result<()> {
+        let mut networks = _networks.to_vec();
+        networks.sort();
+        networks.dedup();
+        let prefix = networks
+            .iter()
+            .find(|candidate| networks.iter().all(|net| candidate.contains(net)))
+            .context(
+                "Windows WinNAT requires one internal prefix containing all mesh source networks",
+            )?;
+        for name in [ifname, uplink] {
+            let alias = ps_quote(name);
+            let previous = powershell(&format!(
+                "$i = @(Get-NetIPInterface -AddressFamily IPv4 -InterfaceAlias '{alias}' -ErrorAction Stop); if ($i.Count -ne 1) {{ throw 'ambiguous IPv4 interface' }}; $i[0].Forwarding.ToString()"
+            ))?;
+            let previous = previous.trim().to_owned();
+            if previous != "Enabled" && previous != "Disabled" {
+                bail!("invalid Windows interface forwarding state");
+            }
+            if previous == "Disabled" {
+                powershell(&format!(
+                    "Set-NetIPInterface -AddressFamily IPv4 -InterfaceAlias '{alias}' -Forwarding Enabled -ErrorAction Stop"
+                ))?;
+                self.forwarding.push((name.to_owned(), previous));
+            }
+        }
+        let name = format!("Tunnet-{}", uuid::Uuid::new_v4().simple());
+        powershell(&format!(
+            "if (@(Get-NetNat -ErrorAction Stop).Count -ne 0) {{ throw 'WinNAT already configured; multiple internal NAT prefixes are unsupported' }}; New-NetNat -Name '{name}' -InternalIPInterfaceAddressPrefix '{prefix}' -ErrorAction Stop | Out-Null"
+        ))?;
+        self.nat = Some(name);
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
-    {
-        // pf anchor owned by Tunnet.
-        let rules = format!("nat on {uplink} from any to any -> ({uplink})\n");
-        let status = Command::new("pfctl")
-            .args(["-a", "com.tunnet/nat", "-f", "-"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(mut stdin) = child.stdin.take() {
-                    stdin.write_all(rules.as_bytes())?;
+    fn install(&mut self, ifname: &str, uplink: &str, _networks: &[Ipv4Net]) -> Result<()> {
+        validate_interface(ifname)?;
+        validate_interface(uplink)?;
+        let rules = run("pfctl", &["-sn"])?;
+        let filters = run("pfctl", &["-sr"])?;
+        if !rules.contains("nat-anchor \"com.apple/*\"")
+            || !filters.contains("anchor \"com.apple/*\"")
+        {
+            bail!("macOS PF configuration lacks the com.apple/* NAT anchor");
+        }
+        let previous = run("sysctl", &["-n", "net.inet.ip.forwarding"])?;
+        if previous.trim() != "1" {
+            run("sysctl", &["-w", "net.inet.ip.forwarding=1"])?;
+            self.forwarding = Some(previous.trim().to_owned());
+        }
+        let tag = format!("tn{}", uuid::Uuid::new_v4().simple());
+        let anchor = format!("com.apple/{tag}");
+        let rules = format!(
+            "nat on {uplink} inet from any to any tagged {tag} -> ({uplink})\npass in on {ifname} inet from any to any tag {tag}\n"
+        );
+        run_input("pfctl", &["-a", &anchor, "-f", "-"], &rules)?;
+        self.anchor = Some(anchor);
+        let output = run("pfctl", &["-E"])?;
+        let token = output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Token : "))
+            .context("PF enable returned no ownership token")?;
+        self.pf_token = Some(token.trim().to_owned());
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub fn teardown(&mut self) -> Result<()> {
+        let mut failures: Vec<anyhow::Error> = Vec::new();
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(table) = &self.table {
+                match run("nft", &["delete", "table", "ip", table]) {
+                    Ok(_) => self.table = None,
+                    Err(error) => failures.push(error),
                 }
-                child.wait()
+            }
+            self.forwarding.retain(|(path, previous)| {
+                let result = std::fs::read_to_string(path).and_then(|current| {
+                    if current.trim() == "1" {
+                        std::fs::write(path, previous)
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(error) = result {
+                    failures.push(error.into());
+                    true
+                } else {
+                    false
+                }
             });
-        match status {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                tracing::warn!(?status, "pfctl masquerade failed");
-                return false;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(name) = &self.nat {
+                match powershell(&format!(
+                    "Remove-NetNat -Name '{name}' -Confirm:$false -ErrorAction Stop"
+                )) {
+                    Ok(_) => self.nat = None,
+                    Err(error) => failures.push(error),
+                }
             }
-            Err(error) => {
-                tracing::warn!(?error, "pfctl spawn failed");
-                return false;
+            self.forwarding.retain(|(name, previous)| {
+                let alias = ps_quote(name);
+                match powershell(&format!("$i = Get-NetIPInterface -AddressFamily IPv4 -InterfaceAlias '{alias}' -ErrorAction Stop; if ($i.Forwarding -eq 'Enabled') {{ Set-NetIPInterface -AddressFamily IPv4 -InterfaceAlias '{alias}' -Forwarding {previous} -ErrorAction Stop }}")) {
+                    Ok(_) => false,
+                    Err(error) => { failures.push(error); true }
+                }
+            });
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(anchor) = &self.anchor {
+                match run("pfctl", &["-a", anchor, "-F", "all"]) {
+                    Ok(_) => self.anchor = None,
+                    Err(error) => failures.push(error),
+                }
+            }
+            if let Some(token) = &self.pf_token {
+                match run("pfctl", &["-X", token]) {
+                    Ok(_) => self.pf_token = None,
+                    Err(error) => failures.push(error),
+                }
+            }
+            if let Some(previous) = &self.forwarding {
+                let result = run("sysctl", &["-n", "net.inet.ip.forwarding"]).and_then(|current| {
+                    if current.trim() == "1" {
+                        run(
+                            "sysctl",
+                            &["-w", &format!("net.inet.ip.forwarding={previous}")],
+                        )
+                    } else {
+                        Ok(String::new())
+                    }
+                });
+                match result {
+                    Ok(_) => self.forwarding = None,
+                    Err(error) => failures.push(error),
+                }
             }
         }
-        let _ = Command::new("pfctl").args(["-e"]).status();
-        tracing::info!(uplink, "installed pf nat anchor com.tunnet/nat");
-        return true;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // Best-effort Hyper-V style NAT; fail loud if unavailable.
-        let ps = "if (-not (Get-NetNat -Name 'TunnetExit' -ErrorAction SilentlyContinue)) { New-NetNat -Name 'TunnetExit' -InternalIPInterfaceAddressPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue }; Write-Output 'ok'";
-        let ok = Command::new("powershell")
-            .args(["-NoProfile", "-Command", ps])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            tracing::warn!(
-                uplink,
-                "Windows New-NetNat failed; exit return traffic needs manual NAT"
-            );
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("gateway cleanup failed: {failures:?}")
         }
-        return ok;
     }
-    #[allow(unreachable_code)]
-    {
-        let _ = uplink;
-        false
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn teardown(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
-fn remove_masquerade(uplink: &str, used_nft: bool) {
-    #[cfg(not(target_os = "linux"))]
-    let _ = (uplink, used_nft);
-    #[cfg(target_os = "linux")]
-    {
-        if used_nft {
-            let _ = Command::new("nft")
-                .args(["delete", "table", "ip", "tunnet_nat"])
-                .status();
+impl Drop for GatewayGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.teardown() {
+            tracing::error!(%error, "gateway cleanup failed");
         }
-        let _ = Command::new("iptables")
-            .args([
-                "-t",
-                "nat",
-                "-D",
-                "POSTROUTING",
-                "-o",
-                uplink,
-                "-j",
-                "MASQUERADE",
-                "-m",
-                "comment",
-                "--comment",
-                "tunnet-exit",
-            ])
-            .status();
     }
-    #[cfg(target_os = "macos")]
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_interface(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
     {
-        let _ = uplink;
-        let _ = Command::new("pfctl")
-            .args(["-a", "com.tunnet/nat", "-F", "all"])
-            .status();
+        bail!("unsupported interface name");
     }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = uplink;
-        let _ = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Remove-NetNat -Name 'TunnetExit' -Confirm:$false -ErrorAction SilentlyContinue",
-            ])
-            .status();
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("launch {program}"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let _ = used_nft;
+    Ok(format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_input(program: &str, args: &[&str], input: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("command stdin missing")?
+        .write_all(input.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn ps_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(target_os = "windows")]
+fn powershell(script: &str) -> Result<String> {
+    use std::os::windows::process::CommandExt;
+    let output = Command::new("powershell")
+        .creation_flags(0x0800_0000)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("$ErrorActionPreference = 'Stop'; {script}"),
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }

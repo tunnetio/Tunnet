@@ -27,12 +27,26 @@ impl AgentMetrics {
     pub fn new() -> anyhow::Result<Self> {
         #[cfg(feature = "metrics-serve")]
         {
+            static RECORDER: parking_lot::Mutex<
+                Option<metrics_exporter_prometheus::PrometheusHandle>,
+            > = parking_lot::Mutex::new(None);
+            let mut recorder = RECORDER.lock();
+            if let Some(handle) = recorder.as_ref() {
+                return Ok(Self {
+                    handle: handle.clone(),
+                });
+            }
             let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
                 .with_recommended_naming(true)
                 .install_recorder()?;
 
             describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
             describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_batches_total", "TUN/QUIC processing batches");
+            describe_counter!(
+                "tunnet_batch_packets_total",
+                "Packets across processing batches"
+            );
             describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
             describe_gauge!("tunnet_active_connections", "Live peer connections");
             describe_gauge!(
@@ -44,21 +58,18 @@ impl AgentMetrics {
                 "Direct network health (1 healthy, 0 degraded)"
             );
 
-            let upkeep = handle.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                loop {
-                    interval.tick().await;
-                    upkeep.run_upkeep();
-                }
-            });
-
+            *recorder = Some(handle.clone());
             Ok(Self { handle })
         }
         #[cfg(not(feature = "metrics-serve"))]
         {
             describe_counter!("tunnet_packets_total", "Packets processed by the tunnel");
             describe_counter!("tunnet_bytes_total", "Bytes processed by the tunnel");
+            describe_counter!("tunnet_batches_total", "TUN/QUIC processing batches");
+            describe_counter!(
+                "tunnet_batch_packets_total",
+                "Packets across processing batches"
+            );
             describe_counter!("tunnet_dropped_packets_total", "Packets dropped");
             describe_gauge!("tunnet_active_connections", "Live peer connections");
             describe_gauge!(
@@ -73,16 +84,25 @@ impl AgentMetrics {
         }
     }
 
-    pub fn packets_inc(&self, direction: &'static str) {
-        counter!("tunnet_packets_total", "direction" => direction).increment(1);
+    pub fn packets_add(&self, direction: &'static str, n: u64) {
+        counter!("tunnet_packets_total", "direction" => direction).increment(n);
+    }
+
+    pub fn batch_observe(&self, direction: &'static str, n: u64) {
+        counter!("tunnet_batch_packets_total", "direction" => direction).increment(n);
+        counter!("tunnet_batches_total", "direction" => direction).increment(1);
     }
 
     pub fn bytes_add(&self, direction: &'static str, n: u64) {
         counter!("tunnet_bytes_total", "direction" => direction).increment(n);
     }
 
+    pub fn dropped_add(&self, reason: &'static str, n: u64) {
+        counter!("tunnet_dropped_packets_total", "reason" => reason).increment(n);
+    }
+
     pub fn dropped_inc(&self, reason: &'static str) {
-        counter!("tunnet_dropped_packets_total", "reason" => reason).increment(1);
+        self.dropped_add(reason, 1);
     }
 
     pub fn active_conns_inc(&self) {
@@ -103,6 +123,7 @@ impl AgentMetrics {
 
     #[cfg(feature = "metrics-serve")]
     pub fn render(&self) -> String {
+        self.handle.run_upkeep();
         self.handle.render()
     }
 }
@@ -114,15 +135,21 @@ pub fn metrics_port(bind: &str) -> &str {
 
 /// Listen on localhost and the assigned overlay IP so peers can scrape via VPN.
 #[cfg(feature = "metrics-serve")]
-pub fn spawn_listeners(metrics: AgentMetrics, metrics_bind: &str, overlay_ip: std::net::Ipv4Addr) {
+pub fn spawn_listeners(
+    metrics: AgentMetrics,
+    metrics_bind: &str,
+    overlay_ip: std::net::Ipv4Addr,
+) -> Vec<tokio::task::JoinHandle<()>> {
     let port = metrics_port(metrics_bind);
+    let mut tasks = Vec::new();
     for bind in [
         format!("127.0.0.1:{}", port),
         format!("{}:{}", overlay_ip, port),
     ] {
         let m = metrics.clone();
-        tokio::spawn(async move { serve_metrics(m, bind).await });
+        tasks.push(tokio::spawn(async move { serve_metrics(m, bind).await }));
     }
+    tasks
 }
 
 #[cfg(feature = "metrics-serve")]
@@ -136,12 +163,18 @@ pub async fn serve_metrics(metrics: AgentMetrics, bind: String) {
         }
     };
     tracing::info!(%bind, "metrics endpoint listening");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let Ok((mut sock, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            accepted = listener.accept(), if connections.len() < 32 => accepted,
+            Some(_) = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let Ok((mut sock, _)) = accepted else {
             continue;
         };
         let m = metrics.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let mut buf = [0u8; 1024];
             let _ = sock.read(&mut buf).await; // best-effort: read the request line
             let body = m.render();
@@ -151,6 +184,7 @@ pub async fn serve_metrics(metrics: AgentMetrics, bind: String) {
                 body
             );
             let _ = sock.write_all(resp.as_bytes()).await;
+            }).await;
         });
     }
 }

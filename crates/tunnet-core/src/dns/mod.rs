@@ -17,9 +17,13 @@ use tunnet_common::DnsConfig;
 use crate::routing::RoutingTable;
 
 mod in_tun;
+mod iroh;
 mod nameserver;
 mod peerdns;
+mod runtime;
 mod upstream;
+pub use iroh::IrohResolver;
+pub use runtime::NativeHickoryRuntimeProvider;
 
 pub use in_tun::{InTun, targets_virtual_resolver};
 pub use nameserver::{UpstreamSource, parse_upstream};
@@ -32,6 +36,7 @@ use peerdns::{answer_owned, answer_ptr, base_response, owned_forward_name, parse
 use upstream::{ExternalLookup, map_external};
 
 const UDP_BUF: usize = DEFAULT_MAX_PAYLOAD_LEN as usize;
+const UDP_WORKERS: usize = 32;
 
 /// Shared PeerDNS engine. Transport (loopback UDP, in-TUN) is separate.
 pub struct Resolver {
@@ -48,6 +53,18 @@ impl Resolver {
             suffix: Arc::from(dns.suffix.as_str()),
             lookup: Arc::new(HickoryLookup::from_dns_config(&dns)?),
         }))
+    }
+
+    pub fn with_external(
+        routes: RoutingTable,
+        dns: &DnsConfig,
+        lookup: Arc<HickoryLookup>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            routes,
+            suffix: Arc::from(dns.suffix.as_str()),
+            lookup,
+        })
     }
 
     pub async fn answer(&self, bytes: &[u8]) -> Vec<u8> {
@@ -121,8 +138,14 @@ async fn run_bound(
 ) -> anyhow::Result<()> {
     let sock = Arc::new(sock);
     let mut buf = vec![0u8; UDP_BUF];
+    let mut workers = tokio::task::JoinSet::new();
     loop {
-        let (n, peer) = match sock.recv_from(&mut buf).await {
+        let received = tokio::select! {
+            biased;
+            _ = workers.join_next(), if !workers.is_empty() => continue,
+            received = sock.recv_from(&mut buf), if workers.len() < UDP_WORKERS => received,
+        };
+        let (n, peer) = match received {
             Ok(v) => v,
             Err(e) if is_transient_udp_recv_error(&e) => {
                 tracing::debug!(?e, %bind, "PeerDNS ignoring transient UDP recv error");
@@ -133,7 +156,7 @@ async fn run_bound(
         let request = buf[..n].to_vec();
         let sock = sock.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
+        workers.spawn(async move {
             let out = resolver.answer_udp(&request, UDP_BUF).await;
             if let Err(e) = sock.send_to(&out, peer).await {
                 tracing::debug!(?e, %peer, "dns send failed");
@@ -325,6 +348,7 @@ mod tests {
             hostname: hostname.to_string(),
             tags: vec![],
             ssh_host_key: Some("ssh-ed25519 AAAA".into()),
+            posture: tunnet_common::PeerPosture::Unknown,
         }
     }
 
@@ -566,6 +590,76 @@ mod tests {
             UpstreamSource::System => {}
             UpstreamSource::Config(_) => panic!("system"),
         }
+    }
+
+    #[tokio::test]
+    async fn listener_shutdown_cancels_queries_and_releases_its_port() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns = DnsConfig {
+            suffix: "tunnet".into(),
+            upstream: vec![format!("udp://{}", upstream.local_addr().unwrap())],
+            dnssec: false,
+        };
+        let resolver = Arc::new(Resolver {
+            routes: routes(),
+            suffix: Arc::from("tunnet"),
+            lookup: Arc::new(HickoryLookup::from_dns_config(&dns).unwrap()),
+        });
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = socket.local_addr().unwrap();
+        let listener = tokio::spawn(run_bound(socket, bind, resolver.clone()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&query_bytes("pending.example.", RecordType::A, 42), bind)
+            .await
+            .unwrap();
+        let mut bytes = [0; 2048];
+        let (n, upstream_peer) =
+            tokio::time::timeout(Duration::from_secs(3), upstream.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        let query = Message::from_bytes(&bytes[..n]).unwrap();
+        listener.abort();
+        assert!(listener.await.unwrap_err().is_cancelled());
+        let socket = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match UdpSocket::bind(bind).await {
+                    Ok(socket) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("rebind failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("old DNS workers retained listener port");
+        let mut response = Message::response(query.metadata.id, OpCode::Query);
+        response.queries = query.queries;
+        upstream
+            .send_to(&response.to_bytes().unwrap(), upstream_peer)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), client.recv_from(&mut bytes))
+                .await
+                .is_err()
+        );
+        let listener = tokio::spawn(run_bound(socket, bind, resolver));
+        client
+            .send_to(&query_bytes("desktop.tunnet.", RecordType::A, 43), bind)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = Message::from_bytes(&bytes[..n]).unwrap();
+        assert_eq!(answer.metadata.id, 43);
+        assert!(answer.metadata.authoritative);
+        listener.abort();
+        assert!(listener.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

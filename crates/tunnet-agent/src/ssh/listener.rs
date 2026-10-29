@@ -30,8 +30,7 @@ pub async fn spawn_ssh_listener(
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     anyhow::ensure!(!bindings.is_empty(), "no SSH bindings");
     let host_key = load_or_create_host_key(paths)?;
-    intercept.set(bindings.iter().map(|b| b.mesh_ip).collect());
-
+    let addresses = bindings.iter().map(|b| b.mesh_ip).collect();
     let mut listeners = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let listener = TcpListener::bind((binding.mesh_ip, SSH_INTERNAL_PORT)).await?;
@@ -45,17 +44,29 @@ pub async fn spawn_ssh_listener(
         listeners.push((listener, binding));
     }
 
+    intercept.set(addresses);
     let handle = tokio::spawn(async move {
+        let _intercept = ListenerIntercept {
+            intercept,
+            forwarding: deps.forwarding.clone(),
+            routes: deps.routes.clone(),
+        };
+        let mut workers = tokio::task::JoinSet::new();
         for (listener, binding) in listeners {
             let deps = deps.clone();
             let host_key = host_key.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
+                let mut sessions = tokio::task::JoinSet::new();
                 loop {
-                    let (socket, peer) = match listener.accept().await {
+                    let accepted = tokio::select! {
+                        result = listener.accept(), if sessions.len() < 64 => result,
+                        Some(_) = sessions.join_next(), if !sessions.is_empty() => continue,
+                    };
+                    let (socket, peer) = match accepted {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::warn!(?e, network_id = %binding.network_id, "ssh accept failed");
-                            continue;
+                            break;
                         }
                     };
                     let local = socket
@@ -64,7 +75,7 @@ pub async fn spawn_ssh_listener(
                     let deps = deps.clone();
                     let binding = binding.clone();
                     let host_key = host_key.clone();
-                    tokio::spawn(async move {
+                    sessions.spawn(async move {
                         let mut methods = MethodSet::empty();
                         methods.push(MethodKind::None);
                         if matches!(binding.policy, BindingPolicy::Managed) {
@@ -91,6 +102,22 @@ pub async fn spawn_ssh_listener(
                 }
             });
         }
+        let _ = workers.join_next().await;
+        workers.shutdown().await;
     });
     Ok(handle)
+}
+
+struct ListenerIntercept {
+    intercept: SshIntercept,
+    forwarding: tunnet_core::ForwardingStore,
+    routes: tunnet_core::RoutingTable,
+}
+
+impl Drop for ListenerIntercept {
+    fn drop(&mut self) {
+        self.intercept.set(Default::default());
+        self.forwarding
+            .set_ssh_addrs(&self.routes, Default::default());
+    }
 }

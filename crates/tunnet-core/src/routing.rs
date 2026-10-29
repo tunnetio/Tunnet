@@ -8,10 +8,11 @@ use iroh::EndpointId;
 use parking_lot::Mutex;
 use prefix_trie::PrefixMap;
 use tunnet_common::{
-    DeviceProfile, DnsConfig, ExitNodeInfo, HostnameRoute, PeerEntry, SubnetRoute,
+    DeviceProfile, DnsConfig, ExitNodeInfo, HostnameRoute, PeerEntry, PeerPosture, SubnetRoute,
 };
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct PeerInfo {
     pub endpoint: EndpointId,
     pub endpoint_hex: String,
@@ -21,9 +22,11 @@ pub struct PeerInfo {
     pub network_id: Uuid,
     pub network_name: String,
     pub ssh_host_key: Option<String>,
+    pub posture: PeerPosture,
 }
 
 /// Resolved hostname route (exact or wildcard).
+#[derive(Clone)]
 pub struct HostnameRouteInfo {
     pub peer: Arc<PeerInfo>,
     pub is_wildcard: bool,
@@ -45,7 +48,21 @@ struct NetworkSlice {
     peer_cidr: Option<Ipv4Net>,
 }
 
+#[derive(Clone)]
+pub struct RouteClaim {
+    pub network: Uuid,
+    pub cidr: Ipv4Net,
+    pub endpoint: EndpointId,
+    pub local: bool,
+}
+
+#[derive(Clone)]
 pub struct Tables {
+    pub default_ambiguous: bool,
+    pub mesh_ranges: BTreeMap<Uuid, Ipv4Net>,
+    pub claims: Vec<RouteClaim>,
+    pub local_ips: std::collections::HashMap<Uuid, Ipv4Addr>,
+    pub profiles: std::collections::HashMap<Uuid, DeviceProfile>,
     pub by_ip: std::collections::HashMap<Ipv4Addr, Arc<PeerInfo>>,
     /// All memberships including same IP across networks.
     pub by_network_ip: std::collections::HashMap<(Uuid, Ipv4Addr), Arc<PeerInfo>>,
@@ -105,6 +122,11 @@ impl RoutingTable {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(Tables {
+                default_ambiguous: false,
+                mesh_ranges: BTreeMap::new(),
+                claims: Vec::new(),
+                local_ips: Default::default(),
+                profiles: Default::default(),
                 by_ip: Default::default(),
                 by_network_ip: Default::default(),
                 by_endpoint: Default::default(),
@@ -130,6 +152,18 @@ impl RoutingTable {
         self.changes.subscribe()
     }
 
+    pub fn tables(&self) -> Arc<Tables> {
+        self.inner.load().clone()
+    }
+
+    pub fn slice_subnets(&self) -> Vec<(Uuid, Vec<Ipv4Net>)> {
+        self.slices
+            .lock()
+            .iter()
+            .map(|(id, slice)| (*id, slice.subnet_routes.iter().map(|r| r.cidr).collect()))
+            .collect()
+    }
+
     /// Look up peer by (network, ip) for inbound / firewall context.
     pub fn lookup_network_ip(&self, network_id: Uuid, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
         self.inner
@@ -150,38 +184,30 @@ impl RoutingTable {
 
     /// Direct peer IP, subnet LPM, then selected exit node for internet.
     pub fn lookup_ip(&self, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
-        // Multicast and broadcast are never routable across the mesh.
-        //
-        // This MUST come before the subnet lookup and the exit-node catch-all.
-        // `is_mesh_or_link_local` covers broadcast but not multicast, so with an
-        // exit node configured multicast passes the internet catch-all and is
-        // tunneled to the exit peer; broadcast leaks the same way via the
-        // `0.0.0.0/0` an exit node contributes to the subnet table. LAN
-        // discovery apps (mDNS, SSDP, Ableton Link) beacon on every interface
-        // including ours, continuously, so this pushes local service
-        // announcements through the tunnel and out of the exit node.
-        //
-        // The mDNS relay is unaffected: it republishes over its own mesh topic
-        // rather than tunneling raw multicast frames.
+        Self::route_in(&self.inner.load(), ip)
+    }
+
+    pub(crate) fn route_in(tables: &Tables, ip: &Ipv4Addr) -> Option<Arc<PeerInfo>> {
+        // Multicast and broadcast are never routable across the mesh, even
+        // with an exit node configured (its 0.0.0.0/0 would otherwise leak them).
         if ip.is_multicast() || ip.is_broadcast() {
             return None;
         }
-        let tables = self.inner.load();
         if let Some(peer) = tables.by_ip.get(ip).cloned() {
             return Some(peer);
         }
         if let Some((prefix, peer)) = tables.subnets.get_lpm(&Ipv4Net::from(*ip)) {
             // Full-tunnel exit CIDR must not steal LAN when allow_local_lan is on.
-            if !(tables.allow_local_lan && is_rfc1918(ip) && prefix.prefix_len() == 0) {
+            if prefix.prefix_len() == 0 && tables.default_ambiguous {
+                return None;
+            }
+            let allow_local_lan = tables
+                .profiles
+                .get(&peer.network_id)
+                .map_or(tables.allow_local_lan, |profile| profile.allow_local_lan);
+            if !(allow_local_lan && is_rfc1918(ip) && prefix.prefix_len() == 0) {
                 return Some(peer.clone());
             }
-        }
-        // Exit node catches remaining (non-mesh, non-LAN when allowed) destinations.
-        if !is_mesh_or_link_local(ip)
-            && !(tables.allow_local_lan && is_rfc1918(ip))
-            && let Some(exit) = &tables.exit_node
-        {
-            return Some(exit.clone());
         }
         None
     }
@@ -502,6 +528,14 @@ impl RoutingTable {
         self.rebuild(Some(version));
     }
 
+    pub fn reserve_mesh_range(&self, network: Uuid, range: Ipv4Net) {
+        let version = self.version();
+        if let Some(slice) = self.slices.lock().get_mut(&network) {
+            slice.peer_cidr = Some(range);
+        }
+        self.rebuild(Some(version));
+    }
+
     pub fn remove_network(&self, network_id: Uuid) {
         self.slices.lock().remove(&network_id);
         self.rebuild(None);
@@ -533,9 +567,9 @@ impl RoutingTable {
 
             let removed_set: std::collections::HashSet<&str> =
                 removed.iter().map(String::as_str).collect();
-            slice.peers.retain(|p| {
-                p.endpoint_id != self_endpoint_id && !removed_set.contains(p.endpoint_id.as_str())
-            });
+            slice
+                .peers
+                .retain(|p| !removed_set.contains(p.endpoint_id.as_str()));
 
             for peer in added {
                 if peer.endpoint_id == self_endpoint_id {
@@ -558,14 +592,19 @@ impl RoutingTable {
     fn rebuild(&self, version: Option<u64>) {
         self.change_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slice_guard = self.slices.lock();
         let slices: Vec<(Uuid, NetworkSlice)> = {
-            let g = self.slices.lock();
+            let g = &slice_guard;
             let mut v: Vec<_> = g.iter().map(|(k, s)| (*k, s.clone())).collect();
             v.sort_by_key(|(id, _)| *id);
             v
         };
 
         let version = version.unwrap_or_else(|| self.inner.load().version.saturating_add(1));
+        let mut mesh_ranges = BTreeMap::new();
+        let mut claims = Vec::new();
+        let mut local_ips = std::collections::HashMap::new();
+        let mut profiles = std::collections::HashMap::new();
         let mut by_ip: std::collections::HashMap<Ipv4Addr, Arc<PeerInfo>> =
             std::collections::HashMap::new();
         let mut by_network_ip: std::collections::HashMap<(Uuid, Ipv4Addr), Arc<PeerInfo>> =
@@ -586,6 +625,10 @@ impl RoutingTable {
         let mut primary_network_name = String::new();
 
         for (network_id, slice) in &slices {
+            if let Some(range) = slice.peer_cidr {
+                mesh_ranges.insert(*network_id, range);
+            }
+            profiles.insert(*network_id, slice.profile.clone());
             if primary_network_name.is_empty() {
                 primary_network_name = slice.network_name.clone();
             }
@@ -593,12 +636,33 @@ impl RoutingTable {
 
             let mut local_by_endpoint: std::collections::HashMap<String, Arc<PeerInfo>> =
                 std::collections::HashMap::new();
+            let mut ip_counts = std::collections::HashMap::new();
+            let mut endpoint_counts = std::collections::HashMap::new();
+            for peer in &slice.peers {
+                *ip_counts.entry(peer.ip).or_insert(0usize) += 1;
+                *endpoint_counts
+                    .entry(peer.endpoint_id.as_str())
+                    .or_insert(0usize) += 1;
+            }
             for p in &slice.peers {
+                if ip_counts[&p.ip] != 1 || endpoint_counts[p.endpoint_id.as_str()] != 1 {
+                    continue;
+                }
                 let Ok(ep) = p.endpoint_id.parse::<EndpointId>() else {
                     tracing::warn!(id = %p.endpoint_id, "skip peer with bad endpoint id");
                     continue;
                 };
                 let ip = p.ip;
+                let local = p.endpoint_id == slice.self_endpoint_id;
+                if local {
+                    local_ips.insert(*network_id, ip);
+                }
+                claims.push(RouteClaim {
+                    network: *network_id,
+                    cidr: Ipv4Net::from(ip),
+                    endpoint: ep,
+                    local,
+                });
                 let info = Arc::new(PeerInfo {
                     endpoint: ep,
                     endpoint_hex: p.endpoint_id.clone(),
@@ -608,6 +672,7 @@ impl RoutingTable {
                     network_id: *network_id,
                     network_name: slice.network_name.clone(),
                     ssh_host_key: p.ssh_host_key.clone(),
+                    posture: p.posture.clone(),
                 });
                 by_network_ip.insert((*network_id, ip), info.clone());
                 if let Some(existing) = by_ip.get(&ip) {
@@ -640,6 +705,14 @@ impl RoutingTable {
             }
 
             for route in &slice.subnet_routes {
+                if let Some(peer) = local_by_endpoint.get(&route.via_endpoint_id) {
+                    claims.push(RouteClaim {
+                        network: *network_id,
+                        cidr: route.cidr,
+                        endpoint: peer.endpoint,
+                        local: route.via_endpoint_id == slice.self_endpoint_id,
+                    });
+                }
                 if route.via_endpoint_id == slice.self_endpoint_id {
                     advertised.push(route.cidr);
                     continue;
@@ -660,6 +733,14 @@ impl RoutingTable {
             for exit in &slice.exit_nodes {
                 if exit.endpoint_id == slice.self_endpoint_id {
                     for cidr in &exit.allowed_cidrs {
+                        if let Ok(endpoint) = slice.self_endpoint_id.parse() {
+                            claims.push(RouteClaim {
+                                network: *network_id,
+                                cidr: *cidr,
+                                endpoint,
+                                local: true,
+                            });
+                        }
                         advertised.push(*cidr);
                     }
                 }
@@ -677,6 +758,12 @@ impl RoutingTable {
                 );
                 if let Some(peer) = peer {
                     for cidr in &exit.allowed_cidrs {
+                        claims.push(RouteClaim {
+                            network: *network_id,
+                            cidr: *cidr,
+                            endpoint: peer.endpoint,
+                            local: false,
+                        });
                         if !subnets.contains_key(cidr) {
                             subnets.insert(*cidr, peer.clone());
                         }
@@ -718,7 +805,19 @@ impl RoutingTable {
 
         hostname_wildcards.sort_by_key(|route| std::cmp::Reverse(route.hostname.len()));
 
+        let default_ambiguous = claims
+            .iter()
+            .filter(|claim| !claim.local && claim.cidr.prefix_len() == 0)
+            .map(|claim| claim.network)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1;
         self.inner.store(Arc::new(Tables {
+            default_ambiguous,
+            mesh_ranges,
+            claims,
+            local_ips,
+            profiles,
             by_ip,
             by_network_ip,
             by_endpoint,
@@ -736,10 +835,6 @@ impl RoutingTable {
         }));
         let _ = self.changes.send(version);
     }
-}
-
-fn is_mesh_or_link_local(ip: &Ipv4Addr) -> bool {
-    ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_unspecified()
 }
 
 fn is_rfc1918(ip: &Ipv4Addr) -> bool {
@@ -763,20 +858,8 @@ fn peer_for_via(
     if let Some(existing) = by_endpoint.get(via_endpoint_id) {
         return Some(existing.clone());
     }
-    let Ok(ep) = via_endpoint_id.parse::<EndpointId>() else {
-        tracing::warn!(id = %via_endpoint_id, "skip route with bad via endpoint id");
-        return None;
-    };
-    Some(Arc::new(PeerInfo {
-        endpoint: ep,
-        endpoint_hex: via_endpoint_id.to_string(),
-        hostname: String::new(),
-        ip: via_ip,
-        tags: Vec::new(),
-        network_id,
-        network_name: network_name.to_string(),
-        ssh_host_key: None,
-    }))
+    let _ = (via_ip, network_id, network_name);
+    None
 }
 
 fn hostname_matches_wildcard(host: &str, suffix: &str) -> bool {
@@ -799,6 +882,7 @@ mod tests {
             hostname: hostname.to_string(),
             tags: vec![],
             ssh_host_key: None,
+            posture: tunnet_common::PeerPosture::Unknown,
         }
     }
 
@@ -1047,6 +1131,45 @@ mod tests {
         assert!(table.lookup_endpoint(&peer_b).is_some());
     }
 
+    #[test]
+    fn peer_delta_preserves_local_identity_and_route_delegation() {
+        let table = RoutingTable::new();
+        let self_id = "aa".repeat(32);
+        let local_ip = "10.7.0.1".parse().unwrap();
+        table.replace(
+            &[peer(&self_id, "10.7.0.1", "self")],
+            &[SubnetRoute {
+                cidr: "192.168.1.0/24".parse().unwrap(),
+                via_endpoint_id: self_id.clone(),
+                via_ip: local_ip,
+            }],
+            &[],
+            &[],
+            &profile(),
+            &dns(),
+            "office",
+            Uuid::nil(),
+            &self_id,
+            1,
+        );
+        table.apply_peer_delta(
+            Uuid::nil(),
+            &[peer(&"bb".repeat(32), "10.7.0.2", "peer")],
+            &[],
+            2,
+            &self_id,
+            "office",
+        );
+        let tables = table.tables();
+        assert_eq!(tables.local_ips.get(&Uuid::nil()), Some(&local_ip));
+        assert!(
+            tables
+                .claims
+                .iter()
+                .any(|claim| claim.local && claim.cidr == "192.168.1.0/24".parse().unwrap())
+        );
+    }
+
     #[tokio::test]
     async fn subscribe_changes_fires_on_rebuild() {
         let table = RoutingTable::new();
@@ -1161,6 +1284,104 @@ mod tests {
             1,
         );
         (table, exit)
+    }
+
+    #[test]
+    fn selected_exit_does_not_authorize_destinations_outside_its_delegation() {
+        let (table, exit) = exit_node_table();
+        table
+            .slices
+            .lock()
+            .get_mut(&Uuid::nil())
+            .unwrap()
+            .exit_nodes[0]
+            .allowed_cidrs = vec!["203.0.113.0/24".parse().unwrap()];
+        table.rebuild(None);
+        assert_eq!(
+            table
+                .lookup_ip(&"203.0.113.9".parse().unwrap())
+                .unwrap()
+                .endpoint_hex,
+            exit
+        );
+        assert!(table.lookup_ip(&"8.8.8.8".parse().unwrap()).is_none());
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    fn defaults_preserve_specific_ownership_and_reject_external_ambiguity(
+        #[case] second_default: bool,
+    ) {
+        let (table, exit) = exit_node_table();
+        let other = Uuid::from_u128(2);
+        let gateway = "cc".repeat(32);
+        table.reserve_mesh_range(Uuid::nil(), "10.7.0.0/24".parse().unwrap());
+        table.replace_network_with_plan(
+            other,
+            &[peer(&gateway, "10.8.0.2", "other")],
+            &dns(),
+            "other",
+            &"aa".repeat(32),
+            2,
+            Some("10.8.0.0/24".parse().unwrap()),
+        );
+        {
+            let mut slices = table.slices.lock();
+            let slice = slices.get_mut(&other).unwrap();
+            slice.subnet_routes.push(SubnetRoute {
+                cidr: "192.0.2.0/24".parse().unwrap(),
+                via_endpoint_id: gateway.clone(),
+                via_ip: "10.8.0.2".parse().unwrap(),
+            });
+            if second_default {
+                slice.profile.exit_node_endpoint_id = Some(gateway.clone());
+                slice.exit_nodes.push(ExitNodeInfo {
+                    endpoint_id: gateway.clone(),
+                    via_ip: "10.8.0.2".parse().unwrap(),
+                    allowed_cidrs: vec!["0.0.0.0/0".parse().unwrap()],
+                });
+            }
+        }
+        table.rebuild(None);
+        let store = crate::forward::ForwardingStore::new();
+        store.republish(&table);
+        let snapshot = store.load();
+        for address in ["10.8.0.2", "192.0.2.42"] {
+            assert_eq!(
+                snapshot
+                    .route(&address.parse().unwrap())
+                    .unwrap()
+                    .endpoint_hex,
+                gateway
+            );
+            assert!(!snapshot.source_allowed(
+                Uuid::nil(),
+                exit.parse().unwrap(),
+                address.parse().unwrap()
+            ));
+        }
+        assert_eq!(
+            snapshot
+                .route(&"10.7.0.5".parse().unwrap())
+                .unwrap()
+                .endpoint_hex,
+            exit
+        );
+        assert!(!snapshot.source_allowed(
+            Uuid::nil(),
+            exit.parse().unwrap(),
+            "10.8.0.99".parse().unwrap()
+        ));
+        assert_eq!(
+            snapshot.route(&"8.8.8.8".parse().unwrap()).is_none(),
+            second_default
+        );
+        assert!(snapshot.source_allowed(
+            Uuid::nil(),
+            exit.parse().unwrap(),
+            "8.8.8.8".parse().unwrap()
+        ));
     }
 
     /// With an exit node configured, multicast passed the internet catch-all
