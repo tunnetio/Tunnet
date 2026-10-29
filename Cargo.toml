@@ -163,7 +163,7 @@ iroh-docs = "0.101"
 tun-rs = { version = "2", features = ["async_tokio"] }
 etherparse = "0.21"
 route_manager = { version = "0.2.13", features = ["async"] }
-russh = { version = "0.63", default-features = false, features = ["ring"] }
+russh = { version = "0.64", default-features = false, features = ["ring"] }
 russh-sftp = "3.0"
 async-trait = "0.1"
 regex = "1"
