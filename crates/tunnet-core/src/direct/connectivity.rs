@@ -3,7 +3,6 @@
 //! Relay selection is [`EffectiveRelayPolicy`] only. DHT, mDNS, and LAN discovery
 //! are separate and never implied by a connectivity "profile".
 
-use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
@@ -12,10 +11,9 @@ use std::sync::Arc;
 use ipnet::Ipv4Net;
 use iroh::Endpoint;
 use iroh::RelayMode;
-use iroh::address_lookup::AddrFilter;
 use iroh::dns::{BoxIter, DNS_TIMEOUT, DnsError, DnsResolver, Resolver, TxtRecordData};
-use iroh::endpoint::Builder;
 use iroh::endpoint::presets;
+use iroh::endpoint::{Builder, DirectAddrFilter};
 use iroh::{EndpointAddr, RelayConfig, RelayMap, TransportAddr};
 #[cfg(feature = "direct")]
 use iroh_mainline_address_lookup::DhtAddressLookup;
@@ -263,30 +261,34 @@ pub fn strip_overlay_addrs(mut addr: EndpointAddr, overlay_nets: &[Ipv4Net]) -> 
     addr
 }
 
-/// Do not publish overlay interface addresses as iroh underlay candidates.
+/// Rejects overlay addresses as iroh direct-address candidates.
+#[derive(Debug)]
+struct OverlayCandidateFilter(Vec<Ipv4Net>);
+
+impl DirectAddrFilter for OverlayCandidateFilter {
+    fn use_nat_candidate(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => !is_overlay_underlay_ip(v4, &self.0),
+            IpAddr::V6(_) => true,
+        }
+    }
+}
+
+/// Keep overlay interface addresses out of iroh's direct addresses.
 ///
-/// `AddrFilter` applies to address *publish*. It does not filter
-/// QNT/handshake candidates on an existing connection (n0-computer/iroh#4399).
+/// The TUN's address is a local interface address like any other, so iroh would
+/// publish it and offer it as a QUIC NAT traversal candidate. A path to or from
+/// it routes underlay traffic back into the tunnel: either a path through the
+/// tunnel itself, which pins `max_datagram_size` to the QUIC floor, or a path
+/// sourced from the overlay address over the underlay, whose replies the peer
+/// routes into its own TUN, so iroh selects a path that cannot deliver. The
+/// filter applies where iroh gathers its direct addresses, which feeds both
+/// publishing and NAT traversal.
 pub fn apply_overlay_addr_filter(builder: Builder, overlay_nets: &[Ipv4Net]) -> Builder {
     if overlay_nets.is_empty() {
         return builder;
     }
-    let nets = overlay_nets.to_vec();
-    builder.addr_filter(AddrFilter::new(move |addrs| {
-        Cow::Owned(
-            addrs
-                .iter()
-                .filter(|a| match a {
-                    TransportAddr::Ip(sa) => match sa.ip() {
-                        IpAddr::V4(v4) => !is_overlay_underlay_ip(v4, &nets),
-                        IpAddr::V6(_) => true,
-                    },
-                    _ => true,
-                })
-                .cloned()
-                .collect(),
-        )
-    }))
+    builder.direct_addr_filter(OverlayCandidateFilter(overlay_nets.to_vec()))
 }
 
 /// Attach address-lookup services independently of relay policy.

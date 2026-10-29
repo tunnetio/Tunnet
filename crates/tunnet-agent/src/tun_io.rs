@@ -179,7 +179,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
         ssh_intercept,
     } = deps;
 
-    let scheduler = OutboundScheduler::new(pool.clone(), metrics.clone(), mtu);
+    let scheduler = OutboundScheduler::new(pool.clone(), metrics.clone(), mtu, tun.clone());
 
     let mut buf = vec![0u8; 65_536];
     tracing::info!("outbound TUN→iroh Byte-DRR loop started");
