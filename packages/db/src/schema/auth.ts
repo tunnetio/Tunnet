@@ -331,6 +331,7 @@ export const oauthClient = pgTable(
 );
 
 export const oauthResource = pgTable("oauth_resource", {
+  id: text("id").primaryKey(),
   identifier: text("identifier").notNull().unique(),
   name: text("name").notNull(),
   accessTokenTtl: integer("access_token_ttl"),
@@ -352,6 +353,7 @@ export const oauthResource = pgTable("oauth_resource", {
 export const oauthClientResource = pgTable(
   "oauth_client_resource",
   {
+    id: text("id").primaryKey(),
     clientId: text("client_id")
       .notNull()
       .references(() => oauthClient.clientId, { onDelete: "cascade" }),
@@ -372,6 +374,7 @@ export const oauthClientResource = pgTable(
 );
 
 export const oauthClientAssertion = pgTable("oauth_client_assertion", {
+  id: text("id").primaryKey(),
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
 });
 
