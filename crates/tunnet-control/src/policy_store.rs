@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey};
-use sqlx::PgPool;
+use sqlx::PgConnection;
 use std::collections::HashMap;
 use tunnet_common::policy::{
     Action, DefaultAction, IcmpPolicy, PolicyBundle, PolicyRule, Protocol, RuleScope, Selector,
@@ -48,7 +48,7 @@ struct NetworkAclMeta {
 }
 
 pub async fn load_network_bundle(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     signing_key: &SigningKey,
     network_id: Uuid,
     version: u64,
@@ -61,7 +61,7 @@ pub async fn load_network_bundle(
          ORDER BY order_index ASC, priority ASC",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let ssh_rows: Vec<SshRow> = sqlx::query_as(
@@ -70,18 +70,18 @@ pub async fn load_network_bundle(
          FROM ssh_policies WHERE network_id = $1 ORDER BY priority DESC",
     )
     .bind(network_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     let meta: NetworkAclMeta =
         sqlx::query_as("SELECT default_action, icmp_policy FROM networks WHERE id = $1")
             .bind(network_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *pool)
             .await?;
 
     let org_id: String = sqlx::query_scalar("SELECT organization_id FROM networks WHERE id = $1")
         .bind(network_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *pool)
         .await?;
 
     let posture_meta = load_posture_metadata(pool, &org_id, Some(network_id)).await?;
@@ -91,8 +91,8 @@ pub async fn load_network_bundle(
         ssh_rows,
         version,
         RuleScope::Network,
-        parse_default_action(&meta.default_action),
-        parse_icmp_policy(&meta.icmp_policy),
+        parse_default_action(&meta.default_action)?,
+        parse_icmp_policy(&meta.icmp_policy)?,
         posture_meta.postures,
         posture_meta.default_src_posture,
         posture_meta.posture_enforcement,
@@ -100,7 +100,7 @@ pub async fn load_network_bundle(
 }
 
 pub async fn load_org_bundle(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     signing_key: &SigningKey,
     organization_id: &str,
     version: u64,
@@ -113,7 +113,7 @@ pub async fn load_org_bundle(
          ORDER BY order_index ASC, priority ASC",
     )
     .bind(organization_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *pool)
     .await?;
 
     // Org-level SSH rules are not modeled yet; network-scoped only.
@@ -133,18 +133,20 @@ pub async fn load_org_bundle(
     )
 }
 
-fn parse_default_action(raw: &str) -> DefaultAction {
+fn parse_default_action(raw: &str) -> anyhow::Result<DefaultAction> {
     match raw {
-        "deny" => DefaultAction::Deny,
-        _ => DefaultAction::Allow,
+        "deny" => Ok(DefaultAction::Deny),
+        "allow" => Ok(DefaultAction::Allow),
+        _ => anyhow::bail!("invalid default policy action"),
     }
 }
 
-fn parse_icmp_policy(raw: &str) -> IcmpPolicy {
+fn parse_icmp_policy(raw: &str) -> anyhow::Result<IcmpPolicy> {
     match raw {
-        "acl" => IcmpPolicy::Acl,
-        "deny" => IcmpPolicy::Deny,
-        _ => IcmpPolicy::Allow,
+        "acl" => Ok(IcmpPolicy::Acl),
+        "deny" => Ok(IcmpPolicy::Deny),
+        "allow" => Ok(IcmpPolicy::Allow),
+        _ => anyhow::bail!("invalid ICMP policy"),
     }
 }
 
@@ -156,7 +158,7 @@ struct PostureMetadata {
 
 /// Load posture defs + settings with inheritance: network ← org ← empty/defaults.
 async fn load_posture_metadata(
-    pool: &PgPool,
+    pool: &mut PgConnection,
     organization_id: &str,
     network_id: Option<Uuid>,
 ) -> anyhow::Result<PostureMetadata> {
@@ -166,38 +168,35 @@ async fn load_posture_metadata(
          WHERE organization_id = $1 AND network_id IS NULL",
     )
     .bind(organization_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .fetch_all(&mut *pool)
+    .await?;
 
-    let mut postures: HashMap<String, Vec<String>> = org_defs
+    let org_postures: HashMap<String, Vec<String>> = org_defs
         .into_iter()
         .map(|d| (d.name, d.assertions.0))
         .collect();
-
-    if let Some(nid) = network_id {
+    let network_postures = if let Some(nid) = network_id {
         let net_defs: Vec<PostureDefinitionRow> = sqlx::query_as(
             "SELECT name, assertions FROM posture_definitions \
              WHERE organization_id = $1 AND network_id = $2",
         )
         .bind(organization_id)
         .bind(nid)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        for d in net_defs {
-            postures.insert(d.name, d.assertions.0);
-        }
-    }
+        .fetch_all(&mut *pool)
+        .await?;
+        net_defs
+            .into_iter()
+            .map(|d| (d.name, d.assertions.0))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let postures = crate::posture::merge_definition_strings(org_postures, network_postures);
 
-    let org_settings = crate::posture::load_settings_row(pool, organization_id, None)
-        .await
-        .unwrap_or(None);
+    let org_settings = crate::posture::load_settings_row(pool, organization_id, None).await?;
 
     let net_settings = if let Some(nid) = network_id {
-        crate::posture::load_settings_row(pool, organization_id, Some(nid))
-            .await
-            .unwrap_or(None)
+        crate::posture::load_settings_row(pool, organization_id, Some(nid)).await?
     } else {
         None
     };
@@ -208,7 +207,10 @@ async fn load_posture_metadata(
     let (default_src_posture, posture_enforcement) = match settings {
         Some(s) => {
             let default_src_posture = s.default_src_posture.0.clone();
-            (default_src_posture, Some(crate::posture::to_enforcement(s)))
+            (
+                default_src_posture,
+                Some(crate::posture::to_enforcement(s)?),
+            )
         }
         None => (Vec::new(), None),
     };
@@ -235,49 +237,52 @@ fn sign_bundle(
 ) -> anyhow::Result<PolicyBundle> {
     let rules = rows
         .into_iter()
-        .map(|r| PolicyRule {
-            src: r.src_selector.0,
-            dst: r.dst_selector.0,
-            action: if r.action == "allow" {
-                Action::Allow
-            } else {
-                Action::Deny
-            },
-            ports: r.ports.0,
-            protocol: r.protocol.and_then(|p| match p.as_str() {
-                "tcp" => Some(Protocol::Tcp),
-                "udp" => Some(Protocol::Udp),
-                "icmp" => Some(Protocol::Icmp),
-                "icmpv6" => Some(Protocol::Icmpv6),
-                "any" => Some(Protocol::Any),
-                _ => None,
-            }),
-            priority: r.priority,
-            order_index: r.order_index,
-            scope,
-            enabled: r.enabled,
-            slug: r.slug,
-            src_posture: {
-                let explicit = r.src_posture.map(|j| j.0).unwrap_or_default();
-                if explicit.is_empty() {
-                    default_src_posture.clone()
-                } else {
-                    explicit
-                }
-            },
+        .map(|r| {
+            Ok(PolicyRule {
+                src: r.src_selector.0,
+                dst: r.dst_selector.0,
+                action: match r.action.as_str() {
+                    "allow" => Action::Allow,
+                    "deny" => Action::Deny,
+                    _ => anyhow::bail!("invalid policy action"),
+                },
+                ports: r.ports.0,
+                protocol: match r.protocol.as_deref() {
+                    None => None,
+                    Some("tcp") => Some(Protocol::Tcp),
+                    Some("udp") => Some(Protocol::Udp),
+                    Some("icmp") => Some(Protocol::Icmp),
+                    Some("icmpv6") => Some(Protocol::Icmpv6),
+                    Some("any") => Some(Protocol::Any),
+                    _ => anyhow::bail!("invalid policy protocol"),
+                },
+                priority: r.priority,
+                order_index: r.order_index,
+                scope,
+                enabled: r.enabled,
+                slug: r.slug,
+                src_posture: {
+                    let explicit = r.src_posture.map(|j| j.0).unwrap_or_default();
+                    if explicit.is_empty() {
+                        default_src_posture.clone()
+                    } else {
+                        explicit
+                    }
+                },
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let ssh_rules = ssh_rows
         .into_iter()
-        .filter_map(|r| {
+        .map(|r| {
             let action = match r.action.as_str() {
                 "accept" => SshAction::Accept,
                 "check" => SshAction::Check,
                 "deny" => SshAction::Deny,
-                _ => return None,
+                _ => anyhow::bail!("invalid SSH policy action"),
             };
-            Some(SshPolicyRule {
+            Ok(SshPolicyRule {
                 src: r.src_selector.0,
                 dst: r.dst_selector.0,
                 action,
@@ -285,11 +290,11 @@ fn sign_bundle(
                 record: r.record,
                 recorder: r.recorder.map(|j| j.0),
                 enforce_recorder: r.enforce_recorder,
-                check_period_secs: r.check_period_secs.map(|s| s as u64),
+                check_period_secs: r.check_period_secs.map(u64::try_from).transpose()?,
                 priority: r.priority,
             })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut bundle = PolicyBundle {
         rules,

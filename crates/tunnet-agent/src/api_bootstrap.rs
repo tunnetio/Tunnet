@@ -67,6 +67,11 @@ impl AgentBootstrapOps {
     }
 
     async fn signed_client(&self) -> anyhow::Result<SignedClient> {
+        if let Some(handle) = &self.handle
+            && let Some(client) = handle.managed_client().await?
+        {
+            return Ok(client);
+        }
         let policy = SealPolicy::from_env_and_flag(false);
         let (identity, persisted, _) = load_agent(&self.paths, policy)?;
         let managed = match persisted {

@@ -3,8 +3,9 @@
 #![cfg(windows)]
 
 use std::ffi::OsString;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use windows_service::service::{
@@ -188,15 +189,60 @@ pub fn stop_and_wait() -> anyhow::Result<()> {
     let status = service
         .query_status()
         .context("query tunnet service status")?;
-    match status.current_state {
-        ServiceState::Stopped => return Ok(()),
-        ServiceState::StopPending => {}
-        _ => {
-            service.stop().context("stop tunnet service")?;
-        }
+    if status.current_state == ServiceState::Stopped && status.process_id.is_none_or(|pid| pid == 0)
+    {
+        return Ok(());
     }
-    wait_for_state(&service, ServiceState::Stopped, Duration::from_secs(45))
-        .context("wait for tunnet service to reach Stopped")?;
+    let pid = status
+        .process_id
+        .context("service did not report its process ID")?;
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::OpenProcess(
+            windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if service.query_status()?.current_state == ServiceState::Stopped {
+            return Ok(());
+        }
+        return Err(error).context("open service process");
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let deadline = Instant::now() + Duration::from_secs(45);
+    if !matches!(
+        status.current_state,
+        ServiceState::Stopped | ServiceState::StopPending
+    ) && let Err(error) = service.stop()
+        && !matches!(
+            service.query_status()?.current_state,
+            ServiceState::Stopped | ServiceState::StopPending
+        )
+    {
+        return Err(error).context("stop tunnet service");
+    }
+    wait_for_state(
+        &service,
+        ServiceState::Stopped,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .context("wait for tunnet service to reach Stopped")?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let result = unsafe {
+        windows_sys::Win32::System::Threading::WaitForSingleObject(
+            process.as_raw_handle(),
+            remaining.as_millis() as u32,
+        )
+    };
+    match result {
+        windows_sys::Win32::Foundation::WAIT_OBJECT_0 => {}
+        windows_sys::Win32::Foundation::WAIT_FAILED => {
+            return Err(std::io::Error::last_os_error()).context("wait for service process");
+        }
+        _ => anyhow::bail!("service process did not exit before the stop deadline"),
+    }
     Ok(())
 }
 

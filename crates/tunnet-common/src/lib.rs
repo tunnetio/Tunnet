@@ -11,6 +11,8 @@ pub mod send;
 pub mod signing;
 pub mod ws;
 
+pub use posture::PeerPosture;
+
 pub use agent_policy::{
     ConfigSource, EffectiveAgentConfig, LocalDualOverrides, LocalOnlySettings, RelayPolicy,
     RemoteAgentPolicy, RemoteAutoUpdatePolicy, RemoteDnsPolicy, RemoteExitNodesPolicy,
@@ -136,6 +138,9 @@ pub struct PeerEntry {
     /// OpenSSH public host key line (`ssh-ed25519 AAAA...`), when advertised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_host_key: Option<String>,
+    /// Control-plane claim for this membership. Missing on the wire is `Unknown`.
+    #[serde(default)]
+    pub posture: PeerPosture,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +302,9 @@ pub struct Ipv6PeerEntry {
     pub endpoint_id: EndpointIdHex,
     pub hostname: String,
     pub tags: Vec<String>,
+    /// Control-plane claim for this membership. Missing on the wire is `Unknown`.
+    #[serde(default)]
+    pub posture: PeerPosture,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +404,9 @@ pub struct NetworkMembershipSnapshot {
     /// This endpoint's hostname (for PeerDNS self-resolution; peers list excludes self).
     #[serde(default)]
     pub self_hostname: String,
+    /// This endpoint's posture claim for this membership. Peers carry theirs on `PeerEntry`.
+    #[serde(default)]
+    pub self_posture: PeerPosture,
     pub policy: policy::PolicyBundle,
     pub gossip_bootstrap: Vec<EndpointIdHex>,
     pub gossip_topic_hex: String,

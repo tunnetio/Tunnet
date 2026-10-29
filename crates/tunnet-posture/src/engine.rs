@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use tunnet_common::posture::CustomScriptConfig;
@@ -34,10 +34,10 @@ pub struct PostureState {
 }
 
 #[derive(Debug, Clone)]
-pub struct PostureChangeEvent {
-    pub changed_attributes: Vec<(String, PostureValue, PostureValue)>,
+pub struct PostureCollection {
+    pub attributes: HashMap<String, PostureValue>,
     pub state_hash: String,
-    pub full_snapshot: bool,
+    pub collected_at: Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -84,9 +84,10 @@ fn default_scripts_dir() -> PathBuf {
 
 pub struct PostureEngine {
     collectors: RwLock<Vec<Box<dyn PostureCollector>>>,
+    collection: Mutex<()>,
     config: RwLock<PostureEngineConfig>,
     state: Arc<RwLock<PostureState>>,
-    change_tx: broadcast::Sender<PostureChangeEvent>,
+    change_tx: broadcast::Sender<PostureCollection>,
 }
 
 impl PostureEngine {
@@ -94,6 +95,7 @@ impl PostureEngine {
         let (change_tx, _) = broadcast::channel(64);
         Self {
             collectors: RwLock::new(collectors),
+            collection: Mutex::new(()),
             config: RwLock::new(config),
             state: Arc::new(RwLock::new(PostureState {
                 attributes: HashMap::new(),
@@ -147,11 +149,17 @@ impl PostureEngine {
                 .collect(),
         )));
 
-        collectors.retain(|c| c.is_available());
+        collectors.retain(|c| {
+            c.is_available()
+                && config
+                    .enabled_collectors
+                    .as_ref()
+                    .is_none_or(|enabled| enabled.iter().any(|name| name == c.name()))
+        });
         collectors
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<PostureChangeEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<PostureCollection> {
         self.change_tx.subscribe()
     }
 
@@ -176,52 +184,38 @@ impl PostureEngine {
         *self.collectors.write().await = collectors;
     }
 
-    pub async fn collect_once(&self) -> Result<PostureChangeEvent, PostureError> {
-        let (changes, full) = self.run_collection(true).await?;
-        Ok(PostureChangeEvent {
-            changed_attributes: changes,
-            state_hash: self.state.read().await.state_hash.clone(),
-            full_snapshot: full,
-        })
+    pub async fn collect_once(&self) -> Result<PostureCollection, PostureError> {
+        let event = self.run_collection().await?;
+        let _ = self.change_tx.send(event.clone());
+        Ok(event)
     }
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
-        let mut is_first = true;
         loop {
-            if cancel.is_cancelled() {
-                break;
+            let collection = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                result = self.collect_once() => result,
+            };
+            match collection {
+                Ok(_) => {}
+                Err(error) => warn!(%error, "posture collection cycle failed"),
             }
-
-            match self.run_collection(is_first).await {
-                Ok((changes, full)) => {
-                    if !changes.is_empty() || full {
-                        let event = PostureChangeEvent {
-                            changed_attributes: changes,
-                            state_hash: self.state.read().await.state_hash.clone(),
-                            full_snapshot: full,
-                        };
-                        let _ = self.change_tx.send(event);
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "posture collection cycle failed");
-                }
-            }
-
-            is_first = false;
-
-            let interval = self.config.read().await.interval;
+            let interval = self
+                .config
+                .read()
+                .await
+                .interval
+                .min(Duration::from_secs(300));
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(interval.max(Duration::from_secs(30))) => {}
             }
         }
     }
 
-    async fn run_collection(
-        &self,
-        force_all: bool,
-    ) -> Result<(Vec<(String, PostureValue, PostureValue)>, bool), PostureError> {
+    async fn run_collection(&self) -> Result<PostureCollection, PostureError> {
+        let _collection = self.collection.lock().await;
         let now = Timestamp::now();
         let mut new_attrs = HashMap::new();
         let mut statuses = HashMap::new();
@@ -229,25 +223,16 @@ impl PostureEngine {
         let collectors = self.collectors.read().await;
         let mut results = Vec::new();
         for collector in collectors.iter() {
-            if !force_all {
-                let last = self
-                    .state
-                    .read()
-                    .await
-                    .last_collected
-                    .get(collector.name())
-                    .copied();
-                if let Some(last) = last
-                    && std::time::Duration::try_from(now.duration_since(last)).unwrap_or_default()
-                        < collector.min_interval()
-                {
-                    continue;
-                }
-            }
-
             let name = collector.name().to_string();
             let result = if collector.is_available() {
-                collector.collect().await
+                tokio::time::timeout(Duration::from_secs(30), collector.collect())
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(PostureError::collector_failed(
+                            &name,
+                            "collection timed out",
+                        ))
+                    })
             } else {
                 Err(PostureError::NotAvailable {
                     collector: name.clone(),
@@ -282,27 +267,25 @@ impl PostureEngine {
         inject_posture_score(&mut new_attrs, &scoring);
 
         let mut state = self.state.write().await;
-        let old_attrs = state.attributes.clone();
-        let was_empty = old_attrs.is_empty();
-
-        for (k, v) in &new_attrs {
-            state.attributes.insert(k.clone(), v.clone());
-        }
-        for (name, status) in statuses {
-            state.collector_statuses.insert(name.clone(), status);
-            state.last_collected.insert(name, now);
-        }
-
-        let changes = diff_attributes(&old_attrs, &state.attributes);
+        state.attributes = new_attrs;
+        state.collector_statuses = statuses;
+        state.last_collected = state
+            .collector_statuses
+            .keys()
+            .map(|name| (name.clone(), now))
+            .collect();
         state.state_hash = compute_state_hash(&state.attributes);
 
         debug!(
-            changed = changes.len(),
             total_attrs = state.attributes.len(),
             "posture collection complete"
         );
 
-        Ok((changes, force_all && was_empty))
+        Ok(PostureCollection {
+            attributes: state.attributes.clone(),
+            state_hash: state.state_hash.clone(),
+            collected_at: now,
+        })
     }
 }
 
@@ -322,35 +305,82 @@ pub fn compute_state_hash(attrs: &HashMap<String, PostureValue>) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-fn diff_attributes(
-    old: &HashMap<String, PostureValue>,
-    new: &HashMap<String, PostureValue>,
-) -> Vec<(String, PostureValue, PostureValue)> {
-    let mut changes = Vec::new();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Platform, PostureAttributes};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    for (key, new_val) in new {
-        match old.get(key) {
-            Some(old_val) if old_val != new_val => {
-                changes.push((key.clone(), old_val.clone(), new_val.clone()));
+    struct Probe(Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl PostureCollector for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn namespace(&self) -> &'static str {
+            "probe"
+        }
+        fn supported_platforms(&self) -> &[Platform] {
+            &[Platform::Windows, Platform::Linux]
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        async fn collect(&self) -> Result<PostureAttributes, PostureError> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(PostureAttributes::new("probe")
+                    .with_attribute("probe:healthy", PostureValue::Bool(true)))
+            } else {
+                Err(PostureError::collector_failed("probe", "unavailable"))
             }
-            None => changes.push((
-                key.clone(),
-                PostureValue::String(String::new()),
-                new_val.clone(),
-            )),
-            _ => {}
         }
     }
 
-    for key in old.keys() {
-        if !new.contains_key(key) {
-            changes.push((
-                key.clone(),
-                old[key].clone(),
-                PostureValue::String(String::new()),
-            ));
+    #[tokio::test]
+    async fn unchanged_reports_refresh_and_failed_evidence_is_removed() {
+        let healthy = Arc::new(AtomicBool::new(true));
+        let engine = PostureEngine::new(
+            vec![Box::new(Probe(healthy.clone()))],
+            PostureEngineConfig::default(),
+        );
+        let mut reports = engine.subscribe();
+        for _ in 0..2 {
+            engine.collect_once().await.unwrap();
+            assert_eq!(
+                reports
+                    .recv()
+                    .await
+                    .unwrap()
+                    .attributes
+                    .get("probe:healthy"),
+                Some(&PostureValue::Bool(true))
+            );
         }
+        healthy.store(false, Ordering::SeqCst);
+        engine.collect_once().await.unwrap();
+        assert!(
+            !reports
+                .recv()
+                .await
+                .unwrap()
+                .attributes
+                .contains_key("probe:healthy")
+        );
+        assert_eq!(
+            engine.state().await.collector_statuses["probe"],
+            CollectorStatus::Error
+        );
+        healthy.store(true, Ordering::SeqCst);
+        engine.collect_once().await.unwrap();
+        assert_eq!(
+            reports
+                .recv()
+                .await
+                .unwrap()
+                .attributes
+                .get("probe:healthy"),
+            Some(&PostureValue::Bool(true))
+        );
     }
-
-    changes
 }

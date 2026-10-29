@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use iroh::EndpointId;
 use parking_lot::Mutex;
 use serde::Serialize;
+use tunnet_common::PeerPosture;
 use tunnet_common::packet::{
     CachedTransport, FragKey, Fragmentation, Packet, ResolvedL4, TcpFlags, frag_key,
     synthesize_reject,
@@ -19,7 +20,8 @@ use tunnet_common::policy::{
 };
 use uuid::Uuid;
 
-use super::snapshot::{ForwardingSnapshot, NetworkPolicy};
+use super::PostureAuthorization;
+use super::snapshot::{AuthorizationEpoch, ForwardingSnapshot, NetworkPolicy};
 use crate::direct::firewall::{FirewallAction, FirewallRule, PeerFilter};
 
 const DENY_LOG_CAP: usize = 64;
@@ -27,7 +29,7 @@ const TCP_ACTIVE_TTL: Duration = Duration::from_secs(300);
 const TCP_TIME_WAIT_TTL: Duration = Duration::from_secs(10);
 const UDP_TTL: Duration = Duration::from_secs(30);
 const ICMP_TTL: Duration = Duration::from_secs(10);
-const GC_INTERVAL: Duration = Duration::from_secs(10);
+const FLOW_CAP: usize = 4096;
 const FRAG_TTL: Duration = Duration::from_secs(2);
 const FRAG_CAP: usize = 4096;
 const SPOOF_WINDOW: Duration = Duration::from_secs(60);
@@ -39,9 +41,13 @@ const TCP_ACK: u8 = TcpFlags::ACK;
 
 #[derive(Debug, Clone)]
 pub enum Decision {
-    Allow,
+    Allow {
+        posture: Option<PostureAuthorization>,
+    },
     Deny,
-    Reject { reply: Bytes },
+    Reject {
+        reply: Bytes,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,22 +72,61 @@ pub struct NetStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FlowKey {
     network: Uuid,
-    proto: u8,
+    peer: EndpointId,
     src: Ipv4Addr,
-    sport: u16,
     dst: Ipv4Addr,
-    dport: u16,
+    transport: FlowTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FlowTransport {
+    Tcp {
+        source: u16,
+        destination: u16,
+    },
+    Udp {
+        source: u16,
+        destination: u16,
+    },
+    Echo {
+        identifier: u16,
+        sequence: u16,
+        request: bool,
+    },
 }
 
 impl FlowKey {
     fn reverse(self) -> Self {
         Self {
             network: self.network,
-            proto: self.proto,
+            peer: self.peer,
             src: self.dst,
-            sport: self.dport,
             dst: self.src,
-            dport: self.sport,
+            transport: match self.transport {
+                FlowTransport::Tcp {
+                    source,
+                    destination,
+                } => FlowTransport::Tcp {
+                    source: destination,
+                    destination: source,
+                },
+                FlowTransport::Udp {
+                    source,
+                    destination,
+                } => FlowTransport::Udp {
+                    source: destination,
+                    destination: source,
+                },
+                FlowTransport::Echo {
+                    identifier,
+                    sequence,
+                    request,
+                } => FlowTransport::Echo {
+                    identifier,
+                    sequence,
+                    request: !request,
+                },
+            },
         }
     }
 }
@@ -104,18 +149,26 @@ enum FlowPhase {
 struct FlowEntry {
     phase: FlowPhase,
     last_seen: Instant,
-    auth: u64,
-    posture_ok: bool,
-    stale: bool,
+    auth: AuthorizationEpoch,
+    posture_ok: Arc<bool>,
+    posture: Option<PostureAuthorization>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FragmentIdentity {
+    network: Uuid,
+    peer: EndpointId,
+    direction: Direction,
+    fragment: FragKey,
 }
 
 #[derive(Debug, Clone)]
 struct FragEntry {
     transport: CachedTransport,
     expires: Instant,
-    auth: u64,
-    posture_ok: bool,
-    stale: bool,
+    auth: AuthorizationEpoch,
+    posture_ok: Arc<bool>,
+    posture: Option<PostureAuthorization>,
 }
 
 struct SpoofState {
@@ -142,24 +195,22 @@ pub struct PeerCtx<'a> {
     pub network_name: &'a str,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AuthCtx {
-    epoch: u64,
-    posture_ok: bool,
-    stale: bool,
+    epoch: AuthorizationEpoch,
+    posture_ok: Arc<bool>,
 }
 
 impl AuthCtx {
     fn of(snap: &ForwardingSnapshot, net: Uuid) -> Self {
         Self {
             epoch: snap.auth_epoch(net),
-            posture_ok: **snap.posture_ok.load(),
-            stale: **snap.stale.load(),
+            posture_ok: snap.posture_ok.load_full(),
         }
     }
 
-    fn matches(&self, auth: u64, posture_ok: bool, stale: bool) -> bool {
-        self.epoch == auth && self.posture_ok == posture_ok && self.stale == stale
+    fn matches(&self, auth: AuthorizationEpoch, posture_ok: &Arc<bool>) -> bool {
+        self.epoch == auth && Arc::ptr_eq(&self.posture_ok, posture_ok)
     }
 }
 
@@ -176,8 +227,8 @@ pub struct PolicyEngine {
 }
 
 struct PolicyInner {
-    flows: DashMap<FlowKey, FlowEntry>,
-    frags: Mutex<HashMap<(Uuid, FragKey), FragEntry>>,
+    flows: Mutex<HashMap<FlowKey, FlowEntry>>,
+    frags: Mutex<HashMap<FragmentIdentity, FragEntry>>,
     spoof: DashMap<Uuid, SpoofState>,
     global: Counters,
     nets: DashMap<Uuid, Counters>,
@@ -187,7 +238,7 @@ struct PolicyInner {
 impl Default for PolicyInner {
     fn default() -> Self {
         Self {
-            flows: DashMap::new(),
+            flows: Mutex::new(HashMap::new()),
             frags: Mutex::new(HashMap::new()),
             spoof: DashMap::new(),
             global: Counters::default(),
@@ -199,23 +250,7 @@ impl Default for PolicyInner {
 
 impl PolicyEngine {
     pub fn new() -> Self {
-        let engine = Self {
-            inner: Arc::new(PolicyInner::default()),
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let inner = engine.inner.clone();
-            handle.spawn(async move {
-                let mut tick = tokio::time::interval(GC_INTERVAL);
-                loop {
-                    tick.tick().await;
-                    let now = Instant::now();
-                    inner.flows.retain(|_, st| !flow_expired(st, now));
-                    let mut frags = inner.frags.lock();
-                    frags.retain(|_, e| e.expires > now);
-                }
-            });
-        }
-        engine
+        Self::default()
     }
 
     pub fn evaluate(
@@ -235,14 +270,14 @@ impl PolicyEngine {
             self.count(net, false, false);
             return Decision::Deny;
         };
-        let Some(l4) = self.resolve(&ctx, net, pkt) else {
+        let Some(l4) = self.resolve(&ctx, snap, net, peer.endpoint, direction, pkt) else {
             self.count(net, false, false);
             return Decision::Deny;
         };
-        match snap.policy_for(net) {
+        let decision = match snap.policy_for(net) {
             None => {
-                self.count(net, true, false);
-                Decision::Allow
+                self.count(net, false, false);
+                Decision::Deny
             }
             Some(NetworkPolicy::Managed { bundle }) => {
                 self.managed(&ctx, snap, net, peer, direction, src, dst, l4, bundle)
@@ -255,32 +290,80 @@ impl PolicyEngine {
             }) => self.direct(
                 &ctx, net, peer, direction, pkt, src, dst, l4, *enabled, local, suggested,
             ),
+        };
+        if let Decision::Allow { posture } = decision {
+            self.remember_fragment(&ctx, net, peer.endpoint, direction, pkt, posture);
+        } else if matches!(pkt.fragmentation, Fragmentation::First { .. })
+            && let Some(key) = frag_key(pkt)
+        {
+            self.inner.frags.lock().remove(&FragmentIdentity {
+                network: net,
+                peer: peer.endpoint,
+                direction,
+                fragment: key,
+            });
         }
+        decision
     }
 
     pub fn evaluate_flow(&self, snap: &ForwardingSnapshot, flow: &FlowContext) -> Decision {
         let Some(NetworkPolicy::Managed { bundle }) = snap.managed.and_then(|n| snap.policy_for(n))
         else {
-            return Decision::Allow;
+            return Decision::Deny;
         };
-        let posture_required = !bundle.default_src_posture.is_empty()
-            || bundle.rules.iter().any(|r| !r.src_posture.is_empty());
-        let flow = FlowContext {
-            src_posture_ok: if posture_required {
-                flow.src_posture_ok
-            } else {
-                true
-            },
-            ..flow.clone()
-        };
-        let verdict = evaluate_flow_policy(bundle, &flow);
-        if verdict.action == Action::Deny {
-            if **snap.stale.load()
-                && bundle.rules.is_empty()
-                && bundle.default_action == tunnet_common::policy::DefaultAction::Allow
-            {
-                return Decision::Allow;
+        self.evaluate_managed_flow(bundle, flow, Direction::Outbound)
+    }
+
+    pub fn evaluate_network_flow(
+        &self,
+        snap: &ForwardingSnapshot,
+        network: Uuid,
+        peer: &PeerCtx<'_>,
+        direction: Direction,
+        flow: &FlowContext,
+    ) -> Decision {
+        match snap.policy_for(network) {
+            Some(NetworkPolicy::Managed { bundle }) => {
+                self.evaluate_managed_flow(bundle, flow, direction)
             }
+            Some(NetworkPolicy::Direct {
+                enabled,
+                local,
+                suggested,
+                ..
+            }) => {
+                if !enabled {
+                    return Decision::Allow { posture: None };
+                }
+                let l4 = ResolvedL4 {
+                    protocol: flow.protocol,
+                    src_port: None,
+                    dst_port: flow.dst_port,
+                    tcp_flags: None,
+                    icmp_type: None,
+                    icmp_id: None,
+                    icmp_seq: None,
+                };
+                match match_rules(local, direction, l4, peer, network)
+                    .or_else(|| match_rules(suggested, direction, l4, peer, network))
+                    .unwrap_or(FirewallAction::Allow)
+                {
+                    FirewallAction::Allow => Decision::Allow { posture: None },
+                    FirewallAction::Deny | FirewallAction::Reject => Decision::Deny,
+                }
+            }
+            None => Decision::Deny,
+        }
+    }
+
+    fn evaluate_managed_flow(
+        &self,
+        bundle: &tunnet_common::policy::PolicyBundle,
+        flow: &FlowContext,
+        direction: Direction,
+    ) -> Decision {
+        let verdict = evaluate_flow_policy(bundle, flow);
+        if verdict.action == Action::Deny {
             self.record_deny(
                 &flow.src.endpoint_hex,
                 flow.dst_port,
@@ -289,7 +372,11 @@ impl PolicyEngine {
             );
             return Decision::Deny;
         }
-        Decision::Allow
+        Decision::Allow {
+            posture: verdict
+                .posture_required
+                .then_some(PostureAuthorization { source: direction }),
+        }
     }
 
     pub fn record_spoof(&self, net: Uuid, peer_hex: &str) -> bool {
@@ -330,8 +417,9 @@ impl PolicyEngine {
             flows: self
                 .inner
                 .flows
+                .lock()
                 .iter()
-                .filter(|e| e.key().network == net)
+                .filter(|(k, _)| k.network == net)
                 .count(),
         })
     }
@@ -341,16 +429,26 @@ impl PolicyEngine {
     }
 
     pub fn flush(&self) {
-        self.inner.flows.clear();
+        self.inner.flows.lock().clear();
         self.inner.frags.lock().clear();
     }
 
     pub fn flush_network(&self, net: Uuid) {
-        self.inner.flows.retain(|k, _| k.network != net);
-        self.inner.frags.lock().retain(|(n, _), _| *n != net);
+        self.inner.nets.remove(&net);
+        self.inner.spoof.remove(&net);
+        self.inner.flows.lock().retain(|k, _| k.network != net);
+        self.inner.frags.lock().retain(|key, _| key.network != net);
     }
 
-    fn resolve(&self, ctx: &AuthCtx, net: Uuid, pkt: &Packet<'_>) -> Option<ResolvedL4> {
+    fn resolve(
+        &self,
+        ctx: &AuthCtx,
+        snap: &ForwardingSnapshot,
+        net: Uuid,
+        peer: EndpointId,
+        direction: Direction,
+        pkt: &Packet<'_>,
+    ) -> Option<ResolvedL4> {
         if pkt.transport.is_later_fragment() {
             let key = FragKey {
                 src: pkt.ip.src(),
@@ -359,15 +457,41 @@ impl PolicyEngine {
                 identification: pkt.fragmentation.identification()?,
             };
             let mut frags = self.inner.frags.lock();
-            let entry = frags.get(&(net, key))?;
-            if !ctx.matches(entry.auth, entry.posture_ok, entry.stale)
+            let entry = frags.get(&FragmentIdentity {
+                network: net,
+                peer,
+                direction,
+                fragment: key,
+            })?;
+            if !ctx.matches(entry.auth, &entry.posture_ok)
+                || entry
+                    .posture
+                    .is_some_and(|posture| !posture.allows(snap, net, peer))
                 || Instant::now() >= entry.expires
             {
-                frags.remove(&(net, key));
+                frags.remove(&FragmentIdentity {
+                    network: net,
+                    peer,
+                    direction,
+                    fragment: key,
+                });
                 return None;
             }
             return Some(entry.transport.to_resolved());
         }
+        ResolvedL4::from_transport(pkt.transport)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remember_fragment(
+        &self,
+        ctx: &AuthCtx,
+        net: Uuid,
+        peer: EndpointId,
+        direction: Direction,
+        pkt: &Packet<'_>,
+        posture: Option<PostureAuthorization>,
+    ) {
         if matches!(pkt.fragmentation, Fragmentation::First { .. })
             && let (Some(key), Some(transport)) = (
                 frag_key(pkt),
@@ -375,24 +499,34 @@ impl PolicyEngine {
             )
         {
             let mut frags = self.inner.frags.lock();
+            frags.retain(|_, entry| entry.expires > Instant::now());
             if frags.len() >= FRAG_CAP
-                && !frags.contains_key(&(net, key))
+                && !frags.contains_key(&FragmentIdentity {
+                    network: net,
+                    peer,
+                    direction,
+                    fragment: key,
+                })
                 && let Some(oldest) = frags.iter().min_by_key(|(_, e)| e.expires).map(|(k, _)| *k)
             {
                 frags.remove(&oldest);
             }
             frags.insert(
-                (net, key),
+                FragmentIdentity {
+                    network: net,
+                    peer,
+                    direction,
+                    fragment: key,
+                },
                 FragEntry {
                     transport,
                     expires: Instant::now() + FRAG_TTL,
                     auth: ctx.epoch,
-                    posture_ok: ctx.posture_ok,
-                    stale: ctx.stale,
+                    posture_ok: ctx.posture_ok.clone(),
+                    posture,
                 },
             );
         }
-        ResolvedL4::from_transport(pkt.transport)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -409,55 +543,62 @@ impl PolicyEngine {
         bundle: &tunnet_common::policy::PolicyBundle,
     ) -> Decision {
         let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-        if let Some(key) = managed_key(net, l4.protocol, src, dst, l4.src_port, l4.dst_port)
-            && self.flow_allows(ctx, direction, key, tcp_flags)
+        if let Some(key) = flow_key(net, peer.endpoint, src, dst, l4)
+            && let Some(posture) = self.flow_allows(ctx, Some(snap), direction, key, tcp_flags)
         {
             self.count(net, true, false);
-            return Decision::Allow;
+            return Decision::Allow { posture };
         }
-        let mut peer_side = snap.peer_endpoint(peer.endpoint);
-        let self_side = snap.self_endpoint();
+        let peer_posture = snap
+            .binding(net, peer.endpoint)
+            .map(|binding| binding.posture.clone())
+            .unwrap_or(PeerPosture::Unknown);
+        let self_posture = if *ctx.posture_ok {
+            snap.source_posture(net, peer.endpoint, Direction::Outbound)
+        } else {
+            PeerPosture::Unknown
+        };
+        let mut peer_side = tunnet_common::policy::FlowEndpoint::member(
+            peer.hex.to_owned(),
+            peer.tags.to_vec(),
+            peer.network_name.to_owned(),
+            None,
+            peer_posture.clone(),
+        );
+        let mut self_side = snap.self_endpoint();
+        self_side.posture = self_posture.clone();
         let (src_side, dst_side) = match direction {
             Direction::Outbound => {
+                self_side.ip = Some(src);
                 peer_side.ip = Some(dst);
                 (self_side, peer_side)
             }
             Direction::Inbound => {
+                self_side.ip = Some(dst);
                 peer_side.ip = Some(src);
                 (peer_side, self_side)
             }
         };
-        let posture_required = !bundle.default_src_posture.is_empty()
-            || bundle.rules.iter().any(|r| !r.src_posture.is_empty());
         let flow = FlowContext {
             src: src_side,
             dst: dst_side,
             protocol: l4.protocol,
             dst_port: l4.dst_port,
-            src_posture_ok: if posture_required {
-                **snap.posture_ok.load()
-            } else {
-                true
-            },
         };
         let verdict = evaluate_flow_policy(bundle, &flow);
         if verdict.action == Action::Deny {
-            if **snap.stale.load()
-                && bundle.rules.is_empty()
-                && bundle.default_action == tunnet_common::policy::DefaultAction::Allow
-            {
-                self.count(net, true, false);
-                return Decision::Allow;
-            }
             self.record_deny(peer.hex, flow.dst_port, flow.protocol, &verdict);
             self.count(net, false, false);
             return Decision::Deny;
         }
-        if let Some(key) = managed_key(net, l4.protocol, src, dst, l4.src_port, l4.dst_port) {
-            self.open_flow(ctx, key, l4.protocol, tcp_flags);
+        let posture = verdict
+            .posture_required
+            .then_some(PostureAuthorization { source: direction });
+        if let Some(key) = flow_key(net, peer.endpoint, src, dst, l4) {
+            self.open_flow(ctx, key, l4.protocol, tcp_flags, posture);
         }
         self.count(net, true, false);
-        Decision::Allow
+        Decision::Allow { posture }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,24 +618,45 @@ impl PolicyEngine {
     ) -> Decision {
         if !enabled {
             self.count(net, true, false);
-            return Decision::Allow;
+            return Decision::Allow { posture: None };
         }
         let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-        if let Some(key) = direct_key(net, l4.protocol, src, dst, l4)
-            && self.flow_allows(ctx, direction, key, tcp_flags)
+        if let Some(key) = flow_key(net, peer.endpoint, src, dst, l4)
+            && let Some(posture) = self.flow_allows(ctx, None, direction, key, tcp_flags)
         {
             self.count(net, true, false);
-            return Decision::Allow;
+            return Decision::Allow { posture };
         }
         if let Some(action) = match_rules(local, direction, l4, peer, net) {
-            return self.apply(ctx, net, action, direction, pkt, src, dst, l4);
+            return self.apply(
+                ctx,
+                net,
+                peer.endpoint,
+                action,
+                direction,
+                pkt,
+                src,
+                dst,
+                l4,
+            );
         }
         if let Some(action) = match_rules(suggested, direction, l4, peer, net) {
-            return self.apply(ctx, net, action, direction, pkt, src, dst, l4);
+            return self.apply(
+                ctx,
+                net,
+                peer.endpoint,
+                action,
+                direction,
+                pkt,
+                src,
+                dst,
+                l4,
+            );
         }
         self.apply(
             ctx,
             net,
+            peer.endpoint,
             FirewallAction::Allow,
             direction,
             pkt,
@@ -509,6 +671,7 @@ impl PolicyEngine {
         &self,
         ctx: &AuthCtx,
         net: Uuid,
+        peer: EndpointId,
         action: FirewallAction,
         _direction: Direction,
         pkt: &Packet<'_>,
@@ -518,12 +681,12 @@ impl PolicyEngine {
     ) -> Decision {
         match action {
             FirewallAction::Allow => {
-                if let Some(key) = direct_key(net, l4.protocol, src, dst, l4) {
+                if let Some(key) = flow_key(net, peer, src, dst, l4) {
                     let tcp_flags = l4.tcp_flags.map(|f| f.0).unwrap_or(0);
-                    self.open_flow(ctx, key, l4.protocol, tcp_flags);
+                    self.open_flow(ctx, key, l4.protocol, tcp_flags, None);
                 }
                 self.count(net, true, false);
-                Decision::Allow
+                Decision::Allow { posture: None }
             }
             FirewallAction::Deny => {
                 self.count(net, false, false);
@@ -541,24 +704,24 @@ impl PolicyEngine {
     fn flow_allows(
         &self,
         ctx: &AuthCtx,
+        snap: Option<&ForwardingSnapshot>,
         direction: Direction,
         fwd: FlowKey,
         tcp_flags: u8,
-    ) -> bool {
+    ) -> Option<Option<PostureAuthorization>> {
         let now = Instant::now();
         let rev = fwd.reverse();
-        let mut entry = match self.inner.flows.get_mut(&fwd) {
-            Some(e) => e,
-            None => match self.inner.flows.get_mut(&rev) {
-                Some(e) => e,
-                None => return false,
-            },
-        };
-        let key = *entry.key();
-        if !ctx.matches(entry.auth, entry.posture_ok, entry.stale) || flow_expired(&entry, now) {
-            drop(entry);
-            self.inner.flows.remove(&key);
-            return false;
+        let mut flows = self.inner.flows.lock();
+        let key = if flows.contains_key(&fwd) { fwd } else { rev };
+        let entry = flows.get_mut(&key)?;
+        if !ctx.matches(entry.auth, &entry.posture_ok)
+            || entry.posture.is_some_and(|posture| {
+                snap.is_none_or(|snap| !posture.allows(snap, fwd.network, fwd.peer))
+            })
+            || flow_expired(entry, now)
+        {
+            flows.remove(&key);
+            return None;
         }
         let inbound = matches!(direction, Direction::Inbound);
         match entry.phase {
@@ -571,34 +734,44 @@ impl PolicyEngine {
                             entry.phase = FlowPhase::Tcp(TcpPhase::Established);
                         }
                         entry.last_seen = now;
-                        return true;
+                        return Some(entry.posture);
                     }
                     if !inbound {
                         entry.last_seen = now;
-                        return true;
+                        return Some(entry.posture);
                     }
-                    false
+                    None
                 }
                 TcpPhase::Established => {
                     if (tcp_flags & TCP_RST) != 0 || (tcp_flags & TCP_FIN) != 0 {
                         entry.phase = FlowPhase::Tcp(TcpPhase::TimeWait);
                     }
                     entry.last_seen = now;
-                    true
+                    Some(entry.posture)
                 }
                 TcpPhase::TimeWait => {
                     entry.last_seen = now;
-                    true
+                    Some(entry.posture)
                 }
             },
             FlowPhase::Udp | FlowPhase::Icmp => {
                 entry.last_seen = now;
-                true
+                Some(entry.posture)
             }
         }
     }
 
-    fn open_flow(&self, ctx: &AuthCtx, key: FlowKey, proto: Protocol, tcp_flags: u8) {
+    fn open_flow(
+        &self,
+        ctx: &AuthCtx,
+        key: FlowKey,
+        proto: Protocol,
+        tcp_flags: u8,
+        posture: Option<PostureAuthorization>,
+    ) {
+        if matches!(key.transport, FlowTransport::Echo { request: false, .. }) {
+            return;
+        }
         let now = Instant::now();
         let phase = match proto {
             Protocol::Tcp => {
@@ -614,14 +787,20 @@ impl PolicyEngine {
             Protocol::Icmp | Protocol::Icmpv6 => FlowPhase::Icmp,
             Protocol::Any | Protocol::Other(_) => return,
         };
-        self.inner
-            .flows
+        let mut flows = self.inner.flows.lock();
+        if flows.len() >= FLOW_CAP && !flows.contains_key(&key) {
+            flows.retain(|_, entry| !flow_expired(entry, now));
+            if flows.len() >= FLOW_CAP {
+                return;
+            }
+        }
+        flows
             .entry(key)
             .and_modify(|st| {
                 st.last_seen = now;
                 st.auth = ctx.epoch;
-                st.posture_ok = ctx.posture_ok;
-                st.stale = ctx.stale;
+                st.posture_ok = ctx.posture_ok.clone();
+                st.posture = posture;
                 if matches!(st.phase, FlowPhase::Tcp(TcpPhase::SynSent))
                     && matches!(phase, FlowPhase::Tcp(TcpPhase::Established))
                 {
@@ -635,8 +814,8 @@ impl PolicyEngine {
                 phase,
                 last_seen: now,
                 auth: ctx.epoch,
-                posture_ok: ctx.posture_ok,
-                stale: ctx.stale,
+                posture_ok: ctx.posture_ok.clone(),
+                posture,
             });
     }
 
@@ -695,71 +874,39 @@ impl PolicyEngine {
     }
 }
 
-fn proto_num(proto: Protocol) -> Option<u8> {
-    match proto {
-        Protocol::Tcp => Some(6),
-        Protocol::Udp => Some(17),
-        Protocol::Icmp => Some(1),
-        Protocol::Icmpv6 => Some(58),
-        Protocol::Other(n) => Some(n),
-        Protocol::Any => None,
-    }
-}
-
-fn managed_key(
+fn flow_key(
     network: Uuid,
-    proto: Protocol,
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    src_port: Option<u16>,
-    dst_port: Option<u16>,
-) -> Option<FlowKey> {
-    let num = proto_num(proto)?;
-    if num == 1 {
-        return Some(FlowKey {
-            network,
-            proto: num,
-            src: src.min(dst),
-            sport: src_port.unwrap_or(0),
-            dst: src.max(dst),
-            dport: 0,
-        });
-    }
-    Some(FlowKey {
-        network,
-        proto: num,
-        src,
-        sport: src_port.unwrap_or(0),
-        dst,
-        dport: dst_port.unwrap_or(0),
-    })
-}
-
-fn direct_key(
-    network: Uuid,
-    proto: Protocol,
+    peer: EndpointId,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     l4: ResolvedL4,
 ) -> Option<FlowKey> {
-    let num = proto.ip_number()?;
-    if proto.is_icmp() {
-        return Some(FlowKey {
-            network,
-            proto: num,
-            src: src.min(dst),
-            sport: l4.icmp_id.unwrap_or(0),
-            dst: src.max(dst),
-            dport: 0,
-        });
-    }
+    let transport = match l4.protocol {
+        Protocol::Tcp => FlowTransport::Tcp {
+            source: l4.src_port?,
+            destination: l4.dst_port?,
+        },
+        Protocol::Udp => FlowTransport::Udp {
+            source: l4.src_port?,
+            destination: l4.dst_port?,
+        },
+        Protocol::Icmp => FlowTransport::Echo {
+            identifier: l4.icmp_id?,
+            sequence: l4.icmp_seq?,
+            request: match l4.icmp_type? {
+                8 => true,
+                0 => false,
+                _ => return None,
+            },
+        },
+        _ => return None,
+    };
     Some(FlowKey {
         network,
-        proto: num,
+        peer,
         src,
-        sport: l4.src_port.unwrap_or(0),
         dst,
-        dport: l4.dst_port.unwrap_or(0),
+        transport,
     })
 }
 
@@ -867,6 +1014,10 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: PeerPosture::verified(
+                    ["disk-encryption"],
+                    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600),
+                ),
             }],
             &[],
             &[],
@@ -888,6 +1039,10 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 1),
                 tags: vec![],
                 network: "net".into(),
+                posture: PeerPosture::verified(
+                    ["disk-encryption"],
+                    jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600),
+                ),
             },
         );
         (store, PolicyEngine::new(), routes)
@@ -955,6 +1110,120 @@ mod tests {
         eval_as(policy, snap, net, &hex(PEER_HEX), "peer", dir, raw)
     }
 
+    fn publish_claims(
+        store: &ForwardingStore,
+        routes: &RoutingTable,
+        bundle: &PolicyBundle,
+        self_until: jiff::Timestamp,
+        peer_until: jiff::Timestamp,
+    ) {
+        store.update_managed(
+            routes,
+            NET,
+            bundle.clone(),
+            SelfIdentity {
+                endpoint_hex: hex(SELF_HEX),
+                ip: Ipv4Addr::new(100, 64, 0, 1),
+                tags: vec![],
+                network: "net".into(),
+                posture: PeerPosture::verified(["disk-encryption"], self_until),
+            },
+            || {
+                routes.apply_peer_delta(
+                    NET,
+                    &[tunnet_common::PeerEntry {
+                        ip: Ipv4Addr::new(100, 64, 0, 2),
+                        endpoint_id: hex(PEER_HEX),
+                        hostname: "peer".into(),
+                        tags: vec![],
+                        ssh_host_key: None,
+                        posture: PeerPosture::verified(["disk-encryption"], peer_until),
+                    }],
+                    &[],
+                    2,
+                    &hex(SELF_HEX),
+                    "net",
+                )
+            },
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(Direction::Outbound)]
+    #[case(Direction::Inbound)]
+    fn proof_continuity_and_origin_expiry_control_both_flow_directions(#[case] origin: Direction) {
+        let mut bundle = allow_tcp_80_bundle();
+        bundle.rules[0].src_posture = vec!["disk-encryption".into()];
+        let (store, policy, routes) = managed_setup(bundle.clone());
+        let local = Ipv4Addr::new(100, 64, 0, 1);
+        let peer = Ipv4Addr::new(100, 64, 0, 2);
+        let (source, destination, return_direction) = match origin {
+            Direction::Outbound => (local, peer, Direction::Inbound),
+            Direction::Inbound => (peer, local, Direction::Outbound),
+        };
+        let request = tcp_pkt(source, destination, 52_000, 80, TCP_SYN);
+        let response = tcp_pkt(destination, source, 80, 52_000, TCP_SYN | TCP_ACK);
+        assert!(
+            matches!(eval(&policy,&store.load(),NET,origin,&request), Decision::Allow { posture: Some(PostureAuthorization { source }) } if source == origin)
+        );
+        let epoch = store.load().auth_epoch(NET);
+        let now = jiff::Timestamp::now();
+        let live = now + jiff::SignedDuration::from_secs(1200);
+        publish_claims(&store, &routes, &bundle, live, live);
+        assert_eq!(store.load().auth_epoch(NET), epoch);
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, return_direction, &response),
+            Decision::Allow { .. }
+        ));
+        let expired = now - jiff::SignedDuration::from_secs(1);
+        let (self_until, peer_until) = match origin {
+            Direction::Outbound => (expired, live),
+            Direction::Inbound => (live, expired),
+        };
+        publish_claims(&store, &routes, &bundle, self_until, peer_until);
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, return_direction, &response),
+            Decision::Deny
+        ));
+        publish_claims(&store, &routes, &bundle, live, live);
+        assert_ne!(store.load().auth_epoch(NET), epoch);
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, return_direction, &response),
+            Decision::Deny
+        ));
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, origin, &request),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, return_direction, &response),
+            Decision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn unrelated_posture_rule_does_not_attach_expiry_to_allowed_flow() {
+        let mut bundle = allow_tcp_80_bundle();
+        let mut restricted = bundle.rules[0].clone();
+        restricted.ports = vec![PortRange { start: 22, end: 22 }];
+        restricted.src_posture = vec!["disk-encryption".into()];
+        bundle.rules.push(restricted);
+        let (store, policy, routes) = managed_setup(bundle.clone());
+        let expired = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
+        publish_claims(&store, &routes, &bundle, expired, expired);
+        let raw = tcp_pkt(
+            Ipv4Addr::new(100, 64, 0, 1),
+            Ipv4Addr::new(100, 64, 0, 2),
+            52_000,
+            80,
+            TCP_SYN,
+        );
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, Direction::Outbound, &raw),
+            Decision::Allow { posture: None }
+        ));
+    }
+
     #[test]
     fn managed_allow_opens_flow_for_return() {
         let (store, policy, _routes) = managed_setup(allow_tcp_80_bundle());
@@ -964,12 +1233,12 @@ mod tests {
         let out = tcp_pkt(self_ip, peer_ip, 52_000, 80, TCP_SYN);
         assert!(matches!(
             eval(&policy, &snap, NET, Direction::Outbound, &out),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
         let ret = tcp_pkt(peer_ip, self_ip, 80, 52_000, TCP_ACK | TCP_SYN);
         assert!(matches!(
             eval(&policy, &snap, NET, Direction::Inbound, &ret),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -997,7 +1266,7 @@ mod tests {
         let out = tcp_pkt(self_ip, peer_ip, 52_000, 80, TCP_SYN);
         assert!(matches!(
             eval(policy, &store.load(), NET, Direction::Outbound, &out),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1007,16 +1276,6 @@ mod tests {
             Ipv4Addr::new(100, 64, 0, 1),
             80,
             52_000,
-            TCP_ACK,
-        )
-    }
-
-    fn return_covered() -> Vec<u8> {
-        tcp_pkt(
-            Ipv4Addr::new(100, 64, 0, 2),
-            Ipv4Addr::new(100, 64, 0, 1),
-            80,
-            80,
             TCP_ACK,
         )
     }
@@ -1034,7 +1293,7 @@ mod tests {
                 Direction::Inbound,
                 &return_packet()
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1057,7 +1316,7 @@ mod tests {
                 Direction::Inbound,
                 &return_packet()
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1077,6 +1336,7 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 1),
                 tags: vec![],
                 network: "net".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
         );
         assert!(matches!(
@@ -1104,7 +1364,7 @@ mod tests {
                 &store.load(),
                 NET,
                 Direction::Inbound,
-                &return_covered()
+                &return_packet()
             ),
             Decision::Deny
         ));
@@ -1115,9 +1375,20 @@ mod tests {
                 &store.load(),
                 NET,
                 Direction::Inbound,
-                &return_covered()
+                &return_packet()
             ),
-            Decision::Allow
+            Decision::Deny
+        ));
+        open_managed_flow(&policy, &store);
+        assert!(matches!(
+            eval(
+                &policy,
+                &store.load(),
+                NET,
+                Direction::Inbound,
+                &return_packet()
+            ),
+            Decision::Allow { .. }
         ));
     }
 
@@ -1132,9 +1403,9 @@ mod tests {
                 &store.load(),
                 NET,
                 Direction::Inbound,
-                &return_covered()
+                &return_packet()
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1148,7 +1419,7 @@ mod tests {
         first[7] = 0;
         assert!(matches!(
             eval(&policy, &store.load(), NET, Direction::Outbound, &first),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
         let mut denied = allow_tcp_80_bundle();
         denied.default_action = DefaultAction::Deny;
@@ -1162,6 +1433,7 @@ mod tests {
                 ip: self_ip,
                 tags: vec![],
                 network: "net".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
         );
         let mut later = tcp_pkt(self_ip, peer_ip, 52_000, 80, TCP_SYN);
@@ -1174,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_open_network_fails_open() {
+    fn stale_policy_preserves_explicit_decisions() {
         let (store, policy, _routes) = managed_setup(PolicyBundle {
             rules: vec![],
             default_action: DefaultAction::Allow,
@@ -1191,7 +1463,7 @@ mod tests {
         );
         assert!(matches!(
             eval(&policy, &snap, NET, Direction::Inbound, &p),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1226,6 +1498,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -1264,7 +1537,7 @@ mod tests {
         let p = tcp_pkt(src, dst, 12345, 443, TCP_SYN);
         assert!(matches!(
             eval(&policy, &snap, NET, dir, &p),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1281,7 +1554,7 @@ mod tests {
         );
         assert!(matches!(
             eval(&policy, &snap, NET, Direction::Outbound, &out),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
         let ret = tcp_pkt(
             Ipv4Addr::new(100, 64, 0, 2),
@@ -1292,8 +1565,68 @@ mod tests {
         );
         assert!(matches!(
             eval(&policy, &snap, NET, Direction::Inbound, &ret),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
+    }
+
+    #[rstest]
+    #[case(0, 0, 7, true)]
+    #[case(0, 0, 8, false)]
+    #[case(0, 1, 7, false)]
+    #[case(8, 0, 7, false)]
+    #[case(3, 0, 7, false)]
+    #[case(5, 0, 7, false)]
+    fn echo_conntrack_only_authorizes_matching_reply(
+        #[case] message_type: u8,
+        #[case] identifier: u16,
+        #[case] sequence: u16,
+        #[case] allowed: bool,
+        #[values(false, true)] managed: bool,
+    ) {
+        use crate::direct::firewall::{FirewallDirection, PeerFilter};
+        let (store, policy, _routes) = if managed {
+            let mut bundle = allow_tcp_80_bundle();
+            bundle.icmp_policy = IcmpPolicy::Acl;
+            bundle.rules[0].src = Selector::Endpoint(hex(SELF_HEX));
+            bundle.rules[0].protocol = Some(Protocol::Icmp);
+            bundle.rules[0].ports.clear();
+            managed_setup(bundle)
+        } else {
+            direct_setup(vec![FirewallRule {
+                direction: FirewallDirection::In,
+                action: FirewallAction::Deny,
+                protocol: Protocol::Icmp,
+                ports: vec![],
+                peer: PeerFilter::Any,
+            }])
+        };
+        let make = |src, dst, identifier, sequence| {
+            let builder = etherparse::PacketBuilder::ipv4(src, dst, 64)
+                .icmpv4_echo_request(identifier, sequence);
+            let mut packet = Vec::new();
+            builder.write(&mut packet, &[0; 20]).unwrap();
+            packet
+        };
+        let snap = store.load();
+        let request = make([100, 64, 0, 1], [100, 64, 0, 2], 0, 7);
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &request),
+            Decision::Allow { .. }
+        ));
+        let mut incoming = make([100, 64, 0, 2], [100, 64, 0, 1], identifier, sequence);
+        incoming[20] = message_type;
+        incoming[22..24].fill(0);
+        let checksum = etherparse::checksum::Sum16BitWords::new()
+            .add_slice(&incoming[20..])
+            .ones_complement();
+        incoming[22..24].copy_from_slice(&checksum.to_be_bytes());
+        assert_eq!(
+            matches!(
+                eval(&policy, &snap, NET, Direction::Inbound, &incoming),
+                Decision::Allow { .. }
+            ),
+            allowed
+        );
     }
 
     #[test]
@@ -1309,6 +1642,7 @@ mod tests {
                 hostname: "peer-a".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -1328,6 +1662,7 @@ mod tests {
                 hostname: "peer-b".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &tunnet_common::DnsConfig::default(),
             "b",
@@ -1361,7 +1696,7 @@ mod tests {
                 Direction::Outbound,
                 &out_a
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
         assert!(matches!(
             eval_as(
@@ -1373,7 +1708,7 @@ mod tests {
                 Direction::Outbound,
                 &out_b
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
         store.set_firewall(
             &routes,
@@ -1415,7 +1750,7 @@ mod tests {
                 Direction::Inbound,
                 &ret_b
             ),
-            Decision::Allow
+            Decision::Allow { .. }
         ));
     }
 
@@ -1498,5 +1833,199 @@ mod tests {
             eval(&policy, &snap, NET, Direction::Outbound, &later),
             Decision::Deny
         ));
+    }
+    #[test]
+    fn missing_policy_denies_packets_and_streams() {
+        let (store, policy, routes) = managed_setup(allow_tcp_80_bundle());
+        let raw = tcp_pkt(
+            "100.64.0.1".parse().unwrap(),
+            "100.64.0.2".parse().unwrap(),
+            52000,
+            80,
+            TCP_SYN,
+        );
+        assert!(matches!(
+            eval(&policy, &store.load(), NET, Direction::Outbound, &raw),
+            Decision::Allow { .. }
+        ));
+        store.clear_managed(&routes, NET);
+        let snap = store.load();
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &raw),
+            Decision::Deny
+        ));
+        let flow = FlowContext {
+            src: snap.self_endpoint(),
+            dst: tunnet_common::policy::FlowEndpoint::external(Some("10.0.0.1".parse().unwrap())),
+            protocol: Protocol::Tcp,
+            dst_port: Some(80),
+        };
+        assert!(matches!(policy.evaluate_flow(&snap, &flow), Decision::Deny));
+    }
+
+    #[test]
+    fn posture_transition_without_packets_invalidates_return_flow() {
+        let (store, policy, _) = managed_setup(allow_tcp_80_bundle());
+        open_managed_flow(&policy, &store);
+        assert!(matches!(
+            eval(
+                &policy,
+                &store.load(),
+                NET,
+                Direction::Inbound,
+                &return_packet()
+            ),
+            Decision::Allow { .. }
+        ));
+        let source = store.posture_source();
+        source.store(Arc::new(false));
+        source.store(Arc::new(true));
+        assert!(matches!(
+            eval(
+                &policy,
+                &store.load(),
+                NET,
+                Direction::Inbound,
+                &return_packet()
+            ),
+            Decision::Deny
+        ));
+        open_managed_flow(&policy, &store);
+        assert!(matches!(
+            eval(
+                &policy,
+                &store.load(),
+                NET,
+                Direction::Inbound,
+                &return_packet()
+            ),
+            Decision::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn tracked_flow_and_fragment_metadata_are_peer_and_direction_scoped() {
+        let (store, policy, _) = managed_setup(allow_tcp_80_bundle());
+        open_managed_flow(&policy, &store);
+        let snap = store.load();
+        assert!(matches!(
+            eval_as(
+                &policy,
+                &snap,
+                NET,
+                &hex("cc"),
+                "other",
+                Direction::Inbound,
+                &return_packet()
+            ),
+            Decision::Deny
+        ));
+        let mut first = tcp_pkt(
+            "100.64.0.1".parse().unwrap(),
+            "100.64.0.2".parse().unwrap(),
+            52000,
+            80,
+            TCP_SYN,
+        );
+        first[6] = 0x20;
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &first),
+            Decision::Allow { .. }
+        ));
+        let mut later = first.clone();
+        later[6] = 0;
+        later[7] = 8;
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &later),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            eval_as(
+                &policy,
+                &snap,
+                NET,
+                &hex("cc"),
+                "other",
+                Direction::Outbound,
+                &later
+            ),
+            Decision::Deny
+        ));
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Inbound, &later),
+            Decision::Deny
+        ));
+        first[22..24].copy_from_slice(&443u16.to_be_bytes());
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &first),
+            Decision::Deny
+        ));
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Outbound, &later),
+            Decision::Deny
+        ));
+    }
+
+    #[test]
+    fn stale_control_plane_does_not_override_icmp_deny() {
+        let (store, policy, _) = managed_setup(PolicyBundle {
+            icmp_policy: IcmpPolicy::Deny,
+            ..PolicyBundle::default()
+        });
+        let builder = etherparse::PacketBuilder::ipv4([100, 64, 0, 1], [100, 64, 0, 2], 64)
+            .icmpv4_echo_request(1, 2);
+        let mut raw = Vec::new();
+        builder.write(&mut raw, &[]).unwrap();
+        for stale in [false, true, false] {
+            store.set_stale(stale);
+            assert!(matches!(
+                eval(&policy, &store.load(), NET, Direction::Outbound, &raw),
+                Decision::Deny
+            ));
+        }
+    }
+
+    #[test]
+    fn flow_pressure_has_bounded_return_authorization() {
+        use crate::direct::firewall::{FirewallAction, FirewallDirection, FirewallRule};
+        let (store, policy, _) = direct_setup(vec![FirewallRule {
+            direction: FirewallDirection::In,
+            action: FirewallAction::Deny,
+            protocol: PolProto::Tcp,
+            ports: vec![],
+            peer: PeerFilter::Any,
+        }]);
+        let snap = store.load();
+        for port in 10000..=14096 {
+            let raw = tcp_pkt(
+                "100.64.0.1".parse().unwrap(),
+                "100.64.0.2".parse().unwrap(),
+                port,
+                443,
+                TCP_SYN,
+            );
+            assert!(matches!(
+                eval(&policy, &snap, NET, Direction::Outbound, &raw),
+                Decision::Allow { .. }
+            ));
+        }
+        let return_to = |port| {
+            tcp_pkt(
+                "100.64.0.2".parse().unwrap(),
+                "100.64.0.1".parse().unwrap(),
+                443,
+                port,
+                TCP_ACK,
+            )
+        };
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Inbound, &return_to(10000)),
+            Decision::Allow { .. }
+        ));
+        assert!(matches!(
+            eval(&policy, &snap, NET, Direction::Inbound, &return_to(14096)),
+            Decision::Deny
+        ));
+        assert_eq!(policy.net_stats(NET).unwrap().flows, 4096);
     }
 }

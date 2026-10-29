@@ -3,7 +3,9 @@
 //! Admission answers one question: is this peer currently a trusted member?
 //! Flow policy runs where real flow context exists, never here.
 
+use parking_lot::RwLock;
 use std::fmt;
+use std::sync::Arc;
 
 use iroh::EndpointAddr;
 use iroh::endpoint::{
@@ -20,15 +22,11 @@ pub const CLOSE_NOT_MEMBER: u32 = 403;
 pub const CLOSE_NOT_MEMBER_REASON: &[u8] = b"not_member";
 pub const CLOSE_AUTH_REQUIRED: u32 = 401;
 pub const CLOSE_AUTH_REQUIRED_REASON: &[u8] = b"auth_required";
-/// Reason used before the contract above; still honored from older peers.
-pub const CLOSE_LEGACY_POLICY_DENY_REASON: &[u8] = b"policy_deny";
 
 /// True when an application close carries this crate's authorization rejection.
 pub fn is_authorization_close(code: u32, reason: &[u8]) -> bool {
     match code {
-        CLOSE_NOT_MEMBER => {
-            reason == CLOSE_NOT_MEMBER_REASON || reason == CLOSE_LEGACY_POLICY_DENY_REASON
-        }
+        CLOSE_NOT_MEMBER => reason == CLOSE_NOT_MEMBER_REASON,
         CLOSE_AUTH_REQUIRED => reason == CLOSE_AUTH_REQUIRED_REASON,
         _ => false,
     }
@@ -43,6 +41,7 @@ pub fn is_authorization_close(code: u32, reason: &[u8]) -> bool {
 #[derive(Clone)]
 pub struct TransportAuth {
     inner: TransportAuthInner,
+    gate: Arc<RwLock<()>>,
 }
 
 #[derive(Clone)]
@@ -58,10 +57,15 @@ enum TransportAuthInner {
 
 impl TransportAuth {
     pub fn managed(routes: &RoutingTable) -> Self {
+        Self::managed_with_gate(routes, Arc::new(RwLock::new(())))
+    }
+
+    pub fn managed_with_gate(routes: &RoutingTable, gate: Arc<RwLock<()>>) -> Self {
         Self {
             inner: TransportAuthInner::Managed {
                 routes: routes.clone(),
             },
+            gate,
         }
     }
 
@@ -69,7 +73,12 @@ impl TransportAuth {
     pub fn direct(auth: &AuthCache) -> Self {
         Self {
             inner: TransportAuthInner::Direct { auth: auth.clone() },
+            gate: auth.authorization_gate(),
         }
+    }
+
+    pub fn authorization_gate(&self) -> Arc<RwLock<()>> {
+        self.gate.clone()
     }
 
     pub fn allows(&self, peer_hex: &str) -> bool {
@@ -108,6 +117,12 @@ impl TransportHook {
     pub fn managed(routes: &RoutingTable) -> Self {
         Self {
             auth: TransportAuth::managed(routes),
+        }
+    }
+
+    pub fn managed_with_gate(routes: &RoutingTable, gate: Arc<RwLock<()>>) -> Self {
+        Self {
+            auth: TransportAuth::managed_with_gate(routes, gate),
         }
     }
 
@@ -191,6 +206,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -212,6 +228,7 @@ mod tests {
                 ip: Ipv4Addr::new(100, 64, 0, 1),
                 tags: vec![],
                 network: "net".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
         );
         let policy = PolicyEngine::new();
@@ -254,17 +271,37 @@ mod tests {
         let peer_ip = Ipv4Addr::new(100, 64, 0, 2);
         let snap = forwarding.load();
         assert!(matches!(
-            policy.evaluate_flow(
+            policy.evaluate_network_flow(
                 &snap,
+                uuid::Uuid::nil(),
+                &crate::forward::PeerCtx {
+                    endpoint: peer.parse().unwrap(),
+                    hex: &peer,
+                    hostname: "peer",
+                    tags: &[],
+                    network_name: "net"
+                },
+                tunnet_common::policy::Direction::Outbound,
                 &FlowContext {
-                    src: FlowEndpoint::member(self_id, vec![], "net".into(), Some(self_ip)),
-                    dst: FlowEndpoint::member(peer.clone(), vec![], "net".into(), Some(peer_ip)),
+                    src: FlowEndpoint::member(
+                        self_id,
+                        vec![],
+                        "net".into(),
+                        Some(self_ip),
+                        tunnet_common::PeerPosture::Unknown,
+                    ),
+                    dst: FlowEndpoint::member(
+                        peer.clone(),
+                        vec![],
+                        "net".into(),
+                        Some(peer_ip),
+                        tunnet_common::PeerPosture::Unknown,
+                    ),
                     protocol: Protocol::Icmp,
                     dst_port: None,
-                    src_posture_ok: true,
                 },
             ),
-            crate::forward::Decision::Allow
+            crate::forward::Decision::Allow { .. }
         ));
     }
 
@@ -272,7 +309,7 @@ mod tests {
     fn authorization_close_contract() {
         assert!(is_authorization_close(403, b"not_member"));
         assert!(is_authorization_close(401, b"auth_required"));
-        assert!(is_authorization_close(403, b"policy_deny"));
+        assert!(!is_authorization_close(403, b"policy_deny"));
         assert!(!is_authorization_close(0, b"tie_break"));
         assert!(!is_authorization_close(1, b"dataplane_down"));
         assert!(!is_authorization_close(403, b"something_else"));

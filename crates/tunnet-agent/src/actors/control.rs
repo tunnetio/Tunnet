@@ -5,12 +5,11 @@
 //! control state, and dispatches typed commands to subsystem actors.
 //! Normal disconnects are operational state (reconnect/backoff), never actor
 //! failures. Long independent I/O is delegated to subsystem managers via
-//! bounded one-shot tasks so heartbeats/policy updates never stall.
+//! owned tasks; policy updates remain ordered.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
@@ -19,19 +18,18 @@ use tunnet_core::ws_client::{ControlPlaneLink, ControlTransport};
 use tunnet_core::{CoreNode, StatePaths};
 use uuid::Uuid;
 
-use super::dataplane::{BringDown, DataPlaneActor};
+use super::dataplane::{DataPlaneActor, ReconcileState, WithdrawPlane};
 #[cfg(feature = "posture")]
 use super::posture::{
     ApplyPostureConfig, ApplyRemoteAgentPolicy, PostureActor, PostureStatusChanged, Recheck,
 };
-use super::routes::{ApplyDesiredRoutes, ClearRoutes, RouteActor};
 #[cfg(feature = "ssh")]
 use super::ssh_registry::SshRegistryActor;
-use crate::system_routes::desired_from_membership;
 
 #[derive(Clone)]
 pub struct ControlPlaneActorArgs {
-    pub transport: TransportConfig,
+    pub client: Arc<tunnet_core::control::SignedClient>,
+    pub link: ControlPlaneLink,
     pub node: CoreNode,
     pub network_id: Uuid,
     pub hostname: String,
@@ -39,10 +37,6 @@ pub struct ControlPlaneActorArgs {
     pub paths: StatePaths,
     /// Periodic snapshot poll interval (fallback when WS stalls).
     pub poll_secs: u64,
-    /// Underlay pins captured at startup; control-plane snapshots must not wipe them.
-    pub underlay_hosts: Vec<std::net::Ipv4Addr>,
-    /// Late-bound by the supervisor (`SetRouteActor`); `None` until wired.
-    pub route_actor: Option<ActorRef<RouteActor>>,
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
     #[cfg(feature = "posture")]
     pub posture_actor: Option<ActorRef<PostureActor>>,
@@ -50,15 +44,8 @@ pub struct ControlPlaneActorArgs {
     pub ssh_registry: Option<ActorRef<SshRegistryActor>>,
 }
 
-#[derive(Clone)]
-pub struct TransportConfig {
-    pub control_url: String,
-    pub endpoint_id: String,
-    pub signing_key: SigningKey,
-}
-
 pub struct ControlPlaneActor {
-    self_ref: ActorRef<ControlPlaneActor>,
+    self_ref: WeakActorRef<ControlPlaneActor>,
     cfg: ControlPlaneActorArgs,
     client_tx: tokio::sync::mpsc::Sender<ClientMsg>,
     link: ControlPlaneLink,
@@ -67,6 +54,12 @@ pub struct ControlPlaneActor {
     forwarder: Option<super::OwnedTask>,
     heartbeat: Option<super::OwnedTask>,
     poller: Option<super::OwnedTask>,
+    poll_request: Option<super::OwnedTask>,
+    poll_token: Option<Arc<()>>,
+    authority: Arc<()>,
+    file_tasks: tokio::task::JoinSet<()>,
+    #[cfg(feature = "local-api")]
+    tunnel_starts: std::collections::HashMap<String, super::OwnedTask>,
     revisions: Arc<tunnet_core::sync::ManagedRevisions>,
 }
 
@@ -82,17 +75,8 @@ impl Actor for ControlPlaneActor {
         // status and event wiring observe the live transport. The link is a
         // read model; the actor owns the task driving it. Restarts reuse the
         // same link - it never becomes stale.
-        let link = args
-            .node
-            .control_link
-            .clone()
-            .unwrap_or_else(|| ControlPlaneLink::new(args.transport.control_url.clone()));
-        let transport = ControlTransport {
-            control_url: args.transport.control_url.clone(),
-            endpoint_id: args.transport.endpoint_id.clone(),
-            signing_key: args.transport.signing_key.clone(),
-            link: link.clone(),
-        };
+        let link = args.link.clone();
+        let transport = ControlTransport::new(&args.client, link.clone());
         let cancel = tokio_util::sync::CancellationToken::new();
 
         // Owned transport task. `run` only returns on cancellation; any
@@ -215,7 +199,7 @@ impl Actor for ControlPlaneActor {
             .await;
 
         Ok(Self {
-            self_ref: actor_ref,
+            self_ref: actor_ref.downgrade(),
             cfg: args,
             client_tx,
             link,
@@ -224,6 +208,12 @@ impl Actor for ControlPlaneActor {
             forwarder: Some(forwarder),
             heartbeat: Some(heartbeat),
             poller: Some(poller),
+            poll_request: None,
+            poll_token: None,
+            authority: Arc::new(()),
+            file_tasks: tokio::task::JoinSet::new(),
+            #[cfg(feature = "local-api")]
+            tunnel_starts: std::collections::HashMap::new(),
             revisions,
         })
     }
@@ -237,6 +227,15 @@ impl Actor for ControlPlaneActor {
         // bounded abort-after-timeout semantics: after this returns, none
         // of the actor's long-lived tasks may still be running.
         self.cancel.cancel();
+        #[cfg(feature = "local-api")]
+        for (_, task) in self.tunnel_starts.drain() {
+            task.shutdown().await;
+        }
+        self.file_tasks.abort_all();
+        while self.file_tasks.join_next().await.is_some() {}
+        if let Some(task) = self.poll_request.take() {
+            task.shutdown().await;
+        }
         if let Some(task) = self.transport_task.take() {
             task.shutdown().await;
         }
@@ -259,6 +258,40 @@ impl Actor for ControlPlaneActor {
 }
 
 impl ControlPlaneActor {
+    fn recovered(&mut self) {
+        self.authority = Arc::new(());
+        self.cfg.node.forwarding.set_stale(false);
+    }
+
+    fn start_poll(&mut self) {
+        if self.poll_request.is_some() || self.cancel.is_cancelled() {
+            return;
+        }
+        let signed = self.cfg.client.clone();
+        let actor = self.self_ref.clone();
+        let known = self.revisions.load().org.0;
+        let authority = self.authority.clone();
+        let token = Arc::new(());
+        self.poll_token = Some(token.clone());
+        self.poll_request = Some(super::OwnedTask::spawn(
+            "control-snapshot-request",
+            self.cancel.child_token(),
+            async move {
+                let result = signed.poll(known).await;
+                if let Some(actor) = actor.upgrade() {
+                    let _ = actor
+                        .tell(PollCompleted {
+                            token,
+                            authority,
+                            result,
+                        })
+                        .send()
+                        .await;
+                }
+            },
+        ));
+    }
+
     fn send_client(&self, msg: ClientMsg) {
         // Non-blocking: control channel is bounded; heartbeats/reports may
         // drop under extreme pressure rather than stall the mailbox.
@@ -267,7 +300,8 @@ impl ControlPlaneActor {
         }
     }
 
-    async fn handle_server(&self, msg: ServerMsg) {
+    async fn handle_server(&mut self, msg: ServerMsg) {
+        while self.file_tasks.try_join_next().is_some() {}
         let node = self.cfg.node.clone();
         match msg {
             ServerMsg::Snapshot(snap) => {
@@ -281,13 +315,14 @@ impl ControlPlaneActor {
                         &node.forwarding,
                         &self.revisions,
                         snap.version,
-                        &self.cfg.transport.endpoint_id,
+                        &self.cfg.client.endpoint_id,
                         &self.cfg.hostname,
                         Some(&self.cfg.paths.known_hosts_file()),
                     );
                     if !applied {
                         return;
                     }
+                    self.recovered();
                     node.peers.set_cloud_relay_urls(
                         snap.connectivity_relays
                             .iter()
@@ -296,46 +331,12 @@ impl ControlPlaneActor {
                     );
                     node.pool.reconcile().await;
                     node.peers.reconcile().await;
-                    // Typed dispatch: routes via RouteActor (bounded ask with timeout).
-                    let desired = membership_desired(
-                        &node,
-                        &m.device_profile,
-                        m.assigned_ipv4,
-                        m.prefix,
-                        &m.subnet_routes
-                            .iter()
-                            .filter(|r| r.via_endpoint_id != self.cfg.transport.endpoint_id)
-                            .map(|r| r.cidr)
-                            .collect::<Vec<_>>(),
-                        m.device_profile.exit_node_endpoint_id.is_some(),
-                        &self.cfg.underlay_hosts,
-                    );
+                    #[cfg(feature = "posture")]
                     let network_version = m.version;
                     let client_tx = self.client_tx.clone();
                     let policy = m.agent_policy.clone();
                     let paths = self.cfg.paths.clone();
                     let store = node.effective_config.clone();
-                    match self.cfg.route_actor.clone() {
-                        Some(route_actor) => {
-                            if let Ok(res) = tokio::time::timeout(
-                                Duration::from_secs(15),
-                                route_actor.ask(ApplyDesiredRoutes {
-                                    desired,
-                                    version: crate::actors::ControlVersion::Snapshot(
-                                        network_version,
-                                    ),
-                                }),
-                            )
-                            .await
-                                && let Err(e) = res
-                            {
-                                tracing::warn!(error = %e, "route apply via control plane failed");
-                            }
-                        }
-                        None => {
-                            tracing::debug!("route actor not wired yet; skipping route apply");
-                        }
-                    }
                     let posture_forwarded = {
                         #[cfg(feature = "posture")]
                         {
@@ -375,7 +376,7 @@ impl ControlPlaneActor {
                             .await;
                     }
                     if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
-                        let _ = dataplane_actor.ask(super::dataplane::BringUp).await;
+                        let _ = dataplane_actor.ask(ReconcileState).await;
                     }
                     tunnet_core::state::save_snapshot_cache(&self.cfg.paths, &snap).ok();
                     tracing::info!(
@@ -388,19 +389,15 @@ impl ControlPlaneActor {
                     .get(&self.cfg.network_id)
                     .is_some_and(|network| self.revisions.accept_absence(snap.version, *network))
                 {
-                    node.routes
-                        .clear_managed(self.cfg.network_id, &self.cfg.transport.endpoint_id);
+                    self.recovered();
                     node.forwarding
                         .clear_managed(&node.routes, self.cfg.network_id);
                     node.pool.reconcile().await;
                     node.peers.reconcile().await;
                     node.pool.close_all().await;
                     node.peers.close_all().await;
-                    if let Some(route_actor) = &self.cfg.route_actor {
-                        let _ = route_actor.ask(ClearRoutes).await;
-                    }
                     if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
-                        let _ = dataplane_actor.ask(BringDown).await;
+                        let _ = dataplane_actor.ask(WithdrawPlane).await;
                     }
                     tunnet_core::state::save_snapshot_cache(&self.cfg.paths, &snap).ok();
                     tracing::warn!(network_id = %self.cfg.network_id, "managed membership is no longer active");
@@ -410,17 +407,21 @@ impl ControlPlaneActor {
                 let network_name = node.routes.network_name();
                 if !tunnet_core::sync::apply_delta(
                     &node.routes,
+                    &node.forwarding,
                     &self.revisions,
                     &delta,
-                    &self.cfg.transport.endpoint_id,
+                    &self.cfg.client.endpoint_id,
                     self.cfg.network_id,
                     &network_name,
                 ) {
                     return;
                 }
+                self.recovered();
                 node.pool.reconcile().await;
                 node.peers.reconcile().await;
-                node.forwarding.republish(&node.routes);
+                if let Some(plane) = &self.cfg.dataplane_actor {
+                    let _ = plane.ask(ReconcileState).await;
+                }
                 tracing::info!(
                     v = delta.version,
                     added = delta.added.len(),
@@ -441,18 +442,14 @@ impl ControlPlaneActor {
                 {
                     return;
                 }
-                node.routes
-                    .clear_managed(network_id, &self.cfg.transport.endpoint_id);
+                self.recovered();
                 node.forwarding.clear_managed(&node.routes, network_id);
                 node.pool.reconcile().await;
                 node.peers.reconcile().await;
                 node.pool.close_all().await;
                 node.peers.close_all().await;
-                if let Some(route_actor) = &self.cfg.route_actor {
-                    let _ = route_actor.ask(ClearRoutes).await;
-                }
                 if let Some(dataplane_actor) = &self.cfg.dataplane_actor {
-                    let _ = dataplane_actor.ask(BringDown).await;
+                    let _ = dataplane_actor.ask(WithdrawPlane).await;
                 }
                 tracing::warn!(%network_id, %reason, "managed membership revoked");
             }
@@ -461,15 +458,7 @@ impl ControlPlaneActor {
             }
             ServerMsg::Ping { nonce } => {
                 self.send_client(ClientMsg::Pong { nonce });
-                // Fetch off the mailbox; the result returns through PollCompleted.
-                if let Some(signed) = node.signed.clone() {
-                    let actor = self.self_ref.clone();
-                    let known = self.revisions.load().org.0;
-                    tokio::spawn(async move {
-                        let result = signed.poll(known).await;
-                        let _ = actor.tell(PollCompleted(result)).send().await;
-                    });
-                }
+                self.start_poll();
             }
             ServerMsg::StartServe {
                 serve_id,
@@ -487,42 +476,40 @@ impl ControlPlaneActor {
                 {
                     let mgr = node.serves.clone();
                     let tx = self.client_tx.clone();
-                    tokio::spawn(async move {
-                        let parsed_target = target_addr
-                            .as_deref()
-                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
-                        let result = mgr
-                            .start(
-                                serve_id.clone(),
-                                port,
-                                &protocol,
-                                &internal_hostname,
-                                certificate_pem.as_deref(),
-                                private_key_pem.as_deref(),
-                                tunnet_core::serve::ServeAcl {
-                                    access_mode,
-                                    allowed_tags,
-                                    allowed_endpoint_ids,
-                                },
-                                parsed_target,
-                                true,
-                            )
-                            .await;
-                        match result {
-                            Ok(_) => {
-                                let _ = tx.send(ClientMsg::ServeReady { serve_id }).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!(?e, %serve_id, "StartServe failed");
-                                let _ = tx
-                                    .send(ClientMsg::ServeFailed {
-                                        serve_id,
-                                        error: e.to_string(),
-                                    })
-                                    .await;
-                            }
+                    let parsed_target = target_addr
+                        .as_deref()
+                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+                    let result = mgr
+                        .start(
+                            serve_id.clone(),
+                            port,
+                            &protocol,
+                            &internal_hostname,
+                            certificate_pem.as_deref(),
+                            private_key_pem.as_deref(),
+                            tunnet_core::serve::ServeAcl {
+                                access_mode,
+                                allowed_tags,
+                                allowed_endpoint_ids,
+                            },
+                            parsed_target,
+                            true,
+                        )
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            let _ = tx.send(ClientMsg::ServeReady { serve_id }).await;
                         }
-                    });
+                        Err(e) => {
+                            tracing::warn!(?e, %serve_id, "StartServe failed");
+                            let _ = tx
+                                .send(ClientMsg::ServeFailed {
+                                    serve_id,
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
+                    }
                 }
                 #[cfg(not(feature = "local-api"))]
                 {
@@ -544,9 +531,7 @@ impl ControlPlaneActor {
                 #[cfg(feature = "local-api")]
                 {
                     let mgr = node.serves.clone();
-                    tokio::spawn(async move {
-                        mgr.reconcile_managed(&serve_ids).await;
-                    });
+                    mgr.reconcile_managed(&serve_ids).await;
                 }
                 #[cfg(not(feature = "local-api"))]
                 {
@@ -558,10 +543,8 @@ impl ControlPlaneActor {
                 {
                     let mgr = node.serves.clone();
                     let tx = self.client_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = mgr.stop_by_id(&serve_id).await;
-                        let _ = tx.send(ClientMsg::ServeStopped { serve_id }).await;
-                    });
+                    let _ = mgr.stop_by_id(&serve_id).await;
+                    let _ = tx.send(ClientMsg::ServeStopped { serve_id }).await;
                 }
                 #[cfg(not(feature = "local-api"))]
                 {
@@ -581,14 +564,27 @@ impl ControlPlaneActor {
             } => {
                 #[cfg(feature = "local-api")]
                 {
+                    self.tunnel_starts.retain(|_, task| !task.is_finished());
+                    if self.tunnel_starts.contains_key(&tunnel_id) {
+                        return;
+                    }
+                    if self.tunnel_starts.len() >= 16 {
+                        self.send_client(ClientMsg::TunnelFailed {
+                            tunnel_id,
+                            error: "tunnel starts busy".into(),
+                        });
+                        return;
+                    }
+                    let key = tunnel_id.clone();
+                    let cancel = self.cancel.child_token();
                     let mgr = node.tunnels.clone();
                     let tx = self.client_tx.clone();
-                    tokio::spawn(async move {
-                        let parsed_target = target_addr
-                            .as_deref()
-                            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
-                        match mgr
-                            .start(
+                    let task =
+                        super::OwnedTask::spawn("control-tunnel-start", cancel, async move {
+                            let parsed_target = target_addr
+                                .as_deref()
+                                .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+                            let start = mgr.start(
                                 tunnel_id.clone(),
                                 &edge_addr,
                                 &subdomain,
@@ -600,24 +596,28 @@ impl ControlPlaneActor {
                                 parsed_target,
                                 false,
                                 None,
-                            )
-                            .await
-                        {
-                            Ok(info) => {
-                                tracing::info!(url = %info.public_url, "OpenTunnel active");
-                                let _ = tx.send(ClientMsg::TunnelReady { tunnel_id }).await;
+                            );
+                            match tokio::time::timeout(Duration::from_secs(20), start)
+                                .await
+                                .map_err(anyhow::Error::from)
+                                .and_then(|result| result)
+                            {
+                                Ok(info) => {
+                                    tracing::info!(url = %info.public_url, "OpenTunnel active");
+                                    let _ = tx.send(ClientMsg::TunnelReady { tunnel_id }).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?e, %tunnel_id, "OpenTunnel failed");
+                                    let _ = tx
+                                        .send(ClientMsg::TunnelFailed {
+                                            tunnel_id,
+                                            error: e.to_string(),
+                                        })
+                                        .await;
+                                }
                             }
-                            Err(e) => {
-                                tracing::warn!(?e, %tunnel_id, "OpenTunnel failed");
-                                let _ = tx
-                                    .send(ClientMsg::TunnelFailed {
-                                        tunnel_id,
-                                        error: e.to_string(),
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
+                        });
+                    self.tunnel_starts.insert(key, task);
                 }
                 #[cfg(not(feature = "local-api"))]
                 {
@@ -637,12 +637,13 @@ impl ControlPlaneActor {
             ServerMsg::StopTunnel { tunnel_id } => {
                 #[cfg(feature = "local-api")]
                 {
+                    if let Some(task) = self.tunnel_starts.remove(&tunnel_id) {
+                        task.shutdown().await;
+                    }
                     let mgr = node.tunnels.clone();
                     let tx = self.client_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = mgr.stop(&tunnel_id);
-                        let _ = tx.send(ClientMsg::TunnelStopped { tunnel_id }).await;
-                    });
+                    let _ = mgr.stop(&tunnel_id);
+                    let _ = tx.send(ClientMsg::TunnelStopped { tunnel_id }).await;
                 }
                 #[cfg(not(feature = "local-api"))]
                 {
@@ -652,10 +653,8 @@ impl ControlPlaneActor {
             ServerMsg::KillSshSession { session_id } => {
                 #[cfg(feature = "ssh")]
                 if let Some(reg) = self.cfg.ssh_registry.clone() {
-                    tokio::spawn(async move {
-                        use super::ssh_registry::KillSession;
-                        let _ = reg.ask(KillSession { session_id }).await;
-                    });
+                    use super::ssh_registry::KillSession;
+                    let _ = reg.ask(KillSession { session_id }).await;
                 } else {
                     tracing::warn!(%session_id, "KillSshSession ignored (registry not wired)");
                 }
@@ -670,9 +669,17 @@ impl ControlPlaneActor {
                 target,
                 message,
             } => {
+                if self.file_tasks.len() >= 16 {
+                    self.send_client(ClientMsg::TransferFailed {
+                        transfer_id,
+                        error: "transfer workers busy".into(),
+                        rejected: false,
+                    });
+                    return;
+                }
                 let mgr = node.send.clone();
                 let tx = self.client_tx.clone();
-                tokio::spawn(async move {
+                self.file_tasks.spawn(async move {
                     if let Err(e) = mgr
                         .send_file_with_id(
                             std::path::Path::new(&path),
@@ -694,23 +701,39 @@ impl ControlPlaneActor {
                 });
             }
             ServerMsg::AcceptTransfer { transfer_id } => {
-                let mgr = node.send.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = mgr.accept_pending(&transfer_id).await {
-                        tracing::warn!(?e, %transfer_id, "AcceptTransfer failed");
+                if self.file_tasks.len() >= 16 {
+                    self.send_client(ClientMsg::TransferFailed {
+                        transfer_id,
+                        error: "transfer workers busy".into(),
+                        rejected: false,
+                    });
+                    return;
+                }
+                match node.send.begin_accept_pending(&transfer_id) {
+                    Ok(download) => {
+                        self.file_tasks.spawn(async move {
+                            if let Err(error) = download.await {
+                                tracing::warn!(?error, %transfer_id, "AcceptTransfer failed");
+                            }
+                        });
                     }
-                });
+                    Err(error) => tracing::warn!(?error, %transfer_id, "AcceptTransfer failed"),
+                }
             }
             ServerMsg::RejectTransfer {
                 transfer_id,
                 reason,
             } => {
                 let mgr = node.send.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = mgr.reject_pending(&transfer_id, reason).await {
-                        tracing::warn!(?e, %transfer_id, "RejectTransfer failed");
-                    }
-                });
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    mgr.reject_pending(&transfer_id, reason),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    error => tracing::warn!(?error, %transfer_id, "RejectTransfer failed"),
+                }
             }
             ServerMsg::SetSendConsent {
                 mode,
@@ -718,26 +741,21 @@ impl ControlPlaneActor {
                 pin_blobs,
             } => {
                 let mgr = node.send.clone();
-                tokio::spawn(async move {
-                    let mut cfg = mgr.config();
-                    if let Some(m) = tunnet_common::send::SendConsentMode::parse(&mode) {
-                        cfg.consent = m;
-                    }
-                    if let Some(p) = inbox_path {
-                        cfg.inbox_path = std::path::PathBuf::from(p);
-                    }
-                    cfg.pin_blobs = pin_blobs;
-                    mgr.set_config(cfg);
-                });
+                let mut cfg = mgr.config();
+                if let Some(m) = tunnet_common::send::SendConsentMode::parse(&mode) {
+                    cfg.consent = m;
+                }
+                if let Some(p) = inbox_path {
+                    cfg.inbox_path = std::path::PathBuf::from(p);
+                }
+                cfg.pin_blobs = pin_blobs;
+                mgr.set_config(cfg);
             }
             ServerMsg::PostureRecheck =>
             {
                 #[cfg(feature = "posture")]
                 if let Some(p) = &self.cfg.posture_actor {
-                    let p = p.clone();
-                    tokio::spawn(async move {
-                        let _ = p.tell(Recheck).send().await;
-                    });
+                    let _ = p.tell(Recheck).send().await;
                 }
             }
             #[cfg(feature = "posture")]
@@ -747,17 +765,14 @@ impl ControlPlaneActor {
                 custom_scripts,
             } => {
                 if let Some(p) = &self.cfg.posture_actor {
-                    let p = p.clone();
-                    tokio::spawn(async move {
-                        let _ = p
-                            .tell(ApplyPostureConfig {
-                                interval_secs,
-                                enabled_collectors,
-                                custom_scripts,
-                            })
-                            .send()
-                            .await;
-                    });
+                    let _ = p
+                        .tell(ApplyPostureConfig {
+                            interval_secs,
+                            enabled_collectors,
+                            custom_scripts,
+                        })
+                        .send()
+                        .await;
                 }
             }
             #[cfg(not(feature = "posture"))]
@@ -765,20 +780,17 @@ impl ControlPlaneActor {
             #[cfg(feature = "posture")]
             ServerMsg::AgentConfigUpdate { policy } => {
                 if let Some(p) = &self.cfg.posture_actor {
-                    let p = p.clone();
                     let paths = self.cfg.paths.clone();
                     let store = node.effective_config.clone();
-                    tokio::spawn(async move {
-                        let _ = p
-                            .tell(ApplyRemoteAgentPolicy {
-                                policy,
-                                paths,
-                                store,
-                                version: crate::actors::ControlVersion::Local,
-                            })
-                            .send()
-                            .await;
-                    });
+                    let _ = p
+                        .tell(ApplyRemoteAgentPolicy {
+                            policy,
+                            paths,
+                            store,
+                            version: crate::actors::ControlVersion::Local,
+                        })
+                        .send()
+                        .await;
                 }
             }
             #[cfg(not(feature = "posture"))]
@@ -791,47 +803,21 @@ impl ControlPlaneActor {
                 remediation_messages,
             } => {
                 if let Some(p) = &self.cfg.posture_actor {
-                    let p = p.clone();
-                    tokio::spawn(async move {
-                        let _ = p
-                            .tell(PostureStatusChanged {
-                                postures,
-                                enforcement_action,
-                                grace_secs: grace_period_remaining_secs,
-                                remediation: remediation_messages,
-                            })
-                            .send()
-                            .await;
-                    });
+                    let _ = p
+                        .tell(PostureStatusChanged {
+                            postures,
+                            enforcement_action,
+                            grace_secs: grace_period_remaining_secs,
+                            remediation: remediation_messages,
+                        })
+                        .send()
+                        .await;
                 }
             }
             #[cfg(not(feature = "posture"))]
             ServerMsg::PostureStatus { .. } => {}
         }
     }
-}
-
-fn membership_desired(
-    node: &CoreNode,
-    profile: &tunnet_common::DeviceProfile,
-    assigned: std::net::Ipv4Addr,
-    prefix: u8,
-    remote_subnets: &[ipnet::Ipv4Net],
-    has_exit: bool,
-    underlay_hosts: &[std::net::Ipv4Addr],
-) -> crate::system_routes::DesiredRoutes {
-    // ifname resolved fromControlPlaneActor cfg at call site; use tunnet0 default here
-    // and let RouteActor resolve the real index via DesiredRoutes.tun_if_index.
-    let _ = node;
-    desired_from_membership(
-        "tunnet0",
-        profile,
-        assigned,
-        prefix,
-        remote_subnets,
-        has_exit,
-        underlay_hosts,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -871,31 +857,41 @@ struct PollNow;
 
 impl Message<PollNow> for ControlPlaneActor {
     type Reply = ();
-    async fn handle(&mut self, _msg: PollNow, ctx: &mut Context<Self, Self::Reply>) {
-        if let Some(signed) = self.cfg.node.signed.clone() {
-            let actor = ctx.actor_ref().clone();
-            let known = self.revisions.load().org.0;
-            tokio::spawn(async move {
-                let result = signed.poll(known).await;
-                let _ = actor.tell(PollCompleted(result)).send().await;
-            });
-        }
+    async fn handle(&mut self, _msg: PollNow, _ctx: &mut Context<Self, Self::Reply>) {
+        self.start_poll();
     }
 }
 
-struct PollCompleted(anyhow::Result<tunnet_common::EndpointSnapshot>);
+struct PollCompleted {
+    token: Arc<()>,
+    authority: Arc<()>,
+    result: anyhow::Result<tunnet_common::EndpointSnapshot>,
+}
 
 impl Message<PollCompleted> for ControlPlaneActor {
     type Reply = ();
     async fn handle(&mut self, msg: PollCompleted, _ctx: &mut Context<Self, Self::Reply>) {
-        match msg.0 {
+        if !self
+            .poll_token
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &msg.token))
+        {
+            return;
+        }
+        self.poll_token = None;
+        if let Some(task) = self.poll_request.take() {
+            task.shutdown().await;
+        }
+        match msg.result {
             Ok(snapshot) => {
                 self.handle_server(ServerMsg::Snapshot(Box::new(snapshot)))
-                    .await
+                    .await;
             }
             Err(error) => {
-                self.cfg.node.forwarding.set_stale(true);
-                tracing::warn!(?error, "poll failed");
+                if Arc::ptr_eq(&msg.authority, &self.authority) {
+                    self.cfg.node.forwarding.set_stale(true);
+                    tracing::warn!(?error, "poll failed");
+                }
             }
         }
     }
@@ -967,17 +963,6 @@ impl Message<ForwardClientMsg> for ControlPlaneActor {
     }
 }
 
-/// Late-bind the route actor (filled by the supervisor after the dataplane
-/// tree starts; `ActorRef`s stay valid across supervised restarts).
-pub struct SetRouteActor(pub Option<ActorRef<RouteActor>>);
-
-impl Message<SetRouteActor> for ControlPlaneActor {
-    type Reply = ();
-    async fn handle(&mut self, msg: SetRouteActor, _ctx: &mut Context<Self, Self::Reply>) {
-        self.cfg.route_actor = msg.0;
-    }
-}
-
 pub struct SetDataPlaneActor(pub Option<ActorRef<DataPlaneActor>>);
 
 impl Message<SetDataPlaneActor> for ControlPlaneActor {
@@ -1016,10 +1001,6 @@ mod tests {
     use kameo::supervision::{RestartPolicy, SupervisionStrategy};
 
     async fn test_args(node: CoreNode) -> ControlPlaneActorArgs {
-        let route = RouteActor::spawn_with_mailbox(
-            super::super::routes::RouteActorArgs,
-            kameo::mailbox::bounded(super::super::ROUTE_MAILBOX),
-        );
         #[cfg(feature = "ssh")]
         let ssh = SshRegistryActor::spawn_with_mailbox(
             (),
@@ -1029,21 +1010,21 @@ mod tests {
         let signing_key = node.identity.signing_key.clone();
         let paths = node.paths.clone();
         ControlPlaneActorArgs {
-            transport: TransportConfig {
-                // Nothing listens here: connect fails fast (refused) and the
-                // transport backs off - offline-safe.
-                control_url: "http://127.0.0.1:9".into(),
-                endpoint_id,
-                signing_key,
-            },
+            client: Arc::new(
+                tunnet_core::control::SignedClient::new(
+                    "https://1.1.1.1:9".into(),
+                    endpoint_id,
+                    signing_key,
+                )
+                .expect("test client"),
+            ),
+            link: ControlPlaneLink::new("https://1.1.1.1:9"),
             node,
             network_id: Uuid::nil(),
             hostname: "test-host".into(),
             agent_version: env!("CARGO_PKG_VERSION"),
             paths,
             poll_secs: 30,
-            underlay_hosts: Vec::new(),
-            route_actor: Some(route),
             dataplane_actor: None,
             #[cfg(feature = "posture")]
             posture_actor: None,

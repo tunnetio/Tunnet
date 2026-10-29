@@ -14,10 +14,10 @@
 //! Keeping this a trait keeps JNI out of the agent: `tunnet-mobile` owns the
 //! JVM call, and tests can install a fake.
 
-use std::net::Ipv4Addr;
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::net::{Ipv4Addr, TcpStream, UdpSocket};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwapOption;
@@ -66,6 +66,9 @@ pub trait TunProvider: Send + Sync {
     /// `ParcelFileDescriptor.detachFd()`, never `getFd()`, since the returned
     /// descriptor is closed when the device is dropped.
     fn establish(&self, request: TunRequest) -> anyhow::Result<OwnedFd>;
+
+    /// Exclude a borrowed underlay socket from the VPN before transport use.
+    fn protect_socket(&self, fd: BorrowedFd<'_>) -> anyhow::Result<()>;
 }
 
 struct BoundProvider {
@@ -75,18 +78,30 @@ struct BoundProvider {
 
 impl TunProvider for BoundProvider {
     fn establish(&self, request: TunRequest) -> anyhow::Result<OwnedFd> {
+        let _guard = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
         if EPOCH.load(Ordering::SeqCst) != self.epoch {
             bail!("TunProvider was replaced; this Service is no longer the host");
         }
         self.inner.establish(request)
     }
+
+    fn protect_socket(&self, fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+        let _guard = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        if EPOCH.load(Ordering::SeqCst) != self.epoch {
+            bail!("TunProvider was replaced; this Service is no longer the host");
+        }
+        self.inner.protect_socket(fd)
+    }
 }
 
 static PROVIDER: ArcSwapOption<BoundProvider> = ArcSwapOption::const_empty();
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+// Provider calls must finish before the Service can release its host bridge.
+static PROVIDER_LIFECYCLE: Mutex<()> = Mutex::new(());
 
 /// Install the platform bridge. Replaces any previous provider.
 pub fn set_provider(provider: Box<dyn TunProvider>) {
+    let _guard = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     let epoch = EPOCH.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     PROVIDER.store(Some(Arc::new(BoundProvider {
         epoch,
@@ -98,8 +113,31 @@ pub fn set_provider(provider: Box<dyn TunProvider>) {
 ///
 /// Does not stop the agent. A later [`set_provider`] rebinds a new host.
 pub fn clear_provider() {
+    let _guard = PROVIDER_LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     EPOCH.fetch_add(1, Ordering::SeqCst);
     PROVIDER.store(None);
+}
+
+/// Protect every new UDP socket, including transport rebinds.
+pub fn protect_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
+    protect_socket(socket.as_fd())
+}
+
+/// Protect a relay socket before its first connection attempt.
+pub fn protect_tcp_socket(socket: &TcpStream) -> std::io::Result<()> {
+    protect_socket(socket.as_fd())
+}
+
+fn protect_socket(fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let provider = PROVIDER.load_full().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no TunProvider installed",
+        )
+    })?;
+    provider
+        .protect_socket(fd)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))
 }
 
 /// Ask the app for a tunnel descriptor.
@@ -146,6 +184,24 @@ mod tests {
             // SAFETY: fds[1] is closed here, fds[0] ownership moves to caller.
             unsafe { libc::close(fds[1]) };
             Ok(unsafe { OwnedFd::from_raw_fd(fds[0]) })
+        }
+
+        fn protect_socket(&self, fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+            if fd.as_raw_fd() < 0 {
+                bail!("invalid socket");
+            }
+            Ok(())
+        }
+    }
+
+    struct Refused;
+    impl TunProvider for Refused {
+        fn establish(&self, request: TunRequest) -> anyhow::Result<OwnedFd> {
+            Fake.establish(request)
+        }
+
+        fn protect_socket(&self, _fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+            bail!("VPN permission revoked");
         }
     }
 
@@ -199,5 +255,31 @@ mod tests {
         assert!(err.contains("replaced"), "{err}");
         let err = establish(request()).unwrap_err().to_string();
         assert!(err.contains("no TunProvider"), "{err}");
+    }
+
+    #[test]
+    fn socket_protection_requires_the_current_provider_and_keeps_ownership() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        clear_provider();
+        assert_eq!(
+            protect_udp_socket(&socket).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        set_provider(Box::new(Fake));
+        let old = PROVIDER.load_full().unwrap();
+        protect_udp_socket(&socket).unwrap();
+        set_provider(Box::new(Fake));
+        assert!(old.protect_socket(socket.as_fd()).is_err());
+        protect_udp_socket(&socket).unwrap();
+        set_provider(Box::new(Refused));
+        assert_eq!(
+            protect_udp_socket(&socket).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        clear_provider();
+        assert!(old.protect_socket(socket.as_fd()).is_err());
+        assert!(protect_udp_socket(&socket).is_err());
+        assert!(socket.local_addr().is_ok());
     }
 }

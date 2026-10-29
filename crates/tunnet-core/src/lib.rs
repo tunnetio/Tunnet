@@ -63,8 +63,8 @@ pub use leave::leave_direct_network;
 pub use node::DirectNetworkRuntime;
 pub use node::{CoreNode, CoreNodeConfig};
 pub use peer::{
-    BatchOutcome, PeerConnSnapshot, PeerManager, RecvHook, SendBatchOutcome, SendOutcome,
-    SessionCtl, SessionStats,
+    PeerConnSnapshot, PeerManager, PeerTransportStats, RecvHook, SendBatchOutcome, SendOutcome,
+    SessionCtl, SessionStats, WeakPeerManager,
 };
 pub use routing::{PeerInfo, RoutingTable};
 #[cfg(feature = "send")]

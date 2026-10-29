@@ -127,7 +127,6 @@ impl DataPlaneSupervisor {}
 pub struct GetDataPlaneChildren;
 #[derive(Clone, kameo::Reply)]
 pub struct DataPlaneChildren {
-    pub route_actor: Option<ActorRef<RouteActor>>,
     pub dataplane_actor: Option<ActorRef<DataPlaneActor>>,
 }
 
@@ -139,7 +138,6 @@ impl Message<GetDataPlaneChildren> for DataPlaneSupervisor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         DataPlaneChildren {
-            route_actor: self.route_actor.clone(),
             dataplane_actor: self.dataplane_actor.clone(),
         }
     }
@@ -154,6 +152,8 @@ impl Message<GetDataPlaneChildren> for DataPlaneSupervisor {
 pub struct PostureSpawnConfig {
     pub agent_version: String,
     pub src_posture_ok: Arc<arc_swap::ArcSwap<bool>>,
+    pub authorization_gate: Arc<parking_lot::RwLock<()>>,
+    pub forwarding: tunnet_core::ForwardingStore,
 }
 
 #[derive(Clone)]
@@ -230,6 +230,8 @@ impl Actor for AgentSupervisor {
                         agent_version: p.agent_version,
                         control: control.clone(),
                         src_posture_ok: p.src_posture_ok,
+                        authorization_gate: p.authorization_gate,
+                        forwarding: p.forwarding,
                     },
                 )
                 .restart_policy(RestartPolicy::Transient)
@@ -243,16 +245,13 @@ impl Actor for AgentSupervisor {
         // Wire late-bound subsystem refs into the control actor. Refs stay
         // valid across supervised restarts (restart is in place).
         if let Some(control) = &control_actor {
+            use super::control::SetDataPlaneActor;
             #[cfg(feature = "posture")]
             use super::control::SetPostureActor;
-            use super::control::{SetDataPlaneActor, SetRouteActor};
-            let mut route_ref = None;
             let mut dataplane_ref = None;
             if let Ok(children) = dataplane_sup.ask(GetDataPlaneChildren).await {
-                route_ref = children.route_actor;
                 dataplane_ref = children.dataplane_actor;
             }
-            let _ = control.tell(SetRouteActor(route_ref)).send().await;
             let _ = control.tell(SetDataPlaneActor(dataplane_ref)).send().await;
             #[cfg(feature = "posture")]
             let _ = control
@@ -670,6 +669,7 @@ mod tests {
             dataplane: DataPlaneSupervisorArgs {
                 route_args: RouteActorArgs,
                 dataplane_config: DataPlaneActorConfig {
+                    desired_up: Arc::new(AtomicBool::new(false)),
                     ifname: "tunnet-test-down".into(),
                     local_addrs: vec!["10.9.0.1".parse().unwrap()],
                     peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],
@@ -732,7 +732,10 @@ mod tests {
         assert!(!dp.is_alive(), "dataplane must stay stopped (no restart)");
         #[cfg(feature = "ssh")]
         assert!(!ssh.is_alive());
-        assert!(published.load_full().is_none(), "TUN generation withdrawn");
+        assert!(
+            published.current.load_full().is_none(),
+            "TUN generation withdrawn"
+        );
         assert!(!status.is_up(), "status read-model down");
         // Control surface observes the same down state without an actor hop.
         let control = ActorDataPlaneControl::new(status.clone(), dp);

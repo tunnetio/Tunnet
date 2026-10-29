@@ -960,6 +960,13 @@ pub struct ControlPlaneStatusInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct OnDemandStatusInfo {
+    pub queue_packets: usize,
+    pub queue_bytes: usize,
+    pub quic_accepted_packets: u64,
+    pub quic_accepted_bytes: u64,
+    pub transport_drops: u64,
+    pub oversize_packets: u64,
+    pub pmtu_feedback_drops: u64,
     pub reconnect_attempts: u64,
     pub reconnect_success: u64,
     pub reconnect_fail: u64,
@@ -1075,8 +1082,32 @@ pub struct PingSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerTransportStats {
+    pub peer: String,
+    pub token: u64,
+    pub selected_local_addr: Option<String>,
+    pub selected_remote_addr: Option<String>,
+    pub max_datagram_size: Option<usize>,
+    pub send_buffer_available_bytes: usize,
+    pub queue_packets: usize,
+    pub queue_bytes: usize,
+    pub udp_tx_packets: u64,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_packets: u64,
+    pub udp_rx_bytes: u64,
+    pub datagram_frames_tx: u64,
+    pub datagram_frames_rx: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub selected_rtt_us: Option<u64>,
+    pub selected_cwnd_bytes: Option<u64>,
+    pub selected_udp_mtu: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DiagInfo {
+    pub peer_transport_stats: Vec<PeerTransportStats>,
     pub nat_type: String,
     pub endpoint_id: String,
     pub endpoint_online: bool,

@@ -3,13 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
 use bytes::Bytes;
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::FutureExt;
 use iroh::TransportAddr;
 use iroh::endpoint::{
-    ConnectError, ConnectWithOptsError, ConnectingError, Connection, ConnectionError, PathEvent,
+    ConnectError, ConnectWithOptsError, ConnectingError, Connection, ConnectionError,
 };
 use iroh::{Endpoint, EndpointId};
 use parking_lot::{Mutex, RwLock};
@@ -31,6 +30,7 @@ const REMOTE_RETRY_MAX_SHIFT: u32 = 5;
 pub const MAX_QUEUE_PACKETS: usize = 512;
 pub const MAX_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 pub const QUEUE_TTL: Duration = Duration::from_secs(30);
+const SEND_BATCH_MAX: usize = 32;
 
 pub(crate) enum DialFailure {
     LocalDenied,
@@ -129,83 +129,11 @@ fn selected_path_is_cloud_relay(conn: &Connection, urls: &HashSet<String>) -> bo
     }
 }
 
-pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
-    if let Some(max) = conn.max_datagram_size()
-        && packet.len() > max
-    {
-        anyhow::bail!(
-            "datagram_too_large: packet {} > max_datagram_size {}",
-            packet.len(),
-            max
-        );
-    }
-    if conn.datagram_send_buffer_space() == 0 {
-        conn.send_datagram_wait(packet)
-            .await
-            .context("send_datagram_wait (datagram buffer full or connection closed)")?;
-        return Ok(());
-    }
-    conn.send_datagram(packet)
-        .context("send_datagram (packet too big or unsupported)")?;
-    Ok(())
-}
-
-const SEND_BATCH_MAX: usize = 32;
-const TRANSPORT_LOG_EVERY: Duration = Duration::from_secs(15);
-
-pub struct BatchOutcome {
-    pub accepted: usize,
-    pub accepted_bytes: u64,
-    pub oversize: usize,
-    pub transport_drops: usize,
-}
-
-pub async fn send_datagram_batch(conn: &Connection, queue: &mut VecDeque<Bytes>) -> BatchOutcome {
-    let mut out = BatchOutcome {
-        accepted: 0,
-        accepted_bytes: 0,
-        oversize: 0,
-        transport_drops: 0,
-    };
-    let mut batch: Vec<Bytes> = Vec::with_capacity(SEND_BATCH_MAX);
-    while !queue.is_empty() {
-        let max = conn.max_datagram_size();
-        batch.clear();
-        while batch.len() < SEND_BATCH_MAX {
-            if queue
-                .front()
-                .is_some_and(|f| max.is_some_and(|m| f.len() > m))
-            {
-                queue.pop_front();
-                out.oversize += 1;
-                continue;
-            }
-            let Some(packet) = queue.pop_front() else {
-                break;
-            };
-            batch.push(packet);
-        }
-        if batch.is_empty() {
-            continue;
-        }
-        match conn.send_many_datagrams(&batch) {
-            Ok(n) => {
-                for b in batch.drain(..n.min(batch.len())) {
-                    out.accepted += 1;
-                    out.accepted_bytes += b.len() as u64;
-                }
-                out.transport_drops += batch.len();
-                batch.clear();
-            }
-            Err(_) => {
-                out.transport_drops += batch.len();
-                batch.clear();
-            }
-        }
-    }
-    out
-}
-
+use crate::forward::snapshot::AuthorizationEpoch;
+use crate::forward::{ForwardingStore, unframe};
+use crate::transport_auth::{CLOSE_NOT_MEMBER, CLOSE_NOT_MEMBER_REASON};
+use tokio_util::task::TaskTracker;
+pub type FeedbackHook = Arc<dyn Fn(Bytes) -> bool + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
     Admitted,
@@ -213,7 +141,6 @@ pub enum SendOutcome {
     Denied,
     Closed,
 }
-
 pub struct SendBatchOutcome {
     pub admitted: usize,
     pub admitted_bytes: u64,
@@ -221,7 +148,6 @@ pub struct SendBatchOutcome {
     pub blocked: bool,
     pub closed: bool,
 }
-
 #[derive(Debug, Clone, Serialize)]
 pub struct PeerConnSnapshot {
     pub state: String,
@@ -230,7 +156,7 @@ pub struct PeerConnSnapshot {
     pub live: bool,
     pub path: String,
 }
-
+pub use tunnet_common::local_api::PeerTransportStats;
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStats {
     pub reconnect_attempts: u64,
@@ -242,8 +168,14 @@ pub struct SessionStats {
     pub dials_suppressed: u64,
     pub reconnect_latency_avg_us: u64,
     pub reconnect_latency_max_us: u64,
+    pub queue_packets: usize,
+    pub queue_bytes: usize,
+    pub quic_accepted_packets: u64,
+    pub quic_accepted_bytes: u64,
+    pub transport_drops: u64,
+    pub oversize_packets: u64,
+    pub pmtu_feedback_drops: u64,
 }
-
 #[derive(Default)]
 struct SessionMetrics {
     reconnect_attempts: AtomicU64,
@@ -256,318 +188,370 @@ struct SessionMetrics {
     dials_suppressed: AtomicU64,
     reconnect_latency_sum_us: AtomicU64,
     reconnect_latency_max_us: AtomicU64,
+    quic_accepted_packets: AtomicU64,
+    quic_accepted_bytes: AtomicU64,
+    oversize_packets: AtomicU64,
+    pmtu_feedback_drops: AtomicU64,
 }
-
-enum SessionState {
-    Idle,
-    Connecting,
-    Connected {
-        auth_gen: u64,
-    },
-    Backoff {
-        until: Instant,
-        step: u32,
-    },
-    Blocked {
-        generation: u64,
-    },
-    Rejected {
-        generation: u64,
-        first: Instant,
-        retry_after: Instant,
-    },
-}
-
-impl SessionState {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Connecting => "dialing",
-            Self::Connected { .. } => "connected",
-            Self::Backoff { .. } => "backoff",
-            Self::Blocked { .. } => "blocked",
-            Self::Rejected { .. } => "rejected",
-        }
-    }
+pub struct AuthorizedPacket {
+    pub packet: Bytes,
+    pub epoch: AuthorizationEpoch,
+    pub local_posture: Arc<bool>,
+    pub proof: Option<crate::forward::PostureAuthorization>,
 }
 
 struct QueuedPacket {
+    id: u64,
     bytes: Bytes,
+    network: uuid::Uuid,
+    epoch: AuthorizationEpoch,
+    posture: Arc<bool>,
+    proof: Option<crate::forward::PostureAuthorization>,
     enqueued_at: Instant,
 }
-
-struct SessionQueue {
-    packets: VecDeque<QueuedPacket>,
-    bytes: usize,
+#[derive(Default)]
+struct Retry {
+    step: u32,
+    rejected: Option<(u64, Instant)>,
+    until: Option<Instant>,
+    blocked: Option<u64>,
 }
-
-impl SessionQueue {
-    fn push(&mut self, packet: Bytes) -> bool {
-        if self.packets.len() >= MAX_QUEUE_PACKETS || self.bytes + packet.len() > MAX_QUEUE_BYTES {
-            return false;
-        }
-        self.bytes += packet.len();
-        self.packets.push_back(QueuedPacket {
-            bytes: packet,
-            enqueued_at: Instant::now(),
-        });
-        true
-    }
-
-    fn drop_all(&mut self) -> usize {
-        let n = self.packets.len();
-        self.packets.clear();
-        self.bytes = 0;
-        n
-    }
-
-    fn pop_due(&mut self, now: Instant) -> (VecDeque<Bytes>, usize) {
-        let mut expired = 0usize;
-        while self
-            .packets
-            .front()
-            .is_some_and(|p| now.saturating_duration_since(p.enqueued_at) > QUEUE_TTL)
-        {
-            if let Some(p) = self.packets.pop_front() {
-                self.bytes = self.bytes.saturating_sub(p.bytes.len());
-                expired += 1;
+impl Retry {
+    fn failed(&mut self, failure: DialFailure, generation: u64, now: Instant) {
+        match failure {
+            DialFailure::LocalDenied => self.blocked = Some(generation),
+            DialFailure::Transient => {
+                self.until = Some(now + backoff_delay(self.step));
+                self.step = self.step.saturating_add(1);
+            }
+            DialFailure::RemoteRejected => {
+                let first = self
+                    .rejected
+                    .filter(|(g, _)| *g == generation)
+                    .map_or(now, |(_, first)| first);
+                self.rejected = Some((generation, first));
+                self.until = Some(now + remote_retry_delay(now.saturating_duration_since(first)));
             }
         }
-        let mut out = VecDeque::with_capacity(self.packets.len());
-        for p in self.packets.drain(..) {
-            self.bytes = self.bytes.saturating_sub(p.bytes.len());
-            out.push_back(p.bytes);
-        }
-        debug_assert_eq!(self.bytes, 0);
-        (out, expired)
     }
 }
-
-struct SessionConn {
+#[derive(Clone)]
+struct Installed {
     conn: Connection,
     opened_by_us: bool,
-}
-
-struct ActiveGen {
-    generation: u64,
+    token: u64,
     cancel: CancellationToken,
 }
-
-pub struct SessionCtl {
-    manager: PeerManager,
-    peer: EndpointId,
+struct SessionData {
+    queue: VecDeque<QueuedPacket>,
+    queue_bytes: usize,
+    next_packet_id: u64,
+    conn: Option<Installed>,
     token: u64,
-    generation: u64,
+    retry: Retry,
+    connecting: bool,
+    worker_running: bool,
+    last_activity: Instant,
 }
-
-impl SessionCtl {
-    pub fn peer(&self) -> EndpointId {
-        self.peer
+impl SessionData {
+    fn clear_queue(&mut self) -> usize {
+        let count = self.queue.len();
+        self.queue.clear();
+        self.queue_bytes = 0;
+        count
     }
-
-    pub fn cancel(&self) -> Option<CancellationToken> {
-        self.manager.active_cancel(self.generation)
+    fn pop(&mut self) -> Option<QueuedPacket> {
+        let packet = self.queue.pop_front()?;
+        self.queue_bytes -= packet.bytes.len();
+        Some(packet)
     }
-
-    pub fn finished(&self) {
-        self.manager
-            .recv_finished(self.peer, self.token, self.generation);
+    fn close(&mut self, code: u32, reason: &[u8]) {
+        self.token = self
+            .token
+            .checked_add(1)
+            .expect("connection identity exhausted");
+        if let Some(old) = self.conn.take() {
+            old.cancel.cancel();
+            old.conn.close(code.into(), reason);
+        }
+        self.connecting = false;
     }
 }
-
-pub type RecvHook = Arc<dyn Fn(EndpointId, Connection, SessionCtl) -> JoinHandle<()> + Send + Sync>;
-
 struct PeerSession {
     peer: EndpointId,
-    queue: Mutex<SessionQueue>,
-    conn: Mutex<Option<SessionConn>>,
-    state: Mutex<SessionState>,
-    install_lock: Mutex<()>,
+    data: Mutex<SessionData>,
     notify: Notify,
-    sender_running: AtomicBool,
-    sender_handle: Mutex<Option<JoinHandle<()>>>,
-    recv_handle: Mutex<Option<JoinHandle<()>>>,
-    token: AtomicU64,
-    last_activity: Mutex<Instant>,
-    last_transport_log: Mutex<Instant>,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
 }
-
 impl PeerSession {
     fn new(peer: EndpointId) -> Self {
         Self {
             peer,
-            queue: Mutex::new(SessionQueue {
-                packets: VecDeque::new(),
-                bytes: 0,
+            data: Mutex::new(SessionData {
+                queue: VecDeque::new(),
+                queue_bytes: 0,
+                next_packet_id: 0,
+                conn: None,
+                token: 0,
+                retry: Retry::default(),
+                connecting: false,
+                worker_running: false,
+                last_activity: Instant::now(),
             }),
-            conn: Mutex::new(None),
-            state: Mutex::new(SessionState::Idle),
-            install_lock: Mutex::new(()),
             notify: Notify::new(),
-            sender_running: AtomicBool::new(false),
-            sender_handle: Mutex::new(None),
-            recv_handle: Mutex::new(None),
-            token: AtomicU64::new(0),
-            last_activity: Mutex::new(Instant::now()),
-            last_transport_log: Mutex::new(Instant::now()),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
         }
     }
-
-    fn touch(&self) {
-        *self.last_activity.lock() = Instant::now();
+}
+pub struct SessionCtl {
+    peer: EndpointId,
+    generation: u64,
+    cancel: CancellationToken,
+}
+impl SessionCtl {
+    pub fn peer(&self) -> EndpointId {
+        self.peer
     }
-
-    fn live_conn(&self) -> Option<Connection> {
-        self.conn
-            .lock()
-            .as_ref()
-            .filter(|s| s.conn.close_reason().is_none())
-            .map(|s| s.conn.clone())
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn cancel(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 }
-
+pub type RecvHook = Arc<dyn Fn(EndpointId, Connection, SessionCtl) -> JoinHandle<()> + Send + Sync>;
+struct ActiveGen {
+    generation: u64,
+    cancel: CancellationToken,
+    hook: RecvHook,
+    feedback: FeedbackHook,
+    tasks: TaskTracker,
+}
+#[derive(Default)]
+struct Lifecycle {
+    active: Option<ActiveGen>,
+    stopping: bool,
+}
 struct PeerManagerInner {
     endpoint: Endpoint,
     alpn: &'static [u8],
     sessions: DashMap<EndpointId, Arc<PeerSession>>,
     gate: RwLock<Option<TransportAuth>>,
-    metrics: SessionMetrics,
+    forwarding: RwLock<Option<ForwardingStore>>,
+    metrics: Arc<SessionMetrics>,
     cloud_relay_meter: CloudRelayMeter,
     cloud_relay_urls: Arc<RwLock<HashSet<String>>>,
-    peer_cloud_relay: Arc<DashMap<EndpointId, AtomicBool>>,
-    keep_alive: AtomicBool,
-    keep_alive_peers: DashMap<EndpointId, ()>,
-    active: Mutex<Option<ActiveGen>>,
-    recv_hook: Mutex<Option<RecvHook>>,
+    keep_alive: Arc<AtomicBool>,
+    keep_alive_peers: Arc<DashMap<EndpointId, ()>>,
+    lifecycle: Mutex<Lifecycle>,
+    shutdown: tokio::sync::Mutex<()>,
 }
-
+impl Drop for PeerManagerInner {
+    fn drop(&mut self) {
+        if let Some(active) = self.lifecycle.get_mut().active.take() {
+            active.cancel.cancel();
+            active.tasks.close();
+        }
+        for session in self.sessions.iter() {
+            session.data.lock().close(0, b"dataplane_down");
+        }
+    }
+}
 #[derive(Clone)]
 pub struct PeerManager {
     inner: Arc<PeerManagerInner>,
 }
-
+#[derive(Clone)]
+pub struct WeakPeerManager {
+    inner: std::sync::Weak<PeerManagerInner>,
+}
+impl WeakPeerManager {
+    pub fn upgrade(&self) -> Option<PeerManager> {
+        self.inner.upgrade().map(|inner| PeerManager { inner })
+    }
+}
 impl PeerManager {
+    pub fn downgrade(&self) -> WeakPeerManager {
+        WeakPeerManager {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
     pub fn new(endpoint: Endpoint, alpn: &'static [u8]) -> Self {
-        let manager = Self {
+        Self {
             inner: Arc::new(PeerManagerInner {
                 endpoint,
                 alpn,
                 sessions: DashMap::new(),
                 gate: RwLock::new(None),
-                metrics: SessionMetrics::default(),
+                forwarding: RwLock::new(None),
+                metrics: Arc::new(SessionMetrics::default()),
                 cloud_relay_meter: CloudRelayMeter::new(),
                 cloud_relay_urls: Arc::new(RwLock::new(HashSet::new())),
-                peer_cloud_relay: Arc::new(DashMap::new()),
-                keep_alive: AtomicBool::new(true),
-                keep_alive_peers: DashMap::new(),
-                active: Mutex::new(None),
-                recv_hook: Mutex::new(None),
+                keep_alive: Arc::new(AtomicBool::new(true)),
+                keep_alive_peers: Arc::new(DashMap::new()),
+                lifecycle: Mutex::new(Lifecycle::default()),
+                shutdown: tokio::sync::Mutex::new(()),
             }),
-        };
-        manager.spawn_idle_sweeper();
-        manager
+        }
     }
-
     pub fn set_transport_auth(&self, auth: TransportAuth) {
+        let lifecycle = self.inner.lifecycle.lock();
+        assert!(
+            lifecycle.active.is_none(),
+            "configure auth before activation"
+        );
         *self.inner.gate.write() = Some(auth);
     }
-
-    fn gate_allows(&self, peer_hex: &str) -> bool {
-        self.inner
-            .gate
-            .read()
-            .as_ref()
-            .is_none_or(|g| g.allows(peer_hex))
+    pub fn set_forwarding(&self, forwarding: ForwardingStore) {
+        let lifecycle = self.inner.lifecycle.lock();
+        assert!(
+            lifecycle.active.is_none(),
+            "configure forwarding before activation"
+        );
+        *self.inner.forwarding.write() = Some(forwarding);
     }
-
-    fn gate_generation(&self) -> u64 {
-        self.inner
-            .gate
-            .read()
-            .as_ref()
-            .map(|g| g.generation())
-            .unwrap_or(0)
+    pub fn activate(
+        &self,
+        generation: u64,
+        cancel: CancellationToken,
+        hook: RecvHook,
+        feedback: FeedbackHook,
+    ) -> anyhow::Result<()> {
+        let mut lifecycle = self.inner.lifecycle.lock();
+        anyhow::ensure!(
+            lifecycle.active.is_none() && !lifecycle.stopping,
+            "dataplane already active or stopping"
+        );
+        anyhow::ensure!(!cancel.is_cancelled(), "dataplane cancelled");
+        anyhow::ensure!(
+            self.inner.gate.read().is_some(),
+            "transport authorization absent"
+        );
+        lifecycle.active = Some(ActiveGen {
+            generation,
+            cancel,
+            hook,
+            feedback,
+            tasks: TaskTracker::new(),
+        });
+        Ok(())
     }
-
-    pub fn set_recv_hook(&self, hook: RecvHook) {
-        *self.inner.recv_hook.lock() = Some(hook);
-    }
-
-    pub fn clear_recv_hook(&self) {
-        *self.inner.recv_hook.lock() = None;
-    }
-
-    pub fn activate(&self, generation: u64, cancel: CancellationToken) {
-        *self.inner.active.lock() = Some(ActiveGen { generation, cancel });
-    }
-
-    pub fn deactivate(&self) {
-        *self.inner.active.lock() = None;
-        *self.inner.recv_hook.lock() = None;
-        for entry in self.inner.sessions.iter() {
-            let session = entry.value().clone();
-            session.token.fetch_add(1, Ordering::AcqRel);
-            if let Some(h) = session.sender_handle.lock().take() {
-                h.abort();
+    pub async fn deactivate(&self) {
+        let _shutdown = self.inner.shutdown.lock().await;
+        let active = {
+            let mut lifecycle = self.inner.lifecycle.lock();
+            lifecycle.stopping = true;
+            let active = lifecycle.active.take();
+            if let Some(active) = &active {
+                active.cancel.cancel();
+                active.tasks.close();
             }
-            if let Some(h) = session.recv_handle.lock().take() {
-                h.abort();
+            for session in self.inner.sessions.iter() {
+                let mut data = session.data.lock();
+                data.close(0, b"dataplane_down");
+                data.clear_queue();
+                session.notify.notify_one();
             }
-            session.sender_running.store(false, Ordering::Release);
-            if let Some(s) = session.conn.lock().take() {
-                s.conn.close(0u32.into(), b"dataplane_down");
-            }
-            session.queue.lock().drop_all();
-            *session.state.lock() = SessionState::Idle;
+            active
+        };
+        if let Some(active) = active {
+            active.tasks.wait().await;
         }
+        let mut lifecycle = self.inner.lifecycle.lock();
+        self.inner.sessions.clear();
+        lifecycle.stopping = false;
     }
-
-    fn active_gen(&self) -> Option<u64> {
-        self.inner.active.lock().as_ref().map(|a| a.generation)
+    fn start_worker(&self, session: &Arc<PeerSession>, active: &ActiveGen, auth: TransportAuth) {
+        let mut data = session.data.lock();
+        if data.worker_running {
+            return;
+        }
+        data.worker_running = true;
+        drop(data);
+        let deps = WorkerDeps {
+            manager: Arc::downgrade(&self.inner),
+            endpoint: self.inner.endpoint.clone(),
+            alpn: self.inner.alpn,
+            auth,
+            forwarding: self.inner.forwarding.read().clone(),
+            metrics: self.inner.metrics.clone(),
+            urls: self.inner.cloud_relay_urls.clone(),
+            meter: self.inner.cloud_relay_meter.clone(),
+            keep_alive: self.inner.keep_alive.clone(),
+            keep_alive_peers: self.inner.keep_alive_peers.clone(),
+            generation: active.generation,
+            cancel: active.cancel.child_token(),
+            hook: active.hook.clone(),
+            feedback: active.feedback.clone(),
+        };
+        active.tasks.spawn(run_session(session.clone(), deps));
     }
-
-    fn active_cancel(&self, generation: u64) -> Option<CancellationToken> {
-        self.inner
+    fn retire_idle(&self, session: &Arc<PeerSession>, generation: u64) -> bool {
+        let lifecycle = self.inner.lifecycle.lock();
+        if lifecycle
             .active
-            .lock()
             .as_ref()
-            .filter(|a| a.generation == generation)
-            .map(|a| a.cancel.clone())
-    }
-
-    fn session(&self, peer: EndpointId) -> Arc<PeerSession> {
+            .is_none_or(|active| active.generation != generation || active.cancel.is_cancelled())
+        {
+            return false;
+        }
+        let mut data = session.data.lock();
+        if data.conn.is_some() || !data.queue.is_empty() || data.last_activity.elapsed() < QUEUE_TTL
+        {
+            return false;
+        }
+        data.worker_running = false;
+        data.close(0, b"idle");
+        drop(data);
         self.inner
             .sessions
-            .entry(peer)
-            .or_insert_with(|| Arc::new(PeerSession::new(peer)))
-            .clone()
+            .remove_if(&session.peer, |_, entry| Arc::ptr_eq(entry, session));
+        true
     }
-
-    pub fn send(&self, peer: EndpointId, packet: Bytes) -> SendOutcome {
-        match self.send_batch(peer, vec![packet]) {
-            SendBatchOutcome { admitted: 1, .. } => SendOutcome::Admitted,
-            SendBatchOutcome { closed: true, .. } => SendOutcome::Closed,
-            SendBatchOutcome { blocked: true, .. } => SendOutcome::Denied,
-            _ => SendOutcome::QueueFull,
+    #[cfg(test)]
+    fn send(&self, peer: EndpointId, packet: Bytes) -> SendOutcome {
+        Self::single(self.send_batch(peer, vec![packet]))
+    }
+    pub fn send_authorized(&self, peer: EndpointId, packet: AuthorizedPacket) -> SendOutcome {
+        Self::single(self.send_batch_authorized(peer, vec![packet]))
+    }
+    fn single(out: SendBatchOutcome) -> SendOutcome {
+        if out.admitted == 1 {
+            SendOutcome::Admitted
+        } else if out.closed {
+            SendOutcome::Closed
+        } else if out.blocked {
+            SendOutcome::Denied
+        } else {
+            SendOutcome::QueueFull
         }
     }
-
-    pub fn send_batch(&self, peer: EndpointId, packets: Vec<Bytes>) -> SendBatchOutcome {
-        if !self.inner.active.lock().is_some() {
-            return SendBatchOutcome {
-                admitted: 0,
-                admitted_bytes: 0,
-                queue_full: packets.len(),
-                blocked: false,
-                closed: true,
-            };
-        }
-        let session = self.session(peer);
-        let peer_hex = format!("{peer}");
+    #[cfg(test)]
+    fn send_batch(&self, peer: EndpointId, packets: Vec<Bytes>) -> SendBatchOutcome {
+        let forwarding = self.inner.forwarding.read().clone();
+        let snapshot = forwarding.as_ref().map(|f| f.load());
+        let packets = packets
+            .into_iter()
+            .filter_map(|p| {
+                let (net, _) = unframe(&p).ok()?;
+                let s = snapshot.as_ref()?;
+                Some(AuthorizedPacket {
+                    packet: p,
+                    epoch: s.auth_epoch(net),
+                    local_posture: s.posture_ok.load_full(),
+                    proof: None,
+                })
+            })
+            .collect();
+        self.send_batch_authorized(peer, packets)
+    }
+    pub fn send_batch_authorized(
+        &self,
+        peer: EndpointId,
+        packets: Vec<AuthorizedPacket>,
+    ) -> SendBatchOutcome {
         let mut out = SendBatchOutcome {
             admitted: 0,
             admitted_bytes: 0,
@@ -575,349 +559,286 @@ impl PeerManager {
             blocked: false,
             closed: false,
         };
+        let lifecycle = self.inner.lifecycle.lock();
+        let Some(active) = lifecycle
+            .active
+            .as_ref()
+            .filter(|a| !a.cancel.is_cancelled())
+        else {
+            out.closed = true;
+            return out;
+        };
+        let Some(auth) = self.inner.gate.read().clone() else {
+            out.blocked = true;
+            return out;
+        };
+        let gate = auth.authorization_gate();
+        let _authorization = gate.read();
+        if !auth.allows(&peer.to_string()) {
+            out.blocked = true;
+            return out;
+        }
+        let forwarding = self.inner.forwarding.read();
+        let snapshot = forwarding.as_ref().map(|f| f.load());
+        let session = self
+            .inner
+            .sessions
+            .entry(peer)
+            .or_insert_with(|| Arc::new(PeerSession::new(peer)))
+            .clone();
+        let mut data = session.data.lock();
+        if data.retry.blocked == Some(auth.generation()) {
+            out.blocked = true;
+            return out;
+        }
+        let was_empty = data.queue.is_empty();
+        for AuthorizedPacket {
+            packet,
+            epoch,
+            local_posture: posture,
+            proof,
+        } in packets
         {
-            let mut state = session.state.lock();
-            if matches!(*state, SessionState::Blocked { generation } if generation == self.gate_generation())
+            let Ok((network, _)) = unframe(&packet) else {
+                out.blocked = true;
+                continue;
+            };
+            if snapshot.as_ref().is_none_or(|s| {
+                s.auth_epoch(network) != epoch
+                    || !s.allows_network(network, peer)
+                    || !Arc::ptr_eq(&s.posture_ok.load_full(), &posture)
+                    || proof.is_some_and(|proof| !proof.allows(s, network, peer))
+            }) {
+                out.blocked = true;
+                continue;
+            }
+            if data.queue.len() == MAX_QUEUE_PACKETS
+                || data.queue_bytes + packet.len() > MAX_QUEUE_BYTES
             {
-                self.inner
-                    .metrics
-                    .dials_suppressed
-                    .fetch_add(1, Ordering::Relaxed);
-                out.blocked = true;
-                return out;
+                out.queue_full += 1;
+                continue;
             }
-            if !self.gate_allows(&peer_hex) {
-                let dropped = session.queue.lock().drop_all();
-                self.inner
-                    .metrics
-                    .packets_dropped_blocked
-                    .fetch_add(dropped as u64 + packets.len() as u64, Ordering::Relaxed);
-                *state = SessionState::Blocked {
-                    generation: self.gate_generation(),
-                };
-                out.blocked = true;
-                return out;
-            }
-            if matches!(*state, SessionState::Blocked { .. }) {
-                *state = SessionState::Idle;
-            }
-            let mut queue = session.queue.lock();
-            let mut buffered = 0u64;
-            for packet in packets {
-                let len = packet.len();
-                if !queue.push(packet) {
-                    out.queue_full += 1;
-                } else {
-                    out.admitted += 1;
-                    out.admitted_bytes += len as u64;
-                    buffered += 1;
-                }
-            }
-            drop(queue);
-            if out.queue_full > 0 {
-                self.inner
-                    .metrics
-                    .packets_dropped_timeout
-                    .fetch_add(out.queue_full as u64, Ordering::Relaxed);
-            }
-            if buffered > 0 {
-                self.inner
-                    .metrics
-                    .packets_buffered
-                    .fetch_add(buffered, Ordering::Relaxed);
-            }
+            let bytes = packet.len();
+            data.next_packet_id = data
+                .next_packet_id
+                .checked_add(1)
+                .expect("packet identity exhausted");
+            let id = data.next_packet_id;
+            data.queue.push_back(QueuedPacket {
+                id,
+                bytes: packet,
+                network,
+                epoch,
+                posture,
+                proof,
+                enqueued_at: Instant::now(),
+            });
+            data.queue_bytes += bytes;
+            out.admitted += 1;
+            out.admitted_bytes += bytes as u64;
         }
         if out.admitted > 0 {
-            session.touch();
-            self.ensure_sender(&session);
-            session.notify.notify_one();
+            data.last_activity = Instant::now();
+        }
+        drop(data);
+        drop(forwarding);
+        if out.admitted > 0 {
+            self.inner
+                .metrics
+                .packets_buffered
+                .fetch_add(out.admitted as u64, Ordering::Relaxed);
+            self.start_worker(&session, active, auth);
+            if was_empty {
+                session.notify.notify_one();
+            }
+        } else {
+            let data = session.data.lock();
+            let unused = !data.worker_running && data.conn.is_none() && data.queue.is_empty();
+            drop(data);
+            if unused {
+                self.inner
+                    .sessions
+                    .remove_if(&peer, |_, entry| Arc::ptr_eq(entry, &session));
+            }
         }
         out
     }
-
-    pub fn conn_max_datagram_size(&self, peer: EndpointId) -> Option<usize> {
-        let session = self.inner.sessions.get(&peer)?;
-        session.live_conn()?.max_datagram_size()
-    }
-
-    fn ensure_sender(&self, session: &Arc<PeerSession>) {
-        if session.sender_running.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let Some(generation) = self.active_gen() else {
-            session.sender_running.store(false, Ordering::Release);
-            return;
-        };
-        let manager = self.clone();
-        let sender_session = session.clone();
-        let token = session.token.load(Ordering::Acquire);
-        let handle = tokio::spawn(async move {
-            run_sender(manager, sender_session, token, generation).await;
-        });
-        *session.sender_handle.lock() = Some(handle);
-    }
-
     pub fn install(&self, peer: EndpointId, conn: Connection, opened_by_us: bool) -> bool {
-        let (generation, cancel) = match self.inner.active.lock().as_ref() {
-            Some(a) => (a.generation, a.cancel.clone()),
-            None => {
-                conn.close(0u32.into(), b"dataplane_down");
-                return false;
-            }
-        };
-        if cancel.is_cancelled() {
+        let lifecycle = self.inner.lifecycle.lock();
+        let Some(active) = lifecycle
+            .active
+            .as_ref()
+            .filter(|a| !a.cancel.is_cancelled())
+        else {
             conn.close(0u32.into(), b"dataplane_down");
             return false;
-        }
-        let peer_hex = format!("{peer}");
-        if !self.gate_allows(&peer_hex) {
-            conn.close(1u32.into(), b"not_authorized");
+        };
+        let Some(auth) = self.inner.gate.read().clone() else {
+            conn.close(CLOSE_NOT_MEMBER.into(), CLOSE_NOT_MEMBER_REASON);
+            return false;
+        };
+        let gate = auth.authorization_gate();
+        let _authorization = gate.read();
+        if conn.remote_id() != peer || !auth.allows(&peer.to_string()) {
+            conn.close(CLOSE_NOT_MEMBER.into(), CLOSE_NOT_MEMBER_REASON);
             return false;
         }
-        let session = self.session(peer);
-        let _guard = session.install_lock.lock();
-        let token = session.token.load(Ordering::Acquire);
-        {
-            let mut slot = session.conn.lock();
-            if let Some(existing) = slot.as_ref().filter(|s| s.conn.close_reason().is_none()) {
-                if !prefer_incoming(
-                    self.inner.endpoint.id(),
-                    peer,
-                    existing.opened_by_us,
-                    opened_by_us,
-                ) {
-                    conn.close(0u32.into(), b"tie_break");
-                    return false;
-                }
-                existing.conn.close(0u32.into(), b"tie_break");
-            }
-            *slot = Some(SessionConn {
-                conn: conn.clone(),
-                opened_by_us,
-            });
-            *session.state.lock() = SessionState::Connected {
-                auth_gen: self.gate_generation(),
-            };
-        }
-        session.touch();
-        self.spawn_cloud_relay_path_watch(peer, conn.clone());
-        if let Some(hook) = self.inner.recv_hook.lock().clone() {
-            let ctl = SessionCtl {
-                manager: self.clone(),
+        let session = self
+            .inner
+            .sessions
+            .entry(peer)
+            .or_insert_with(|| Arc::new(PeerSession::new(peer)))
+            .clone();
+        let mut data = session.data.lock();
+        if let Some(old) = data
+            .conn
+            .as_ref()
+            .filter(|c| c.conn.close_reason().is_none())
+            && !prefer_incoming(
+                self.inner.endpoint.id(),
                 peer,
-                token,
-                generation,
-            };
-            let handle = hook(peer, conn.clone(), ctl);
-            if let Some(old) = session.recv_handle.lock().replace(handle) {
-                old.abort();
-            }
+                old.opened_by_us,
+                opened_by_us,
+            )
+        {
+            conn.close(0u32.into(), b"tie_break");
+            return false;
         }
-        self.ensure_sender(&session);
+        data.close(0, b"replaced");
+        let token = data.token;
+        data.conn = Some(Installed {
+            conn,
+            opened_by_us,
+            token,
+            cancel: active.cancel.child_token(),
+        });
+        data.retry = Retry::default();
+        data.last_activity = Instant::now();
+        drop(data);
+        self.start_worker(&session, active, auth);
         session.notify.notify_one();
         true
     }
-
-    fn recv_finished(&self, peer: EndpointId, token: u64, generation: u64) {
-        if self.active_gen() != Some(generation) {
-            return;
-        }
-        let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) else {
+    pub async fn reconcile(&self) {
+        let _lifecycle = self.inner.lifecycle.lock();
+        let Some(auth) = self.inner.gate.read().clone() else {
             return;
         };
-        if session.token.load(Ordering::Acquire) != token {
-            return;
-        }
-        let mut guard = session.recv_handle.lock();
-        if guard.as_ref().is_some_and(|h| h.is_finished()) {
-            guard.take();
-        }
-    }
-
-    pub async fn reconcile(&self) {
-        let generation = self.gate_generation();
-        for entry in self.inner.sessions.iter() {
-            let session = entry.value().clone();
-            let peer_hex = format!("{}", session.peer);
-            if self.gate_allows(&peer_hex) {
-                let mut state = session.state.lock();
-                match *state {
-                    SessionState::Blocked { .. } | SessionState::Rejected { .. } => {
-                        *state = SessionState::Idle;
-                        session.notify.notify_one();
-                    }
-                    _ => {}
+        let gate = auth.authorization_gate();
+        let _authorization = gate.read();
+        for session in self.inner.sessions.iter() {
+            let mut data = session.data.lock();
+            if !auth.allows(&session.peer.to_string()) {
+                data.close(CLOSE_NOT_MEMBER, CLOSE_NOT_MEMBER_REASON);
+                let dropped = data.clear_queue();
+                self.inner
+                    .metrics
+                    .packets_dropped_blocked
+                    .fetch_add(dropped as u64, Ordering::Relaxed);
+                data.retry.blocked = Some(auth.generation());
+            } else if data.retry.blocked != Some(auth.generation()) {
+                data.retry.blocked = None;
+                if data
+                    .retry
+                    .rejected
+                    .is_some_and(|(g, _)| g != auth.generation())
+                {
+                    data.retry = Retry::default();
                 }
-                drop(state);
-                let _ = generation;
-                continue;
             }
-            let dropped = session.queue.lock().drop_all();
-            self.inner
-                .metrics
-                .packets_dropped_blocked
-                .fetch_add(dropped as u64, Ordering::Relaxed);
-            if let Some(s) = session.conn.lock().take() {
-                s.conn.close(1u32.into(), b"not_authorized");
-            }
-            let mut state = session.state.lock();
-            if !matches!(*state, SessionState::Blocked { generation: g } if g == generation) {
-                *state = SessionState::Blocked { generation };
-                session.notify.notify_one();
-            }
+            session.notify.notify_one();
         }
     }
-
     pub async fn revoke_peer(&self, peer: EndpointId) {
-        let generation = self.gate_generation();
-        if let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) {
-            let dropped = session.queue.lock().drop_all();
+        let _lifecycle = self.inner.lifecycle.lock();
+        if let Some(session) = self.inner.sessions.get(&peer) {
+            let mut data = session.data.lock();
+            data.close(CLOSE_NOT_MEMBER, CLOSE_NOT_MEMBER_REASON);
+            let dropped = data.clear_queue();
             self.inner
                 .metrics
                 .packets_dropped_blocked
                 .fetch_add(dropped as u64, Ordering::Relaxed);
-            if let Some(s) = session.conn.lock().take() {
-                s.conn.close(1u32.into(), b"not_authorized");
-            }
-            if let Some(h) = session.recv_handle.lock().take() {
-                h.abort();
-            }
-            *session.state.lock() = SessionState::Blocked { generation };
+            data.retry.blocked = self.inner.gate.read().as_ref().map(|a| a.generation());
             session.notify.notify_one();
         }
     }
-
     pub async fn close_all(&self) {
-        for entry in self.inner.sessions.iter() {
-            let session = entry.value().clone();
-            session.queue.lock().drop_all();
-            if let Some(s) = session.conn.lock().take() {
-                s.conn.close(0u32.into(), b"dataplane_down");
-            }
-            *session.state.lock() = SessionState::Idle;
+        let _lifecycle = self.inner.lifecycle.lock();
+        for session in self.inner.sessions.iter() {
+            let mut data = session.data.lock();
+            data.close(0, b"dataplane_down");
+            data.clear_queue();
+            data.retry = Retry::default();
             session.notify.notify_one();
         }
     }
-
     pub fn set_keep_alive(&self, enabled: bool) {
         self.inner.keep_alive.store(enabled, Ordering::Relaxed);
     }
-
     pub fn keep_alive(&self) -> bool {
         self.inner.keep_alive.load(Ordering::Relaxed)
     }
-
     pub fn set_peer_keep_alive(&self, peer: EndpointId, enabled: bool) {
         if enabled {
             self.inner.keep_alive_peers.insert(peer, ());
         } else {
             self.inner.keep_alive_peers.remove(&peer);
         }
+        if let Some(s) = self.inner.sessions.get(&peer) {
+            s.notify.notify_one();
+        }
     }
-
     pub fn set_cloud_relay_urls(&self, urls: impl IntoIterator<Item = String>) {
-        let normalized: HashSet<String> = urls
+        *self.inner.cloud_relay_urls.write() = urls
             .into_iter()
             .map(|u| u.trim_end_matches('/').to_string())
             .collect();
-        *self.inner.cloud_relay_urls.write() = normalized;
-        self.inner.peer_cloud_relay.clear();
     }
-
     pub fn cloud_relay_meter(&self) -> CloudRelayMeter {
         self.inner.cloud_relay_meter.clone()
     }
-
-    fn spawn_cloud_relay_path_watch(&self, peer: EndpointId, conn: Connection) {
-        let urls = self.inner.cloud_relay_urls.clone();
-        let flags = self.inner.peer_cloud_relay.clone();
-        tokio::spawn(async move {
-            let refresh = |conn: &Connection| {
-                let metered = selected_path_is_cloud_relay(conn, &urls.read());
-                flags
-                    .entry(peer)
-                    .or_insert_with(|| AtomicBool::new(false))
-                    .store(metered, Ordering::Relaxed);
-            };
-            refresh(&conn);
-            let mut events = conn.path_events();
-            while let Some(ev) = events.next().await {
-                match ev {
-                    PathEvent::Selected { .. }
-                    | PathEvent::Lagged { .. }
-                    | PathEvent::Opened { .. }
-                    | PathEvent::Closed { .. } => {
-                        refresh(&conn);
-                    }
-                    _ => {}
-                }
-            }
-            flags.remove(&peer);
-        });
-    }
-
-    pub fn record_bytes_in(&self, peer: EndpointId, n: u64) {
-        if let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) {
-            session.bytes_in.fetch_add(n, Ordering::Relaxed);
-            session.touch();
+    pub fn record_bytes_in(&self, peer: EndpointId, bytes: u64) {
+        if let Some(s) = self.inner.sessions.get(&peer) {
+            s.bytes_in.fetch_add(bytes, Ordering::Relaxed);
+            s.data.lock().last_activity = Instant::now();
         }
     }
-
-    fn record_bytes_out(&self, session: &PeerSession, n: u64) {
-        session.bytes_out.fetch_add(n, Ordering::Relaxed);
-        if self
-            .inner
-            .peer_cloud_relay
-            .get(&session.peer)
-            .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            self.inner.cloud_relay_meter.record(n);
-        }
-        session.touch();
-    }
-
     pub fn has_live(&self, peer: EndpointId) -> bool {
-        let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) else {
-            return false;
-        };
-        match session.conn.try_lock() {
-            Some(g) => g.as_ref().is_some_and(|s| s.conn.close_reason().is_none()),
-            None => true,
-        }
+        self.inner.sessions.get(&peer).is_some_and(|s| {
+            s.data
+                .lock()
+                .conn
+                .as_ref()
+                .is_some_and(|c| c.conn.close_reason().is_none())
+        })
     }
-
-    pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
-        let mut active_conns = 0u32;
-        let mut bytes_rx = 0u64;
-        let mut bytes_tx = 0u64;
-        for entry in self.inner.sessions.iter() {
-            let session = entry.value();
-            let live = match session.conn.try_lock() {
-                Some(g) => g.as_ref().is_some_and(|s| s.conn.close_reason().is_none()),
-                None => true,
-            };
-            if live {
-                active_conns += 1;
-            }
-            bytes_rx += session.bytes_in.load(Ordering::Relaxed);
-            bytes_tx += session.bytes_out.load(Ordering::Relaxed);
-        }
-        (active_conns, bytes_tx, bytes_rx)
-    }
-
     pub fn peer_bytes(&self, peer: EndpointId) -> (u64, u64) {
-        let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) else {
-            return (0, 0);
-        };
-        (
-            session.bytes_in.load(Ordering::Relaxed),
-            session.bytes_out.load(Ordering::Relaxed),
-        )
+        self.inner.sessions.get(&peer).map_or((0, 0), |s| {
+            (
+                s.bytes_in.load(Ordering::Relaxed),
+                s.bytes_out.load(Ordering::Relaxed),
+            )
+        })
     }
-
+    pub fn heartbeat_counters(&self) -> (u32, u64, u64) {
+        let mut out = (0, 0, 0);
+        for s in self.inner.sessions.iter() {
+            out.0 += u32::from(
+                s.data
+                    .lock()
+                    .conn
+                    .as_ref()
+                    .is_some_and(|c| c.conn.close_reason().is_none()),
+            );
+            out.1 += s.bytes_out.load(Ordering::Relaxed);
+            out.2 += s.bytes_in.load(Ordering::Relaxed);
+        }
+        out
+    }
     pub fn peer_snapshot(&self, peer: EndpointId) -> PeerConnSnapshot {
         let keep_alive = self.keep_alive() || self.inner.keep_alive_peers.contains_key(&peer);
-        let Some(session) = self.inner.sessions.get(&peer).map(|e| e.value().clone()) else {
+        let Some(s) = self.inner.sessions.get(&peer) else {
             return PeerConnSnapshot {
                 state: "idle".into(),
                 keep_alive,
@@ -926,857 +847,1179 @@ impl PeerManager {
                 path: "unknown".into(),
             };
         };
-        let conn_guard = session.conn.try_lock();
-        let live = conn_guard
+        let data = s.data.lock();
+        let live = data
+            .conn
             .as_ref()
-            .and_then(|g| g.as_ref())
-            .map(|s| s.conn.clone());
-        let state = match session.state.try_lock() {
-            Some(g) => g.as_str().to_string(),
-            None => "connected".to_string(),
+            .filter(|c| c.conn.close_reason().is_none());
+        let state = if live.is_some() {
+            "connected"
+        } else if data.retry.blocked.is_some() {
+            "blocked"
+        } else if data.connecting {
+            "dialing"
+        } else if data.retry.rejected.is_some() {
+            "rejected"
+        } else if data.retry.until.is_some() {
+            "backoff"
+        } else {
+            "idle"
         };
         PeerConnSnapshot {
-            state,
+            state: state.into(),
             keep_alive,
-            last_activity_secs_ago: session.last_activity.lock().elapsed().as_secs(),
+            last_activity_secs_ago: data.last_activity.elapsed().as_secs(),
             live: live.is_some(),
-            path: selected_path_kind(live.as_ref()),
+            path: selected_path_kind(live.map(|c| &c.conn)),
         }
     }
-
     pub fn session_stats(&self) -> SessionStats {
-        let success = self.inner.metrics.reconnect_success.load(Ordering::Relaxed);
-        let sum = self
-            .inner
-            .metrics
-            .reconnect_latency_sum_us
-            .load(Ordering::Relaxed);
+        let m = &self.inner.metrics;
+        let success = m.reconnect_success.load(Ordering::Relaxed);
+        let mut queue_packets = 0;
+        let mut queue_bytes = 0;
+        for session in self.inner.sessions.iter() {
+            let data = session.data.lock();
+            queue_packets += data.queue.len();
+            queue_bytes += data.queue_bytes;
+        }
         SessionStats {
-            reconnect_attempts: self
-                .inner
-                .metrics
-                .reconnect_attempts
-                .load(Ordering::Relaxed),
+            reconnect_attempts: m.reconnect_attempts.load(Ordering::Relaxed),
             reconnect_success: success,
-            reconnect_fail: self.inner.metrics.reconnect_fail.load(Ordering::Relaxed),
-            packets_buffered: self.inner.metrics.packets_buffered.load(Ordering::Relaxed),
-            packets_dropped_timeout: self
-                .inner
-                .metrics
-                .packets_dropped_timeout
+            reconnect_fail: m.reconnect_fail.load(Ordering::Relaxed),
+            packets_buffered: m.packets_buffered.load(Ordering::Relaxed),
+            packets_dropped_timeout: m.packets_dropped_timeout.load(Ordering::Relaxed),
+            packets_dropped_blocked: m.packets_dropped_blocked.load(Ordering::Relaxed),
+            dials_suppressed: m.dials_suppressed.load(Ordering::Relaxed),
+            reconnect_latency_avg_us: m
+                .reconnect_latency_sum_us
                 .load(Ordering::Relaxed)
-                + self
-                    .inner
-                    .metrics
-                    .packets_dropped_transport
-                    .load(Ordering::Relaxed),
-            packets_dropped_blocked: self
-                .inner
-                .metrics
-                .packets_dropped_blocked
-                .load(Ordering::Relaxed),
-            dials_suppressed: self.inner.metrics.dials_suppressed.load(Ordering::Relaxed),
-            reconnect_latency_avg_us: sum.checked_div(success).unwrap_or(0),
-            reconnect_latency_max_us: self
-                .inner
-                .metrics
-                .reconnect_latency_max_us
-                .load(Ordering::Relaxed),
+                .checked_div(success)
+                .unwrap_or(0),
+            reconnect_latency_max_us: m.reconnect_latency_max_us.load(Ordering::Relaxed),
+            queue_packets,
+            queue_bytes,
+            quic_accepted_packets: m.quic_accepted_packets.load(Ordering::Relaxed),
+            quic_accepted_bytes: m.quic_accepted_bytes.load(Ordering::Relaxed),
+            transport_drops: m.packets_dropped_transport.load(Ordering::Relaxed),
+            oversize_packets: m.oversize_packets.load(Ordering::Relaxed),
+            pmtu_feedback_drops: m.pmtu_feedback_drops.load(Ordering::Relaxed),
         }
     }
-
-    fn spawn_idle_sweeper(&self) {
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                tick.tick().await;
-                if inner.keep_alive.load(Ordering::Relaxed) {
-                    continue;
-                }
-                for entry in inner.sessions.iter() {
-                    let session = entry.value().clone();
-                    if inner.keep_alive_peers.contains_key(&session.peer) {
-                        continue;
-                    }
-                    let idle = matches!(*session.state.lock(), SessionState::Connected { .. })
-                        && session.queue.lock().packets.is_empty()
-                        && session.last_activity.lock().elapsed()
-                            >= Duration::from_secs(crate::iroh_pool::DEFAULT_IDLE_SECS);
-                    if !idle {
-                        continue;
-                    }
-                    if let Some(s) = session.conn.lock().take() {
-                        s.conn.close(0u32.into(), b"idle");
-                    }
-                    *session.state.lock() = SessionState::Idle;
-                    session.notify.notify_one();
-                }
-            }
-        });
+    pub fn transport_stats(&self) -> Vec<PeerTransportStats> {
+        let mut peers = Vec::new();
+        for session in self.inner.sessions.iter() {
+            let data = session.data.lock();
+            let Some(installed) = data.conn.as_ref() else {
+                continue;
+            };
+            let paths = installed.conn.paths();
+            let selected = paths.iter().find(|p| p.is_selected());
+            let stats = installed.conn.stats();
+            let path_stats = selected.as_ref().map(|p| p.stats());
+            peers.push(PeerTransportStats {
+                peer: session.peer.to_string(),
+                token: installed.token,
+                selected_local_addr: selected.as_ref().map(|p| format!("{:?}", p.local_addr())),
+                selected_remote_addr: selected.as_ref().map(|p| format!("{:?}", p.remote_addr())),
+                max_datagram_size: installed.conn.max_datagram_size(),
+                send_buffer_available_bytes: installed.conn.datagram_send_buffer_space(),
+                queue_packets: data.queue.len(),
+                queue_bytes: data.queue_bytes,
+                udp_tx_packets: stats.udp_tx.datagrams,
+                udp_tx_bytes: stats.udp_tx.bytes,
+                udp_rx_packets: stats.udp_rx.datagrams,
+                udp_rx_bytes: stats.udp_rx.bytes,
+                datagram_frames_tx: stats.frame_tx.datagram,
+                datagram_frames_rx: stats.frame_rx.datagram,
+                lost_packets: stats.lost_packets,
+                lost_bytes: stats.lost_bytes,
+                selected_rtt_us: path_stats.as_ref().map(|p| p.rtt.as_micros() as u64),
+                selected_cwnd_bytes: path_stats.as_ref().map(|p| p.cwnd),
+                selected_udp_mtu: path_stats.as_ref().map(|p| p.current_mtu),
+            });
+        }
+        peers.sort_by(|a, b| a.peer.cmp(&b.peer));
+        peers
     }
-
-    async fn dial_once(&self, peer: EndpointId) -> Result<Connection, (DialFailure, Arc<str>)> {
-        let start = Instant::now();
-        self.inner
-            .metrics
-            .reconnect_attempts
-            .fetch_add(1, Ordering::Relaxed);
-        match tokio::time::timeout(
-            RECONNECT_TIMEOUT,
-            self.inner.endpoint.connect(peer, self.inner.alpn),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => {
-                if let Some(reason) = conn.close_reason() {
-                    let msg: Arc<str> =
-                        Arc::from(format!("connection to {peer} dead on arrival: {reason:?}"));
-                    if is_auth_close_error(&reason) {
-                        return Err((DialFailure::RemoteRejected, msg));
-                    }
-                    return Err((DialFailure::Transient, msg));
-                }
-                let latency_us = start.elapsed().as_micros() as u64;
-                self.inner
-                    .metrics
-                    .reconnect_success
-                    .fetch_add(1, Ordering::Relaxed);
-                self.inner
-                    .metrics
-                    .reconnect_latency_sum_us
-                    .fetch_add(latency_us, Ordering::Relaxed);
-                let max = self
-                    .inner
-                    .metrics
-                    .reconnect_latency_max_us
-                    .load(Ordering::Relaxed);
-                if latency_us > max {
-                    self.inner
-                        .metrics
-                        .reconnect_latency_max_us
-                        .store(latency_us, Ordering::Relaxed);
-                }
-                Ok(conn)
-            }
-            Ok(Err(e)) => {
-                let kind = classify_connect_error(&e);
-                let msg: Arc<str> = Arc::from(format!("connect to {peer}: {e}"));
-                Err((kind, msg))
-            }
-            Err(_) => Err((
-                DialFailure::Transient,
-                Arc::from(format!("reconnect to {peer} timed out")),
-            )),
+}
+struct WorkerDeps {
+    manager: std::sync::Weak<PeerManagerInner>,
+    endpoint: Endpoint,
+    alpn: &'static [u8],
+    auth: TransportAuth,
+    forwarding: Option<ForwardingStore>,
+    metrics: Arc<SessionMetrics>,
+    urls: Arc<RwLock<HashSet<String>>>,
+    meter: CloudRelayMeter,
+    keep_alive: Arc<AtomicBool>,
+    keep_alive_peers: Arc<DashMap<EndpointId, ()>>,
+    generation: u64,
+    cancel: CancellationToken,
+    hook: RecvHook,
+    feedback: FeedbackHook,
+}
+impl WorkerDeps {
+    fn packet_allowed(&self, peer: EndpointId, peer_hex: &str, p: &QueuedPacket) -> bool {
+        self.auth.allows(peer_hex)
+            && self.forwarding.as_ref().is_some_and(|f| {
+                let s = f.load();
+                s.auth_epoch(p.network) == p.epoch
+                    && s.allows_network(p.network, peer)
+                    && Arc::ptr_eq(&s.posture_ok.load_full(), &p.posture)
+                    && p.proof
+                        .is_none_or(|proof| proof.allows(&s, p.network, peer))
+            })
+    }
+    fn accepted(&self, session: &PeerSession, conn: &Connection, packets: usize, bytes: u64) {
+        self.metrics
+            .quic_accepted_packets
+            .fetch_add(packets as u64, Ordering::Relaxed);
+        self.metrics
+            .quic_accepted_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        session.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+        if selected_path_is_cloud_relay(conn, &self.urls.read()) {
+            self.meter.record(bytes);
         }
     }
 }
-
-async fn run_sender(manager: PeerManager, session: Arc<PeerSession>, token: u64, generation: u64) {
+async fn stop_reader(reader: &mut Option<(u64, JoinHandle<()>)>) {
+    if let Some((_, h)) = reader.take() {
+        h.abort();
+        let _ = h.await;
+    }
+}
+async fn run_session(session: Arc<PeerSession>, deps: WorkerDeps) {
     let peer = session.peer;
+    let peer_hex = peer.to_string();
+    let gate = deps.auth.authorization_gate();
+    let mut reader: Option<(u64, JoinHandle<()>)> = None;
+    let mut retired = false;
     loop {
-        if manager.active_gen() != Some(generation)
-            || session.token.load(Ordering::Acquire) != token
-        {
+        if deps.cancel.is_cancelled() {
             break;
         }
-        let conn = session.live_conn();
-        if let Some(conn) = conn {
-            let gate_gen = manager.gate_generation();
-            let validated = matches!(*session.state.lock(), SessionState::Connected { auth_gen } if auth_gen == gate_gen);
-            if !validated {
-                if manager.gate_allows(&format!("{peer}")) {
-                    *session.state.lock() = SessionState::Connected { auth_gen: gate_gen };
-                } else {
-                    if let Some(s) = session.conn.lock().take() {
-                        s.conn.close(1u32.into(), b"not_authorized");
-                    }
-                    let dropped = session.queue.lock().drop_all();
-                    manager
-                        .inner
-                        .metrics
-                        .packets_dropped_blocked
-                        .fetch_add(dropped as u64, Ordering::Relaxed);
-                    *session.state.lock() = SessionState::Blocked {
-                        generation: gate_gen,
-                    };
-                    continue;
-                }
-            }
-            let now = Instant::now();
-            let (mut due, expired) = session.queue.lock().pop_due(now);
-            if expired > 0 {
-                manager
-                    .inner
-                    .metrics
-                    .packets_dropped_timeout
-                    .fetch_add(expired as u64, Ordering::Relaxed);
-            }
-            if due.is_empty() {
-                session.notify.notified().await;
-                continue;
-            }
-            let total = due.len();
-            let out = send_datagram_batch(&conn, &mut due).await;
-            debug_assert!(due.is_empty());
-            if out.accepted > 0 {
-                manager.record_bytes_out(&session, out.accepted_bytes);
-            }
-            let dropped = total - out.accepted;
-            if dropped > 0 {
-                manager
-                    .inner
-                    .metrics
-                    .packets_dropped_transport
+        let installed = {
+            let _authorization = gate.read();
+            let mut data = session.data.lock();
+            if !deps.auth.allows(&peer_hex) {
+                data.close(CLOSE_NOT_MEMBER, CLOSE_NOT_MEMBER_REASON);
+                let dropped = data.clear_queue();
+                deps.metrics
+                    .packets_dropped_blocked
                     .fetch_add(dropped as u64, Ordering::Relaxed);
+                data.retry.blocked = Some(deps.auth.generation());
             }
-            if now.saturating_duration_since(*session.last_transport_log.lock())
-                >= TRANSPORT_LOG_EVERY
-            {
-                *session.last_transport_log.lock() = now;
-                let stats = conn.stats();
-                tracing::info!(
-                    peer = %peer,
-                    max_datagram_size = ?conn.max_datagram_size(),
-                    udp_tx_datagrams = stats.udp_tx.datagrams,
-                    udp_tx_bytes = stats.udp_tx.bytes,
-                    lost_packets = stats.lost_packets,
-                    lost_bytes = stats.lost_bytes,
-                    accepted = out.accepted,
-                    oversize = out.oversize,
-                    send_dropped = out.transport_drops,
-                    "tunnel transport state",
-                );
-            }
-            if conn.close_reason().is_some() {
-                if session
-                    .conn
-                    .lock()
-                    .as_ref()
-                    .is_some_and(|s| s.conn.close_reason().is_some())
-                {
-                    session.conn.lock().take();
+            while let Some(packet) = data.queue.front() {
+                let expired = packet.enqueued_at.elapsed() >= QUEUE_TTL;
+                if !expired && deps.packet_allowed(peer, &peer_hex, packet) {
+                    break;
                 }
-                classify_dead_conn(&manager, &session, &conn, peer);
-                continue;
-            }
-            continue;
-        }
-
-        if session.conn.lock().take().is_some() {
-            *session.state.lock() = SessionState::Idle;
-        }
-        enum Decision {
-            Dial,
-            Wait(Instant),
-            Hold,
-        }
-        let decision = {
-            let mut state = session.state.lock();
-            let gate_gen = manager.gate_generation();
-            let peer_hex = format!("{peer}");
-            if !manager.gate_allows(&peer_hex) {
-                let fresh = !matches!(*state, SessionState::Blocked { generation } if generation == gate_gen);
-                *state = SessionState::Blocked {
-                    generation: gate_gen,
-                };
-                if fresh {
-                    let dropped = session.queue.lock().drop_all();
-                    manager
-                        .inner
-                        .metrics
-                        .packets_dropped_blocked
-                        .fetch_add(dropped as u64, Ordering::Relaxed);
+                data.pop();
+                if expired {
+                    deps.metrics
+                        .packets_dropped_timeout
+                        .fetch_add(1, Ordering::Relaxed);
                 } else {
-                    manager
-                        .inner
-                        .metrics
-                        .dials_suppressed
+                    deps.metrics
+                        .packets_dropped_blocked
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Decision::Hold
-            } else {
-                if matches!(*state, SessionState::Blocked { .. }) {
-                    *state = SessionState::Idle;
-                }
-                match *state {
-                    SessionState::Rejected {
-                        generation,
-                        retry_after,
-                        ..
-                    } => {
-                        if generation != gate_gen || Instant::now() >= retry_after {
-                            if session.queue.lock().packets.is_empty() {
-                                Decision::Hold
-                            } else {
-                                Decision::Dial
-                            }
-                        } else {
-                            manager
-                                .inner
-                                .metrics
-                                .dials_suppressed
-                                .fetch_add(1, Ordering::Relaxed);
-                            Decision::Wait(retry_after)
-                        }
+            }
+            if let Some(conn) = data
+                .conn
+                .as_ref()
+                .filter(|c| c.conn.close_reason().is_some())
+            {
+                let failure = conn.conn.close_reason().map(|e| {
+                    if is_auth_close_error(&e) {
+                        DialFailure::RemoteRejected
+                    } else {
+                        DialFailure::Transient
                     }
-                    SessionState::Backoff { until, .. } => {
-                        if Instant::now() >= until {
-                            if session.queue.lock().packets.is_empty() {
-                                Decision::Hold
-                            } else {
-                                Decision::Dial
-                            }
-                        } else {
-                            manager
-                                .inner
-                                .metrics
-                                .dials_suppressed
-                                .fetch_add(1, Ordering::Relaxed);
-                            Decision::Wait(until)
-                        }
-                    }
-                    SessionState::Connecting => Decision::Hold,
-                    _ => {
-                        if session.queue.lock().packets.is_empty() {
-                            Decision::Hold
-                        } else {
-                            Decision::Dial
-                        }
-                    }
+                });
+                data.close(0, b"closed");
+                if let Some(f) = failure {
+                    data.retry.failed(f, deps.auth.generation(), Instant::now());
                 }
             }
+            if data.conn.is_some()
+                && !deps.keep_alive.load(Ordering::Relaxed)
+                && !deps.keep_alive_peers.contains_key(&peer)
+                && data.queue.is_empty()
+                && data.last_activity.elapsed()
+                    >= Duration::from_secs(crate::iroh_pool::DEFAULT_IDLE_SECS)
+            {
+                data.close(0, b"idle");
+            }
+            data.conn.clone()
         };
-        match decision {
-            Decision::Hold => {
-                session.notify.notified().await;
+        if reader.as_ref().map(|(token, _)| *token) != installed.as_ref().map(|c| c.token) {
+            stop_reader(&mut reader).await;
+            if let Some(conn) = &installed {
+                let ctl = SessionCtl {
+                    peer,
+                    generation: deps.generation,
+                    cancel: conn.cancel.clone(),
+                };
+                reader = Some((conn.token, (deps.hook)(peer, conn.conn.clone(), ctl)));
             }
-            Decision::Wait(until) => {
-                tokio::select! {
-                    _ = session.notify.notified() => {}
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {}
+        }
+        if let Some(installed) = installed {
+            if reader
+                .as_ref()
+                .is_some_and(|(_, handle)| handle.is_finished())
+            {
+                stop_reader(&mut reader).await;
+                let mut data = session.data.lock();
+                if data
+                    .conn
+                    .as_ref()
+                    .is_some_and(|c| c.token == installed.token)
+                {
+                    data.close(0, b"receiver_ended");
+                    data.retry.failed(
+                        DialFailure::Transient,
+                        deps.auth.generation(),
+                        Instant::now(),
+                    );
                 }
+                continue;
             }
-            Decision::Dial => {
-                *session.state.lock() = SessionState::Connecting;
-                let rejected_ctx = match *session.state.lock() {
-                    SessionState::Rejected {
-                        generation, first, ..
-                    } => Some((generation, first)),
-                    _ => None,
-                };
-                let backoff_step = match *session.state.lock() {
-                    SessionState::Backoff { step, .. } => step,
-                    _ => 0,
-                };
-                match manager.dial_once(peer).await {
-                    Ok(conn) => {
-                        if !manager.gate_allows(&format!("{peer}")) {
-                            conn.close(1u32.into(), b"not_authorized");
-                            let dropped = session.queue.lock().drop_all();
-                            manager
-                                .inner
-                                .metrics
+            let progress = {
+                let _authorization = gate.read();
+                let mut data = session.data.lock();
+                let mut accepted = 0;
+                let mut bytes = 0;
+                if data
+                    .conn
+                    .as_ref()
+                    .is_some_and(|c| c.token == installed.token)
+                {
+                    for _ in 0..SEND_BATCH_MAX {
+                        let Some(front) = data.queue.front() else {
+                            break;
+                        };
+                        if !deps.packet_allowed(peer, &peer_hex, front) {
+                            data.pop();
+                            deps.metrics
                                 .packets_dropped_blocked
-                                .fetch_add(dropped as u64, Ordering::Relaxed);
-                            *session.state.lock() = SessionState::Blocked {
-                                generation: manager.gate_generation(),
-                            };
+                                .fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        manager.install(peer, conn, true);
+                        let Some(maximum) = installed.conn.max_datagram_size() else {
+                            break;
+                        };
+                        let mut packet = data.pop().expect("queued packet");
+                        if packet.bytes.len() > maximum {
+                            deps.metrics
+                                .oversize_packets
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        use crate::forward::mtu::{PreparedDatagram, prepare_datagram};
+                        match prepare_datagram(packet.bytes, maximum) {
+                            PreparedDatagram::Ready(bytes) => packet.bytes = bytes,
+                            PreparedDatagram::Fragments(fragments) => {
+                                let bytes: usize = fragments.iter().map(Bytes::len).sum();
+                                if data.queue.len() + fragments.len() <= MAX_QUEUE_PACKETS
+                                    && data.queue_bytes + bytes <= MAX_QUEUE_BYTES
+                                {
+                                    for bytes in fragments.into_iter().rev() {
+                                        data.queue_bytes += bytes.len();
+                                        data.next_packet_id = data
+                                            .next_packet_id
+                                            .checked_add(1)
+                                            .expect("packet identity exhausted");
+                                        let id = data.next_packet_id;
+                                        data.queue.push_front(QueuedPacket {
+                                            id,
+                                            bytes,
+                                            network: packet.network,
+                                            epoch: packet.epoch,
+                                            posture: packet.posture.clone(),
+                                            proof: packet.proof,
+                                            enqueued_at: packet.enqueued_at,
+                                        });
+                                    }
+                                } else {
+                                    deps.metrics
+                                        .packets_dropped_transport
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                continue;
+                            }
+                            PreparedDatagram::Feedback(reply) => {
+                                if !(deps.feedback)(reply) {
+                                    deps.metrics
+                                        .pmtu_feedback_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                deps.metrics
+                                    .packets_dropped_transport
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            PreparedDatagram::Drop => {
+                                deps.metrics
+                                    .packets_dropped_transport
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        }
+                        let size = packet.bytes.len();
+                        let sent = matches!(
+                            installed
+                                .conn
+                                .send_datagram_wait(packet.bytes.clone())
+                                .now_or_never(),
+                            Some(Ok(()))
+                        );
+                        if !sent {
+                            data.queue_bytes += size;
+                            data.queue.push_front(packet);
+                            break;
+                        }
+                        accepted += 1;
+                        bytes += size as u64;
                     }
-                    Err((DialFailure::LocalDenied, _)) => {
-                        let dropped = session.queue.lock().drop_all();
-                        manager
-                            .inner
-                            .metrics
-                            .packets_dropped_blocked
-                            .fetch_add(dropped as u64, Ordering::Relaxed);
-                        manager
-                            .inner
-                            .metrics
-                            .reconnect_fail
-                            .fetch_add(1, Ordering::Relaxed);
-                        *session.state.lock() = SessionState::Blocked {
-                            generation: manager.gate_generation(),
-                        };
-                    }
-                    Err((DialFailure::RemoteRejected, _)) => {
-                        manager
-                            .inner
-                            .metrics
-                            .reconnect_fail
-                            .fetch_add(1, Ordering::Relaxed);
-                        let now = Instant::now();
-                        let generation = manager.gate_generation();
-                        let (first, _continuing) = match rejected_ctx {
-                            Some((g, first)) if g == generation => (first, true),
-                            _ => (now, false),
-                        };
-                        let delay = remote_retry_delay(now.saturating_duration_since(first));
-                        *session.state.lock() = SessionState::Rejected {
-                            generation,
-                            first,
-                            retry_after: now + delay,
-                        };
-                    }
-                    Err((DialFailure::Transient, _)) => {
-                        manager
-                            .inner
-                            .metrics
-                            .reconnect_fail
-                            .fetch_add(1, Ordering::Relaxed);
-                        let wait = backoff_delay(backoff_step);
-                        *session.state.lock() = SessionState::Backoff {
-                            until: Instant::now() + wait,
-                            step: backoff_step.saturating_add(1),
-                        };
+                    if accepted != 0 {
+                        deps.accepted(&session, &installed.conn, accepted, bytes);
+                        data.last_activity = Instant::now();
                     }
                 }
+                accepted
+            };
+            if progress != 0 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let pending = session
+                .data
+                .lock()
+                .queue
+                .front()
+                .map(|p| (p.id, p.bytes.clone()));
+            let pending_identity = pending.as_ref().map(|(id, _)| *id);
+            enum Submission {
+                Accepted,
+                Denied,
+                Failed,
+                Resize,
+            }
+            enum Event {
+                Wake,
+                Closed,
+                Receiver,
+                Submitted(Submission),
+                Tick,
+                Cancel,
+            }
+            let event = if let Some((packet_id, packet)) = pending {
+                let send = installed.conn.send_datagram_wait(packet.clone());
+                tokio::pin!(send);
+                tokio::select! {
+                    biased;
+                    _ = deps.cancel.cancelled() => Event::Cancel,
+                    _ = installed.cancel.cancelled() => Event::Wake,
+                    _ = installed.conn.closed() => Event::Closed,
+                    _ = async { if let Some((_, h)) = reader.as_mut() { let _ = h.await; } else { std::future::pending::<()>().await; } } => Event::Receiver,
+                    _ = session.notify.notified() => Event::Wake,
+                    result = std::future::poll_fn(|cx| {
+                        let _authorization = gate.read(); let data = session.data.lock();
+                        let valid = data.conn.as_ref().is_some_and(|c| c.token == installed.token) && data.queue.front().is_some_and(|p| p.id == packet_id && deps.packet_allowed(peer, &peer_hex, p));
+                        if !valid || deps.cancel.is_cancelled() { return std::task::Poll::Ready(Submission::Denied); }
+                        match std::future::Future::poll(send.as_mut(), cx) {
+                            std::task::Poll::Ready(Ok(())) => {
+                                deps.accepted(&session, &installed.conn, 1, packet.len() as u64);
+                                std::task::Poll::Ready(Submission::Accepted)
+                            }
+                            std::task::Poll::Ready(Err(iroh::endpoint::SendDatagramError::TooLarge)) => std::task::Poll::Ready(Submission::Resize),
+                            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Submission::Failed),
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    }) => Event::Submitted(result),
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => Event::Tick,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = deps.cancel.cancelled() => Event::Cancel,
+                    _ = installed.cancel.cancelled() => Event::Wake,
+                    _ = installed.conn.closed() => Event::Closed,
+                    _ = async { if let Some((_, h)) = reader.as_mut() { let _ = h.await; } else { std::future::pending::<()>().await; } } => Event::Receiver,
+                    _ = session.notify.notified() => Event::Wake,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => Event::Tick,
+                }
+            };
+            match event {
+                Event::Cancel => break,
+                Event::Receiver => {
+                    reader.take();
+                    let mut data = session.data.lock();
+                    if data
+                        .conn
+                        .as_ref()
+                        .is_some_and(|c| c.token == installed.token)
+                    {
+                        data.close(0, b"receiver_ended");
+                        data.retry.failed(
+                            DialFailure::Transient,
+                            deps.auth.generation(),
+                            Instant::now(),
+                        );
+                    }
+                }
+                Event::Submitted(Submission::Resize) => {}
+                Event::Submitted(submission) => {
+                    let mut data = session.data.lock();
+                    if data
+                        .conn
+                        .as_ref()
+                        .is_some_and(|c| c.token == installed.token)
+                        && data
+                            .queue
+                            .front()
+                            .is_some_and(|p| Some(p.id) == pending_identity)
+                        && data.pop().is_some()
+                    {
+                        match submission {
+                            Submission::Accepted => data.last_activity = Instant::now(),
+                            Submission::Denied => {
+                                deps.metrics
+                                    .packets_dropped_blocked
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Submission::Failed => {
+                                deps.metrics
+                                    .packets_dropped_transport
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            Submission::Resize => unreachable!(),
+                        }
+                    }
+                }
+                Event::Wake | Event::Closed | Event::Tick => {}
+            }
+            tokio::task::consume_budget().await;
+            continue;
+        }
+        let decision = {
+            let _authorization = gate.read();
+            let mut data = session.data.lock();
+            if data
+                .retry
+                .blocked
+                .is_some_and(|g| g != deps.auth.generation())
+                || data
+                    .retry
+                    .rejected
+                    .is_some_and(|(g, _)| g != deps.auth.generation())
+            {
+                data.retry = Retry::default();
+            }
+            let now = Instant::now();
+            if data.queue.is_empty() && data.last_activity.elapsed() >= QUEUE_TTL {
+                None
+            } else if !data.queue.is_empty()
+                && data.retry.blocked.is_none()
+                && data.retry.until.is_none_or(|until| until <= now)
+            {
+                data.connecting = true;
+                Some((true, data.token, now))
+            } else {
+                Some((
+                    false,
+                    data.token,
+                    data.retry
+                        .until
+                        .filter(|until| *until > now)
+                        .unwrap_or(now + Duration::from_secs(1)),
+                ))
+            }
+        };
+        let Some((dial, token, until)) = decision else {
+            let Some(manager) = deps.manager.upgrade() else {
+                break;
+            };
+            if (PeerManager { inner: manager }).retire_idle(&session, deps.generation) {
+                retired = true;
+                break;
+            }
+            continue;
+        };
+        if !dial {
+            tokio::select! { _ = deps.cancel.cancelled() => break, _ = session.notify.notified() => {}, _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => {} }
+            continue;
+        }
+        deps.metrics
+            .reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let dial = tokio::time::timeout(RECONNECT_TIMEOUT, deps.endpoint.connect(peer, deps.alpn));
+        tokio::pin!(dial);
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = deps.cancel.cancelled() => break None,
+                _ = session.notify.notified() => {
+                    let data = session.data.lock();
+                    if data.token != token || data.conn.is_some() {
+                        break None;
+                    }
+                }
+                result = &mut dial => break Some(result),
+            }
+        };
+        let Some(result) = result else {
+            continue;
+        };
+        match result {
+            Ok(Ok(conn)) => {
+                if let Some(manager) = deps.manager.upgrade() {
+                    if (PeerManager { inner: manager }).install(peer, conn, true) {
+                        let latency = started.elapsed().as_micros() as u64;
+                        deps.metrics
+                            .reconnect_success
+                            .fetch_add(1, Ordering::Relaxed);
+                        deps.metrics
+                            .reconnect_latency_sum_us
+                            .fetch_add(latency, Ordering::Relaxed);
+                        deps.metrics
+                            .reconnect_latency_max_us
+                            .fetch_max(latency, Ordering::Relaxed);
+                    }
+                } else {
+                    conn.close(0u32.into(), b"owner_gone");
+                    break;
+                }
+            }
+            failure => {
+                let _authorization = gate.read();
+                let mut data = session.data.lock();
+                if data.token != token || data.conn.is_some() {
+                    continue;
+                }
+                let kind = match failure {
+                    Ok(Err(e)) => classify_connect_error(&e),
+                    Err(_) => DialFailure::Transient,
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                data.connecting = false;
+                data.retry
+                    .failed(kind, deps.auth.generation(), Instant::now());
+                deps.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
-    if session.token.load(Ordering::Acquire) == token {
-        session.sender_running.store(false, Ordering::Release);
-        if manager.active_gen() == Some(generation) && !session.queue.lock().packets.is_empty() {
-            manager.ensure_sender(&session);
+    stop_reader(&mut reader).await;
+    if retired {
+        return;
+    }
+    if let Some(manager) = deps.manager.upgrade() {
+        let lifecycle = manager.lifecycle.lock();
+        let mut data = session.data.lock();
+        data.worker_running = false;
+        data.close(0, b"session_ended");
+        let remove = data.queue.is_empty() || deps.cancel.is_cancelled();
+        drop(data);
+        if remove {
+            manager
+                .sessions
+                .remove_if(&peer, |_, entry| Arc::ptr_eq(entry, &session));
+        } else if let Some(active) = lifecycle.active.as_ref() {
+            PeerManager {
+                inner: manager.clone(),
+            }
+            .start_worker(&session, active, deps.auth.clone());
         }
     }
-}
-
-fn classify_dead_conn(
-    manager: &PeerManager,
-    session: &Arc<PeerSession>,
-    dead: &Connection,
-    peer: EndpointId,
-) {
-    let generation = manager.gate_generation();
-    if matches!(*session.state.lock(), SessionState::Rejected { generation: g, .. } if g == generation)
-    {
-        return;
-    }
-    let Some(reason) = dead.close_reason() else {
-        *session.state.lock() = SessionState::Idle;
-        return;
-    };
-    if !is_auth_close_error(&reason) {
-        *session.state.lock() = SessionState::Idle;
-        return;
-    }
-    let now = Instant::now();
-    *session.state.lock() = SessionState::Rejected {
-        generation,
-        first: now,
-        retry_after: now + remote_retry_delay(Duration::ZERO),
-    };
-    let _ = peer;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::rstest;
+    use crate::forward::{SelfIdentity, frame};
+    use crate::routing::RoutingTable;
+    use iroh::address_lookup::memory::MemoryLookup;
+    use std::sync::atomic::AtomicUsize;
+    use tunnet_common::policy::PolicyBundle;
 
-    #[test]
-    fn queue_admission_enforces_packet_and_byte_limits() {
-        let mut q = SessionQueue {
-            packets: VecDeque::new(),
-            bytes: 0,
-        };
-        for _ in 0..MAX_QUEUE_PACKETS {
-            assert!(q.push(Bytes::from_static(b"x")));
-        }
-        assert!(!q.push(Bytes::from_static(b"overflow")));
+    const ALPN: &[u8] = b"tunnet/session-test";
 
-        let mut q = SessionQueue {
-            packets: VecDeque::new(),
-            bytes: 0,
-        };
-        assert!(q.push(Bytes::from(vec![0u8; MAX_QUEUE_BYTES])));
-        assert!(!q.push(Bytes::from_static(b"overflow")));
+    fn configure(manager: &PeerManager, peer: EndpointId) -> (ForwardingStore, RoutingTable) {
+        configure_at(manager, peer, "100.64.0.1", "100.64.0.2")
     }
 
-    #[test]
-    fn queue_ttl_expiry_drops_stale_packets() {
-        let mut q = SessionQueue {
-            packets: VecDeque::new(),
-            bytes: 0,
-        };
-        q.packets.push_back(QueuedPacket {
-            bytes: Bytes::from_static(b"stale"),
-            enqueued_at: Instant::now() - QUEUE_TTL - Duration::from_secs(1),
-        });
-        q.bytes = 5;
-        q.packets.push_back(QueuedPacket {
-            bytes: Bytes::from_static(b"fresh"),
-            enqueued_at: Instant::now(),
-        });
-        q.bytes += 5;
-        let (due, expired) = q.pop_due(Instant::now());
-        assert_eq!(expired, 1);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0], Bytes::from_static(b"fresh"));
-        assert_eq!(q.bytes, 0);
-    }
-
-    #[rstest]
-    #[case(false, true, true)]
-    #[case(true, false, false)]
-    #[case(true, true, false)]
-    #[case(false, false, false)]
-    fn tie_break_prefers_canonical_initiator_side(
-        #[case] existing_by_us: bool,
-        #[case] incoming_by_us: bool,
-        #[case] want_switch: bool,
-    ) {
-        let a = iroh::SecretKey::generate().public();
-        let b = iroh::SecretKey::generate().public();
-        let (low, high) = if a < b { (a, b) } else { (b, a) };
-        assert_eq!(
-            prefer_incoming(low, high, existing_by_us, incoming_by_us),
-            want_switch
+    fn configure_at(
+        manager: &PeerManager,
+        peer: EndpointId,
+        local_ip: &str,
+        peer_ip: &str,
+    ) -> (ForwardingStore, RoutingTable) {
+        let routes = RoutingTable::new();
+        routes.replace(
+            &[tunnet_common::PeerEntry {
+                ip: peer_ip.parse().unwrap(),
+                endpoint_id: peer.to_string(),
+                hostname: "peer".into(),
+                tags: vec![],
+                ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
+            }],
+            &[],
+            &[],
+            &[],
+            &tunnet_common::DeviceProfile::default(),
+            &tunnet_common::DnsConfig::default(),
+            "test",
+            uuid::Uuid::nil(),
+            &manager.inner.endpoint.id().to_string(),
+            1,
         );
-        assert_eq!(
-            prefer_incoming(high, low, incoming_by_us, existing_by_us),
-            want_switch
+        let forwarding = ForwardingStore::new();
+        forwarding.set_managed_bundle(
+            &routes,
+            uuid::Uuid::nil(),
+            PolicyBundle::default(),
+            SelfIdentity {
+                endpoint_hex: manager.inner.endpoint.id().to_string(),
+                ip: local_ip.parse().unwrap(),
+                tags: vec![],
+                network: "test".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
+            },
         );
+        manager.set_transport_auth(TransportAuth::managed_with_gate(
+            &routes,
+            forwarding.authorization_gate(),
+        ));
+        manager.set_forwarding(forwarding.clone());
+        (forwarding, routes)
     }
 
-    #[rstest]
-    #[case(0)]
-    #[case(3)]
-    #[case(11)]
-    fn backoff_delay_stays_bounded(#[case] step: u32) {
-        assert!(backoff_delay(step) <= BACKOFF_CAP);
+    async fn endpoints() -> (Endpoint, Endpoint) {
+        endpoints_with_config(iroh::endpoint::QuicTransportConfig::default()).await
     }
 
-    #[test]
-    fn backoff_delay_grows_with_step() {
-        assert!(backoff_delay(8) > backoff_delay(0));
-    }
-
-    #[test]
-    fn remote_retry_delay_is_bounded_and_grows() {
-        let fresh = remote_retry_delay(Duration::ZERO);
-        assert!(fresh >= Duration::from_secs(5));
-        let aged = remote_retry_delay(Duration::from_secs(3600));
-        assert!(aged <= REMOTE_RETRY_CAP);
-        assert!(aged > fresh);
-    }
-
-    async fn bind_endpoint() -> Endpoint {
-        Endpoint::builder(iroh::endpoint::presets::N0)
-            .bind()
-            .await
-            .expect("bind test endpoint")
-    }
-
-    fn active_manager(ep: Endpoint) -> PeerManager {
-        let manager = PeerManager::new(ep, b"test/tunnel");
-        manager.activate(1, CancellationToken::new());
-        manager
-    }
-
-    #[tokio::test]
-    async fn install_before_activation_is_rejected() {
-        const ALPN: &[u8] = b"test/inactive-install";
-        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
+    async fn endpoints_with_config(
+        config: iroh::endpoint::QuicTransportConfig,
+    ) -> (Endpoint, Endpoint) {
+        let lookup = MemoryLookup::new();
+        let a = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .transport_config(config)
+            .address_lookup(lookup.clone())
             .alpns(vec![ALPN.to_vec()])
             .bind()
             .await
-            .expect("bind server");
-        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .unwrap();
+        let b = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .address_lookup(lookup.clone())
+            .alpns(vec![ALPN.to_vec()])
             .bind()
             .await
-            .expect("bind client");
-        let accept = tokio::spawn({
-            let server = server.clone();
-            async move {
-                while let Some(incoming) = server.accept().await {
-                    tokio::spawn(async move {
-                        let _ = incoming.await;
-                    });
-                }
+            .unwrap();
+        lookup.add_endpoint_info(a.addr());
+        lookup.add_endpoint_info(b.addr());
+        (a, b)
+    }
+
+    async fn connection(a: &Endpoint, b: &Endpoint) -> (Connection, Connection) {
+        let (outgoing, incoming) = tokio::join!(a.connect(b.id(), ALPN), async {
+            b.accept().await.unwrap().await.unwrap()
+        });
+        (outgoing.unwrap(), incoming)
+    }
+
+    async fn wait_for(check: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !check() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn receiver_replacement_recovery_and_shutdown(#[case] shutdown_first: bool) {
+        let (a, b) = endpoints().await;
+        let manager = PeerManager::new(a.clone(), ALPN);
+        configure(&manager, b.id());
+        let readers = Arc::new(AtomicUsize::new(0));
+        let end_reader = Arc::new(AtomicBool::new(false));
+        let hook: RecvHook = Arc::new({
+            let readers = readers.clone();
+            let end_reader = end_reader.clone();
+            move |_, _, ctl| {
+                let readers = readers.clone();
+                let end_reader = end_reader.clone();
+                tokio::spawn(async move {
+                    struct Reader(Arc<AtomicUsize>);
+                    impl Drop for Reader {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    readers.fetch_add(1, Ordering::SeqCst);
+                    let _reader = Reader(readers);
+                    loop {
+                        if end_reader.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::select! { _ = ctl.cancel.cancelled() => return, _ = tokio::time::sleep(Duration::from_millis(10)) => {} }
+                    }
+                })
             }
         });
-        let conn = client.connect(server.addr(), ALPN).await.expect("connect");
-        let peer = server.id();
-        let ep = bind_endpoint().await;
-        let manager = PeerManager::new(ep, ALPN);
+        manager
+            .activate(
+                1,
+                CancellationToken::new(),
+                hook.clone(),
+                Arc::new(|_| true),
+            )
+            .unwrap();
+        let preferred = a.id() < b.id();
+        let (first, _remote_first) = connection(&a, &b).await;
+        assert!(manager.install(b.id(), first.clone(), !preferred));
+        wait_for(|| readers.load(Ordering::SeqCst) == 1).await;
+        let (second, remote_second) = connection(&a, &b).await;
+        assert!(manager.install(b.id(), second.clone(), preferred));
+        tokio::time::timeout(Duration::from_secs(5), first.closed())
+            .await
+            .unwrap();
+        wait_for(|| readers.load(Ordering::SeqCst) == 1 && manager.has_live(b.id())).await;
+        let packet = frame(uuid::Uuid::nil(), b"replacement-packet");
+        assert_eq!(manager.send(b.id(), packet.clone()), SendOutcome::Admitted);
         assert_eq!(
-            manager.send(peer, Bytes::from_static(b"p")),
-            SendOutcome::Closed
+            tokio::time::timeout(Duration::from_secs(5), remote_second.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
         );
-        assert!(!manager.install(peer, conn, false));
-        accept.abort();
+
+        end_reader.store(true, Ordering::SeqCst);
+        wait_for(|| !manager.has_live(b.id()) && readers.load(Ordering::SeqCst) == 0).await;
+        end_reader.store(false, Ordering::SeqCst);
+        let packet = frame(uuid::Uuid::nil(), b"recovered-packet");
+        assert_eq!(manager.send(b.id(), packet.clone()), SendOutcome::Admitted);
+        let recovered_remote = tokio::time::timeout(Duration::from_secs(5), async {
+            b.accept().await.unwrap().await.unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), recovered_remote.read_datagram())
+                .await
+                .unwrap()
+                .unwrap(),
+            packet
+        );
+        assert!(manager.session_stats().reconnect_success > 0);
+        let (racing, _remote_racing) = connection(&a, &b).await;
+        let install = async {
+            if shutdown_first {
+                tokio::task::yield_now().await;
+            }
+            manager.install(b.id(), racing, preferred)
+        };
+        let shutdown = async {
+            if !shutdown_first {
+                tokio::task::yield_now().await;
+            }
+            manager.deactivate().await;
+        };
+        tokio::join!(install, shutdown);
+        assert!(!manager.has_live(b.id()));
+        assert!(manager.inner.sessions.is_empty());
+        assert_eq!(readers.load(Ordering::SeqCst), 0);
+        manager
+            .activate(2, CancellationToken::new(), hook, Arc::new(|_| true))
+            .unwrap();
+        let (restarted, _remote_restarted) = connection(&a, &b).await;
+        assert!(manager.install(b.id(), restarted, preferred));
+        wait_for(|| readers.load(Ordering::SeqCst) == 1).await;
+        manager.deactivate().await;
+        a.close().await;
+        b.close().await;
     }
 
     #[tokio::test]
-    async fn blocked_peer_denies_without_dial() {
-        use crate::routing::RoutingTable;
-        let ep = bind_endpoint().await;
-        let manager = active_manager(ep);
-        let routes = RoutingTable::new();
-        manager.set_transport_auth(TransportAuth::managed(&routes));
-        let peer = iroh::SecretKey::generate().public();
-        for _ in 0..8 {
-            assert_eq!(
-                manager.send(peer, Bytes::from_static(b"p")),
-                SendOutcome::Denied
-            );
-        }
-        assert_eq!(manager.session_stats().reconnect_attempts, 0);
-        assert!(manager.session_stats().dials_suppressed > 0);
+    async fn congested_transport_preserves_admitted_packets() {
+        let (a, b) = endpoints_with_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .datagram_send_buffer_size(512)
+                .build(),
+        )
+        .await;
+        let manager = PeerManager::new(a.clone(), ALPN);
+        configure(&manager, b.id());
+        manager
+            .activate(
+                1,
+                CancellationToken::new(),
+                Arc::new(|_, _, ctl| tokio::spawn(async move { ctl.cancel.cancelled().await })),
+                Arc::new(|_| true),
+            )
+            .unwrap();
+        let (outgoing, incoming) = connection(&a, &b).await;
+        assert!(manager.install(b.id(), outgoing, true));
+        let expected: Vec<_> = (0..7)
+            .map(|id| frame(uuid::Uuid::nil(), &[id; 46]))
+            .collect();
+        assert_eq!(
+            manager.send_batch(b.id(), expected[..3].to_vec()).admitted,
+            3
+        );
+        assert_eq!(
+            manager.send_batch(b.id(), expected[3..].to_vec()).admitted,
+            4
+        );
+        let mut received = Vec::new();
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            for _ in 0..expected.len() {
+                received.push(incoming.read_datagram().await.unwrap());
+            }
+        })
+        .await;
+        manager.deactivate().await;
+        a.close().await;
+        b.close().await;
+        assert!(result.is_ok(), "received {} of 7 packets", received.len());
+        received.sort();
+        assert_eq!(received, expected);
     }
 
     #[tokio::test]
-    async fn revoke_peer_drops_queue_and_blocks() {
-        let ep = bind_endpoint().await;
-        let manager = active_manager(ep);
-        let peer = iroh::SecretKey::generate().public();
+    async fn bounded_queue_is_cleared_on_authorization_revocation() {
+        let (a, b) = endpoints().await;
+        let manager = PeerManager::new(a.clone(), ALPN);
+        let (forwarding, routes) = configure(&manager, b.id());
+        manager
+            .activate(
+                1,
+                CancellationToken::new(),
+                Arc::new(|_, _, ctl| tokio::spawn(async move { ctl.cancel.cancelled().await })),
+                Arc::new(|_| true),
+            )
+            .unwrap();
+        let packet = frame(uuid::Uuid::nil(), &[1; 100]);
+        let outcome = manager.send_batch(b.id(), vec![packet; MAX_QUEUE_PACKETS + 1]);
+        assert_eq!(outcome.admitted, MAX_QUEUE_PACKETS);
+        assert_eq!(outcome.queue_full, 1);
+        assert_eq!(manager.session_stats().queue_packets, MAX_QUEUE_PACKETS);
+        forwarding.clear_managed(&routes, uuid::Uuid::nil());
+        manager.reconcile().await;
+        assert_eq!(manager.session_stats().queue_packets, 0);
         assert_eq!(
-            manager.send(peer, Bytes::from_static(b"one")),
-            SendOutcome::Admitted
-        );
-        manager.revoke_peer(peer).await;
-        assert_eq!(
-            manager.send(peer, Bytes::from_static(b"two")),
+            manager.send(b.id(), frame(uuid::Uuid::nil(), b"revoked")),
             SendOutcome::Denied
         );
-        let snap = manager.peer_snapshot(peer);
-        assert_eq!(snap.state, "blocked");
+        manager.deactivate().await;
+        assert!(manager.inner.sessions.is_empty());
+        a.close().await;
+        b.close().await;
     }
 
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn stale_recv_finish_keeps_newer_reader() {
-        let ep = bind_endpoint().await;
-        let manager = active_manager(ep);
-        let peer = iroh::SecretKey::generate().public();
-        let session = manager.session(peer);
-        let h1 = tokio::spawn(async {});
-        let h2 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(30)).await });
-        *session.recv_handle.lock() = Some(h1);
-        let token = session.token.load(Ordering::Acquire);
-        *session.recv_handle.lock() = Some(h2);
-        manager.recv_finished(peer, token, 1);
-        assert!(session.recv_handle.lock().is_some());
-        if let Some(h) = session.recv_handle.lock().take() {
-            h.abort();
-        }
-    }
-
-    #[tokio::test]
-    async fn session_roundtrip_over_real_quic() {
-        use iroh::address_lookup::memory::MemoryLookup;
-        const ALPN: &[u8] = b"test/tunnel-rt";
-        let disco = MemoryLookup::new();
-        let endpoint_a = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .address_lookup(disco.clone())
-            .bind()
-            .await
-            .expect("bind A");
-        let endpoint_b = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .address_lookup(disco.clone())
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await
-            .expect("bind B");
-        disco.add_endpoint_info(endpoint_a.addr());
-        disco.add_endpoint_info(endpoint_b.addr());
-        let id_b = endpoint_b.id();
-        let (got_tx, mut got_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        let accept = tokio::spawn({
-            let endpoint_b = endpoint_b.clone();
-            async move {
-                while let Some(incoming) = endpoint_b.accept().await {
-                    let tx = got_tx.clone();
-                    tokio::spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            let mut batch: [Bytes; 8] = std::array::from_fn(|_| Bytes::new());
-                            while let Ok(n) = conn.read_many_datagrams(&mut batch).await {
-                                for dg in &batch[..n] {
-                                    let _ = tx.send(dg.to_vec()).await;
-                                }
-                                batch[n..].fill(Bytes::new());
-                            }
+    async fn queued_packet_uses_installed_connection_mtu(#[case] df: bool) {
+        let (a, b) = endpoints_with_config(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .initial_mtu(1200)
+                .mtu_discovery_config(None)
+                .build(),
+        )
+        .await;
+        let manager = PeerManager::new(a.clone(), ALPN);
+        configure(&manager, b.id());
+        let (outgoing, incoming) = connection(&a, &b).await;
+        let maximum = outgoing.max_datagram_size().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        manager
+            .activate(
+                1,
+                CancellationToken::new(),
+                Arc::new(|_, _, ctl| tokio::spawn(async move { ctl.cancel.cancelled().await })),
+                Arc::new(move |packet| tx.try_send(packet).is_ok()),
+            )
+            .unwrap();
+        let mut ip = etherparse::Ipv4Header::new(
+            1260,
+            64,
+            etherparse::IpNumber::UDP,
+            [100, 64, 0, 1],
+            [100, 64, 0, 2],
+        )
+        .unwrap();
+        ip.dont_fragment = df;
+        let mut raw = Vec::new();
+        etherparse::PacketBuilder::ip(etherparse::IpHeaders::Ipv4(ip, Default::default()))
+            .udp(1234, 5678)
+            .write(&mut raw, &[42; 1252])
+            .unwrap();
+        assert_eq!(
+            manager.send(b.id(), frame(uuid::Uuid::nil(), &raw)),
+            SendOutcome::Admitted
+        );
+        assert!(manager.install(b.id(), outgoing, true));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            if df {
+                let reply = rx.recv().await.unwrap();
+                let (_, rest) = etherparse::Ipv4Header::from_slice(&reply).unwrap();
+                let (icmp, quoted) = etherparse::Icmpv4Header::from_slice(rest).unwrap();
+                assert_eq!(
+                    icmp.icmp_type,
+                    etherparse::Icmpv4Type::DestinationUnreachable(
+                        etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded {
+                            next_hop_mtu: (maximum - crate::forward::FRAME_OVERHEAD) as u16
                         }
-                    });
+                    )
+                );
+                assert_eq!(quoted, &raw[..28]);
+            } else {
+                let mut payload = vec![0; raw.len() - 20];
+                let mut received = 0;
+                while received < payload.len() {
+                    let datagram = incoming.read_datagram().await.unwrap();
+                    assert!(datagram.len() <= maximum);
+                    let (network, fragment) = unframe(&datagram).unwrap();
+                    assert_eq!(network, uuid::Uuid::nil());
+                    let (header, bytes) = etherparse::Ipv4Header::from_slice(fragment).unwrap();
+                    let offset = usize::from(header.fragment_offset.value()) * 8;
+                    payload[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    received += bytes.len();
                 }
+                assert_eq!(payload, raw[20..]);
             }
-        });
+        })
+        .await
+        .unwrap();
+        manager.deactivate().await;
+        a.close().await;
+        b.close().await;
+    }
 
-        let manager = PeerManager::new(endpoint_a.clone(), ALPN);
-        manager.activate(7, CancellationToken::new());
-        manager.set_recv_hook(Arc::new(|_, _, _| tokio::spawn(async {})));
-        for i in 0..5u8 {
-            assert_eq!(
-                manager.send(id_b, Bytes::from(vec![i; 64])),
-                SendOutcome::Admitted
+    #[test]
+    fn retry_history_survives_attempts_and_rejections() {
+        let mut retry = Retry::default();
+        let now = Instant::now();
+        for step in 0..6 {
+            retry.failed(DialFailure::Transient, 7, now);
+            let delay = retry.until.unwrap().duration_since(now);
+            let max = BACKOFF_BASE * (1 << step);
+            assert!(delay >= max / 2 && delay <= max);
+            assert_eq!(retry.step, step + 1);
+        }
+        retry.failed(DialFailure::RemoteRejected, 7, now);
+        retry.failed(
+            DialFailure::RemoteRejected,
+            7,
+            now + Duration::from_secs(30),
+        );
+        assert_eq!(retry.rejected, Some((7, now)));
+        assert!(retry.until.unwrap() > now + Duration::from_secs(60));
+        retry.failed(
+            DialFailure::RemoteRejected,
+            8,
+            now + Duration::from_secs(31),
+        );
+        assert_eq!(retry.rejected, Some((8, now + Duration::from_secs(31))));
+    }
+
+    #[tokio::test]
+    async fn incoming_connection_wins_over_pending_idle_retirement() {
+        let (a, b) = endpoints().await;
+        let (conn, remote) = connection(&a, &b).await;
+        let manager = PeerManager::new(a.clone(), ALPN);
+        configure(&manager, b.id());
+        manager
+            .activate(
+                1,
+                CancellationToken::new(),
+                Arc::new(|_, _, ctl| tokio::spawn(async move { ctl.cancel.cancelled().await })),
+                Arc::new(|_| true),
+            )
+            .unwrap();
+        let old = Arc::new(PeerSession::new(b.id()));
+        {
+            let mut data = old.data.lock();
+            data.worker_running = true;
+            data.last_activity = Instant::now() - QUEUE_TTL;
+        }
+        manager.inner.sessions.insert(b.id(), old.clone());
+        assert!(manager.install(b.id(), conn, true));
+        let token = old.data.lock().token;
+        assert!(!manager.retire_idle(&old, 1));
+        assert_eq!(old.data.lock().token, token);
+        assert!(
+            old.data
+                .lock()
+                .conn
+                .as_ref()
+                .unwrap()
+                .conn
+                .close_reason()
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            &manager.inner.sessions.get(&b.id()).unwrap(),
+            &old
+        ));
+        manager.deactivate().await;
+        remote.close(0u32.into(), b"done");
+        a.close().await;
+        b.close().await;
+    }
+
+    #[cfg(feature = "direct")]
+    #[tokio::test]
+    async fn firewall_reject_round_trip_uses_authenticated_network_framing() {
+        use crate::direct::firewall::{
+            FirewallAction, FirewallDirection, FirewallRule, PeerFilter,
+        };
+        use crate::forward::{
+            FirewallRules, InDecision, OutDecision, PolicyEngine, inbound_frame, outbound,
+        };
+        use tunnet_common::policy::Protocol;
+        let (a, b) = endpoints().await;
+        let manager_a = PeerManager::new(a.clone(), ALPN);
+        let manager_b = PeerManager::new(b.clone(), ALPN);
+        let (store_a, routes_a) = configure(&manager_a, b.id());
+        let (store_b, routes_b) = configure_at(&manager_b, a.id(), "100.64.0.2", "100.64.0.1");
+        for (store, routes, peer, reject) in [
+            (&store_a, &routes_a, b.id(), false),
+            (&store_b, &routes_b, a.id(), true),
+        ] {
+            let auth = crate::direct::AuthCache::with_gate(store.authorization_gate());
+            auth.insert(peer.to_string(), uuid::Uuid::nil());
+            auth.insert(store.load().self_id.endpoint_hex.clone(), uuid::Uuid::nil());
+            store.set_direct_auth(auth);
+            store.set_firewall(
+                routes,
+                uuid::Uuid::nil(),
+                FirewallRules {
+                    enabled: true,
+                    local: if reject {
+                        vec![FirewallRule {
+                            direction: FirewallDirection::In,
+                            action: FirewallAction::Reject,
+                            protocol: Protocol::Tcp,
+                            ports: vec![],
+                            peer: PeerFilter::Any,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    ..FirewallRules::default()
+                },
             );
         }
-        let mut received = Vec::new();
-        for _ in 0..5 {
-            received.push(
-                tokio::time::timeout(Duration::from_secs(20), got_rx.recv())
-                    .await
-                    .expect("datagram arrives")
-                    .expect("channel open"),
-            );
-        }
-        received.sort();
-        assert_eq!(received, (0..5u8).map(|i| vec![i; 64]).collect::<Vec<_>>());
-        assert!(manager.has_live(id_b));
-        let (active, tx, rx) = manager.heartbeat_counters();
-        assert_eq!(active, 1);
-        assert_eq!(tx, 5 * 64);
-        let _ = rx;
-        manager.deactivate();
-        assert!(!manager.has_live(id_b));
-        accept.abort();
-    }
-
-    #[tokio::test]
-    async fn send_datagram_batch_drains_queue() {
-        for count in [1, SEND_BATCH_MAX, SEND_BATCH_MAX + 5] {
-            assert_batch_roundtrip(count).await;
-        }
-    }
-
-    async fn assert_batch_roundtrip(count: usize) {
-        const ALPN: &[u8] = b"test/batch-rt";
-        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await
-            .expect("bind server");
-        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .bind()
-            .await
-            .expect("bind client");
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(count * 2);
-        let accept = tokio::spawn({
-            let server = server.clone();
-            async move {
-                while let Some(incoming) = server.accept().await {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let Ok(conn) = incoming.await else { return };
-                        let mut batch: [Bytes; SEND_BATCH_MAX] =
-                            std::array::from_fn(|_| Bytes::new());
-                        while let Ok(n) = conn.read_many_datagrams(&mut batch).await {
-                            for dg in &batch[..n] {
-                                if tx.send(dg[0]).await.is_err() {
-                                    return;
-                                }
-                            }
-                            batch[n..].fill(Bytes::new());
+        let policy_a = PolicyEngine::new();
+        let policy_b = PolicyEngine::new();
+        let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(1);
+        let hook_a: RecvHook = Arc::new({
+            let store = store_a.clone();
+            let policy = policy_a.clone();
+            move |peer, conn, ctl| {
+                let store = store.clone();
+                let policy = policy.clone();
+                let tx = result_tx.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = ctl.cancel.cancelled() => {},
+                        received = conn.read_datagram() => {
+                            let received = received.unwrap();
+                            let snapshot = store.load();
+                            let InDecision::ToTun { network, ip, .. } = inbound_frame(&snapshot, &policy, &received, peer) else { panic!("Reject did not pass remote forwarding policy"); };
+                            tx.send((network, Bytes::copy_from_slice(ip))).await.unwrap();
+                            ctl.cancel.cancelled().await;
                         }
-                    });
-                }
+                    }
+                })
             }
         });
-        let conn = client.connect(server.addr(), ALPN).await.expect("connect");
-        let mut queue: VecDeque<Bytes> =
-            (0..count).map(|i| Bytes::from(vec![i as u8; 64])).collect();
-        let out = send_datagram_batch(&conn, &mut queue).await;
-        assert_eq!(out.accepted, count);
-        assert_eq!(out.accepted_bytes, (count * 64) as u64);
-        assert_eq!(out.oversize, 0);
-        assert_eq!(out.transport_drops, 0);
-        assert!(queue.is_empty());
-        let mut received = Vec::with_capacity(count);
-        for _ in 0..count {
-            received.push(
-                tokio::time::timeout(Duration::from_secs(15), rx.recv())
-                    .await
-                    .expect("datagram arrives")
-                    .expect("channel open"),
-            );
-        }
-        assert_eq!(received, (0..count).map(|i| i as u8).collect::<Vec<_>>());
-        accept.abort();
-    }
-
-    #[tokio::test]
-    async fn send_datagram_batch_skips_oversized() {
-        const ALPN: &[u8] = b"test/batch-skip";
-        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await
-            .expect("bind server");
-        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .bind()
-            .await
-            .expect("bind client");
-        let server_addr = server.addr();
-        let accept = tokio::spawn({
-            async move {
-                while let Some(incoming) = server.accept().await {
-                    tokio::spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            tokio::time::sleep(Duration::from_secs(30)).await;
-                            drop(conn);
+        let hook_b: RecvHook = Arc::new({
+            let store = store_b.clone();
+            let policy = policy_b.clone();
+            let manager = manager_b.downgrade();
+            move |peer, conn, ctl| {
+                let store = store.clone();
+                let policy = policy.clone();
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = ctl.cancel.cancelled() => {},
+                        received = conn.read_datagram() => {
+                            let received = received.unwrap();
+                            let snapshot = store.load();
+                            let InDecision::Reject { network, reply } = inbound_frame(&snapshot, &policy, &received, peer) else { panic!("inbound TCP SYN did not reject"); };
+                            assert_eq!(manager.upgrade().unwrap().send_authorized(peer, AuthorizedPacket { packet: frame(network, &reply), epoch: snapshot.auth_epoch(network), local_posture: snapshot.posture_ok.load_full(), proof: None }), SendOutcome::Admitted);
+                            ctl.cancel.cancelled().await;
                         }
-                    });
-                }
+                    }
+                })
             }
         });
-        let conn = client.connect(server_addr, ALPN).await.expect("connect");
-        let max = conn.max_datagram_size().expect("datagrams enabled");
-        let mut queue: VecDeque<Bytes> = VecDeque::from([
-            Bytes::from(vec![1u8; 64]),
-            Bytes::from(vec![0u8; max + 1]),
-            Bytes::from(vec![2u8; 64]),
-        ]);
-        let out = send_datagram_batch(&conn, &mut queue).await;
-        assert_eq!(out.accepted, 2);
-        assert_eq!(out.oversize, 1);
-        assert_eq!(out.transport_drops, 0);
-        assert!(queue.is_empty());
-        accept.abort();
-    }
-
-    #[rstest]
-    #[case(1)]
-    #[case(33)]
-    #[case(96)]
-    #[tokio::test]
-    async fn send_datagram_batch_chunks_whole_queue(#[case] count: usize) {
-        const ALPN: &[u8] = b"test/batch-chunk";
-        let server = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await
-            .expect("bind server");
-        let client = Endpoint::builder(iroh::endpoint::presets::Minimal)
-            .bind()
-            .await
-            .expect("bind client");
-        let server_addr = server.addr();
-        let accept = tokio::spawn({
-            async move {
-                while let Some(incoming) = server.accept().await {
-                    tokio::spawn(async move {
-                        if let Ok(conn) = incoming.await {
-                            let mut batch: [Bytes; SEND_BATCH_MAX] =
-                                std::array::from_fn(|_| Bytes::new());
-                            while conn.read_many_datagrams(&mut batch).await.is_ok() {
-                                batch.fill(Bytes::new());
-                            }
-                        }
-                    });
+        manager_a
+            .activate(1, CancellationToken::new(), hook_a, Arc::new(|_| true))
+            .unwrap();
+        manager_b
+            .activate(1, CancellationToken::new(), hook_b, Arc::new(|_| true))
+            .unwrap();
+        let (conn_a, conn_b) = connection(&a, &b).await;
+        assert!(manager_a.install(b.id(), conn_a, true));
+        assert!(manager_b.install(a.id(), conn_b, false));
+        let mut syn = Vec::new();
+        etherparse::PacketBuilder::ipv4([100, 64, 0, 1], [100, 64, 0, 2], 64)
+            .tcp(42000, 443, 123, 4096)
+            .syn()
+            .write(&mut syn, &[])
+            .unwrap();
+        let snapshot = store_a.load();
+        assert!(
+            matches!(outbound(&snapshot, &policy_a, &syn), OutDecision::Forward { peer, network, .. } if peer == b.id() && network == uuid::Uuid::nil())
+        );
+        assert_eq!(
+            manager_a.send_authorized(
+                b.id(),
+                AuthorizedPacket {
+                    packet: frame(uuid::Uuid::nil(), &syn),
+                    epoch: snapshot.auth_epoch(uuid::Uuid::nil()),
+                    local_posture: snapshot.posture_ok.load_full(),
+                    proof: None
                 }
-            }
-        });
-        let conn = client.connect(server_addr, ALPN).await.expect("connect");
-        let mut queue: VecDeque<Bytes> = (0..count)
-            .map(|i| Bytes::from(vec![(i % 251) as u8; 64]))
-            .collect();
-        let out = send_datagram_batch(&conn, &mut queue).await;
-        assert_eq!(out.accepted, count);
-        assert!(queue.is_empty());
-        accept.abort();
+            ),
+            SendOutcome::Admitted
+        );
+        let (network, reply) = tokio::time::timeout(Duration::from_secs(5), result_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(network, uuid::Uuid::nil());
+        let packet = tunnet_common::packet::parse(&reply).unwrap();
+        assert_eq!(packet.ip.v4_src().unwrap().octets(), [100, 64, 0, 2]);
+        assert_eq!(packet.ip.v4_dst().unwrap().octets(), [100, 64, 0, 1]);
+        let tcp = etherparse::TcpHeaderSlice::from_slice(&reply[20..]).unwrap();
+        assert!(tcp.rst());
+        assert!(tcp.ack());
+        assert_eq!(tcp.source_port(), 443);
+        assert_eq!(tcp.destination_port(), 42000);
+        assert_eq!(tcp.acknowledgment_number(), 124);
+        assert_eq!(
+            tcp.checksum(),
+            tunnet_common::packet::tcp_ipv4_checksum_of(&reply).unwrap()
+        );
+        manager_a.deactivate().await;
+        manager_b.deactivate().await;
+        a.close().await;
+        b.close().await;
     }
 }

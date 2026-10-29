@@ -4,6 +4,7 @@ use tunnet_common::packet::{self, Packet, Transport};
 use tunnet_common::policy::Direction;
 use uuid::Uuid;
 
+use super::PostureAuthorization;
 use super::frame::unframe;
 use super::policy::{Decision, PeerCtx, PolicyEngine};
 use super::snapshot::{ForwardingSnapshot, NetworkPolicy};
@@ -20,20 +21,31 @@ pub struct SshRewrite {
 
 #[derive(Debug)]
 pub enum OutDecision {
-    Forward { peer: EndpointId, network: Uuid },
+    Forward {
+        peer: EndpointId,
+        network: Uuid,
+        posture: Option<PostureAuthorization>,
+    },
     LocalDns,
     RewriteSsh(SshRewrite),
-    Reject { reply: Bytes },
-    Drop { reason: &'static str },
+    Reject {
+        reply: Bytes,
+    },
+    Drop {
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug)]
 pub enum InDecision<'a> {
     ToTun {
+        network: Uuid,
         ip: &'a [u8],
         ssh: Option<SshRewrite>,
+        posture: Option<PostureAuthorization>,
     },
     Reject {
+        network: Uuid,
         reply: Bytes,
     },
     Spoof {
@@ -74,7 +86,16 @@ fn outbound_routed(
     pkt: &Packet<'_>,
 ) -> OutDecision {
     let dst = pkt.ip.v4_dst().unwrap();
-    if snap.tables.advertised.iter().any(|net| net.contains(&dst)) {
+    if !snap.tables.by_ip.contains_key(&dst)
+        && snap.tables.advertised.iter().any(|local| {
+            local.contains(&dst)
+                && !snap
+                    .tables
+                    .subnets
+                    .get_lpm(&ipnet::Ipv4Net::from(dst))
+                    .is_some_and(|(remote, _)| remote.prefix_len() > local.prefix_len())
+        })
+    {
         return OutDecision::Drop {
             reason: "local_subnet",
         };
@@ -93,6 +114,17 @@ fn outbound_routed(
     if pkt.wire_len > snap.tun_mtu as usize {
         return OutDecision::Drop { reason: "oversize" };
     }
+    if !snap.allows_network(peer.network_id, peer.endpoint) {
+        return OutDecision::Drop {
+            reason: "unauthorized_network",
+        };
+    }
+    let source = pkt.ip.v4_src().unwrap();
+    if !snap.local_source_allowed(peer.network_id, source) {
+        return OutDecision::Drop {
+            reason: "unauthorized_source",
+        };
+    }
     let ctx = PeerCtx {
         endpoint: peer.endpoint,
         hex: &peer.endpoint_hex,
@@ -101,9 +133,10 @@ fn outbound_routed(
         network_name: &peer.network_name,
     };
     match policy.evaluate(snap, peer.network_id, &ctx, Direction::Outbound, pkt) {
-        Decision::Allow => OutDecision::Forward {
+        Decision::Allow { posture } => OutDecision::Forward {
             peer: peer.endpoint,
             network: peer.network_id,
+            posture,
         },
         Decision::Deny => OutDecision::Drop {
             reason: deny_reason(snap, peer.network_id, false),
@@ -122,6 +155,11 @@ pub fn inbound_frame<'a>(
         Ok(f) => f,
         Err(e) => return InDecision::Drop { reason: e.reason() },
     };
+    if !snap.allows_network(net, peer) {
+        return InDecision::Drop {
+            reason: "unauthorized_network",
+        };
+    }
     let Some(binding) = snap.binding(net, peer) else {
         return InDecision::Drop {
             reason: "unauthorized_network",
@@ -141,8 +179,14 @@ pub fn inbound_frame<'a>(
         };
     }
     let src = pkt.ip.v4_src().unwrap();
-    if src != binding.ip {
+    if !snap.source_allowed(net, peer, src) {
         return InDecision::Spoof { network: net };
+    }
+    let dst = pkt.ip.v4_dst().unwrap();
+    if !snap.destination_allowed(net, dst) {
+        return InDecision::Drop {
+            reason: "unauthorized_destination",
+        };
     }
     let ctx = PeerCtx {
         endpoint: binding.endpoint,
@@ -152,14 +196,19 @@ pub fn inbound_frame<'a>(
         network_name: &binding.network_name,
     };
     match policy.evaluate(snap, net, &ctx, Direction::Inbound, &pkt) {
-        Decision::Allow => InDecision::ToTun {
+        Decision::Allow { posture } => InDecision::ToTun {
+            network: net,
             ip,
             ssh: ssh_inbound(&pkt, snap),
+            posture,
         },
         Decision::Deny => InDecision::Drop {
             reason: deny_reason(snap, net, true),
         },
-        Decision::Reject { reply } => InDecision::Reject { reply },
+        Decision::Reject { reply } => InDecision::Reject {
+            network: net,
+            reply,
+        },
     }
 }
 
@@ -268,6 +317,7 @@ mod tests {
                     hostname: "peer".into(),
                     tags: vec![],
                     ssh_host_key: None,
+                    posture: tunnet_common::PeerPosture::Unknown,
                 },
                 tunnet_common::PeerEntry {
                     ip: "10.7.0.1".parse().unwrap(),
@@ -275,6 +325,7 @@ mod tests {
                     hostname: "self".into(),
                     tags: vec![],
                     ssh_host_key: None,
+                    posture: tunnet_common::PeerPosture::Unknown,
                 },
             ],
             &[],
@@ -297,6 +348,7 @@ mod tests {
                 ip: "10.7.0.1".parse().unwrap(),
                 tags: vec![],
                 network: "office".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
         );
         (store, PolicyEngine::new(), routes)
@@ -336,6 +388,7 @@ mod tests {
                 hostname: "self".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -417,6 +470,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -436,6 +490,7 @@ mod tests {
                 hostname: "peer2".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &tunnet_common::DnsConfig::default(),
             "two",
@@ -452,6 +507,7 @@ mod tests {
                 ip: "10.7.0.1".parse().unwrap(),
                 tags: vec![],
                 network: "one".into(),
+                posture: tunnet_common::PeerPosture::Unknown,
             },
         );
         let snap = store.load();
@@ -574,8 +630,191 @@ mod tests {
         let raw = v4_packet("10.7.0.2", "10.7.0.1", 40000, 443);
         let framed = super::super::frame::frame(Uuid::nil(), &raw);
         match inbound_frame(&snap, &policy, &framed, peer) {
-            InDecision::ToTun { ip, ssh: None } => assert_eq!(ip, &raw[..]),
+            InDecision::ToTun { ip, ssh: None, .. } => assert_eq!(ip, &raw[..]),
             d => panic!("unexpected {d:?}"),
         }
+    }
+    #[rstest]
+    #[case("192.168.1.20", "10.7.0.1", true)]
+    #[case("192.168.2.20", "10.7.0.1", false)]
+    #[case("10.7.0.3", "10.7.0.1", false)]
+    #[case("192.168.1.20", "10.8.0.1", false)]
+    #[case("192.168.1.20", "172.16.0.20", true)]
+    #[case("192.168.1.20", "172.17.0.20", false)]
+    fn gateway_delegation_preserves_source_and_destination_isolation(
+        #[case] src: &str,
+        #[case] dst: &str,
+        #[case] allowed: bool,
+    ) {
+        let (store, policy, routes) = managed_setup();
+        let mut peers: Vec<_> = routes
+            .peers()
+            .iter()
+            .map(|peer| tunnet_common::PeerEntry {
+                ip: peer.ip,
+                endpoint_id: peer.endpoint_hex.clone(),
+                hostname: peer.hostname.clone(),
+                tags: peer.tags.clone(),
+                ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
+            })
+            .collect();
+        peers.push(tunnet_common::PeerEntry {
+            ip: "10.7.0.3".parse().unwrap(),
+            endpoint_id: "cc".repeat(32),
+            hostname: "other".into(),
+            tags: vec![],
+            ssh_host_key: None,
+            posture: tunnet_common::PeerPosture::Unknown,
+        });
+        let delegates = [
+            tunnet_common::SubnetRoute {
+                cidr: "192.168.1.0/24".parse().unwrap(),
+                via_endpoint_id: "bb".repeat(32),
+                via_ip: "10.7.0.2".parse().unwrap(),
+            },
+            tunnet_common::SubnetRoute {
+                cidr: "172.16.0.0/16".parse().unwrap(),
+                via_endpoint_id: "aa".repeat(32),
+                via_ip: "10.7.0.1".parse().unwrap(),
+            },
+        ];
+        store.update_routes(&routes, || {
+            routes.replace(
+                &peers,
+                &delegates,
+                &[],
+                &[],
+                &Default::default(),
+                &Default::default(),
+                "office",
+                Uuid::nil(),
+                &"aa".repeat(32),
+                2,
+            )
+        });
+        let framed = super::super::frame::frame(Uuid::nil(), &v4_packet(src, dst, 40000, 443));
+        assert_eq!(
+            matches!(
+                inbound_frame(
+                    &store.load(),
+                    &policy,
+                    &framed,
+                    "bb".repeat(32).parse().unwrap()
+                ),
+                InDecision::ToTun { .. }
+            ),
+            allowed
+        );
+    }
+
+    #[cfg(feature = "direct")]
+    #[test]
+    fn direct_membership_requires_independent_network_auth_and_rechecks_revocation() {
+        let (store, policy, routes) = managed_setup();
+        let auth = crate::direct::AuthCache::with_gate(store.authorization_gate());
+        store.set_direct_auth(auth.clone());
+        auth.insert("aa".repeat(32), Uuid::nil());
+        store.set_firewall(
+            &routes,
+            Uuid::nil(),
+            super::super::snapshot::FirewallRules::default(),
+        );
+        let peer = "bb".repeat(32).parse().unwrap();
+        let raw = v4_packet("10.7.0.2", "10.7.0.1", 40000, 443);
+        let framed = super::super::frame::frame(Uuid::nil(), &raw);
+        let snap = store.load();
+        auth.insert("bb".repeat(32), Uuid::from_u128(2));
+        assert!(matches!(
+            inbound_frame(&snap, &policy, &framed, peer),
+            InDecision::Drop {
+                reason: "unauthorized_network"
+            }
+        ));
+        auth.insert("bb".repeat(32), Uuid::nil());
+        assert!(matches!(
+            inbound_frame(&snap, &policy, &framed, peer),
+            InDecision::ToTun { .. }
+        ));
+        let epoch = snap.auth_epoch(Uuid::nil());
+        auth.remove_network(&"bb".repeat(32), Uuid::nil());
+        assert!(matches!(
+            inbound_frame(&snap, &policy, &framed, peer),
+            InDecision::Drop {
+                reason: "unauthorized_network"
+            }
+        ));
+        auth.insert("bb".repeat(32), Uuid::nil());
+        assert_ne!(epoch, snap.auth_epoch(Uuid::nil()));
+        auth.remove_network(&"aa".repeat(32), Uuid::nil());
+        assert!(matches!(
+            inbound_frame(&snap, &policy, &framed, peer),
+            InDecision::Drop {
+                reason: "unauthorized_network"
+            }
+        ));
+        assert!(matches!(
+            outbound(
+                &snap,
+                &policy,
+                &v4_packet("10.7.0.1", "10.7.0.2", 40000, 443)
+            ),
+            OutDecision::Drop {
+                reason: "unauthorized_network"
+            }
+        ));
+    }
+    #[test]
+    fn exit_advertisement_allows_mesh_return_packets_without_source_spoofing() {
+        let (store, policy, routes) = managed_setup();
+        let peers: Vec<_> = routes
+            .peers()
+            .iter()
+            .map(|peer| tunnet_common::PeerEntry {
+                ip: peer.ip,
+                endpoint_id: peer.endpoint_hex.clone(),
+                hostname: peer.hostname.clone(),
+                tags: peer.tags.clone(),
+                ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
+            })
+            .collect();
+        let exit = tunnet_common::ExitNodeInfo {
+            endpoint_id: "aa".repeat(32),
+            via_ip: "10.7.0.1".parse().unwrap(),
+            allowed_cidrs: vec!["0.0.0.0/0".parse().unwrap()],
+        };
+        store.update_routes(&routes, || {
+            routes.replace(
+                &peers,
+                &[],
+                &[],
+                &[exit],
+                &Default::default(),
+                &Default::default(),
+                "office",
+                Uuid::nil(),
+                &"aa".repeat(32),
+                2,
+            )
+        });
+        let reply = v4_packet("198.51.100.1", "10.7.0.2", 443, 40000);
+        assert!(matches!(
+            outbound(&store.load(), &policy, &reply),
+            OutDecision::Forward { .. }
+        ));
+        let spoof = super::super::frame::frame(
+            Uuid::nil(),
+            &v4_packet("198.51.100.1", "10.7.0.1", 443, 40000),
+        );
+        assert!(matches!(
+            inbound_frame(
+                &store.load(),
+                &policy,
+                &spoof,
+                "bb".repeat(32).parse().unwrap()
+            ),
+            InDecision::Spoof { .. }
+        ));
     }
 }

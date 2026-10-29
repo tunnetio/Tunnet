@@ -166,12 +166,16 @@ pub struct DocsMembership {
 }
 
 struct DocsInner {
+    cancel: tokio_util::sync::CancellationToken,
+    watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     docs: Docs,
     gossip: Gossip,
     blobs: FsStore,
     doc: Doc,
     author: AuthorId,
     members: Mutex<HashMap<String, MembershipEntry>>,
+    sequences: Mutex<HashMap<String, u64>>,
+    authority_mutation: tokio::sync::Mutex<()>,
     network_id: Uuid,
     network_name: String,
     genesis: parking_lot::RwLock<Option<Genesis>>,
@@ -180,6 +184,7 @@ struct DocsInner {
     endpoint_signing_key: SigningKey,
     coordinator_verifying_key: String,
     network_epoch: Arc<AtomicU64>,
+    self_grant: Mutex<Option<NetworkGrant>>,
     content_key: String,
     revoked: Arc<Mutex<HashSet<String>>>,
     hostname: String,
@@ -187,6 +192,8 @@ struct DocsInner {
     self_endpoint_id: String,
     paths: StatePaths,
     forward: ForwardingStore,
+    auth: AuthCache,
+    routes: RoutingTable,
     dns: Arc<ArcSwap<DnsConfig>>,
     /// Shared with [`crate::direct::spawn_seed_auth`] so membership updates refresh dials.
     seed_peers: Arc<Mutex<Vec<String>>>,
@@ -194,6 +201,15 @@ struct DocsInner {
     /// Fired after live membership sync (docs events). The agent uses it to
     /// reconcile connection pools: no polling timers for auth changes.
     change_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl Drop for DocsInner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(task) = self.watcher.get_mut().take() {
+            task.abort();
+        }
+    }
 }
 
 /// Inputs for [`DocsMembership::bootstrap`].
@@ -226,6 +242,10 @@ impl DocsMembership {
 
     pub fn namespace_id(&self) -> NamespaceId {
         self.inner.doc.id()
+    }
+
+    pub fn self_grant(&self) -> Option<NetworkGrant> {
+        self.inner.self_grant.lock().clone()
     }
 
     pub fn network_epoch(&self) -> u64 {
@@ -310,12 +330,16 @@ impl DocsMembership {
 
         let membership = Self {
             inner: Arc::new(DocsInner {
+                cancel: tokio_util::sync::CancellationToken::new(),
+                watcher: Mutex::new(None),
                 docs,
                 gossip,
                 blobs,
                 doc: doc.clone(),
                 author,
                 members: Mutex::new(HashMap::new()),
+                sequences: Mutex::new(HashMap::new()),
+                authority_mutation: tokio::sync::Mutex::new(()),
                 network_id: direct.network_id,
                 network_name: direct.network_name.clone(),
                 genesis: parking_lot::RwLock::new(Some(direct.genesis.clone())),
@@ -324,6 +348,7 @@ impl DocsMembership {
                 endpoint_signing_key,
                 coordinator_verifying_key,
                 network_epoch: network_epoch.clone(),
+                self_grant: Mutex::new(Some(direct.self_record.grant.clone())),
                 content_key,
                 revoked: revoked.clone(),
                 hostname: direct.hostname.clone(),
@@ -331,6 +356,8 @@ impl DocsMembership {
                 self_endpoint_id: self_endpoint_id.to_string(),
                 paths: paths.clone(),
                 forward: forward.clone(),
+                auth: auth.clone(),
+                routes: routes.clone(),
                 dns: Arc::new(ArcSwap::from_pointee(dns)),
                 seed_peers: seed_peers.clone(),
                 coordinator_endpoint_id: direct.coordinator_endpoint_id.clone(),
@@ -360,52 +387,78 @@ impl DocsMembership {
             tracing::warn!(?e, "apply pending kicks");
         }
 
-        let bg = membership.clone();
-        let routes_bg = routes.clone();
-        let forward_bg = forward.clone();
-        let auth_bg = auth.clone();
-        tokio::spawn(async move {
-            let mut kick_tick = tokio::time::interval(std::time::Duration::from_secs(5));
-            tokio::pin!(events);
-            loop {
-                tokio::select! {
-                    ev = events.next() => {
-                        match ev {
-                            Some(Ok(LiveEvent::InsertLocal { .. }))
-                            | Some(Ok(LiveEvent::InsertRemote { .. }))
-                            | Some(Ok(LiveEvent::ContentReady { .. }))
-                            | Some(Ok(LiveEvent::PendingContentReady))
-                            | Some(Ok(LiveEvent::SyncFinished(_))) => {
-                                if let Err(e) = bg.rebuild_from_doc().await {
-                                    tracing::debug!(?e, "docs membership rebuild");
-                                    continue;
+        let weak = Arc::downgrade(&membership.inner);
+        let cancel = membership.inner.cancel.clone();
+        let task = tokio::spawn(async move {
+            let work = async move {
+                let mut kick_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                tokio::pin!(events);
+                loop {
+                    tokio::select! {
+                        ev = events.next() => {
+                            let Some(inner) = weak.upgrade() else { return; };
+                            let bg = DocsMembership { inner };
+                            match ev {
+                                Some(Ok(LiveEvent::InsertLocal { .. }))
+                                | Some(Ok(LiveEvent::InsertRemote { .. }))
+                                | Some(Ok(LiveEvent::ContentReady { .. }))
+                                | Some(Ok(LiveEvent::PendingContentReady))
+                                | Some(Ok(LiveEvent::SyncFinished(_))) => {
+                                    if let Err(e) = bg.rebuild_from_doc().await {
+                                        tracing::debug!(?e, "docs membership rebuild");
+                                        continue;
+                                    }
+                                    bg.project_runtime(&bg.inner.auth, &bg.inner.routes, &bg.inner.forward);
+                                    if let Err(e) = bg.sync_firewall_policy(&bg.inner.routes).await {
+                                        tracing::debug!(?e, "docs firewall policy sync");
+                                    }
                                 }
-                                bg.project_runtime(&auth_bg, &routes_bg, &forward_bg);
-                                if let Err(e) = bg.sync_firewall_policy(&routes_bg).await {
-                                    tracing::debug!(?e, "docs firewall policy sync");
+                                Some(Ok(LiveEvent::NeighborUp(pk))) => {
+                                    tracing::debug!(peer = %pk, "docs neighbor up");
                                 }
+                                Some(Ok(LiveEvent::NeighborDown(pk))) => {
+                                    tracing::debug!(peer = %pk, "docs neighbor down");
+                                }
+                                Some(Err(e)) => {
+                                    tracing::warn!(?e, "docs live event error");
+                                    break;
+                                }
+                                None => break,
                             }
-                            Some(Ok(LiveEvent::NeighborUp(pk))) => {
-                                tracing::debug!(peer = %pk, "docs neighbor up");
-                            }
-                            Some(Ok(LiveEvent::NeighborDown(pk))) => {
-                                tracing::debug!(peer = %pk, "docs neighbor down");
-                            }
-                            Some(Err(e)) => {
-                                tracing::warn!(?e, "docs live event error");
-                                break;
-                            }
-                            None => break,
+                        }
+                        _ = kick_tick.tick() => {
+                            let Some(inner) = weak.upgrade() else { return; };
+                            let bg = DocsMembership { inner };
+                            let _ = bg.apply_pending_kicks().await;
                         }
                     }
-                    _ = kick_tick.tick() => {
-                        let _ = bg.apply_pending_kicks().await;
-                    }
                 }
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = work => {},
             }
         });
+        *membership.inner.watcher.lock() = Some(task);
 
         Ok((membership, created_ticket, namespace_str))
+    }
+
+    pub async fn shutdown(&self) {
+        self.inner.cancel.cancel();
+        self.inner.change_hook.lock().take();
+        let task = self.inner.watcher.lock().take();
+        if let Some(mut task) = task
+            && tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.inner
+            .auth
+            .invalidate_network(self.inner.network_id, || {});
     }
 
     pub async fn publish_genesis(&self, genesis: &Genesis) -> anyhow::Result<()> {
@@ -509,6 +562,7 @@ impl DocsMembership {
         &self,
         entry: &MembershipEntry,
     ) -> anyhow::Result<(NetworkGrant, String, SignedMemberRecord)> {
+        let _authority = self.inner.authority_mutation.lock().await;
         let grant = self.issue_grant(
             &entry.endpoint_id,
             if entry.coordinator {
@@ -519,13 +573,19 @@ impl DocsMembership {
         )?;
         let sequence = self
             .inner
-            .members
+            .sequences
             .lock()
             .get(&entry.endpoint_id)
-            .map(|_| 2)
-            .unwrap_or(1);
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("member sequence exhausted")?;
         let record = self.build_record(entry, grant.clone(), sequence)?;
         self.write_member_record(&record).await?;
+        self.inner
+            .sequences
+            .lock()
+            .insert(entry.endpoint_id.clone(), sequence);
         self.inner
             .members
             .lock()
@@ -568,9 +628,13 @@ impl DocsMembership {
         forward: &ForwardingStore,
     ) {
         let network_id = self.inner.network_id;
-        for member in self.snapshot_members() {
-            if member.status != "kicked" {
-                auth.insert(member.endpoint_id.clone(), network_id);
+        let members = self.snapshot_members();
+        for endpoint in auth.peers_for(network_id) {
+            if !members
+                .iter()
+                .any(|member| member.status != "kicked" && member.endpoint_id == endpoint)
+            {
+                auth.remove_network(&endpoint, network_id);
             }
         }
         self.evict_revoked_from_auth(auth);
@@ -642,28 +706,18 @@ impl DocsMembership {
         Ok(())
     }
 
-    /// Coordinator revokes a peer: bump epoch, write revocation + kicked record.
     pub async fn kick_peer(&self, endpoint_id: &str) -> anyhow::Result<()> {
         let Some(sk) = &self.inner.coordinator_signing_key else {
             anyhow::bail!("coordinator signing key not configured");
         };
 
-        let new_epoch = self.inner.network_epoch.load(Ordering::Relaxed) + 1;
-        let epoch = sign_epoch(
-            sk,
-            EpochRecord {
-                network_epoch: new_epoch,
-                sig: String::new(),
-            },
-        )?;
-        set_json(&self.inner.doc, self.inner.author, epoch_key(), &epoch).await?;
-        self.inner.network_epoch.store(new_epoch, Ordering::Relaxed);
-
+        let _authority = self.inner.authority_mutation.lock().await;
+        let network_epoch = self.inner.network_epoch.load(Ordering::Relaxed);
         let revocation = sign_revocation(
             sk,
             Revocation {
                 endpoint_id: endpoint_id.to_string(),
-                network_epoch: new_epoch,
+                network_epoch,
                 reason: "kicked".into(),
                 sig: String::new(),
             },
@@ -675,14 +729,18 @@ impl DocsMembership {
             &revocation,
         )
         .await?;
-        self.inner.revoked.lock().insert(endpoint_id.to_string());
-
-        // Epoch bump invalidates prior grants; revocation is membership authority.
-        self.inner.members.lock().remove(endpoint_id);
+        self.inner
+            .auth
+            .revoke_network_peer(self.inner.network_id, endpoint_id, || {
+                self.inner.revoked.lock().insert(endpoint_id.to_string());
+                self.inner.members.lock().remove(endpoint_id);
+            });
+        self.project_runtime(&self.inner.auth, &self.inner.routes, &self.inner.forward);
         Ok(())
     }
 
     pub async fn rebuild_from_doc(&self) -> anyhow::Result<()> {
+        let _authority = self.inner.authority_mutation.lock().await;
         let coord_vk = verifying_key_from_hex(&self.inner.coordinator_verifying_key)
             .context("coordinator verifying key")?;
 
@@ -707,7 +765,7 @@ impl DocsMembership {
             .context("missing valid genesis; recreate with `tunnet create`")?;
         *self.inner.genesis.write() = Some(genesis.clone());
 
-        let mut min_epoch = 0u64;
+        let mut min_epoch = self.inner.network_epoch.load(Ordering::Relaxed);
         for bytes in self.get_all_key_bytes(&epoch_key()).await? {
             let Ok(epoch) = serde_json::from_slice::<EpochRecord>(&bytes) else {
                 continue;
@@ -716,8 +774,12 @@ impl DocsMembership {
                 min_epoch = min_epoch.max(epoch.network_epoch);
             }
         }
-        if min_epoch > 0 {
-            self.inner.network_epoch.store(min_epoch, Ordering::Relaxed);
+        if min_epoch != self.inner.network_epoch.load(Ordering::Relaxed) {
+            self.inner
+                .auth
+                .invalidate_network(self.inner.network_id, || {
+                    self.inner.network_epoch.store(min_epoch, Ordering::Relaxed)
+                });
         }
 
         let mut revoked = HashSet::new();
@@ -742,12 +804,24 @@ impl DocsMembership {
                     continue;
                 }
             };
-            let revocation: Revocation = serde_json::from_slice(&bytes)?;
-            if verify_revocation(&coord_vk, &revocation).is_ok() {
+            let Ok(revocation) = serde_json::from_slice::<Revocation>(&bytes) else {
+                continue;
+            };
+            if revocation.endpoint_id == endpoint_id
+                && verify_revocation(&coord_vk, &revocation).is_ok()
+            {
                 revoked.insert(endpoint_id.to_string());
             }
         }
-        *self.inner.revoked.lock() = revoked.clone();
+        let previous_revoked = self.revoked_snapshot();
+        for endpoint in revoked.difference(&previous_revoked) {
+            self.inner
+                .auth
+                .revoke_network_peer(self.inner.network_id, endpoint, || {
+                    self.inner.revoked.lock().insert(endpoint.clone());
+                });
+        }
+        revoked.extend(previous_revoked);
 
         let stream = self
             .inner
@@ -758,6 +832,7 @@ impl DocsMembership {
         tokio::pin!(stream);
 
         let mut map = HashMap::new();
+        let mut self_grant = None;
         while let Some(item) = stream.next().await {
             let entry = item.context("peer entry")?;
             let key = std::str::from_utf8(entry.key()).unwrap_or("");
@@ -793,8 +868,20 @@ impl DocsMembership {
                     continue;
                 }
             };
+            if record.endpoint_id != endpoint_id || record.network_id != self.inner.network_id {
+                continue;
+            }
             if verify_member_record(&coord_vk, &record, min_epoch).is_err() {
                 tracing::warn!(peer = %endpoint_id, "member record verification failed");
+                continue;
+            }
+            if self
+                .inner
+                .sequences
+                .lock()
+                .get(endpoint_id)
+                .is_some_and(|sequence| record.sequence < *sequence)
+            {
                 continue;
             }
             if validate_member_against_genesis(&genesis, &record).is_err() {
@@ -808,6 +895,9 @@ impl DocsMembership {
                 .get(endpoint_id)
                 .is_none_or(|(sequence, _): &(u64, MembershipEntry)| record.sequence > *sequence);
             if replace {
+                if record.endpoint_id == self.inner.self_endpoint_id {
+                    self_grant = Some(record.grant.clone());
+                }
                 map.insert(
                     endpoint_id.to_string(),
                     (
@@ -824,6 +914,15 @@ impl DocsMembership {
                         },
                     ),
                 );
+            }
+        }
+        {
+            let mut sequences = self.inner.sequences.lock();
+            for (endpoint, (sequence, _)) in &map {
+                sequences
+                    .entry(endpoint.clone())
+                    .and_modify(|current| *current = (*current).max(*sequence))
+                    .or_insert(*sequence);
             }
         }
         let mut map: HashMap<String, MembershipEntry> = map
@@ -889,7 +988,21 @@ impl DocsMembership {
                 );
             }
         }
+        *self.inner.self_grant.lock() = self_grant;
         *self.inner.members.lock() = map;
+        if let Some(grant) = self.self_grant() {
+            let context = super::auth::build_auth_server_context(&HashMap::from([(
+                self.inner.network_id,
+                self.clone(),
+            )]));
+            self.inner
+                .auth
+                .authenticate(&context, &grant, &self.inner.self_endpoint_id)?;
+        } else {
+            self.inner
+                .auth
+                .remove_network(&self.inner.self_endpoint_id, self.inner.network_id);
+        }
         Ok(())
     }
 
@@ -904,6 +1017,7 @@ impl DocsMembership {
                 hostname: m.hostname.clone(),
                 tags: m.tags.clone(),
                 ssh_host_key: m.ssh_host_key.clone(),
+                posture: tunnet_common::PeerPosture::Unknown,
             })
             .collect();
         let version = members.len() as u64;
@@ -914,16 +1028,17 @@ impl DocsMembership {
             .read()
             .clone()
             .map(|g| g.address_plan.peer_cidr);
-        routes.replace_network_with_plan(
-            self.inner.network_id,
-            &peers,
-            &dns,
-            &self.inner.network_name,
-            &self.inner.self_endpoint_id,
-            version,
-            peer_cidr,
-        );
-        forward.republish(routes);
+        forward.update_routes(routes, || {
+            routes.replace_network_with_plan(
+                self.inner.network_id,
+                &peers,
+                &dns,
+                &self.inner.network_name,
+                &self.inner.self_endpoint_id,
+                version,
+                peer_cidr,
+            )
+        });
         self.fire_change_hook();
         if let Ok(json) = serde_json::to_vec_pretty(&members) {
             let _ = tunnet_common::persistence::atomic_write(
@@ -940,6 +1055,7 @@ impl DocsMembership {
                 hostname: peer.hostname.clone(),
                 tags: peer.tags.clone(),
                 ssh_host_key: peer.ssh_host_key.clone(),
+                posture: tunnet_common::PeerPosture::Unknown,
             })
             .collect();
         if let Err(e) = crate::known_hosts::sync_known_hosts(

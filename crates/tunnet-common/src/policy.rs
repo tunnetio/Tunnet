@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::posture::PostureEnforcementConfig;
+use jiff::Timestamp;
+
+use crate::posture::{PeerPosture, PostureEnforcementConfig};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -64,6 +66,7 @@ pub enum EvalReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalVerdict {
+    pub posture_required: bool,
     pub action: Action,
     pub reason: EvalReason,
     pub rule_slug: Option<String>,
@@ -77,6 +80,7 @@ impl EvalVerdict {
             reason: EvalReason::IcmpPolicy,
             rule_slug: None,
             scope: None,
+            posture_required: false,
         }
     }
 
@@ -87,12 +91,14 @@ impl EvalVerdict {
                 reason: EvalReason::DefaultAllow,
                 rule_slug: None,
                 scope: None,
+                posture_required: false,
             },
             DefaultAction::Deny => Self {
                 action: Action::Deny,
                 reason: EvalReason::DefaultDeny,
                 rule_slug: None,
                 scope: None,
+                posture_required: false,
             },
         }
     }
@@ -103,6 +109,7 @@ impl EvalVerdict {
             reason,
             rule_slug: rule.slug.clone(),
             scope: Some(rule.scope),
+            posture_required: false,
         }
     }
 }
@@ -357,8 +364,8 @@ pub struct EvalCtx<'a> {
     pub peer_network: &'a str,
     pub dst_port: Option<u16>,
     pub protocol: Protocol,
-    /// When false, rules with non-empty `src_posture` do not match.
-    pub src_posture_ok: bool,
+    /// Named claim of the flow source for this direction.
+    pub src_posture: PeerPosture,
 }
 
 /// One side of a flow: a mesh member or an external (non-mesh) target.
@@ -371,6 +378,8 @@ pub struct FlowEndpoint {
     pub tags: Vec<String>,
     pub network: String,
     pub ip: Option<Ipv4Addr>,
+    /// Claim for this endpoint in the flow's network. External sides are `Unknown`.
+    pub posture: PeerPosture,
 }
 
 impl FlowEndpoint {
@@ -379,12 +388,14 @@ impl FlowEndpoint {
         tags: Vec<String>,
         network: String,
         ip: Option<Ipv4Addr>,
+        posture: PeerPosture,
     ) -> Self {
         Self {
             endpoint_hex,
             tags,
             network,
             ip,
+            posture,
         }
     }
 
@@ -394,6 +405,7 @@ impl FlowEndpoint {
             tags: Vec::new(),
             network: String::new(),
             ip,
+            posture: PeerPosture::Unknown,
         }
     }
 }
@@ -407,8 +419,6 @@ pub struct FlowContext {
     pub dst: FlowEndpoint,
     pub protocol: Protocol,
     pub dst_port: Option<u16>,
-    /// When false, rules with non-empty `src_posture` do not match.
-    pub src_posture_ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -423,8 +433,8 @@ pub struct Ipv6EvalCtx<'a> {
     pub peer_network: &'a str,
     pub dst_port: Option<u16>,
     pub protocol: Protocol,
-    /// When false, rules with non-empty `src_posture` do not match.
-    pub src_posture_ok: bool,
+    /// Named claim of the flow source for this direction.
+    pub src_posture: PeerPosture,
 }
 
 impl Selector {
@@ -517,12 +527,16 @@ pub fn merge_policy_bundles(org: &PolicyBundle, network: &PolicyBundle) -> Polic
 
 /// Canonical bytes signed by the control plane for a policy bundle.
 pub fn policy_bundle_sign_bytes(bundle: &PolicyBundle) -> Result<Vec<u8>, serde_json::Error> {
+    let postures: std::collections::BTreeMap<_, _> = bundle.postures.iter().collect();
     serde_json::to_vec(&(
         &bundle.rules,
         &bundle.ssh_rules,
         bundle.version,
         bundle.default_action,
         bundle.icmp_policy,
+        postures,
+        &bundle.default_src_posture,
+        &bundle.posture_enforcement,
     ))
 }
 
@@ -536,7 +550,12 @@ pub fn verify_policy_bundle_signature(
     use ed25519_dalek::Verifier;
 
     if bundle.signature.is_empty() {
-        if bundle.rules.is_empty() && bundle.ssh_rules.is_empty() {
+        if bundle.rules.is_empty()
+            && bundle.ssh_rules.is_empty()
+            && bundle.postures.is_empty()
+            && bundle.default_src_posture.is_empty()
+            && bundle.posture_enforcement.is_none()
+        {
             return Ok(());
         }
         return Err(crate::ProtocolError::BadSignature);
@@ -589,7 +608,7 @@ pub fn evaluate_detailed(
     evaluate_phases(
         bundle,
         |r| rule_matches_v4(r, ctx, direction),
-        ctx.src_posture_ok,
+        &ctx.src_posture,
     )
 }
 
@@ -612,7 +631,7 @@ pub fn evaluate_ipv6_detailed(
     evaluate_phases(
         bundle,
         |r| rule_matches_v6(r, ctx, direction),
-        ctx.src_posture_ok,
+        &ctx.src_posture,
     )
 }
 
@@ -624,22 +643,37 @@ pub fn evaluate_flow(bundle: &PolicyBundle, flow: &FlowContext) -> EvalVerdict {
             IcmpPolicy::Acl => {}
         }
     }
-    evaluate_phases(bundle, |r| rule_matches_flow(r, flow), flow.src_posture_ok)
+    evaluate_phases(bundle, |r| rule_matches_flow(r, flow), &flow.src.posture)
 }
 
-fn evaluate_phases<F>(bundle: &PolicyBundle, mut matcher: F, src_posture_ok: bool) -> EvalVerdict
+/// Explicit `src_posture` names replace `default_src_posture`. An empty rule list uses the default.
+pub fn effective_posture_names<'a>(rule: &'a PolicyRule, bundle: &'a PolicyBundle) -> &'a [String] {
+    if rule.src_posture.is_empty() {
+        &bundle.default_src_posture
+    } else {
+        &rule.src_posture
+    }
+}
+
+fn evaluate_phases<F>(
+    bundle: &PolicyBundle,
+    mut matcher: F,
+    src_posture: &PeerPosture,
+) -> EvalVerdict
 where
     F: FnMut(&PolicyRule) -> bool,
 {
+    let now = Timestamp::now();
     let mut posture_skip: Option<&PolicyRule> = None;
 
     // Phase 1: Organization Deny
     if let Some(rule) = first_matching_in_phase(
-        &bundle.rules,
+        bundle,
         RuleScope::Organization,
         Action::Deny,
         &mut matcher,
-        src_posture_ok,
+        src_posture,
+        now,
         &mut posture_skip,
     ) {
         return EvalVerdict::rule(Action::Deny, EvalReason::OrgDeny, rule);
@@ -647,11 +681,12 @@ where
 
     // Phase 2: Network Deny
     if let Some(rule) = first_matching_in_phase(
-        &bundle.rules,
+        bundle,
         RuleScope::Network,
         Action::Deny,
         &mut matcher,
-        src_posture_ok,
+        src_posture,
+        now,
         &mut posture_skip,
     ) {
         return EvalVerdict::rule(Action::Deny, EvalReason::NetworkDeny, rule);
@@ -659,40 +694,60 @@ where
 
     // Phase 3: Network Allow (org Allow is not supported in v1)
     if let Some(rule) = first_matching_in_phase(
-        &bundle.rules,
+        bundle,
         RuleScope::Network,
         Action::Allow,
         &mut matcher,
-        src_posture_ok,
+        src_posture,
+        now,
         &mut posture_skip,
     ) {
-        return EvalVerdict::rule(Action::Allow, EvalReason::NetworkAllow, rule);
+        let mut verdict = EvalVerdict::rule(Action::Allow, EvalReason::NetworkAllow, rule);
+        verdict.posture_required = !effective_posture_names(rule, bundle).is_empty();
+        return verdict;
     }
 
     if let Some(rule) = posture_skip {
         return EvalVerdict {
-            action: bundle.default_action.into(),
+            action: Action::Deny,
             reason: EvalReason::PostureSkip,
             rule_slug: rule.slug.clone(),
             scope: Some(rule.scope),
+            posture_required: false,
         };
     }
 
-    EvalVerdict::default_action(bundle.default_action)
+    if !bundle.default_src_posture.is_empty()
+        && !src_posture.satisfies(&bundle.default_src_posture, now)
+    {
+        return EvalVerdict {
+            action: Action::Deny,
+            reason: EvalReason::PostureSkip,
+            rule_slug: None,
+            scope: None,
+            posture_required: false,
+        };
+    }
+    let mut verdict = EvalVerdict::default_action(bundle.default_action);
+    verdict.posture_required =
+        verdict.action == Action::Allow && !bundle.default_src_posture.is_empty();
+    verdict
 }
 
 fn first_matching_in_phase<'a, F>(
-    rules: &'a [PolicyRule],
+    bundle: &'a PolicyBundle,
     scope: RuleScope,
     action: Action,
     matcher: &mut F,
-    src_posture_ok: bool,
+    src_posture: &PeerPosture,
+    now: Timestamp,
     posture_skip: &mut Option<&'a PolicyRule>,
 ) -> Option<&'a PolicyRule>
 where
     F: FnMut(&PolicyRule) -> bool,
 {
-    let mut candidates: Vec<&PolicyRule> = rules
+    let mut candidates: Vec<&PolicyRule> = bundle
+        .rules
         .iter()
         .filter(|r| r.enabled && r.scope == scope && r.action == action)
         .collect();
@@ -706,7 +761,8 @@ where
         if !matcher(rule) {
             continue;
         }
-        if !rule.src_posture.is_empty() && !src_posture_ok {
+        let names = effective_posture_names(rule, bundle);
+        if !src_posture.satisfies(names, now) {
             if posture_skip.is_none() {
                 *posture_skip = Some(rule);
             }
@@ -832,7 +888,7 @@ fn proto_port_ok(r: &PolicyRule, protocol: Protocol, dst_port: Option<u16>) -> b
     true
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Inbound,
     Outbound,
@@ -855,7 +911,7 @@ mod tests {
             peer_network: "",
             dst_port: port,
             protocol,
-            src_posture_ok: true,
+            src_posture: PeerPosture::Unknown,
         }
     }
 
@@ -1052,7 +1108,7 @@ mod tests {
             peer_network: "",
             dst_port: None,
             protocol: Protocol::Any,
-            src_posture_ok: true,
+            src_posture: PeerPosture::Unknown,
         };
         assert_eq!(
             evaluate_ipv6(&PolicyBundle::default(), &ctx, Direction::Outbound),
@@ -1178,8 +1234,12 @@ mod tests {
         assert_eq!(merged.default_src_posture, vec!["os".to_string()]);
     }
 
-    #[test]
-    fn verify_policy_bundle_signature_round_trip_and_tamper() {
+    #[rstest::rstest]
+    #[case("rule")]
+    #[case("definition")]
+    #[case("default_posture")]
+    #[case("enforcement")]
+    fn verify_policy_bundle_signature_round_trip_and_tamper(#[case] field: &str) {
         use base64::Engine;
         use ed25519_dalek::{Signer, SigningKey};
 
@@ -1203,7 +1263,17 @@ mod tests {
         bundle.signature = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
         assert!(verify_policy_bundle_signature(&bundle, &verifying_key).is_ok());
 
-        bundle.rules[0].priority = 99;
+        match field {
+            "rule" => bundle.rules[0].priority = 99,
+            "definition" => {
+                bundle
+                    .postures
+                    .insert("encrypted".into(), vec!["disk_encrypted == true".into()]);
+            }
+            "default_posture" => bundle.default_src_posture.push("encrypted".into()),
+            "enforcement" => bundle.posture_enforcement = Some(Default::default()),
+            _ => unreachable!(),
+        }
         assert!(matches!(
             verify_policy_bundle_signature(&bundle, &verifying_key),
             Err(crate::ProtocolError::BadSignature)
@@ -1265,12 +1335,24 @@ mod tests {
 
     fn member_flow(src_tags: Vec<String>, dst_ip: Option<Ipv4Addr>, port: u16) -> FlowContext {
         FlowContext {
-            src: FlowEndpoint::member("peer".into(), src_tags, "net".into(), None),
+            src: FlowEndpoint::member(
+                "peer".into(),
+                src_tags,
+                "net".into(),
+                None,
+                PeerPosture::Unknown,
+            ),
             dst: FlowEndpoint::external(dst_ip),
             protocol: Protocol::Tcp,
             dst_port: Some(port),
-            src_posture_ok: true,
         }
+    }
+
+    fn live_claim(names: &[&str]) -> PeerPosture {
+        PeerPosture::verified(
+            names.iter().copied(),
+            Timestamp::now() + jiff::SignedDuration::from_secs(60),
+        )
     }
 
     #[test]
@@ -1318,6 +1400,99 @@ mod tests {
         )]);
         // An external target has no tags: tag-scoped destination rules cannot match it.
         let flow = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Deny);
+    }
+
+    #[rstest::rstest]
+    #[case(false, false, Action::Allow)]
+    #[case(true, false, Action::Deny)]
+    #[case(true, true, Action::Allow)]
+    fn default_posture_does_not_fall_through_to_allow(
+        #[case] required: bool,
+        #[case] compliant: bool,
+        #[case] expected: Action,
+    ) {
+        let mut bundle = PolicyBundle::default();
+        if required {
+            bundle.default_src_posture.push("compliant".into());
+        }
+        let mut flow = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        if compliant {
+            flow.src.posture = live_claim(&["compliant"]);
+        }
+        assert_eq!(evaluate_flow(&bundle, &flow).action, expected);
+        let mut rule = flow_rule(Selector::Any, Selector::Any, 443);
+        rule.src_posture.push("compliant".into());
+        bundle.rules.push(rule);
+        assert_eq!(
+            evaluate_flow(&bundle, &flow).action,
+            if compliant {
+                Action::Allow
+            } else {
+                Action::Deny
+            },
+        );
+    }
+
+    #[test]
+    fn explicit_posture_names_override_the_default_list() {
+        let mut bundle = PolicyBundle {
+            default_src_posture: vec!["corp".into()],
+            default_action: DefaultAction::Deny,
+            ..Default::default()
+        };
+        let mut specified = flow_rule(Selector::Any, Selector::Any, 443);
+        specified.src_posture = vec!["guest".into()];
+        let mut unspecified = flow_rule(Selector::Any, Selector::Any, 22);
+        unspecified.src_posture.clear();
+        bundle.rules = vec![specified, unspecified];
+
+        let mut guest = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        guest.src.posture = live_claim(&["guest"]);
+        assert_eq!(evaluate_flow(&bundle, &guest).action, Action::Allow);
+
+        let mut guest_ssh = guest.clone();
+        guest_ssh.dst_port = Some(22);
+        assert_eq!(evaluate_flow(&bundle, &guest_ssh).action, Action::Deny);
+
+        let mut corp = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 22);
+        corp.src.posture = live_claim(&["corp"]);
+        assert_eq!(evaluate_flow(&bundle, &corp).action, Action::Allow);
+    }
+
+    #[test]
+    fn expired_claim_denies_only_posture_rules() {
+        let mut bundle = PolicyBundle {
+            default_action: DefaultAction::Allow,
+            ..PolicyBundle::default()
+        };
+        let mut gated = flow_rule(Selector::Any, Selector::Any, 443);
+        gated.src_posture = vec!["corp".into()];
+        let open = flow_rule(Selector::Any, Selector::Any, 22);
+        bundle.rules = vec![gated, open];
+        let mut flow = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        flow.src.posture = PeerPosture::verified(
+            ["corp"],
+            Timestamp::now() - jiff::SignedDuration::from_secs(1),
+        );
+        assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Deny);
+        flow.dst_port = Some(22);
+        assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Allow);
+    }
+
+    #[test]
+    fn posture_requirement_is_or_of_the_effective_names() {
+        let mut bundle = PolicyBundle {
+            default_action: DefaultAction::Deny,
+            ..PolicyBundle::default()
+        };
+        let mut rule = flow_rule(Selector::Any, Selector::Any, 443);
+        rule.src_posture = vec!["corp".into(), "guest".into()];
+        bundle.rules = vec![rule];
+        let mut flow = member_flow(vec![], Some(Ipv4Addr::new(10, 8, 0, 7)), 443);
+        flow.src.posture = live_claim(&["guest"]);
+        assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Allow);
+        flow.src.posture = live_claim(&["other"]);
         assert_eq!(evaluate_flow(&bundle, &flow).action, Action::Deny);
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::task::{JoinHandle, JoinSet};
 
 use super::types::{LocalService, is_mesh_ipv4};
 
@@ -23,17 +24,22 @@ pub fn spawn_scanner(
     daemon: ServiceDaemon,
     mesh_ip: Ipv4Addr,
     advertised: AdvertisedSet,
-    tx: mpsc::UnboundedSender<ScanEvent>,
-) -> anyhow::Result<()> {
-    let meta_rx = daemon
+    tx: mpsc::Sender<ScanEvent>,
+) -> anyhow::Result<JoinHandle<()>> {
+    let mut meta_rx = daemon
         .browse(META_QUERY)
         .map_err(|e| anyhow::anyhow!("mdns browse meta: {e}"))?;
 
     let browsing: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
+        let mut browsers = JoinSet::new();
         loop {
-            match meta_rx.recv_async().await {
+            let event = tokio::select! {
+                event = meta_rx.recv_async() => event,
+                _ = browsers.join_next(), if !browsers.is_empty() => { continue; }
+            };
+            match event {
                 Ok(ServiceEvent::ServiceFound(_meta, service_type)) => {
                     let ty = normalize_type(&service_type);
                     if ty == META_QUERY || !ty.contains("._") {
@@ -45,47 +51,80 @@ pub fn spawn_scanner(
                             continue;
                         }
                     }
-                    spawn_type_browser(daemon.clone(), ty, mesh_ip, advertised.clone(), tx.clone());
+                    if browsing.lock().len() > 64 {
+                        browsing.lock().remove(&ty);
+                        continue;
+                    }
+                    let daemon = daemon.clone();
+                    let advertised = advertised.clone();
+                    let tx = tx.clone();
+                    let browsing = browsing.clone();
+                    browsers.spawn(async move {
+                        browse_type(daemon, ty.clone(), mesh_ip, advertised, tx).await;
+                        browsing.lock().remove(&ty);
+                    });
                 }
                 Ok(other) => {
                     tracing::trace!(?other, "mdns meta event");
                 }
                 Err(e) => {
                     tracing::debug!(error = %e, "mdns meta browse ended");
-                    break;
+                    match renew_browse(&daemon, META_QUERY).await {
+                        Ok(receiver) => meta_rx = receiver,
+                        Err(_) => break,
+                    }
                 }
             }
         }
-    });
-
-    Ok(())
+    }))
 }
 
-fn spawn_type_browser(
+async fn renew_browse(
+    daemon: &ServiceDaemon,
+    service_type: &str,
+) -> mdns_sd::Result<mdns_sd::Receiver<ServiceEvent>> {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match daemon.browse(service_type) {
+            Err(mdns_sd::Error::Again) => continue,
+            result => return result,
+        }
+    }
+}
+
+async fn browse_type(
     daemon: ServiceDaemon,
     service_type: String,
     mesh_ip: Ipv4Addr,
     advertised: AdvertisedSet,
-    tx: mpsc::UnboundedSender<ScanEvent>,
+    tx: mpsc::Sender<ScanEvent>,
 ) {
-    let Ok(rx) = daemon.browse(&service_type) else {
+    let Ok(mut rx) = renew_browse(&daemon, &service_type).await else {
         tracing::warn!(%service_type, "mdns browse service type failed");
         return;
     };
     tracing::debug!(%service_type, "browsing mDNS service type");
-    tokio::spawn(async move {
-        while let Ok(ev) = rx.recv_async().await {
-            handle_service_event(ev, mesh_ip, &advertised, &tx);
+    loop {
+        tokio::select! {
+            _ = tx.closed() => break,
+            event = rx.recv_async() => match event {
+                Ok(event) => handle_service_event(event, mesh_ip, &advertised, &tx).await,
+                Err(_) => match renew_browse(&daemon, &service_type).await {
+                    Ok(receiver) => rx = receiver,
+                    Err(_) => break,
+                },
+            },
         }
-        tracing::debug!(%service_type, "mdns service-type browse ended");
-    });
+    }
+    let _ = daemon.stop_browse(&service_type);
+    tracing::debug!(%service_type, "mdns service-type browse ended");
 }
 
-fn handle_service_event(
+async fn handle_service_event(
     event: ServiceEvent,
     mesh_ip: Ipv4Addr,
     advertised: &AdvertisedSet,
-    tx: &mpsc::UnboundedSender<ScanEvent>,
+    tx: &mpsc::Sender<ScanEvent>,
 ) {
     match event {
         ServiceEvent::ServiceResolved(info) => {
@@ -122,14 +161,14 @@ fn handle_service_event(
                 port = svc.port,
                 "mDNS service discovered"
             );
-            let _ = tx.send(ScanEvent::Upsert(svc));
+            let _ = tx.send(ScanEvent::Upsert(svc)).await;
         }
         ServiceEvent::ServiceRemoved(_ty, fullname) => {
             if advertised.lock().contains(&fullname.to_lowercase()) {
                 return;
             }
             tracing::info!(%fullname, "mDNS service removed");
-            let _ = tx.send(ScanEvent::Remove { fullname });
+            let _ = tx.send(ScanEvent::Remove { fullname }).await;
         }
         _ => {}
     }

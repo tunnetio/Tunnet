@@ -27,7 +27,6 @@ use tunnet_core::stream::{StreamHandler, StreamProtocolHandler, TUNNEL_STREAM_AL
 use tunnet_core::{ForwardingStore, PeerManager, RoutingTable, SendManager, StatePaths};
 use uuid::Uuid;
 
-use crate::actors::dataplane::PublishedPlane;
 #[cfg(feature = "ssh")]
 use crate::recorder::{RecordingStore, serve_recording_connection};
 
@@ -35,7 +34,6 @@ pub struct AcceptDeps {
     pub endpoint: iroh::Endpoint,
     pub routes: RoutingTable,
     pub forwarding: ForwardingStore,
-    pub tun: PublishedPlane,
     pub stream_handler: StreamHandler,
     #[cfg(feature = "ssh")]
     pub cp_tx: Option<tokio::sync::mpsc::Sender<ClientMsg>>,
@@ -59,16 +57,14 @@ pub struct AcceptDeps {
 
 /// Spawn the unified ALPN router. Keep the returned [`Router`] alive for the process lifetime.
 pub fn spawn(deps: AcceptDeps) -> Router {
-    let tunnel = TunnelHandler {
-        tun: deps.tun,
-        peers: deps.peers,
-    };
+    let tunnel = TunnelHandler { peers: deps.peers };
     let stream = StreamProtocolHandler::new(deps.stream_handler);
     let auth_server_ctx = deps.auth_server_ctx.clone();
     let auth = AuthHandler {
         direct_auth: deps.direct_auth.clone(),
         auth_server_ctx: auth_server_ctx.clone(),
         self_endpoint_id: deps.self_endpoint_id.clone(),
+        exchanges: Arc::new(tokio::sync::Semaphore::new(64)),
     };
     let join = JoinHandler {
         authorities: deps.join_authorities,
@@ -125,7 +121,6 @@ pub fn spawn(deps: AcceptDeps) -> Router {
 
 #[derive(Clone)]
 struct TunnelHandler {
-    tun: PublishedPlane,
     peers: PeerManager,
 }
 
@@ -137,15 +132,9 @@ impl fmt::Debug for TunnelHandler {
 
 impl ProtocolHandler for TunnelHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        if self.tun.load_full().is_none() {
-            tracing::debug!("tunnel ALPN ignored (data plane down)");
-            conn.close(1u32.into(), b"dataplane_down");
-            return Ok(());
-        }
         let peer = conn.remote_id();
         if !self.peers.install(peer, conn.clone(), false) {
             tracing::debug!(%peer, "accept lost tie-break or dataplane down; closing");
-            conn.close(0u32.into(), b"tie_break");
             return Ok(());
         }
         Ok(())
@@ -157,6 +146,7 @@ struct AuthHandler {
     direct_auth: Option<AuthCache>,
     auth_server_ctx: Option<SharedAuthServerContext>,
     self_endpoint_id: String,
+    exchanges: Arc<tokio::sync::Semaphore>,
 }
 
 impl fmt::Debug for AuthHandler {
@@ -167,17 +157,26 @@ impl fmt::Debug for AuthHandler {
 
 impl ProtocolHandler for AuthHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let Ok(_exchange) = self.exchanges.try_acquire() else {
+            conn.close(401u32.into(), b"auth_required");
+            return Ok(());
+        };
         let (Some(auth), Some(ctx)) = (self.direct_auth.clone(), self.auth_server_ctx.clone())
         else {
             tracing::debug!("AUTH_ALPN ignored (not in Direct mode)");
             conn.close(0u32.into(), b"not_direct");
             return Ok(());
         };
-        match run_auth_server(&conn, &ctx, &self.self_endpoint_id, &auth).await {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::debug!(?e, "direct auth handshake failed");
-                conn.close(401u32.into(), b"auth_failed");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_auth_server(&conn, &ctx, &self.self_endpoint_id, &auth),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            other => {
+                tracing::debug!(?other, "direct auth handshake failed");
+                conn.close(401u32.into(), b"auth_required");
             }
         }
         Ok(())

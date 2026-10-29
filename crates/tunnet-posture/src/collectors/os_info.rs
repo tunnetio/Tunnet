@@ -3,7 +3,6 @@ use crate::error::PostureError;
 use crate::platform::Platform;
 use crate::value::PostureValue;
 use async_trait::async_trait;
-use std::time::Duration;
 
 pub struct OsCollector {
     tunnet_version: String,
@@ -95,10 +94,6 @@ impl PostureCollector for OsCollector {
             .insert("node:uptime".into(), PostureValue::Number(uptime));
 
         Ok(attrs)
-    }
-
-    fn min_interval(&self) -> Duration {
-        Duration::from_secs(60)
     }
 }
 

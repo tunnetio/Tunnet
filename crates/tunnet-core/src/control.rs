@@ -13,7 +13,8 @@ const ALLOW_PRIVATE_CONTROL_ENDPOINTS: &str = "TUNNET_ALLOW_PRIVATE_CONTROL_ENDP
 /// An outbound control-plane or management endpoint that cannot be redirected
 /// or resolved to a local network address unless the service operator opted in.
 #[derive(Clone)]
-struct ServiceEndpoint {
+pub(crate) struct ServiceEndpoint {
+    tcp_config: Option<[Option<iroh::endpoint::TcpSocketConfig>; 2]>,
     base: Url,
     host: String,
     resolved_addrs: Vec<SocketAddr>,
@@ -70,13 +71,52 @@ impl ServiceEndpoint {
         }
 
         Ok(Self {
+            tcp_config: None,
             base,
             host,
             resolved_addrs,
         })
     }
 
-    fn url(&self, path: &str) -> anyhow::Result<Url> {
+    #[cfg(feature = "managed")]
+    pub(crate) async fn connect_tcp(&self) -> std::io::Result<tokio::net::TcpStream> {
+        let mut last_error = std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no authorized control endpoint address",
+        );
+        for &addr in &self.resolved_addrs {
+            let config = match self.tcp_config {
+                None => iroh::endpoint::TcpSocketConfig::default(),
+                Some(configs) => match configs[usize::from(addr.is_ipv6())] {
+                    Some(config) => config,
+                    None => continue,
+                },
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                iroh::endpoint::connect_tcp(addr, config),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(err)) => last_error = err,
+                Err(_) => {
+                    last_error = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "control endpoint connect timed out",
+                    )
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    #[cfg(feature = "managed")]
+    pub(crate) fn base_url(&self) -> &str {
+        self.base.as_str()
+    }
+
+    pub(crate) fn url(&self, path: &str) -> anyhow::Result<Url> {
         self.base
             .join(path)
             .with_context(|| format!("build endpoint URL for {path}"))
@@ -123,11 +163,24 @@ fn service_http_client(
     endpoint: &ServiceEndpoint,
     timeout: std::time::Duration,
 ) -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout)
+        .no_proxy()
         .redirect(Policy::none())
-        .resolve_to_addrs(&endpoint.host, &endpoint.resolved_addrs)
-        .build()?)
+        .resolve_to_addrs(&endpoint.host, &endpoint.resolved_addrs);
+    if let Some(configs) = endpoint.tcp_config {
+        builder =
+            builder.tcp_socket_initializer(std::sync::Arc::new(move |socket, destination| {
+                let config = configs[usize::from(destination.is_ipv6())].ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "control endpoint address family has no protected socket binding",
+                    )
+                })?;
+                iroh::endpoint::configure_tcp_socket(socket, destination, config)
+            }));
+    }
+    Ok(builder.build()?)
 }
 
 pub struct UnauthedClient {
@@ -140,6 +193,66 @@ mod endpoint_tests {
     use rstest::rstest;
 
     use super::*;
+
+    fn allow_before_connect(socket: &std::net::TcpStream) -> std::io::Result<()> {
+        assert!(socket.peer_addr().is_err());
+        Ok(())
+    }
+
+    fn refuse_socket(_: &std::net::TcpStream) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test protection refused",
+        ))
+    }
+
+    #[rstest]
+    #[case::allow(Some(allow_before_connect as fn(&std::net::TcpStream) -> std::io::Result<()>), true)]
+    #[case::refuse(Some(refuse_socket as fn(&std::net::TcpStream) -> std::io::Result<()>), false)]
+    #[case::missing_family(None, false)]
+    #[tokio::test]
+    async fn protected_http_socket_authorization_precedes_connect(
+        #[case] initialize: Option<fn(&std::net::TcpStream) -> std::io::Result<()>>,
+        #[case] allowed: bool,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = ServiceEndpoint::parse_with_private_endpoints_allowed(&url, true).unwrap();
+        let mut endpoint = ServiceEndpoint {
+            tcp_config: Some([
+                initialize.map(|initialize| iroh::endpoint::TcpSocketConfig {
+                    initialize: Some(initialize),
+                    interface: None,
+                }),
+                None,
+            ]),
+            ..endpoint
+        };
+        endpoint.base.set_host(Some("control.invalid")).unwrap();
+        endpoint.host = "control.invalid".into();
+        let http = service_http_client(&endpoint, std::time::Duration::from_secs(2)).unwrap();
+        let server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                    .await;
+            if let Ok(Ok((mut stream, _))) = accepted {
+                let mut buffer = [0; 2048];
+                let received = stream.read(&mut buffer).await.unwrap();
+                assert!(received > 0);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                true
+            } else {
+                false
+            }
+        });
+        let response = http.get(endpoint.url("").unwrap()).send().await;
+        assert_eq!(response.is_ok(), allowed);
+        assert_eq!(server.await.unwrap(), allowed);
+    }
 
     #[rstest]
     #[case::loopback("http://127.0.0.1:8080")]
@@ -389,6 +502,32 @@ impl Clone for SignedClient {
 }
 
 impl SignedClient {
+    #[cfg(test)]
+    pub(crate) fn new_trusted_loopback(url: &str, signing_key: SigningKey) -> Self {
+        let endpoint = ServiceEndpoint::parse_with_private_endpoints_allowed(url, true).unwrap();
+        let http = service_http_client(&endpoint, std::time::Duration::from_secs(15)).unwrap();
+        Self {
+            endpoint,
+            http,
+            endpoint_id: "aa".into(),
+            signing_key,
+        }
+    }
+
+    pub fn with_tcp_config(
+        mut self,
+        config: Option<[Option<iroh::endpoint::TcpSocketConfig>; 2]>,
+    ) -> anyhow::Result<Self> {
+        self.endpoint.tcp_config = config;
+        self.http = service_http_client(&self.endpoint, std::time::Duration::from_secs(15))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "managed")]
+    pub(crate) fn service_endpoint(&self) -> ServiceEndpoint {
+        self.endpoint.clone()
+    }
+
     pub fn new(base: String, endpoint_id: String, signing_key: SigningKey) -> anyhow::Result<Self> {
         let endpoint = ServiceEndpoint::parse(&base)?;
         let http = service_http_client(&endpoint, std::time::Duration::from_secs(15))?;

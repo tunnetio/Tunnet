@@ -51,7 +51,7 @@ pub fn simulate(
         peer_network: "",
         dst_port: port,
         protocol,
-        src_posture_ok: true,
+        src_posture: tunnet_common::PeerPosture::Unknown,
     };
 
     let verdict = evaluate_detailed(&bundle, &ctx, Direction::Outbound);

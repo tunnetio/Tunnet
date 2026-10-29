@@ -31,13 +31,4 @@ impl Peer {
             tags: p.tags,
         }
     }
-
-    pub(crate) fn from_endpoint_hex(endpoint_id: String) -> Self {
-        Self {
-            ip: String::new(),
-            hostname: String::new(),
-            endpoint_id,
-            tags: Vec::new(),
-        }
-    }
 }

@@ -113,6 +113,9 @@ pub fn apply_membership(
     self_hostname: &str,
     known_hosts_file: Option<&std::path::Path>,
 ) -> bool {
+    let Ok(mesh_range) = ipnet::Ipv4Net::new(membership.assigned_ipv4, membership.prefix) else {
+        return false;
+    };
     // Verify policy signatures BEFORE mutating routes/forwarding state.
     if let Some(vk) = parse_policy_vk(policy_verifying_key) {
         if let Err(e) = verify_policy_bundle_signature(&membership.policy, &vk) {
@@ -129,10 +132,14 @@ pub fn apply_membership(
             );
             return false;
         }
-    } else if !membership.policy.signature.is_empty() || !org_policy.signature.is_empty() {
-        tracing::debug!(
-            "policy verifying key missing; applying merged policy without signature check"
+    } else if policy_verifying_key.is_some()
+        || !membership.policy.signature.is_empty()
+        || !org_policy.signature.is_empty()
+    {
+        tracing::warn!(
+            "policy verifying key missing or invalid; retaining current forwarding state"
         );
+        return false;
     }
 
     // Control plane excludes this endpoint from ipv4_peers (no mesh self-route).
@@ -144,13 +151,14 @@ pub fn apply_membership(
     };
     let mut peers = Vec::with_capacity(membership.ipv4_peers.len() + 1);
     peers.extend_from_slice(&membership.ipv4_peers);
-    if !hostname.is_empty() && !peers.iter().any(|p| p.endpoint_id == self_endpoint_id) {
+    if !peers.iter().any(|p| p.endpoint_id == self_endpoint_id) {
         peers.push(tunnet_common::PeerEntry {
             ip: membership.assigned_ipv4,
             endpoint_id: self_endpoint_id.to_string(),
             hostname: hostname.to_string(),
             tags: membership.self_tags.clone(),
             ssh_host_key: None,
+            posture: membership.self_posture.clone(),
         });
     }
 
@@ -159,19 +167,7 @@ pub fn apply_membership(
         OrgRevision(org_version),
         NetworkRevision(membership.version),
         || {
-            routes.replace(
-                &peers,
-                &membership.subnet_routes,
-                &membership.hostname_routes,
-                &membership.exit_nodes,
-                &membership.device_profile,
-                &membership.dns,
-                &membership.network_name,
-                membership.network_id,
-                self_endpoint_id,
-                membership.version,
-            );
-            forward.set_managed_bundle(
+            forward.update_managed(
                 routes,
                 membership.network_id,
                 merged,
@@ -180,6 +176,22 @@ pub fn apply_membership(
                     ip: membership.assigned_ipv4,
                     tags: membership.self_tags.clone(),
                     network: membership.network_name.clone(),
+                    posture: membership.self_posture.clone(),
+                },
+                || {
+                    routes.replace(
+                        &peers,
+                        &membership.subnet_routes,
+                        &membership.hostname_routes,
+                        &membership.exit_nodes,
+                        &membership.device_profile,
+                        &membership.dns,
+                        &membership.network_name,
+                        membership.network_id,
+                        self_endpoint_id,
+                        membership.version,
+                    );
+                    routes.reserve_mesh_range(membership.network_id, mesh_range);
                 },
             );
         },
@@ -199,6 +211,7 @@ pub fn apply_membership(
 /// Apply a peer-only SnapshotDelta (no policy / route table replace).
 pub fn apply_delta(
     routes: &RoutingTable,
+    forward: &ForwardingStore,
     revisions: &Arc<ManagedRevisions>,
     delta: &tunnet_common::SnapshotDelta,
     self_endpoint_id: &str,
@@ -206,14 +219,16 @@ pub fn apply_delta(
     network_name: &str,
 ) -> bool {
     revisions.apply_delta(NetworkRevision(delta.version), || {
-        routes.apply_peer_delta(
-            network_id,
-            &delta.added,
-            &delta.removed,
-            delta.version,
-            self_endpoint_id,
-            network_name,
-        );
+        forward.update_routes(routes, || {
+            routes.apply_peer_delta(
+                network_id,
+                &delta.added,
+                &delta.removed,
+                delta.version,
+                self_endpoint_id,
+                network_name,
+            );
+        });
     })
 }
 
@@ -337,7 +352,11 @@ pub fn spawn_managed_driver(
         let mut poll_ticker = tokio::time::interval(Duration::from_secs(poll_secs.max(5)));
         poll_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         poll_ticker.tick().await;
+        #[cfg(feature = "send")]
+        let mut file_tasks = tokio::task::JoinSet::new();
         loop {
+            #[cfg(feature = "send")]
+            while file_tasks.try_join_next().is_some() {}
             tokio::select! {
                 _ = poll_ticker.tick() => {
                     if let Some(client) = &poll_client {
@@ -416,7 +435,6 @@ pub fn spawn_managed_driver(
                                 .get(&network_id)
                                 .is_some_and(|network| revisions.accept_absence(snap.version, *network))
                             {
-                                routes.clear_managed(network_id, &self_endpoint_id);
                                 forward.clear_managed(&routes, network_id);
                                 for p in &pools {
                                     p.reconcile().await;
@@ -453,6 +471,7 @@ pub fn spawn_managed_driver(
                             let network_name = routes.network_name();
                             if !apply_delta(
                                 &routes,
+                                &forward,
                             &revisions,
                                 &delta,
                                 &self_endpoint_id,
@@ -464,7 +483,6 @@ pub fn spawn_managed_driver(
                             for p in &pools {
                                 p.reconcile().await;
                             }
-                            forward.republish(&routes);
                             if let Some(peers) = peers.as_ref() {
                                 peers.reconcile().await;
                             }
@@ -478,7 +496,6 @@ pub fn spawn_managed_driver(
                             if revoked_network_id == network_id
                                 && revisions.accept_absence(org_revision, network_revision)
                             {
-                                routes.clear_managed(network_id, &self_endpoint_id);
                                 forward.clear_managed(&routes, network_id);
                                 for pool in &pools {
                                     pool.reconcile().await;
@@ -735,6 +752,13 @@ pub fn spawn_managed_driver(
                             message,
                         } => {
                             if let Some(mgr) = &send {
+                                if file_tasks.len() >= 16 {
+                                    let _ = client_tx.send(ClientMsg::TransferFailed { transfer_id, error: "transfer workers busy".into(), rejected: false }).await;
+                                    continue;
+                                }
+                                let mgr = mgr.clone();
+                                let client_tx = client_tx.clone();
+                                file_tasks.spawn(async move {
                                 let path = std::path::PathBuf::from(path);
                                 match mgr
                                     .send_file_with_id(
@@ -759,6 +783,7 @@ pub fn spawn_managed_driver(
                                             .await;
                                     }
                                 }
+                                });
                             }
                         }
                         #[cfg(not(feature = "send"))]
@@ -774,10 +799,17 @@ pub fn spawn_managed_driver(
                         }
                         #[cfg(feature = "send")]
                         ServerMsg::AcceptTransfer { transfer_id } => {
-                            if let Some(mgr) = &send
-                                && let Err(e) = mgr.accept_pending(&transfer_id).await
-                            {
-                                tracing::warn!(?e, %transfer_id, "AcceptTransfer failed");
+                            if let Some(mgr) = &send {
+                                if file_tasks.len() >= 16 {
+                                    let _ = client_tx.send(ClientMsg::TransferFailed { transfer_id, error: "transfer workers busy".into(), rejected: false }).await;
+                                    continue;
+                                }
+                                match mgr.begin_accept_pending(&transfer_id) {
+                                    Ok(download) => { file_tasks.spawn(async move {
+                                        if let Err(error) = download.await { tracing::warn!(?error, %transfer_id, "AcceptTransfer failed"); }
+                                    }); }
+                                    Err(error) => tracing::warn!(?error, %transfer_id, "AcceptTransfer failed"),
+                                }
                             }
                         }
                         #[cfg(not(feature = "send"))]
@@ -870,6 +902,11 @@ pub fn spawn_managed_driver(
                 }
             }
         }
+        #[cfg(feature = "send")]
+        {
+            file_tasks.abort_all();
+            while file_tasks.join_next().await.is_some() {}
+        }
         transport_cancel.cancel();
         let _ = transport_task.await;
     })
@@ -933,7 +970,6 @@ pub async fn poll_once(
                 .get(&network_id)
                 .is_some_and(|network| revisions.accept_absence(snap.version, *network))
             {
-                routes.clear_managed(network_id, self_endpoint_id);
                 forward.clear_managed(routes, network_id);
                 for pool in pools {
                     pool.reconcile().await;
@@ -967,6 +1003,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             subnet_routes: vec![],
             hostname_routes: vec![],
@@ -982,6 +1019,7 @@ mod tests {
             gossip_topic_hex: String::new(),
             agent_policy: tunnet_common::RemoteAgentPolicy::default(),
             version,
+            self_posture: tunnet_common::PeerPosture::Unknown,
         }
     }
 
@@ -993,6 +1031,39 @@ mod tests {
         assert_eq!(revisions.load().network, NetworkRevision(101));
         assert!(revisions.apply_snapshot(OrgRevision(8), NetworkRevision(102), || {}));
         assert_eq!(revisions.load().org, OrgRevision(8));
+    }
+
+    #[rstest::rstest]
+    #[case(Some("invalid"), "", false)]
+    #[case(None, "invalid", false)]
+    #[case(None, "", true)]
+    fn policy_verification_cannot_be_bypassed_by_missing_or_invalid_key(
+        #[case] key: Option<&str>,
+        #[case] signature: &str,
+        #[case] accepted: bool,
+    ) {
+        let routes = RoutingTable::new();
+        let forward = ForwardingStore::new();
+        let policy = PolicyBundle {
+            signature: signature.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_membership(
+                &membership(1, policy),
+                &PolicyBundle::default(),
+                key,
+                &routes,
+                &forward,
+                &Arc::new(ManagedRevisions::new(0, 0)),
+                1,
+                &"aa".repeat(32),
+                "self",
+                None,
+            ),
+            accepted
+        );
+        assert_eq!(forward.load().managed.is_some(), accepted);
     }
 
     #[test]
@@ -1134,11 +1205,20 @@ mod tests {
                 hostname: "alice".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             removed: vec![],
             version: 42,
         };
-        apply_delta(&routes, &revisions, &delta, &self_id, nid, "office");
+        apply_delta(
+            &routes,
+            &ForwardingStore::new(),
+            &revisions,
+            &delta,
+            &self_id,
+            nid,
+            "office",
+        );
         assert_eq!(revisions.load().org, OrgRevision(1));
         assert_eq!(revisions.load().network, NetworkRevision(42));
         assert_eq!(routes.version(), 42);

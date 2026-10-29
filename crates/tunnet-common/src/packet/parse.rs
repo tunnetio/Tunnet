@@ -93,11 +93,11 @@ fn parse_ipv4<'a>(
             more,
         }
     } else {
-        decode_transport(payload, transport.or_else(|| guess_transport(payload)))
+        decode_first_transport(payload, transport)?
     };
 
     Ok(Packet {
-        raw,
+        raw: &raw[..wire_len],
         wire_len,
         ip,
         fragmentation,
@@ -158,11 +158,11 @@ fn parse_ipv6<'a>(
             more: frag_more,
         }
     } else {
-        decode_transport(payload, transport.or_else(|| guess_transport(payload)))
+        decode_first_transport(payload, transport)?
     };
 
     Ok(Packet {
-        raw,
+        raw: &raw[..wire_len],
         wire_len,
         ip,
         fragmentation,
@@ -170,25 +170,37 @@ fn parse_ipv6<'a>(
     })
 }
 
-fn guess_transport<'a>(payload: &IpPayloadSlice<'a>) -> Option<TransportSlice<'a>> {
-    use etherparse::{Icmpv4Slice, Icmpv6Slice, IpNumber};
-    if payload.payload.is_empty() {
-        return None;
+fn decode_first_transport(
+    payload: &IpPayloadSlice<'_>,
+    transport: Option<TransportSlice<'_>>,
+) -> Result<Transport, ParseError> {
+    use etherparse::{Icmpv4Slice, Icmpv6Slice, IpNumber, UdpHeaderSlice};
+    if let Some(transport) = transport {
+        return Ok(decode_transport(payload, Some(transport)));
     }
     match payload.ip_number {
         IpNumber::TCP => TcpSlice::from_slice(payload.payload)
-            .ok()
-            .map(TransportSlice::Tcp),
-        IpNumber::UDP => UdpSlice::from_slice(payload.payload)
-            .ok()
-            .map(TransportSlice::Udp),
+            .map(|tcp| tcp_transport(&tcp))
+            .map_err(|_| ParseError::MalformedTcp),
+        IpNumber::UDP => {
+            let udp = UdpHeaderSlice::from_slice(payload.payload)
+                .map_err(|_| ParseError::MalformedUdp)?;
+            if udp.length() < 8 || usize::from(udp.length()) < payload.payload.len() {
+                return Err(ParseError::MalformedUdp);
+            }
+            Ok(Transport::Udp {
+                src_port: udp.source_port(),
+                dst_port: udp.destination_port(),
+                payload_len: payload.payload.len() - 8,
+            })
+        }
         IpNumber::ICMP => Icmpv4Slice::from_slice(payload.payload)
-            .ok()
-            .map(TransportSlice::Icmpv4),
+            .map(|icmp| decode_transport(payload, Some(TransportSlice::Icmpv4(icmp))))
+            .map_err(|_| ParseError::MalformedTransport),
         IpNumber::IPV6_ICMP => Icmpv6Slice::from_slice(payload.payload)
-            .ok()
-            .map(TransportSlice::Icmpv6),
-        _ => None,
+            .map(|icmp| decode_transport(payload, Some(TransportSlice::Icmpv6(icmp))))
+            .map_err(|_| ParseError::MalformedTransport),
+        _ => Ok(decode_transport(payload, None)),
     }
 }
 

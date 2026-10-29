@@ -11,18 +11,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointId};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use std::collections::HashMap;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::peer::{
     DialFailure, RECONNECT_TIMEOUT, backoff_delay, classify_connect_error, is_auth_close_error,
     remote_retry_delay,
 };
-use crate::transport_auth::TransportAuth;
+use crate::transport_auth::{CLOSE_NOT_MEMBER, CLOSE_NOT_MEMBER_REASON, TransportAuth};
 
 pub const DEFAULT_IDLE_SECS: u64 = 120;
 
@@ -74,6 +75,9 @@ struct PeerSlot {
     state: PeerConnState,
     last_activity: Instant,
     dial_waiters: Option<DialWaiters>,
+    lifecycle: u64,
+    dial_id: u64,
+    dial_cancel: Option<CancellationToken>,
 }
 
 impl PeerSlot {
@@ -83,6 +87,9 @@ impl PeerSlot {
             state: PeerConnState::Idle,
             last_activity: Instant::now(),
             dial_waiters: None,
+            lifecycle: 0,
+            dial_id: 0,
+            dial_cancel: None,
         }
     }
 
@@ -118,69 +125,6 @@ pub struct OnDemandStats {
     pub reconnect_latency_max_us: u64,
 }
 
-struct ExtraSlot {
-    conn: Option<Connection>,
-    dial_waiters: Option<DialWaiters>,
-    state: PeerConnState,
-}
-
-impl ExtraSlot {
-    fn new() -> Self {
-        Self {
-            conn: None,
-            dial_waiters: None,
-            state: PeerConnState::Idle,
-        }
-    }
-}
-
-type ExtraConnMap = DashMap<(EndpointId, Vec<u8>), Arc<AsyncMutex<ExtraSlot>>>;
-
-trait ConnSlot {
-    fn live_conn(&self) -> Option<Connection>;
-    fn conn_ref(&mut self) -> &mut Option<Connection>;
-    fn slot_state(&mut self) -> &mut PeerConnState;
-    fn slot_waiters(&mut self) -> &mut Option<DialWaiters>;
-    fn touch_slot(&mut self);
-}
-
-impl ConnSlot for PeerSlot {
-    fn live_conn(&self) -> Option<Connection> {
-        PeerSlot::live_conn(self)
-    }
-    fn conn_ref(&mut self) -> &mut Option<Connection> {
-        &mut self.conn
-    }
-    fn slot_state(&mut self) -> &mut PeerConnState {
-        &mut self.state
-    }
-    fn slot_waiters(&mut self) -> &mut Option<DialWaiters> {
-        &mut self.dial_waiters
-    }
-    fn touch_slot(&mut self) {
-        self.touch();
-    }
-}
-
-impl ConnSlot for ExtraSlot {
-    fn live_conn(&self) -> Option<Connection> {
-        self.conn
-            .as_ref()
-            .filter(|c| c.close_reason().is_none())
-            .cloned()
-    }
-    fn conn_ref(&mut self) -> &mut Option<Connection> {
-        &mut self.conn
-    }
-    fn slot_state(&mut self) -> &mut PeerConnState {
-        &mut self.state
-    }
-    fn slot_waiters(&mut self) -> &mut Option<DialWaiters> {
-        &mut self.dial_waiters
-    }
-    fn touch_slot(&mut self) {}
-}
-
 enum LiveUse {
     Use(Connection),
     Revoked,
@@ -195,52 +139,105 @@ fn not_authorized_remote(peer: EndpointId) -> anyhow::Error {
     anyhow::anyhow!("not_authorized: {peer} rejected the connection")
 }
 
-fn mark_local_blocked(slot: &mut impl ConnSlot, generation: u64) -> bool {
-    if let Some(c) = slot.conn_ref().take() {
-        c.close(1u32.into(), b"not_authorized");
+fn mark_local_blocked(slot: &mut PeerSlot, generation: u64) -> bool {
+    if let Some(cancel) = slot.dial_cancel.take() {
+        cancel.cancel();
     }
-    let state = slot.slot_state();
+    if let Some(c) = slot.conn.take() {
+        c.close(CLOSE_NOT_MEMBER.into(), CLOSE_NOT_MEMBER_REASON);
+    }
+    let state = &mut slot.state;
     let fresh = !matches!(state, PeerConnState::Blocked { generation: g } if *g == generation);
     *state = PeerConnState::Blocked { generation };
     fresh
 }
 
-#[derive(Clone)]
-pub struct ConnPool {
+struct Lifecycle {
+    generation: u64,
+    cancel: CancellationToken,
+    shutdown: bool,
+}
+
+type SlotKey = (EndpointId, &'static [u8]);
+type SlotHandle = Arc<AsyncMutex<PeerSlot>>;
+
+struct DialContext {
+    generation: u64,
+    id: u64,
+    cancel: CancellationToken,
+    rejected: Option<(u64, Instant)>,
+    step: u32,
+}
+
+struct PoolInner {
     endpoint: Endpoint,
     alpn: &'static [u8],
-    entries: Arc<DashMap<EndpointId, Arc<AsyncMutex<PeerSlot>>>>,
-    extra: Arc<ExtraConnMap>,
-    keep_alive: Arc<AtomicBool>,
-    metrics: Arc<PoolMetrics>,
-    gate: Arc<RwLock<Option<TransportAuth>>>,
+    entries: Mutex<HashMap<SlotKey, SlotHandle>>,
+    keep_alive: AtomicBool,
+    metrics: PoolMetrics,
+    gate: RwLock<Option<TransportAuth>>,
+    lifecycle: RwLock<Lifecycle>,
+    tasks: TaskTracker,
+    dial_limit: Arc<tokio::sync::Semaphore>,
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
+
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        self.lifecycle.get_mut().cancel.cancel();
+        if let Some(task) = self.sweeper.get_mut().take() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ConnPool {
+    inner: Arc<PoolInner>,
+}
+
+const MAX_SLOTS: usize = 2048;
 
 impl ConnPool {
     pub fn new(endpoint: Endpoint, alpn: &'static [u8]) -> Self {
         let pool = Self {
-            endpoint,
-            alpn,
-            entries: Arc::new(DashMap::new()),
-            extra: Arc::new(DashMap::new()),
-            keep_alive: Arc::new(AtomicBool::new(true)),
-            metrics: Arc::new(PoolMetrics::default()),
-            gate: Arc::new(RwLock::new(None)),
+            inner: Arc::new(PoolInner {
+                endpoint,
+                alpn,
+                entries: Mutex::new(HashMap::new()),
+                keep_alive: AtomicBool::new(true),
+                metrics: PoolMetrics::default(),
+                gate: RwLock::new(None),
+                lifecycle: RwLock::new(Lifecycle {
+                    generation: 0,
+                    cancel: CancellationToken::new(),
+                    shutdown: false,
+                }),
+                tasks: TaskTracker::new(),
+                dial_limit: Arc::new(tokio::sync::Semaphore::new(MAX_SLOTS)),
+                sweeper: Mutex::new(None),
+            }),
         };
         pool.spawn_idle_sweeper();
         pool
     }
 
     pub fn set_transport_auth(&self, auth: TransportAuth) {
-        *self.gate.write() = Some(auth);
+        let _life = self.inner.lifecycle.write();
+        *self.inner.gate.write() = Some(auth);
     }
 
     fn gate_allows(&self, peer_hex: &str) -> bool {
-        self.gate.read().as_ref().is_none_or(|g| g.allows(peer_hex))
+        self.inner
+            .gate
+            .read()
+            .as_ref()
+            .is_none_or(|g| g.allows(peer_hex))
     }
 
     fn gate_generation(&self) -> u64 {
-        self.gate
+        self.inner
+            .gate
             .read()
             .as_ref()
             .map(|g| g.generation())
@@ -255,7 +252,7 @@ impl ConnPool {
         now: Instant,
     ) -> Readiness {
         let (allows, generation) = {
-            let gate = self.gate.read();
+            let gate = self.inner.gate.read();
             match gate.as_ref() {
                 None => (true, 0),
                 Some(auth) => (auth.allows(peer_hex), auth.generation()),
@@ -264,7 +261,8 @@ impl ConnPool {
         if !allows {
             match state {
                 PeerConnState::Blocked { generation: g } if *g == generation => {
-                    self.metrics
+                    self.inner
+                        .metrics
                         .dials_suppressed
                         .fetch_add(1, Ordering::Relaxed);
                     Readiness::Deny
@@ -294,14 +292,16 @@ impl ConnPool {
                         tracing::debug!(%peer, "re-probing rejected peer after cooldown");
                         Readiness::Dial
                     } else {
-                        self.metrics
+                        self.inner
+                            .metrics
                             .dials_suppressed
                             .fetch_add(1, Ordering::Relaxed);
                         Readiness::Wait
                     }
                 }
                 PeerConnState::Backoff { until, .. } if now < *until => {
-                    self.metrics
+                    self.inner
+                        .metrics
                         .dials_suppressed
                         .fetch_add(1, Ordering::Relaxed);
                     Readiness::Wait
@@ -313,12 +313,15 @@ impl ConnPool {
 
     fn mark_remote_rejected(
         &self,
-        slot: &mut impl ConnSlot,
+        slot: &mut PeerSlot,
         peer: EndpointId,
         prev: Option<(u64, Instant)>,
         err: &Arc<str>,
     ) {
-        self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .reconnect_fail
+            .fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let generation = self.gate_generation();
         let (first, continuing) = match prev {
@@ -326,12 +329,12 @@ impl ConnPool {
             _ => (now, false),
         };
         let delay = remote_retry_delay(now.saturating_duration_since(first));
-        *slot.slot_state() = PeerConnState::Rejected {
+        slot.state = PeerConnState::Rejected {
             generation,
             first,
             retry_after: now + delay,
         };
-        if let Some(tx) = slot.slot_waiters().take() {
+        if let Some(tx) = slot.dial_waiters.take() {
             let _ = tx.send(Err(err.clone()));
         }
         if continuing {
@@ -341,24 +344,30 @@ impl ConnPool {
         }
     }
 
-    fn mark_backoff(&self, slot: &mut impl ConnSlot, step: u32, peer: EndpointId, err: &Arc<str>) {
-        self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
+    fn mark_backoff(&self, slot: &mut PeerSlot, step: u32, peer: EndpointId, err: &Arc<str>) {
+        self.inner
+            .metrics
+            .reconnect_fail
+            .fetch_add(1, Ordering::Relaxed);
         let wait = backoff_delay(step);
         let until = Instant::now() + wait;
-        *slot.slot_state() = PeerConnState::Backoff {
+        slot.state = PeerConnState::Backoff {
             until,
             step: step.saturating_add(1),
         };
-        if let Some(tx) = slot.slot_waiters().take() {
+        if let Some(tx) = slot.dial_waiters.take() {
             let _ = tx.send(Err(err.clone()));
         }
         tracing::debug!(%peer, wait_ms = wait.as_millis(), reason = %err, "dial failed; backing off");
     }
 
-    fn mark_local_denied(&self, slot: &mut impl ConnSlot, peer: EndpointId, err: &Arc<str>) {
-        self.metrics.reconnect_fail.fetch_add(1, Ordering::Relaxed);
+    fn mark_local_denied(&self, slot: &mut PeerSlot, peer: EndpointId, err: &Arc<str>) {
+        self.inner
+            .metrics
+            .reconnect_fail
+            .fetch_add(1, Ordering::Relaxed);
         let fresh = mark_local_blocked(slot, self.gate_generation());
-        if let Some(tx) = slot.slot_waiters().take() {
+        if let Some(tx) = slot.dial_waiters.take() {
             let _ = tx.send(Err(err.clone()));
         }
         if fresh {
@@ -366,26 +375,21 @@ impl ConnPool {
         }
     }
 
-    fn locked_live(&self, slot: &mut impl ConnSlot, peer: EndpointId) -> LiveUse {
+    fn locked_live(&self, slot: &mut PeerSlot, peer: EndpointId) -> LiveUse {
         let Some(c) = slot.live_conn() else {
             return LiveUse::Absent;
         };
         let generation = self.gate_generation();
-        let validated = matches!(slot.slot_state(), PeerConnState::Connected { auth_gen } if *auth_gen == generation);
-        if validated {
-            slot.touch_slot();
-            return LiveUse::Use(c);
-        }
         let peer_hex = format!("{peer}");
         if self.gate_allows(&peer_hex) {
-            *slot.slot_state() = PeerConnState::Connected {
+            slot.state = PeerConnState::Connected {
                 auth_gen: generation,
             };
-            slot.touch_slot();
+            slot.touch();
             return LiveUse::Use(c);
         }
-        if let Some(conn) = slot.conn_ref().take() {
-            conn.close(1u32.into(), b"not_authorized");
+        if let Some(conn) = slot.conn.take() {
+            conn.close(CLOSE_NOT_MEMBER.into(), CLOSE_NOT_MEMBER_REASON);
         }
         if mark_local_blocked(slot, generation) {
             tracing::warn!(%peer, "revoked peer connection closed at point of use");
@@ -420,181 +424,203 @@ impl ConnPool {
     }
 
     pub async fn reconcile(&self) {
-        let generation = self.gate_generation();
-        let peers: Vec<_> = self
-            .entries
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for (peer, slot) in peers {
-            let peer_hex = format!("{peer}");
-            let mut g = slot.lock().await;
-            if self.gate_allows(&peer_hex) {
-                match g.state {
-                    PeerConnState::Blocked { .. } => {
-                        g.state = if g.live_conn().is_some() {
-                            PeerConnState::Connected {
-                                auth_gen: generation,
-                            }
-                        } else {
-                            PeerConnState::Idle
-                        };
-                        tracing::info!(%peer, "peer authorized again");
-                    }
-                    PeerConnState::Rejected { .. } => {
-                        g.state = if g.live_conn().is_some() {
-                            PeerConnState::Connected {
-                                auth_gen: generation,
-                            }
-                        } else {
-                            PeerConnState::Idle
-                        };
-                        tracing::debug!(%peer, "re-probing rejected peer after membership change");
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            if mark_local_blocked(&mut *g, generation) {
-                g.dial_waiters = None;
-                tracing::warn!(%peer, "peer authorization revoked; connection invalidated");
+        let slots = self.slots();
+        for ((peer, _), slot) in slots {
+            let mut slot = slot.lock().await;
+            let auth = self.inner.gate.read().clone();
+            let auth_gate = auth.as_ref().map(TransportAuth::authorization_gate);
+            let _validated = auth_gate.as_ref().map(|gate| gate.read());
+            let generation = auth.as_ref().map_or(0, TransportAuth::generation);
+            if auth
+                .as_ref()
+                .is_some_and(|auth| !auth.allows(&peer.to_string()))
+            {
+                mark_local_blocked(&mut slot, generation);
+                slot.dial_id = slot.dial_id.checked_add(1).expect("pool dial id exhausted");
+                slot.dial_waiters = None;
+            } else if matches!(slot.state, PeerConnState::Blocked { .. })
+                || matches!(slot.state,
+                PeerConnState::Rejected { generation: rejected, .. } if rejected != generation)
+            {
+                slot.state = PeerConnState::Idle;
             }
         }
-        let extra: Vec<_> = self
-            .extra
-            .iter()
-            .map(|e| (e.key().clone(), e.value().clone()))
-            .collect();
-        for ((peer, alpn), slot) in extra {
-            let peer_hex = format!("{peer}");
-            let mut g = slot.lock().await;
-            if self.gate_allows(&peer_hex) {
-                if matches!(
-                    g.state,
-                    PeerConnState::Blocked { .. } | PeerConnState::Rejected { .. }
-                ) {
-                    g.state = PeerConnState::Idle;
-                    tracing::debug!(%peer, alpn = %String::from_utf8_lossy(&alpn), "peer authorized again");
-                }
-                continue;
-            }
-            if mark_local_blocked(&mut *g, generation) {
-                g.dial_waiters = None;
-                tracing::warn!(%peer, alpn = %String::from_utf8_lossy(&alpn), "peer authorization revoked; connection invalidated");
-            }
-        }
+        self.reclaim();
     }
 
     pub async fn revoke_peer(&self, peer: EndpointId) {
-        let generation = self.gate_generation();
-        if let Some(slot) = self.entries.get(&peer) {
-            let mut g = slot.lock().await;
-            mark_local_blocked(&mut *g, generation);
-            g.dial_waiters = None;
+        for ((id, _), slot) in self.slots() {
+            if id != peer {
+                continue;
+            }
+            let mut slot = slot.lock().await;
+            mark_local_blocked(&mut slot, self.gate_generation());
+            slot.dial_id = slot.dial_id.checked_add(1).expect("pool dial id exhausted");
+            slot.dial_waiters = None;
         }
-        self.extra.retain(|(p, _), _| *p != peer);
-        tracing::warn!(%peer, "peer revoked; connection state invalidated");
+        self.reclaim();
     }
 
     pub async fn close_all(&self) {
-        let peers: Vec<_> = self
-            .entries
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
-        for (peer, slot) in peers {
-            let mut g = slot.lock().await;
-            if let Some(c) = g.conn.take() {
-                c.close(0u32.into(), b"dataplane_down");
-            }
-            g.state = PeerConnState::Idle;
-            tracing::debug!(%peer, "closed pool connection");
+        self.close(false).await;
+    }
+
+    pub async fn shutdown(&self) {
+        self.close(true).await;
+        let sweeper = self.inner.sweeper.lock().take();
+        if let Some(task) = sweeper {
+            task.abort();
+            let _ = task.await;
         }
-        for entry in self.extra.iter() {
-            let mut g = entry.value().lock().await;
-            if let Some(c) = g.conn.take() {
-                c.close(0u32.into(), b"dataplane_down");
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+    }
+
+    async fn close(&self, shutdown: bool) {
+        let generation = {
+            let mut life = self.inner.lifecycle.write();
+            life.cancel.cancel();
+            life.cancel = CancellationToken::new();
+            life.generation = life
+                .generation
+                .checked_add(1)
+                .expect("pool generation exhausted");
+            life.shutdown |= shutdown;
+            life.generation
+        };
+        for (_, slot) in self.slots() {
+            let mut slot = slot.lock().await;
+            if slot.lifecycle < generation {
+                if let Some(conn) = slot.conn.take() {
+                    conn.close(0u32.into(), b"pool_closed");
+                }
+                slot.dial_waiters = None;
+                slot.state = PeerConnState::Idle;
             }
-            g.state = PeerConnState::Idle;
         }
+        self.reclaim();
     }
 
     pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+        &self.inner.endpoint
     }
     pub fn default_alpn(&self) -> &'static [u8] {
-        self.alpn
+        self.inner.alpn
     }
 
     pub fn set_keep_alive(&self, enabled: bool) {
-        self.keep_alive.store(enabled, Ordering::Relaxed);
+        self.inner.keep_alive.store(enabled, Ordering::Relaxed);
     }
 
     pub fn keep_alive(&self) -> bool {
-        self.keep_alive.load(Ordering::Relaxed)
+        self.inner.keep_alive.load(Ordering::Relaxed)
     }
 
     pub fn on_demand_stats(&self) -> OnDemandStats {
-        let success = self.metrics.reconnect_success.load(Ordering::Relaxed);
+        let success = self.inner.metrics.reconnect_success.load(Ordering::Relaxed);
         let sum = self
+            .inner
             .metrics
             .reconnect_latency_sum_us
             .load(Ordering::Relaxed);
         OnDemandStats {
-            reconnect_attempts: self.metrics.reconnect_attempts.load(Ordering::Relaxed),
+            reconnect_attempts: self
+                .inner
+                .metrics
+                .reconnect_attempts
+                .load(Ordering::Relaxed),
             reconnect_success: success,
-            reconnect_fail: self.metrics.reconnect_fail.load(Ordering::Relaxed),
-            dials_suppressed: self.metrics.dials_suppressed.load(Ordering::Relaxed),
+            reconnect_fail: self.inner.metrics.reconnect_fail.load(Ordering::Relaxed),
+            dials_suppressed: self.inner.metrics.dials_suppressed.load(Ordering::Relaxed),
             reconnect_latency_avg_us: sum.checked_div(success).unwrap_or(0),
             reconnect_latency_max_us: self
+                .inner
                 .metrics
                 .reconnect_latency_max_us
                 .load(Ordering::Relaxed),
         }
     }
 
-    fn slot(&self, peer: EndpointId) -> Arc<AsyncMutex<PeerSlot>> {
-        self.entries
-            .entry(peer)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(PeerSlot::new())))
-            .clone()
+    fn slots(&self) -> Vec<(SlotKey, SlotHandle)> {
+        self.inner
+            .entries
+            .lock()
+            .iter()
+            .map(|(key, slot)| (*key, slot.clone()))
+            .collect()
     }
 
-    fn spawn_idle_sweeper(&self) {
-        let entries = self.entries.clone();
-        let keep_alive = self.keep_alive.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(10));
-            loop {
-                tick.tick().await;
-                if keep_alive.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let timeout = Duration::from_secs(DEFAULT_IDLE_SECS);
-                let peers: Vec<_> = entries
-                    .iter()
-                    .map(|e| (*e.key(), e.value().clone()))
-                    .collect();
-                for (peer, slot) in peers {
-                    let mut g = slot.lock().await;
-                    if !matches!(g.state, PeerConnState::Connected { .. }) {
-                        continue;
-                    }
-                    if g.last_activity.elapsed() < timeout {
-                        continue;
-                    }
-                    if let Some(c) = g.conn.take() {
-                        c.close(0u32.into(), b"idle");
-                    }
-                    g.state = PeerConnState::Idle;
-                    tracing::debug!(%peer, "idled peer connection");
-                }
+    fn reclaim(&self) {
+        self.inner.entries.lock().retain(|_, slot| {
+            if Arc::strong_count(slot) != 1 {
+                return true;
             }
+            let Ok(slot) = slot.try_lock() else {
+                return true;
+            };
+            slot.live_conn().is_some()
+                || slot.dial_waiters.is_some()
+                || matches!(slot.state, PeerConnState::Rejected { retry_after, .. } if retry_after > Instant::now())
+                || (!matches!(slot.state, PeerConnState::Idle)
+                    && slot.last_activity.elapsed() < Duration::from_secs(DEFAULT_IDLE_SECS))
         });
     }
 
+    fn keyed_slot(
+        &self,
+        peer: EndpointId,
+        alpn: &'static [u8],
+    ) -> anyhow::Result<Arc<AsyncMutex<PeerSlot>>> {
+        let key = (peer, alpn);
+        let mut slots = self.inner.entries.lock();
+        if !slots.contains_key(&key) && slots.len() >= MAX_SLOTS {
+            drop(slots);
+            self.reclaim();
+            slots = self.inner.entries.lock();
+        }
+        if let Some(slot) = slots.get(&key) {
+            return Ok(slot.clone());
+        }
+        anyhow::ensure!(slots.len() < MAX_SLOTS, "stream connection pool is full");
+        let slot = Arc::new(AsyncMutex::new(PeerSlot::new()));
+        slots.insert(key, slot.clone());
+        Ok(slot)
+    }
+
+    #[cfg(test)]
+    fn slot(&self, peer: EndpointId) -> Arc<AsyncMutex<PeerSlot>> {
+        self.keyed_slot(peer, self.inner.alpn).unwrap()
+    }
+
+    fn spawn_idle_sweeper(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let task = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let pool = ConnPool { inner };
+                if !pool.keep_alive() {
+                    for (_, slot) in pool.slots() {
+                        let mut slot = slot.lock().await;
+                        if slot.last_activity.elapsed() >= Duration::from_secs(DEFAULT_IDLE_SECS)
+                            && let Some(conn) = slot.conn.take()
+                        {
+                            conn.close(0u32.into(), b"idle");
+                            slot.state = PeerConnState::Idle;
+                        }
+                    }
+                }
+                pool.reclaim();
+            }
+        });
+        *self.inner.sweeper.lock() = Some(task);
+    }
+
     pub async fn get(&self, peer: EndpointId) -> anyhow::Result<Connection> {
-        self.get_alpn(peer, self.alpn).await
+        self.get_alpn(peer, self.inner.alpn).await
     }
 
     pub async fn get_alpn(
@@ -602,123 +628,181 @@ impl ConnPool {
         peer: EndpointId,
         alpn: &'static [u8],
     ) -> anyhow::Result<Connection> {
-        if alpn != self.alpn {
-            return self.get_extra(peer, alpn).await;
-        }
-        let peer_hex = format!("{peer}");
-
-        let slot = self.slot(peer);
-        let now = Instant::now();
-        let mut rejected_ctx: Option<(u64, Instant)> = None;
-        let mut backoff_step = 0u32;
-        let mut waiter_rx = None;
-        let mut am_dialer = false;
-        {
+        anyhow::ensure!(
+            !self.inner.lifecycle.read().shutdown,
+            "stream connection pool is shut down"
+        );
+        let slot = self.keyed_slot(peer, alpn)?;
+        let mut receiver = {
             let mut guard = slot.lock().await;
-            match self.locked_live(&mut *guard, peer) {
-                LiveUse::Use(c) => return Ok(c),
+            let life = self.inner.lifecycle.read();
+            anyhow::ensure!(!life.shutdown, "stream connection pool is shut down");
+            if guard.lifecycle != life.generation {
+                if let Some(conn) = guard.conn.take() {
+                    conn.close(0u32.into(), b"pool_closed");
+                }
+                guard.dial_waiters = None;
+                guard.state = PeerConnState::Idle;
+                guard.lifecycle = life.generation;
+            }
+            let auth = self.inner.gate.read().clone();
+            let auth_gate = auth.as_ref().map(TransportAuth::authorization_gate);
+            let _validated = auth_gate.as_ref().map(|gate| gate.read());
+            match self.locked_live(&mut guard, peer) {
+                LiveUse::Use(conn) => return Ok(conn),
                 LiveUse::Revoked => return Err(not_authorized(peer)),
                 LiveUse::Absent => {}
             }
-            if let Some(dead) = guard.conn.take() {
-                if self.note_dead_conn(&mut guard.state, &dead, peer) {
-                    return Err(not_authorized_remote(peer));
-                }
-                tracing::debug!(%peer, "cached connection dead, dialing again");
+            if let Some(dead) = guard.conn.take()
+                && self.note_dead_conn(&mut guard.state, &dead, peer)
+            {
+                return Err(not_authorized_remote(peer));
             }
-            match self.readiness(&mut guard.state, peer, &peer_hex, now) {
-                Readiness::Deny => {
-                    return Err(not_authorized(peer));
-                }
-                Readiness::Wait => {
-                    anyhow::bail!("dial to {peer} suppressed by backoff");
-                }
+            match self.readiness(&mut guard.state, peer, &peer.to_string(), Instant::now()) {
+                Readiness::Deny => return Err(not_authorized(peer)),
+                Readiness::Wait => anyhow::bail!("dial to {peer} suppressed by backoff"),
                 Readiness::Dial => {}
             }
-            if let Some(tx) = &guard.dial_waiters {
-                waiter_rx = Some(tx.subscribe());
+            if let Some(waiters) = &guard.dial_waiters {
+                waiters.subscribe()
             } else {
-                let (tx, _) = tokio::sync::broadcast::channel(1);
-                guard.dial_waiters = Some(tx);
-                rejected_ctx = match guard.state {
+                let rejected = match guard.state {
                     PeerConnState::Rejected {
                         generation, first, ..
                     } => Some((generation, first)),
                     _ => None,
                 };
-                backoff_step = match guard.state {
+                let step = match guard.state {
                     PeerConnState::Backoff { step, .. } => step,
                     _ => 0,
                 };
+                let permit = self
+                    .inner
+                    .dial_limit
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| anyhow::anyhow!("stream connection dial limit reached"))?;
+                let (tx, receiver) = tokio::sync::broadcast::channel(1);
+                guard.dial_waiters = Some(tx);
+                guard.dial_id = guard
+                    .dial_id
+                    .checked_add(1)
+                    .expect("pool dial id exhausted");
+                let dial_id = guard.dial_id;
                 guard.state = PeerConnState::Dialing;
-                am_dialer = true;
+                let pool = self.clone();
+                let slot = slot.clone();
+                let generation = life.generation;
+                let cancel = life.cancel.child_token();
+                if let Some(old) = guard.dial_cancel.replace(cancel.clone()) {
+                    old.cancel();
+                }
+                self.inner.tasks.spawn(async move {
+                    let _permit = permit;
+                    pool.run_dial(
+                        peer,
+                        alpn,
+                        slot,
+                        DialContext {
+                            generation,
+                            id: dial_id,
+                            cancel,
+                            rejected,
+                            step,
+                        },
+                    )
+                    .await;
+                });
+                receiver
             }
-        }
-
-        if let Some(mut rx) = waiter_rx {
-            match rx.recv().await {
-                Ok(Ok(c)) => return Ok(c),
-                Ok(Err(e)) => anyhow::bail!("{e}"),
-                Err(_) => {
-                    drop(rx);
-                    return Box::pin(self.get_alpn(peer, alpn)).await;
+        };
+        match receiver.recv().await {
+            Ok(Ok(_)) => {
+                let mut slot = slot.lock().await;
+                let life = self.inner.lifecycle.read();
+                anyhow::ensure!(
+                    !life.shutdown && life.generation == slot.lifecycle,
+                    "stream connection pool closed during dial"
+                );
+                let auth = self.inner.gate.read().clone();
+                let auth_gate = auth.as_ref().map(TransportAuth::authorization_gate);
+                let _validated = auth_gate.as_ref().map(|gate| gate.read());
+                match self.locked_live(&mut slot, peer) {
+                    LiveUse::Use(conn) => Ok(conn),
+                    _ => Err(not_authorized(peer)),
                 }
             }
+            Ok(Err(error)) => anyhow::bail!("{error}"),
+            Err(_) => anyhow::bail!("stream connection dial was invalidated"),
         }
+    }
 
-        debug_assert!(am_dialer);
-        let _ = am_dialer;
-
-        match self.dial_once(peer, alpn).await {
+    async fn run_dial(
+        &self,
+        peer: EndpointId,
+        alpn: &'static [u8],
+        slot: SlotHandle,
+        context: DialContext,
+    ) {
+        let DialContext {
+            generation,
+            id: dial_id,
+            cancel,
+            rejected,
+            step,
+        } = context;
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = self.dial_once(peer, alpn) => result,
+        };
+        let mut slot = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                if let Ok(conn) = result { conn.close(0u32.into(), b"pool_closed"); }
+                return;
+            }
+            slot = slot.lock() => slot,
+        };
+        let life = self.inner.lifecycle.read();
+        if life.shutdown || life.generation != generation || slot.dial_id != dial_id {
+            if let Ok(conn) = result {
+                conn.close(0u32.into(), b"pool_closed");
+            }
+            return;
+        }
+        let auth = self.inner.gate.read().clone();
+        let auth_gate = auth.as_ref().map(TransportAuth::authorization_gate);
+        let _validated = auth_gate.as_ref().map(|gate| gate.read());
+        if auth
+            .as_ref()
+            .is_some_and(|auth| !auth.allows(&peer.to_string()))
+        {
+            if let Ok(conn) = result {
+                conn.close(CLOSE_NOT_MEMBER.into(), CLOSE_NOT_MEMBER_REASON);
+            }
+            self.mark_local_denied(&mut slot, peer, &Arc::from("peer revoked while dialing"));
+            return;
+        }
+        match result {
             Ok(conn) => {
-                if !self.gate_allows(&peer_hex) {
-                    conn.close(1u32.into(), b"not_authorized");
-                    let mut guard = slot.lock().await;
-                    if mark_local_blocked(&mut *guard, self.gate_generation()) {
-                        guard.dial_waiters = None;
-                        tracing::warn!(%peer, "peer revoked while dialing; connection dropped");
-                    }
-                    return Err(not_authorized(peer));
-                }
-                let generation = self.gate_generation();
-                let canonical = {
-                    let mut guard = slot.lock().await;
-                    if let Some(existing) = guard.live_conn() {
-                        let existing = existing.clone();
-                        if let Some(tx) = guard.dial_waiters.take() {
-                            let _ = tx.send(Ok(existing.clone()));
-                        }
-                        drop(guard);
-                        conn.close(0u32.into(), b"tie_break");
-                        existing
-                    } else {
-                        guard.conn = Some(conn.clone());
-                        guard.state = PeerConnState::Connected {
-                            auth_gen: generation,
-                        };
-                        guard.touch();
-                        if let Some(tx) = guard.dial_waiters.take() {
-                            let _ = tx.send(Ok(conn.clone()));
-                        }
-                        conn
-                    }
+                slot.conn = Some(conn.clone());
+                slot.state = PeerConnState::Connected {
+                    auth_gen: self.gate_generation(),
                 };
-                Ok(canonical)
+                slot.touch();
+                if let Some(waiters) = slot.dial_waiters.take() {
+                    let _ = waiters.send(Ok(conn));
+                }
             }
-            Err((DialFailure::LocalDenied, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_local_denied(&mut *guard, peer, &err);
-                anyhow::bail!("{err}")
+            Err((DialFailure::LocalDenied, error)) => {
+                self.mark_local_denied(&mut slot, peer, &error)
             }
-            Err((DialFailure::RemoteRejected, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_remote_rejected(&mut *guard, peer, rejected_ctx, &err);
-                anyhow::bail!("{err}")
+            Err((DialFailure::RemoteRejected, error)) => {
+                self.mark_remote_rejected(&mut slot, peer, rejected, &error)
             }
-            Err((DialFailure::Transient, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_backoff(&mut *guard, backoff_step, peer, &err);
-                anyhow::bail!("{err}")
+            Err((DialFailure::Transient, error)) => {
+                self.mark_backoff(&mut slot, step, peer, &error)
             }
         }
     }
@@ -729,11 +813,13 @@ impl ConnPool {
         alpn: &'static [u8],
     ) -> Result<Connection, (DialFailure, Arc<str>)> {
         let start = Instant::now();
-        self.metrics
+        self.inner
+            .metrics
             .reconnect_attempts
             .fetch_add(1, Ordering::Relaxed);
         tracing::debug!(%peer, alpn = %String::from_utf8_lossy(alpn), "dialing peer");
-        match tokio::time::timeout(RECONNECT_TIMEOUT, self.endpoint.connect(peer, alpn)).await {
+        match tokio::time::timeout(RECONNECT_TIMEOUT, self.inner.endpoint.connect(peer, alpn)).await
+        {
             Ok(Ok(conn)) => {
                 if let Some(reason) = conn.close_reason() {
                     let msg: Arc<str> =
@@ -744,18 +830,22 @@ impl ConnPool {
                     return Err((DialFailure::Transient, msg));
                 }
                 let latency_us = start.elapsed().as_micros() as u64;
-                self.metrics
+                self.inner
+                    .metrics
                     .reconnect_success
                     .fetch_add(1, Ordering::Relaxed);
-                self.metrics
+                self.inner
+                    .metrics
                     .reconnect_latency_sum_us
                     .fetch_add(latency_us, Ordering::Relaxed);
                 let max = self
+                    .inner
                     .metrics
                     .reconnect_latency_max_us
                     .load(Ordering::Relaxed);
                 if latency_us > max {
-                    self.metrics
+                    self.inner
+                        .metrics
                         .reconnect_latency_max_us
                         .store(latency_us, Ordering::Relaxed);
                 }
@@ -770,123 +860,6 @@ impl ConnPool {
                 DialFailure::Transient,
                 Arc::from(format!("reconnect to {peer} timed out")),
             )),
-        }
-    }
-
-    fn extra_slot(&self, peer: EndpointId, alpn: &'static [u8]) -> Arc<AsyncMutex<ExtraSlot>> {
-        self.extra
-            .entry((peer, alpn.to_vec()))
-            .or_insert_with(|| Arc::new(AsyncMutex::new(ExtraSlot::new())))
-            .clone()
-    }
-
-    async fn get_extra(&self, peer: EndpointId, alpn: &'static [u8]) -> anyhow::Result<Connection> {
-        let peer_hex = format!("{peer}");
-        let slot = self.extra_slot(peer, alpn);
-        let now = Instant::now();
-        let mut rejected_ctx: Option<(u64, Instant)> = None;
-        let mut backoff_step = 0u32;
-        let mut waiter_rx = None;
-        let mut am_dialer = false;
-        {
-            let mut guard = slot.lock().await;
-            match self.locked_live(&mut *guard, peer) {
-                LiveUse::Use(c) => return Ok(c),
-                LiveUse::Revoked => return Err(not_authorized(peer)),
-                LiveUse::Absent => {}
-            }
-            if let Some(dead) = guard.conn.take()
-                && self.note_dead_conn(&mut guard.state, &dead, peer)
-            {
-                return Err(not_authorized_remote(peer));
-            }
-            match self.readiness(&mut guard.state, peer, &peer_hex, now) {
-                Readiness::Deny => {
-                    return Err(not_authorized(peer));
-                }
-                Readiness::Wait => {
-                    anyhow::bail!("dial to {peer} suppressed by backoff");
-                }
-                Readiness::Dial => {}
-            }
-            if let Some(tx) = &guard.dial_waiters {
-                waiter_rx = Some(tx.subscribe());
-            } else {
-                let (tx, _) = tokio::sync::broadcast::channel(1);
-                guard.dial_waiters = Some(tx);
-                rejected_ctx = match guard.state {
-                    PeerConnState::Rejected {
-                        generation, first, ..
-                    } => Some((generation, first)),
-                    _ => None,
-                };
-                backoff_step = match guard.state {
-                    PeerConnState::Backoff { step, .. } => step,
-                    _ => 0,
-                };
-                guard.state = PeerConnState::Dialing;
-                am_dialer = true;
-            }
-        }
-
-        if let Some(mut rx) = waiter_rx {
-            match rx.recv().await {
-                Ok(Ok(c)) => return Ok(c),
-                Ok(Err(e)) => anyhow::bail!("{e}"),
-                Err(_) => {
-                    drop(rx);
-                    return Box::pin(self.get_extra(peer, alpn)).await;
-                }
-            }
-        }
-
-        debug_assert!(am_dialer);
-        let _ = am_dialer;
-
-        match self.dial_once(peer, alpn).await {
-            Ok(conn) => {
-                if !self.gate_allows(&peer_hex) {
-                    conn.close(1u32.into(), b"not_authorized");
-                    let mut guard = slot.lock().await;
-                    if mark_local_blocked(&mut *guard, self.gate_generation()) {
-                        guard.dial_waiters = None;
-                        tracing::warn!(%peer, alpn = %String::from_utf8_lossy(alpn), "peer revoked while dialing; connection dropped");
-                    }
-                    return Err(not_authorized(peer));
-                }
-                let mut guard = slot.lock().await;
-                if let Some(existing) = guard.live_conn() {
-                    if let Some(tx) = guard.dial_waiters.take() {
-                        let _ = tx.send(Ok(existing.clone()));
-                    }
-                    drop(guard);
-                    conn.close(0u32.into(), b"tie_break");
-                    return Ok(existing);
-                }
-                guard.conn = Some(conn.clone());
-                guard.state = PeerConnState::Connected {
-                    auth_gen: self.gate_generation(),
-                };
-                if let Some(tx) = guard.dial_waiters.take() {
-                    let _ = tx.send(Ok(conn.clone()));
-                }
-                Ok(conn)
-            }
-            Err((DialFailure::LocalDenied, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_local_denied(&mut *guard, peer, &err);
-                anyhow::bail!("{err}")
-            }
-            Err((DialFailure::RemoteRejected, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_remote_rejected(&mut *guard, peer, rejected_ctx, &err);
-                anyhow::bail!("{err}")
-            }
-            Err((DialFailure::Transient, err)) => {
-                let mut guard = slot.lock().await;
-                self.mark_backoff(&mut *guard, backoff_step, peer, &err);
-                anyhow::bail!("{err}")
-            }
         }
     }
 }
@@ -924,6 +897,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -1117,6 +1091,7 @@ mod tests {
                 hostname: "peer".into(),
                 tags: vec![],
                 ssh_host_key: None,
+                posture: tunnet_common::PeerPosture::Unknown,
             }],
             &[],
             &[],
@@ -1308,5 +1283,233 @@ mod tests {
         }
         assert_eq!(pool.on_demand_stats().reconnect_attempts, 0);
         assert!(pool.on_demand_stats().dials_suppressed > 0);
+    }
+    struct PausedPair {
+        pool: ConnPool,
+        routes: RoutingTable,
+        peer: EndpointId,
+        incoming: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for PausedPair {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn paused_pair() -> PausedPair {
+        let lookup = MemoryLookup::new();
+        let a = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .address_lookup(lookup.clone())
+            .bind()
+            .await
+            .unwrap();
+        let b = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .address_lookup(lookup.clone())
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        lookup.add_endpoint_info(a.addr());
+        lookup.add_endpoint_info(b.addr());
+        let peer = b.id();
+        let routes = RoutingTable::new();
+        put_peer(&routes, &peer, "100.64.0.2");
+        let pool = ConnPool::new(a, TEST_ALPN);
+        pool.set_transport_auth(TransportAuth::managed(&routes));
+        let incoming = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn({
+            let incoming = incoming.clone();
+            let proceed = proceed.clone();
+            async move {
+                let mut first = true;
+                let mut connections = Vec::new();
+                while let Some(accept) = b.accept().await {
+                    if first {
+                        incoming.notify_one();
+                        proceed.notified().await;
+                        first = false;
+                    }
+                    if let Ok(conn) = accept.await {
+                        connections.push(conn);
+                    }
+                }
+            }
+        });
+        PausedPair {
+            pool,
+            routes,
+            peer,
+            incoming,
+            proceed,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_while_install_waits_closes_new_connection() {
+        let pair = paused_pair().await;
+        let dial = tokio::spawn({
+            let pool = pair.pool.clone();
+            let peer = pair.peer;
+            async move { pool.get(peer).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pair.incoming.notified())
+            .await
+            .unwrap();
+        let slot = pair.pool.slot(pair.peer);
+        let held = slot.lock().await;
+        pair.proceed.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pair.pool.on_demand_stats().reconnect_success == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pair.routes.replace(
+            &[],
+            &[],
+            &[],
+            &[],
+            &tunnet_common::DeviceProfile::default(),
+            &tunnet_common::DnsConfig::default(),
+            "net",
+            uuid::Uuid::nil(),
+            &"aa".repeat(32),
+            2,
+        );
+        drop(held);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), dial)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(slot.lock().await.live_conn().is_none());
+        pair.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn close_cancels_inflight_dial_and_allows_fresh_recovery() {
+        let pair = paused_pair().await;
+        let dial = tokio::spawn({
+            let pool = pair.pool.clone();
+            let peer = pair.peer;
+            async move { pool.get(peer).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pair.incoming.notified())
+            .await
+            .unwrap();
+        pair.pool.close_all().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), dial)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        pair.proceed.notify_one();
+        let conn = tokio::time::timeout(Duration::from_secs(5), pair.pool.get(pair.peer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conn.close_reason().is_none());
+        pair.pool.shutdown().await;
+        assert!(pair.pool.get(pair.peer).await.is_err());
+        assert!(conn.close_reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn canceled_request_does_not_strand_coalesced_dial() {
+        let pair = paused_pair().await;
+        let request = tokio::spawn({
+            let pool = pair.pool.clone();
+            let peer = pair.peer;
+            async move { pool.get(peer).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), pair.incoming.notified())
+            .await
+            .unwrap();
+        request.abort();
+        let _ = request.await;
+        pair.proceed.notify_one();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), pair.pool.get(pair.peer))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(pair.pool.on_demand_stats().reconnect_attempts, 1);
+        pair.pool.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_maintenance_does_not_retain_pool() {
+        let pool = ConnPool::new(bind_endpoint().await, TEST_ALPN);
+        let weak = Arc::downgrade(&pool.inner);
+        drop(pool);
+        assert!(weak.upgrade().is_none());
+    }
+    #[tokio::test]
+    async fn obsolete_slots_are_bounded_and_reclaimed() {
+        let (pool, _) = denying_pool(bind_endpoint().await);
+        {
+            let mut entries = pool.inner.entries.lock();
+            for i in 0..MAX_SLOTS {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                let peer = SecretKey::from_bytes(&key).public();
+                let mut slot = PeerSlot::new();
+                slot.state = PeerConnState::Blocked { generation: 0 };
+                entries.insert((peer, TEST_ALPN), Arc::new(AsyncMutex::new(slot)));
+            }
+        }
+        assert!(
+            pool.get(SecretKey::generate().public())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("pool is full")
+        );
+        assert_eq!(pool.inner.entries.lock().len(), MAX_SLOTS);
+        for (_, slot) in pool.slots() {
+            slot.lock().await.last_activity =
+                Instant::now() - Duration::from_secs(DEFAULT_IDLE_SECS + 1);
+        }
+        pool.reclaim();
+        assert!(pool.inner.entries.lock().is_empty());
+        pool.shutdown().await;
+    }
+    #[tokio::test]
+    async fn repeated_transport_failures_preserve_retry_step_per_alpn() {
+        let pair = test_pair().await;
+        put_peer(&pair.routes_b, &pair.pool.endpoint().id(), "100.64.0.3");
+        let alpn = b"unsupported/alpn";
+        let slot = pair.pool.keyed_slot(pair.id_b, alpn).unwrap();
+        for expected in 1..=3 {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), pair.pool.get_alpn(pair.id_b, alpn))
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            let mut guard = slot.lock().await;
+            let PeerConnState::Backoff { until, step } = guard.state else {
+                panic!("expected transient backoff, got {:?}", guard.state);
+            };
+            assert_eq!(step, expected);
+            assert!(until > Instant::now());
+            guard.state = PeerConnState::Backoff {
+                until: Instant::now(),
+                step,
+            };
+        }
+        assert!(pair.pool.get(pair.id_b).await.is_ok());
+        pair.pool.shutdown().await;
     }
 }

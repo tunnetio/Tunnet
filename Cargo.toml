@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/noq-proto", "vendor/iroh", "vendor/netwatch", "vendor/iroh-relay", "vendor/reqwest", "vendor/hyper-util", "vendor/swarm-discovery", "vendor/iroh-mdns-address-lookup", "vendor/n0-mainline", "vendor/iroh-mainline-address-lookup", "vendor/portmapper", "vendor/igd-next", "vendor/mdns-sd"]
 members = [
   "crates/tunnet-common",
   "crates/tunnet-core",
@@ -153,14 +154,14 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 
 # Networking
-iroh = { version = "1.3.0" }
-iroh-relay = { version = "1.3.0", default-features = false, features = [
+iroh = { version = "1.4.1" }
+iroh-relay = { version = "1.4.1", default-features = false, features = [
   "server",
 ] }
 iroh-gossip = "0.101"
 iroh-blobs = "0.103"
 iroh-docs = "0.101"
-tun-rs = { version = "2", features = ["async_tokio"] }
+tun-rs = { version = "2.8", features = ["async_tokio"] }
 etherparse = "0.21"
 route_manager = { version = "0.2.13", features = ["async"] }
 russh = { version = "0.63", default-features = false, features = ["ring"] }
@@ -219,3 +220,21 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+noq-proto = { path = "vendor/noq-proto" }
+iroh = { path = "vendor/iroh" }
+netwatch = { path = "vendor/netwatch" }
+iroh-relay = { path = "vendor/iroh-relay" }
+
+reqwest = { path = "vendor/reqwest" }
+hyper-util = { path = "vendor/hyper-util" }
+
+swarm-discovery = { path = "vendor/swarm-discovery" }
+iroh-mdns-address-lookup = { path = "vendor/iroh-mdns-address-lookup" }
+n0-mainline = { path = "vendor/n0-mainline" }
+iroh-mainline-address-lookup = { path = "vendor/iroh-mainline-address-lookup" }
+portmapper = { path = "vendor/portmapper" }
+igd-next = { path = "vendor/igd-next" }
+
+mdns-sd = { path = "vendor/mdns-sd" }

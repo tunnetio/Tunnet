@@ -23,8 +23,6 @@ use tunnet_common::local_api::DirectConnectPendingInfo;
 #[cfg(feature = "local_api")]
 use crate::local_api::LocalApiState;
 #[cfg(feature = "local_api")]
-use crate::routing::PeerInfo;
-#[cfg(feature = "local_api")]
 use crate::state::PersistedState;
 use crate::state::StatePaths;
 
@@ -65,73 +63,6 @@ fn save_pending(paths: &StatePaths, list: &[ConnectPending]) -> anyhow::Result<(
         serde_json::to_vec_pretty(list)?,
     )?;
     Ok(())
-}
-
-#[cfg(feature = "local_api")]
-fn install_peer_route(
-    state: &LocalApiState,
-    endpoint: EndpointId,
-    hostname: &str,
-    ip: std::net::Ipv4Addr,
-) -> anyhow::Result<()> {
-    let direct = state.node.persisted.require_direct_network(None)?;
-    let network_id = direct.network_id;
-    let network_name = direct.network_name.clone();
-
-    let hex = format!("{endpoint}");
-    let _info = std::sync::Arc::new(PeerInfo {
-        endpoint,
-        endpoint_hex: hex.clone(),
-        hostname: hostname.to_string(),
-        ip,
-        tags: vec!["connect".into()],
-        network_id,
-        network_name: network_name.clone(),
-        ssh_host_key: None,
-    });
-    // Merge into routing table via replace with existing peers + this one.
-    let mut peers: Vec<tunnet_common::PeerEntry> = state
-        .node
-        .routes
-        .peers()
-        .into_iter()
-        .filter(|p| p.endpoint_hex != hex && p.network_id == network_id)
-        .map(|p| tunnet_common::PeerEntry {
-            ip: p.ip,
-            endpoint_id: p.endpoint_hex.clone(),
-            hostname: p.hostname.clone(),
-            tags: p.tags.clone(),
-            ssh_host_key: p.ssh_host_key.clone(),
-        })
-        .collect();
-    peers.push(tunnet_common::PeerEntry {
-        ip,
-        endpoint_id: hex.clone(),
-        hostname: hostname.to_string(),
-        tags: vec!["connect".into()],
-        ssh_host_key: None,
-    });
-    let version = state.node.routes.version() + 1;
-    let self_id = state.node.endpoint_id_hex();
-    let dns = crate::agent_config::load_dns(&state.node.paths);
-    state
-        .node
-        .routes
-        .replace_network(network_id, &peers, &dns, &network_name, &self_id, version);
-    state.node.forwarding.republish(&state.node.routes);
-    if let Some(auth) = &state.node.direct_auth {
-        auth.insert(hex, network_id);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "local_api")]
-fn peer_hostname(peer: &crate::routing::PeerInfo) -> &str {
-    if peer.hostname.is_empty() {
-        "peer"
-    } else {
-        peer.hostname.as_str()
-    }
 }
 
 #[cfg(feature = "local_api")]
@@ -187,15 +118,9 @@ pub async fn request_connect(state: &LocalApiState, contact_id: &str) -> anyhow:
             let verified = state
                 .node
                 .routes
-                .lookup_endpoint(&peer_hex)
+                .lookup_endpoint_in(direct.network_id, &peer_hex)
                 .context("peer not in verified membership; join the network first")?;
             let peer_ip = verified.ip;
-            let peer_host = resp
-                .get("hostname")
-                .and_then(|v| v.as_str())
-                .unwrap_or(peer_hostname(&verified));
-            let peer_host = peer_host.to_string();
-            install_peer_route(state, peer, &peer_host, peer_ip)?;
             Ok(format!("Connected to {contact_id} ({peer_ip})"))
         }
         Some("pending") => Ok(format!(
@@ -249,10 +174,9 @@ pub async fn accept_pending(state: &LocalApiState, contact_id: &str) -> anyhow::
     let verified = state
         .node
         .routes
-        .lookup_endpoint(&pending.endpoint_id)
+        .lookup_endpoint_in(direct.network_id, &pending.endpoint_id)
         .context("peer not in verified membership; join the network first")?;
     let peer_ip = verified.ip;
-    install_peer_route(state, peer, &pending.hostname, peer_ip)?;
 
     // Best-effort: dial back to notify acceptance.
     if let Ok(conn) = state.node.endpoint.connect(peer, CONNECT_ALPN).await

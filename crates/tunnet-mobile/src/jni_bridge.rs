@@ -7,7 +7,7 @@
 //!
 //! Command calls still block. Kotlin must invoke them off the main thread.
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -128,6 +128,25 @@ fn string_array<'a>(
 }
 
 impl TunProvider for JvmTunProvider {
+    fn protect_socket(&self, fd: BorrowedFd<'_>) -> Result<()> {
+        let protected = self
+            .vm
+            .attach_current_thread(|env| -> jni::errors::Result<bool> {
+                env.call_method(
+                    &self.service,
+                    jni_str!("protect"),
+                    jni_sig!("(I)Z"),
+                    &[JValue::Int(fd.as_raw_fd())],
+                )?
+                .z()
+            })
+            .map_err(|error: jni::errors::Error| anyhow::anyhow!("VpnService.protect: {error}"))?;
+        if !protected {
+            bail!("VpnService refused to protect the underlay socket");
+        }
+        Ok(())
+    }
+
     fn establish(&self, request: TunRequest) -> Result<OwnedFd> {
         let fd = self
             .vm
@@ -370,22 +389,41 @@ fn attach_or_start(
     device_name: &str,
     service: &JObject,
 ) -> Result<()> {
-    init_android_context(env, service)?;
-    install_provider(env, service)?;
-    install_multicast_host(env, service)?;
-    install_sealer(env)?;
-
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    init_android_context(env, service)?;
+    if let Err(error) = (|| -> Result<()> {
+        install_sealer(env)?;
+        install_multicast_host(env, service)?;
+        install_provider(env, service)
+    })() {
+        drop_host_bridges();
+        return Err(error);
+    }
     if let Some(session) = guard.as_ref() {
         tracing::info!("nativeStart rebound TUN provider; existing agent kept");
-        start_delivery(env.get_java_vm()?, session.latest().clone())?;
+        let delivery = env
+            .get_java_vm()
+            .map_err(anyhow::Error::from)
+            .and_then(|vm| start_delivery(vm, session.latest().clone()));
+        if let Err(error) = delivery {
+            drop_host_bridges();
+            return Err(error);
+        }
         return Ok(());
     }
 
     match AgentSession::start(state_dir, device_name) {
         Ok(session) => {
             tracing::info!("nativeStart created agent runtime");
-            start_delivery(env.get_java_vm()?, session.latest().clone())?;
+            let delivery = env
+                .get_java_vm()
+                .map_err(anyhow::Error::from)
+                .and_then(|vm| start_delivery(vm, session.latest().clone()));
+            if let Err(error) = delivery {
+                drop_host_bridges();
+                session.stop();
+                return Err(error);
+            }
             *guard = Some(session);
             Ok(())
         }
@@ -397,12 +435,9 @@ fn attach_or_start(
 }
 
 fn stop_session() {
-    let session = {
-        let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        guard.take()
-    };
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     drop_host_bridges();
-    if let Some(session) = session {
+    if let Some(session) = guard.take() {
         session.stop();
     }
     stop_delivery();
@@ -562,6 +597,7 @@ pub extern "system" fn Java_io_tunnet_android_TunnetNative_nativeReleaseHost<'lo
 ) {
     unowned
         .with_env(|_env| -> jni::errors::Result<()> {
+            let _guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
             drop_host_bridges();
             Ok(())
         })

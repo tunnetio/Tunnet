@@ -22,12 +22,16 @@ pub struct PostureActorArgs {
     pub agent_version: String,
     pub control: ActorRef<super::control::ControlPlaneActor>,
     pub src_posture_ok: Arc<ArcSwap<bool>>,
+    pub authorization_gate: Arc<parking_lot::RwLock<()>>,
+    pub forwarding: tunnet_core::ForwardingStore,
 }
 
 pub struct PostureActor {
     engine: Arc<PostureEngine>,
     control: ActorRef<super::control::ControlPlaneActor>,
     src_posture_ok: Arc<ArcSwap<bool>>,
+    authorization_gate: Arc<parking_lot::RwLock<()>>,
+    forwarding: tunnet_core::ForwardingStore,
     cancel: tokio_util::sync::CancellationToken,
     tasks: Vec<super::OwnedTask>,
     last_policy_version: Option<u64>,
@@ -49,6 +53,8 @@ impl Actor for PostureActor {
             engine,
             control: args.control,
             src_posture_ok: args.src_posture_ok,
+            authorization_gate: args.authorization_gate,
+            forwarding: args.forwarding,
             cancel,
             tasks: Vec::new(),
             last_policy_version: None,
@@ -73,6 +79,7 @@ impl Actor for PostureActor {
 
 impl PostureActor {
     fn start_owned_tasks(&mut self, actor_ref: ActorRef<Self>) {
+        let mut change_rx = self.engine.subscribe();
         // Engine run loop (owned, cancellable).
         {
             let engine = self.engine.clone();
@@ -92,8 +99,6 @@ impl PostureActor {
         // Delta reporter loop (owned, cancellable). Reports forward through
         // the control actor so posture never holds transport channels.
         {
-            let engine = self.engine.clone();
-            let mut change_rx = engine.subscribe();
             let control = self.control.clone();
             let cancel = self.cancel.clone();
             let report_cancel = cancel.clone();
@@ -110,15 +115,10 @@ impl PostureActor {
                         changed = change_rx.recv() => {
                             match changed {
                                 Ok(event) => {
-                                    let attrs = if event.full_snapshot {
-                                        engine.state().await.attributes
-                                    } else {
-                                        event.changed_attributes.iter().map(|(k, _, new)| (k.clone(), new.clone())).collect()
-                                    };
                                     let msg = ClientMsg::PostureReport {
-                                        full: event.full_snapshot,
-                                        attributes: json_map(&attrs),
-                                        collected_at: Timestamp::now(),
+                                        full: true,
+                                        attributes: json_map(&event.attributes),
+                                        collected_at: event.collected_at,
                                     };
                                     if control
                                         .tell(super::control::ForwardClientMsg(msg))
@@ -136,10 +136,6 @@ impl PostureActor {
                     }
                 }
             }));
-        }
-        // Initial one-shot collection piped back (bounded, not a service loop).
-        {
-            let _ = actor_ref.tell(TriggerInitialCollect).try_send();
         }
     }
 }
@@ -180,7 +176,6 @@ fn json_map(attrs: &HashMap<String, PostureValue>) -> HashMap<String, serde_json
 // ---------------------------------------------------------------------------
 
 pub struct Recheck;
-pub struct TriggerInitialCollect;
 
 pub struct ApplyPostureConfig {
     pub interval_secs: u64,
@@ -217,36 +212,6 @@ impl Message<Recheck> for PostureActor {
         ctx.pipe(async move {
             if let Err(e) = engine.collect_once().await {
                 tracing::warn!(?e, "posture recheck failed");
-            }
-            CollectorChanged
-        });
-    }
-}
-
-impl Message<TriggerInitialCollect> for PostureActor {
-    type Reply = ();
-    async fn handle(&mut self, _msg: TriggerInitialCollect, ctx: &mut Context<Self, Self::Reply>) {
-        let engine = self.engine.clone();
-        let control = self.control.clone();
-        ctx.pipe(async move {
-            match engine.collect_once().await {
-                Ok(event) => {
-                    let attrs = engine.state().await.attributes;
-                    let msg = ClientMsg::PostureReport {
-                        full: event.full_snapshot,
-                        attributes: json_map(&attrs),
-                        collected_at: Timestamp::now(),
-                    };
-                    if control
-                        .tell(super::control::ForwardClientMsg(msg))
-                        .send()
-                        .await
-                        .is_err()
-                    {
-                        tracing::debug!("initial posture report dropped (control gone)");
-                    }
-                }
-                Err(e) => tracing::warn!(?e, "initial posture report failed"),
             }
             CollectorChanged
         });
@@ -336,8 +301,20 @@ impl Message<PostureStatusChanged> for PostureActor {
     type Reply = ();
     async fn handle(&mut self, msg: PostureStatusChanged, _ctx: &mut Context<Self, Self::Reply>) {
         let failing = msg.postures.iter().filter(|p| !p.passed).count();
+        // Enforcement revoke is a local kill switch. Named proof is the snapshot claim.
         let ok = msg.enforcement_action != "revoke";
-        self.src_posture_ok.store(Arc::new(ok));
+        let changed = {
+            let _guard = self.authorization_gate.write();
+            if **self.src_posture_ok.load() == ok {
+                false
+            } else {
+                self.src_posture_ok.store(Arc::new(ok));
+                true
+            }
+        };
+        if changed {
+            self.forwarding.notify_authorization_changed();
+        }
         if failing > 0 {
             tracing::warn!(
                 enforcement_action = %msg.enforcement_action,

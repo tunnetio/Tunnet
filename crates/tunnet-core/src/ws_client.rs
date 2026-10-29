@@ -145,7 +145,7 @@ impl ControlPlaneLink {
 /// `ServerMsg` channels. Exposes an owned `run` future instead of secretly
 /// detaching itself, so the agent `ControlPlaneActor` can own its lifecycle.
 pub struct ControlTransport {
-    pub control_url: String,
+    endpoint: crate::control::ServiceEndpoint,
     pub endpoint_id: String,
     pub signing_key: SigningKey,
     pub link: ControlPlaneLink,
@@ -163,8 +163,9 @@ pub struct PendingControl {
 }
 
 impl PendingControl {
-    pub fn new(control_url: String, endpoint_id: String, signing_key: SigningKey) -> Self {
-        let transport = ControlTransport::new(control_url, endpoint_id, signing_key);
+    pub fn new(client: &crate::control::SignedClient) -> Self {
+        let link = ControlPlaneLink::new(client.service_endpoint().base_url());
+        let transport = ControlTransport::new(client, link);
         let (server_tx, server_rx) = tokio::sync::mpsc::channel::<ServerMsg>(128);
         let (client_tx, client_rx) = tokio::sync::mpsc::channel::<ClientMsg>(128);
         Self {
@@ -182,12 +183,12 @@ impl PendingControl {
 }
 
 impl ControlTransport {
-    pub fn new(control_url: String, endpoint_id: String, signing_key: SigningKey) -> Self {
-        let link = ControlPlaneLink::new(control_url.clone());
+    pub fn new(client: &crate::control::SignedClient, link: ControlPlaneLink) -> Self {
+        let endpoint = client.service_endpoint();
         Self {
-            control_url,
-            endpoint_id,
-            signing_key,
+            endpoint,
+            endpoint_id: client.endpoint_id.clone(),
+            signing_key: client.signing_key.clone(),
             link,
         }
     }
@@ -207,7 +208,7 @@ impl ControlTransport {
     ) {
         ensure_rustls_crypto_provider();
         run(
-            self.control_url,
+            self.endpoint,
             self.endpoint_id,
             self.signing_key,
             server_tx,
@@ -274,7 +275,7 @@ async fn handle_server_frame(
 }
 
 async fn run(
-    control_url: String,
+    endpoint: crate::control::ServiceEndpoint,
     endpoint_id: String,
     signing_key: SigningKey,
     server_tx: tokio::sync::mpsc::Sender<ServerMsg>,
@@ -284,7 +285,7 @@ async fn run(
 ) {
     let mut backoff = MIN_BACKOFF;
     let mut outbound_closed = false;
-    tracing::info!(url = %control_url, "ws reconnect loop starting");
+    tracing::info!(url = %link.url(), "ws reconnect loop starting");
 
     loop {
         if cancel.is_cancelled() {
@@ -298,7 +299,7 @@ async fn run(
                 link.mark_disconnected(Some("control transport shutdown".into()));
                 return;
             }
-            res = connect_once(&control_url, &endpoint_id, &signing_key) => res,
+            res = connect_once(&endpoint, &endpoint_id, &signing_key) => res,
         };
         match connect_res {
             Ok(mut ws) => {
@@ -420,33 +421,41 @@ async fn run(
 }
 
 async fn connect_once(
-    control_url: &str,
+    endpoint: &crate::control::ServiceEndpoint,
     endpoint_id: &str,
     signing_key: &SigningKey,
 ) -> anyhow::Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 > {
-    let ws_url = if let Some(rest) = control_url.strip_prefix("https://") {
-        format!("wss://{rest}/v1/ws")
-    } else if let Some(rest) = control_url.strip_prefix("http://") {
-        format!("ws://{rest}/v1/ws")
+    let mut ws_url = endpoint.url("v1/ws")?;
+    let scheme = if ws_url.scheme() == "https" {
+        "wss"
     } else {
-        anyhow::bail!("control url must start with http:// or https://");
+        "ws"
     };
+    ws_url
+        .set_scheme(scheme)
+        .map_err(|_| anyhow::anyhow!("invalid websocket URL scheme"))?;
 
     let ts = Timestamp::now().as_second();
     let sig = signing::sign(signing_key, "GET", "/v1/ws", ts, &[]);
 
-    let mut req = ws_url.into_client_request().context("build ws request")?;
+    let mut req = ws_url
+        .as_str()
+        .into_client_request()
+        .context("build ws request")?;
     req.headers_mut()
         .insert(HDR_ENDPOINT_ID, endpoint_id.parse()?);
     req.headers_mut()
         .insert(HDR_TIMESTAMP, ts.to_string().parse()?);
     req.headers_mut().insert(HDR_SIGNATURE, sig.parse()?);
 
-    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(req))
-        .await
-        .context("websocket connect timed out")??;
+    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let stream = endpoint.connect_tcp().await?;
+        tokio_tungstenite::client_async_tls(req, stream).await
+    })
+    .await
+    .context("websocket connect timed out")??;
     Ok(ws)
 }
 
@@ -454,13 +463,64 @@ async fn connect_once(
 mod tests {
     use super::*;
 
+    fn socket_permission(socket: &std::net::TcpStream) -> std::io::Result<()> {
+        assert!(socket.peer_addr().is_err());
+        Ok(())
+    }
+
+    fn refuse_socket(_: &std::net::TcpStream) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "test protection refused",
+        ))
+    }
+
+    #[rstest::rstest]
+    #[case::allow(Some(socket_permission as fn(&std::net::TcpStream) -> std::io::Result<()>), true)]
+    #[case::refuse(Some(refuse_socket as fn(&std::net::TcpStream) -> std::io::Result<()>), false)]
+    #[case::missing_family(None, false)]
+    #[tokio::test]
+    async fn protected_websocket_uses_pinned_authorized_socket(
+        #[case] initialize: Option<fn(&std::net::TcpStream) -> std::io::Result<()>>,
+        #[case] allowed: bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = crate::control::SignedClient::new_trusted_loopback(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            SigningKey::generate(&mut rand::rng()),
+        )
+        .with_tcp_config(Some([
+            initialize.map(|initialize| iroh::endpoint::TcpSocketConfig {
+                interface: None,
+                initialize: Some(initialize),
+            }),
+            None,
+        ]))
+        .unwrap();
+        let endpoint = client.service_endpoint();
+        let server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
+            if let Ok(Ok((stream, _))) = accepted {
+                let _ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                true
+            } else {
+                false
+            }
+        });
+        let connected = connect_once(&endpoint, &client.endpoint_id, &client.signing_key).await;
+        assert_eq!(connected.is_ok(), allowed);
+        assert_eq!(server.await.unwrap(), allowed);
+    }
+
     /// A dead control plane is operational state, not failure: the transport
     /// must keep backing off (never return/terminate on its own) and must
     /// stop promptly on cancellation.
     #[tokio::test]
     async fn disconnect_is_operational_state_not_failure() {
         let key = SigningKey::generate(&mut rand::rng());
-        let pending = PendingControl::new("http://127.0.0.1:9".into(), "aa".into(), key);
+        let client = crate::control::SignedClient::new_trusted_loopback("http://127.0.0.1:9", key);
+        let pending = PendingControl::new(&client);
         let link = pending.link();
         let PendingControl {
             transport,

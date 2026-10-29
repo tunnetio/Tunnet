@@ -145,18 +145,14 @@ pub fn stage_daemon_exe(state_dir: Option<&str>) -> anyhow::Result<PathBuf> {
         .zip(dest.canonicalize().ok())
         .is_some_and(|(a, b)| a == b);
     if !source_is_dest {
-        tunnet_common::persistence::atomic_copy(&source, &dest).map_err(|error| {
-            anyhow::anyhow!("copy {} to {}: {error}", source.display(), dest.display())
-        })?;
+        stage_binary(&source, &dest)?;
     }
 
     if let Some(dir) = source.parent() {
         let cli = dir.join(cli_name());
+        let cli_dest = dest_dir.join(cli_name());
         if cli.is_file() {
-            let cli_dest = dest_dir.join(cli_name());
-            tunnet_common::persistence::atomic_copy(&cli, &cli_dest).map_err(|error| {
-                anyhow::anyhow!("copy {} to {}: {error}", cli.display(), cli_dest.display())
-            })?;
+            stage_binary(&cli, &cli_dest)?;
         }
     }
 
@@ -190,17 +186,72 @@ pub fn wipe_state_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
+fn stage_binary(source: &Path, dest: &Path) -> anyhow::Result<()> {
+    if same_artifact(source, dest) {
+        return Ok(());
+    }
+    // SCM may report Stopped while the executable image is still mapped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(dest) {
+            Ok(file) => {
+                drop(file);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                use windows_sys::Win32::Foundation::{
+                    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+                };
+                let locked = error.raw_os_error().is_some_and(|code| {
+                    matches!(
+                        code as u32,
+                        ERROR_ACCESS_DENIED | ERROR_LOCK_VIOLATION | ERROR_SHARING_VIOLATION
+                    )
+                });
+                if !locked || std::time::Instant::now() >= deadline {
+                    return Err(anyhow::anyhow!(
+                        "open {} for staging: {error}",
+                        dest.display()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+    tunnet_common::persistence::atomic_copy(source, dest).map_err(|error| {
+        anyhow::anyhow!("copy {} to {}: {error}", source.display(), dest.display())
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn same_artifact(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+    use std::io::Read;
+
+    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) else {
         return false;
     };
     if ma.len() != mb.len() {
         return false;
     }
-    match (ma.modified(), mb.modified()) {
-        (Ok(ta), Ok(tb)) => ta == tb,
-        _ => false,
+    let mut remaining = ma.len();
+    let mut left = [0; 64 * 1024];
+    let mut right = [0; 64 * 1024];
+    while remaining != 0 {
+        let n = remaining.min(left.len() as u64) as usize;
+        if a.read_exact(&mut left[..n]).is_err()
+            || b.read_exact(&mut right[..n]).is_err()
+            || left[..n] != right[..n]
+        {
+            return false;
+        }
+        remaining -= n as u64;
     }
+    matches!(a.read(&mut left[..1]), Ok(0)) && matches!(b.read(&mut right[..1]), Ok(0))
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -219,6 +270,37 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{newest_workspace_daemon, system_state_dir};
+
+    #[cfg(windows)]
+    #[test]
+    fn artifact_identity_uses_contents() {
+        let root = test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a.exe");
+        let b = root.join("b.exe");
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"two").unwrap();
+        let time = std::fs::metadata(&a).unwrap().modified().unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+        assert!(!super::same_artifact(&a, &b));
+        std::fs::write(&b, b"one").unwrap();
+        assert!(super::same_artifact(&a, &b));
+        assert!(super::same_artifact(&a, &a));
+        use std::os::windows::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+            .open(&b)
+            .unwrap();
+        super::stage_binary(&a, &b).unwrap();
+        drop(held);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn test_root() -> PathBuf {
         std::env::temp_dir().join(format!(

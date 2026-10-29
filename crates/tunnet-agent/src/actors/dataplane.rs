@@ -5,13 +5,12 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwapOption;
 use kameo::actor::{Actor, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
-use tun_rs::AsyncDevice;
 use tunnet_common::DnsConfig;
 use tunnet_common::local_api::LocalEvent;
 use tunnet_core::CoreNode;
@@ -36,14 +35,22 @@ pub struct PublishedDataPlane {
     /// Monotonic generation: readers pin the generation loaded at start and
     /// never observe a newer device.
     pub generation: u64,
-    pub device: Arc<AsyncDevice>,
+    pub writer: crate::tun_io::TunWriter,
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
-pub type PublishedPlane = Arc<ArcSwapOption<PublishedDataPlane>>;
+pub struct PlanePublication {
+    pub current: ArcSwapOption<PublishedDataPlane>,
+    next_generation: AtomicU64,
+}
+
+pub type PublishedPlane = Arc<PlanePublication>;
 
 pub fn new_published_plane() -> PublishedPlane {
-    Arc::new(ArcSwapOption::empty())
+    Arc::new(PlanePublication {
+        current: ArcSwapOption::empty(),
+        next_generation: AtomicU64::new(0),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +59,7 @@ pub fn new_published_plane() -> PublishedPlane {
 
 #[derive(Clone)]
 pub struct DataPlaneActorConfig {
+    pub desired_up: Arc<AtomicBool>,
     pub ifname: String,
     pub local_addrs: Vec<Ipv4Addr>,
     /// Peer ranges of the joined networks. Android must declare the traffic it
@@ -78,6 +86,10 @@ pub enum DataPlaneError {
     Dns(String),
     #[error("Direct network conflict: {0}")]
     Conflict(String),
+    #[error("OS dataplane configuration failed: {0}")]
+    Platform(String),
+    #[error("dataplane cleanup failed: {0}")]
+    Cleanup(String),
 }
 
 #[derive(Clone)]
@@ -117,11 +129,15 @@ pub struct DataPlaneActor {
     up: bool,
     generation: u64,
     outbound: Option<tokio::task::JoinHandle<()>>,
+    writer_task: Option<tokio::task::JoinHandle<()>>,
     generation_cancel: Option<tokio_util::sync::CancellationToken>,
     dns_task: Option<tokio::task::JoinHandle<()>>,
     dns_pool: Option<crate::tun_io::DnsPool>,
     resolver: Option<Arc<tunnet_core::dns::Resolver>>,
     tun_if_index: Option<u32>,
+    gateway: Option<crate::forward::GatewayGuard>,
+    firewall_ifname: Option<String>,
+    startup_retry: Option<(tokio::time::Instant, std::time::Duration)>,
 }
 
 impl Actor for DataPlaneActor {
@@ -129,7 +145,7 @@ impl Actor for DataPlaneActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let auto_up = args.auto_up;
+        let auto_up = args.auto_up && args.config.desired_up.load(Ordering::Acquire);
         let this = Self {
             up: args.initially_up,
             generation: args.initial_generation,
@@ -142,11 +158,15 @@ impl Actor for DataPlaneActor {
             published: args.published,
             status: args.status,
             outbound: None,
+            writer_task: None,
             generation_cancel: None,
             dns_task: None,
             dns_pool: None,
             resolver: None,
             tun_if_index: None,
+            gateway: None,
+            firewall_ifname: None,
+            startup_retry: None,
         };
         if auto_up {
             // Reconstruct service after (re)start from durable state.
@@ -164,7 +184,9 @@ impl Actor for DataPlaneActor {
         // Best-effort deterministic teardown; never hang shutdown. Runs after
         // failure too, so a restarted incarnation never inherits leaked
         // external state (all teardown steps are idempotent).
-        let _ = self.teardown().await;
+        if let Err(error) = self.teardown().await {
+            tracing::error!(%error, "dataplane shutdown cleanup failed");
+        }
         Ok(())
     }
 }
@@ -196,22 +218,36 @@ impl DataPlaneActor {
 
     #[cfg(not(target_os = "android"))]
     fn desired_routes(&self) -> crate::system_routes::DesiredRoutes {
+        let snap = self.node.forwarding.load();
         let mut desired = if self.cfg.is_direct {
-            let peer_ips: Vec<Ipv4Addr> = self.node.routes.peers().iter().map(|p| p.ip).collect();
+            let peer_ips: Vec<Ipv4Addr> = snap.bindings.values().map(|p| p.ip).collect();
             crate::system_routes::desired_direct(
                 &self.cfg.ifname,
                 &peer_ips,
                 &self.cfg.underlay_hosts,
             )
         } else {
-            let (remote_subnets, profile, has_exit) =
-                route_snapshot(&self.node, self.cfg.is_direct, self.cfg.network_id);
-            let first = self
-                .cfg
-                .local_addrs
-                .first()
-                .copied()
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+            let profile = snap
+                .tables
+                .profiles
+                .get(&self.cfg.network_id)
+                .cloned()
+                .unwrap_or_default();
+            let remote_subnets: Vec<_> = snap
+                .tables
+                .claims
+                .iter()
+                .filter(|claim| {
+                    claim.network == self.cfg.network_id
+                        && !claim.local
+                        && claim.cidr.prefix_len() < 32
+                })
+                .map(|claim| claim.cidr)
+                .collect();
+            let has_exit = profile.exit_node_endpoint_id.is_some();
+            let first = snap
+                .local_ip(self.cfg.network_id)
+                .unwrap_or(self.node.self_ipv4);
             desired_from_membership(
                 &self.cfg.ifname,
                 &profile,
@@ -242,39 +278,71 @@ impl DataPlaneActor {
         .map_err(|error| DataPlaneError::Routes(error.to_string()))
     }
 
-    async fn teardown(&mut self) {
-        self.published.store(None);
+    async fn teardown(&mut self) -> Result<(), DataPlaneError> {
+        let mut failures = Vec::new();
+        self.node.peers.deactivate().await;
+        self.published.current.store(None);
         if let Some(cancel) = self.generation_cancel.take() {
             cancel.cancel();
         }
-        self.node.peers.deactivate();
-        if let Some(outbound) = self.outbound.take() {
+        if let Some(mut outbound) = self.outbound.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(3), &mut outbound)
+                .await
+                .is_err()
+        {
             outbound.abort();
+            let _ = outbound.await;
         }
         if let Some(dns_task) = self.dns_task.take() {
             dns_task.abort();
+            let _ = dns_task.await;
         }
-        self.dns_pool = None;
+        if let Some(pool) = self.dns_pool.take() {
+            pool.shutdown().await;
+        }
+        if let Some(mut writer) = self.writer_task.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(3), &mut writer)
+                .await
+                .is_err()
+        {
+            writer.abort();
+            let _ = writer.await;
+        }
         self.resolver = None;
         #[cfg(not(target_os = "android"))]
         {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.route_actor.ask(ClearRoutes),
-            )
-            .await;
+            if let Err(error) = self.route_actor.ask(ClearRoutes).await {
+                failures.push(format!("routes: {error}"));
+            }
         }
-        crate::forward::teardown_exit_nat();
+        if let Some(gateway) = &mut self.gateway {
+            match gateway.teardown() {
+                Ok(()) => self.gateway = None,
+                Err(error) => failures.push(format!("gateway: {error:#}")),
+            }
+        }
+        if let Some(ifname) = &self.firewall_ifname {
+            match crate::system_firewall::teardown(ifname) {
+                Ok(()) => self.firewall_ifname = None,
+                Err(error) => failures.push(format!("firewall: {error:#}")),
+            }
+        }
         if let Some(dns) = self.cfg.dns.clone() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let _ = tokio::task::spawn_blocking(move || dns.restore()).await;
-            })
-            .await;
+            match tokio::task::spawn_blocking(move || dns.restore()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("DNS: {error}")),
+                Err(error) => failures.push(format!("DNS worker: {error}")),
+            }
         }
         self.peer_dns_active.store(false, Ordering::SeqCst);
         self.tun_if_index = None;
         self.up = false;
         self.status.set_up(false);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DataPlaneError::Cleanup(failures.join("; ")))
+        }
     }
 
     async fn do_bring_up(
@@ -282,7 +350,46 @@ impl DataPlaneActor {
         self_ref: kameo::actor::WeakActorRef<Self>,
     ) -> Result<(), DataPlaneError> {
         if self.up {
-            return Ok(());
+            let snap = self.node.forwarding.load();
+            let mut addresses: Vec<_> = snap.tables.local_ips.values().copied().collect();
+            let mut installed = self.cfg.local_addrs.clone();
+            addresses.sort();
+            addresses.dedup();
+            installed.sort();
+            installed.dedup();
+            if !addresses.is_empty() && addresses != installed {
+                self.teardown().await?;
+                self.cfg.local_addrs = addresses;
+            } else {
+                #[cfg(not(target_os = "android"))]
+                if let Err(error) = self.reconcile_routes().await {
+                    self.teardown().await?;
+                    return Err(error);
+                }
+                let advertised = snap
+                    .tables
+                    .claims
+                    .iter()
+                    .any(|claim| claim.local && claim.cidr.prefix_len() < 32);
+                if advertised && self.gateway.is_none() {
+                    match crate::forward::prepare(&self.cfg.ifname, &self.cfg.peer_cidrs, true) {
+                        Ok(gateway) => self.gateway = gateway,
+                        Err(error) => {
+                            self.teardown().await?;
+                            return Err(DataPlaneError::Platform(format!("gateway: {error:#}")));
+                        }
+                    }
+                } else if !advertised && let Some(gateway) = &mut self.gateway {
+                    gateway
+                        .teardown()
+                        .map_err(|error| DataPlaneError::Cleanup(format!("gateway: {error:#}")))?;
+                    self.gateway = None;
+                }
+                return Ok(());
+            }
+        }
+        if self.gateway.is_some() || self.firewall_ifname.is_some() {
+            self.teardown().await?;
         }
         let conflicts = self.direct_conflicts().await;
         if !conflicts.is_empty() {
@@ -291,21 +398,33 @@ impl DataPlaneActor {
                 conflicts.len()
             )));
         }
-        let resolver = tunnet_core::dns::Resolver::new(self.node.routes.clone(), &self.cfg.dns_cfg)
+        let external = self
+            .node
+            .external_dns
+            .as_ref()
+            .ok_or_else(|| {
+                DataPlaneError::Dns("agent DNS requires captured native authority".into())
+            })?
+            .for_dns_config(&self.cfg.dns_cfg)
             .map_err(|error| DataPlaneError::Dns(format!("{error:#}")))?;
+        let resolver = tunnet_core::dns::Resolver::with_external(
+            self.node.routes.clone(),
+            &self.cfg.dns_cfg,
+            external,
+        );
         self.resolver = Some(resolver.clone());
         if self.cfg.dns.is_some() {
             match tunnet_core::dns::listen_udp(tunnet_core::dns::bind_addr(), resolver).await {
                 Ok(task) => self.dns_task = Some(task),
                 Err(error) => {
-                    self.teardown().await;
+                    self.teardown().await?;
                     return Err(DataPlaneError::Dns(format!("{error:#}")));
                 }
             }
         }
         let result = self.do_bring_up_mutating(self_ref).await;
         if result.is_err() {
-            self.teardown().await;
+            self.teardown().await?;
         }
         result
     }
@@ -328,9 +447,18 @@ impl DataPlaneActor {
         {
             self.tun_if_index = tun.if_index().ok();
         }
-        crate::system_firewall::configure(&self.cfg.ifname);
+        crate::system_firewall::configure(&self.cfg.ifname)
+            .map_err(|error| DataPlaneError::Platform(format!("firewall: {error:#}")))?;
+        self.firewall_ifname = Some(self.cfg.ifname.clone());
 
-        let generation = self.generation.wrapping_add(1);
+        let generation = self
+            .published
+            .next_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| DataPlaneError::Tun("generation space exhausted".into()))?
+            + 1;
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let dns_active = match self.cfg.dns.clone() {
@@ -358,17 +486,43 @@ impl DataPlaneActor {
 
         #[cfg(not(target_os = "android"))]
         self.reconcile_routes().await?;
-        crate::forward::ensure_exit_nat(self.node.routes.is_exit_node());
+        let advertised = self
+            .node
+            .forwarding
+            .load()
+            .tables
+            .claims
+            .iter()
+            .any(|claim| claim.local && claim.cidr.prefix_len() < 32);
+        self.gateway = crate::forward::prepare(&self.cfg.ifname, &self.cfg.peer_cidrs, advertised)
+            .map_err(|error| DataPlaneError::Platform(format!("gateway: {error:#}")))?;
 
-        self.node.peers.activate(generation, cancel.clone());
+        self.generation_cancel = Some(cancel.clone());
         self.node
             .forwarding
             .set_mtu(&self.node.routes, self.cfg.mtu);
+        let writer_cancel = cancel.clone();
+        let writer_weak = self_ref.clone();
+        let (writer, writer_task) = crate::tun_io::TunWriter::spawn(
+            tun.clone(),
+            cancel.clone(),
+            self.metrics.clone(),
+            self.node.forwarding.clone(),
+            Box::new(move || {
+                if !writer_cancel.is_cancelled()
+                    && let Some(actor) = writer_weak.upgrade()
+                {
+                    let _ = actor.tell(OutboundExited(generation)).try_send();
+                }
+            }),
+        );
+        self.writer_task = Some(writer_task);
         let dns_pool = match self.resolver.clone() {
             Some(resolver) => {
                 let pool = crate::tun_io::DnsPool::new(
-                    tun.clone(),
+                    writer.clone(),
                     tunnet_core::dns::InTun::new(resolver),
+                    cancel.clone(),
                 );
                 self.dns_pool = Some(pool.clone());
                 pool
@@ -377,28 +531,45 @@ impl DataPlaneActor {
                 return Err(DataPlaneError::Dns("resolver not prepared".into()));
             }
         };
-        {
+        let plane = Arc::new(PublishedDataPlane {
+            generation,
+            writer: writer.clone(),
+            cancel: cancel.clone(),
+        });
+        let recv_hook = {
             let inbound = crate::tun_io::SessionInbound {
-                tun: self.published.clone(),
-                peers: self.node.peers.clone(),
+                plane: plane.clone(),
+                peers: self.node.peers.downgrade(),
                 policy: self.node.policy.clone(),
                 forwarding: self.node.forwarding.clone(),
                 metrics: self.metrics.clone(),
             };
-            self.node
-                .peers
-                .set_recv_hook(std::sync::Arc::new(move |peer, conn, ctl| {
-                    let inbound = inbound.clone();
-                    tokio::spawn(async move {
-                        crate::tun_io::serve_tunnel_connection(peer, conn, ctl, inbound).await;
-                    })
-                }));
-        }
+            std::sync::Arc::new(move |peer, conn, ctl| {
+                let inbound = inbound.clone();
+                tokio::spawn(async move {
+                    crate::tun_io::serve_tunnel_connection(peer, conn, ctl, inbound).await;
+                })
+            }) as tunnet_core::peer::RecvHook
+        };
+
+        self.published.current.store(Some(plane));
+        let feedback_writer = writer.clone();
+        self.node
+            .peers
+            .activate(
+                generation,
+                cancel.clone(),
+                recv_hook,
+                Arc::new(move |packet| feedback_writer.try_send(packet)),
+            )
+            .map_err(|error| DataPlaneError::Tun(format!("activate peer sessions: {error:#}")))?;
 
         let exit_gen = cancel.clone();
         let exit_weak = self_ref.clone();
         let outbound = crate::dataplane::spawn_outbound(crate::dataplane::OutboundSpawn {
             tun: tun.clone(),
+            writer,
+            cancel: cancel.clone(),
             peers: self.node.peers.clone(),
             policy: self.node.policy.clone(),
             forwarding: self.node.forwarding.clone(),
@@ -408,17 +579,11 @@ impl DataPlaneActor {
                 if !exit_gen.is_cancelled()
                     && let Some(actor) = exit_weak.upgrade()
                 {
-                    let _ = actor.tell(OutboundExited).try_send();
+                    let _ = actor.tell(OutboundExited(generation)).try_send();
                 }
             }),
         });
         self.outbound = Some(outbound);
-        self.generation_cancel = Some(cancel.clone());
-        self.published.store(Some(Arc::new(PublishedDataPlane {
-            generation,
-            device: tun,
-            cancel,
-        })));
         self.generation = generation;
         self.up = true;
         self.status.set_up(true);
@@ -429,41 +594,19 @@ impl DataPlaneActor {
 
     async fn do_bring_down(&mut self) -> Result<(), DataPlaneError> {
         if !self.up
-            && self.published.load().is_none()
+            && self.published.current.load().is_none()
             && self.dns_task.is_none()
             && self.dns_pool.is_none()
+            && self.gateway.is_none()
+            && self.firewall_ifname.is_none()
         {
             return Ok(());
         }
-        self.teardown().await;
+        self.teardown().await?;
         let _ = self.events.send(LocalEvent::DataPlaneChanged { up: false });
         tracing::info!("data plane down");
         Ok(())
     }
-}
-
-#[cfg(not(target_os = "android"))]
-fn route_snapshot(
-    node: &CoreNode,
-    is_direct: bool,
-    network_id: Uuid,
-) -> (Vec<ipnet::Ipv4Net>, tunnet_common::DeviceProfile, bool) {
-    if is_direct {
-        return (vec![], tunnet_common::DeviceProfile::default(), false);
-    }
-    if let Some(snap) = tunnet_core::state::load_snapshot_cache(&node.paths)
-        && let Some(m) = snap.memberships.iter().find(|m| m.network_id == network_id)
-    {
-        let remote_subnets: Vec<ipnet::Ipv4Net> = m
-            .subnet_routes
-            .iter()
-            .filter(|r| r.via_endpoint_id != node.identity.endpoint_id_hex())
-            .map(|r| r.cidr)
-            .collect();
-        let has_exit = m.device_profile.exit_node_endpoint_id.is_some();
-        return (remote_subnets, m.device_profile.clone(), has_exit);
-    }
-    (vec![], tunnet_common::DeviceProfile::default(), false)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,9 +615,10 @@ fn route_snapshot(
 
 pub struct BringUp;
 pub struct BringDown;
+pub struct WithdrawPlane;
 pub struct GetStatus;
 pub struct ShutdownPlane;
-pub struct ReconcileDirectState;
+pub struct ReconcileState;
 
 #[derive(Debug, Clone, kameo::Reply)]
 #[allow(dead_code)]
@@ -487,6 +631,7 @@ impl Message<BringUp> for DataPlaneActor {
     type Reply = Result<(), DataPlaneError>;
 
     async fn handle(&mut self, _msg: BringUp, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        self.cfg.desired_up.store(true, Ordering::Release);
         let weak = ctx.actor_ref().downgrade();
         self.do_bring_up(weak).await
     }
@@ -500,6 +645,9 @@ impl Message<BringUpSelf> for DataPlaneActor {
     type Reply = ();
 
     async fn handle(&mut self, _msg: BringUpSelf, ctx: &mut Context<Self, Self::Reply>) {
+        if !self.cfg.desired_up.load(Ordering::Acquire) {
+            return;
+        }
         let weak = ctx.actor_ref().downgrade();
         if let Err(e) = self.do_bring_up(weak).await {
             tracing::error!(error = %e, "automatic dataplane bring-up failed; awaiting explicit BringUp");
@@ -509,13 +657,15 @@ impl Message<BringUpSelf> for DataPlaneActor {
 
 /// The owned outbound loop ended without generation cancellation. Abnormal:
 /// supervision must restart us (fresh generation is published on BringUp).
-struct OutboundExited;
+struct OutboundExited(u64);
 
 impl Message<OutboundExited> for DataPlaneActor {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
-        panic!("outbound TUN loop unexpectedly terminated");
+    async fn handle(&mut self, msg: OutboundExited, _ctx: &mut Context<Self, Self::Reply>) {
+        if self.up && self.generation == msg.0 {
+            panic!("TUN task unexpectedly terminated");
+        }
     }
 }
 
@@ -527,21 +677,31 @@ impl Message<BringDown> for DataPlaneActor {
         _msg: BringDown,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.cfg.desired_up.store(false, Ordering::Release);
         self.do_bring_down().await
     }
 }
 
-impl Message<ReconcileDirectState> for DataPlaneActor {
+impl Message<WithdrawPlane> for DataPlaneActor {
     type Reply = Result<(), DataPlaneError>;
 
     async fn handle(
         &mut self,
-        _msg: ReconcileDirectState,
+        _msg: WithdrawPlane,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.do_bring_down().await
+    }
+}
+
+impl Message<ReconcileState> for DataPlaneActor {
+    type Reply = Result<(), DataPlaneError>;
+
+    async fn handle(
+        &mut self,
+        _msg: ReconcileState,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if !self.cfg.is_direct {
-            return Ok(());
-        }
         if self
             .dns_task
             .as_ref()
@@ -549,6 +709,12 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
         {
             tracing::error!("PeerDNS exited; withdrawing dataplane and DNS lease");
             self.do_bring_down().await?;
+        }
+        if !self.cfg.desired_up.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !self.cfg.is_direct && self.node.forwarding.load().managed.is_none() {
+            return self.do_bring_down().await;
         }
         let conflicts = self.direct_conflicts().await;
         if !conflicts.is_empty() {
@@ -561,16 +727,26 @@ impl Message<ReconcileDirectState> for DataPlaneActor {
             )));
         }
         if self.up {
-            #[cfg(not(target_os = "android"))]
-            {
-                self.reconcile_routes().await
-            }
-            #[cfg(target_os = "android")]
-            {
-                Ok(())
-            }
-        } else {
             self.do_bring_up(ctx.actor_ref().downgrade()).await
+        } else {
+            if self
+                .startup_retry
+                .is_some_and(|(at, _)| tokio::time::Instant::now() < at)
+            {
+                return Ok(());
+            }
+            let result = self.do_bring_up(ctx.actor_ref().downgrade()).await;
+            self.startup_retry = if result.is_err() {
+                let delay = self
+                    .startup_retry
+                    .map_or(std::time::Duration::from_secs(5), |(_, delay)| {
+                        (delay * 2).min(std::time::Duration::from_secs(300))
+                    });
+                Some((tokio::time::Instant::now() + delay, delay))
+            } else {
+                None
+            };
+            result
         }
     }
 }
@@ -673,6 +849,7 @@ mod tests {
         );
         DataPlaneActorArgs {
             config: DataPlaneActorConfig {
+                desired_up: Arc::new(AtomicBool::new(false)),
                 ifname: "tunnet-test-down".into(),
                 local_addrs: vec!["10.9.0.1".parse().unwrap()],
                 peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],
@@ -710,6 +887,10 @@ mod tests {
         // Kameo flattens `Result` replies: `ask` yields a single `Result`.
         actor.ask(BringDown).await.expect("down");
         actor.ask(BringDown).await.expect("down");
+        actor
+            .ask(ReconcileState)
+            .await
+            .expect("paused reconciliation");
         let status: DataPlaneStatus = actor.ask(GetStatus).await.expect("status");
         assert!(!status.up);
         assert_eq!(status.generation, 0);
@@ -744,6 +925,38 @@ mod tests {
         actor.wait_for_shutdown().await;
     }
 
+    struct InstallExitedDns;
+
+    impl Message<InstallExitedDns> for DataPlaneActor {
+        type Reply = ();
+
+        async fn handle(&mut self, _: InstallExitedDns, _: &mut Context<Self, Self::Reply>) {
+            let task = tokio::spawn(async {});
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            self.dns_task = Some(task);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_dns_exit_withdraws_dataplane() {
+        let (node, _tmp) = test_node().await;
+        let mut args = test_args(node);
+        args.config.is_direct = false;
+        args.initially_up = true;
+        let actor = DataPlaneActor::spawn_with_mailbox(
+            args,
+            kameo::mailbox::bounded(crate::actors::DATAPLANE_MAILBOX),
+        );
+        actor.wait_for_startup().await;
+        actor.ask(InstallExitedDns).await.unwrap();
+        actor.ask(ReconcileState).await.unwrap();
+        assert!(!actor.ask(GetStatus).await.unwrap().up);
+        actor.stop_gracefully().await.unwrap();
+        actor.wait_for_shutdown().await;
+    }
+
     #[tokio::test]
     async fn bring_up_failure_or_cycle_leaves_no_residue() {
         use crate::actors::routes::GetRouteStatus;
@@ -765,22 +978,27 @@ mod tests {
             .await
             .expect("BringUp must not hang");
         if res.is_err() {
+            assert!(actor.ask(ReconcileState).await.is_err());
+            actor
+                .ask(ReconcileState)
+                .await
+                .expect("startup retry deferred");
             let status: DataPlaneStatus = actor.ask(GetStatus).await.expect("status");
             assert!(!status.up);
             assert_eq!(status.generation, 0);
-            assert!(published.load_full().is_none());
+            assert!(published.current.load_full().is_none());
             assert!(!status_snapshot.is_up());
             assert!(!peer_dns.load(Ordering::SeqCst));
         } else {
             let status: DataPlaneStatus = actor.ask(GetStatus).await.expect("status");
             assert!(status.up);
             assert_eq!(status.generation, 1);
-            assert!(published.load_full().is_some());
+            assert!(published.current.load_full().is_some());
             assert!(status_snapshot.is_up());
             actor.ask(BringDown).await.expect("down");
             let status: DataPlaneStatus = actor.ask(GetStatus).await.expect("status");
             assert!(!status.up);
-            assert!(published.load_full().is_none());
+            assert!(published.current.load_full().is_none());
             assert!(!status_snapshot.is_up());
             assert!(!peer_dns.load(Ordering::SeqCst));
         }
@@ -822,6 +1040,7 @@ mod tests {
         let dp_args = DataPlaneSupervisorArgs {
             route_args: RouteActorArgs,
             dataplane_config: DataPlaneActorConfig {
+                desired_up: Arc::new(AtomicBool::new(false)),
                 ifname: "tunnet-test-down".into(),
                 local_addrs: vec!["10.9.0.1".parse().unwrap()],
                 peer_cidrs: vec!["10.9.0.0/16".parse().unwrap()],

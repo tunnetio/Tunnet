@@ -221,11 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let node = Arc::new(node);
 
     let stream_handler = match &mode {
-        Mode::Connector(_) => stream_handler(
-            node.routes.clone(),
-            node.forwarding.clone(),
-            node.policy.clone(),
-        ),
+        Mode::Connector(_) => stream_handler(node.forwarding.clone(), node.policy.clone()),
         _ => noop_stream_handler(),
     };
     let _router = spawn_unified_acceptor(node.clone(), stream_handler);
@@ -589,11 +585,17 @@ async fn proxy_egress_connection(
 ) -> anyhow::Result<()> {
     let peer = resolve_peer(&node, mesh_host)
         .with_context(|| format!("no mesh peer matches {mesh_host}"))?;
-    let (send, recv) = dial_stream(&node.pool, peer.endpoint, mesh_port, mesh_host.to_string())
-        .await
-        .context("dial mesh stream")?;
-    let (tcp_read, tcp_write) = tcp.into_split();
-    tunnet_core::stream::splice_bidirectional(recv, send, tcp_read, tcp_write).await?;
+    let mut stream = dial_stream(
+        &node,
+        peer.endpoint,
+        peer.network_id,
+        mesh_port,
+        mesh_host.to_string(),
+    )
+    .await
+    .context("dial mesh stream")?;
+    let mut tcp = tcp;
+    tokio::io::copy_bidirectional(&mut stream, &mut tcp).await?;
     Ok(())
 }
 

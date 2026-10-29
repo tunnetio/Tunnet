@@ -50,6 +50,7 @@ pub const OWNER: &str = "io.tunnet.agent";
 /// reconciliation, restoration - is owned by `osdns`.
 pub struct DnsController {
     manager: DnsManager,
+    operation: parking_lot::Mutex<()>,
     state: parking_lot::Mutex<State>,
 }
 
@@ -98,6 +99,7 @@ impl DnsController {
         }
         Ok(Arc::new(Self {
             manager,
+            operation: parking_lot::Mutex::new(()),
             state: parking_lot::Mutex::new(State { lease: None }),
         }))
     }
@@ -114,10 +116,7 @@ impl DnsController {
     /// that was not already ours, and [`DnsController::is_active`] stays
     /// `false` so callers never claim PeerDNS is active without the overlay.
     pub fn apply(&self, ifname: &str, resolver_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
-        if self.state.lock().lease.is_some() {
-            return self.update(ifname, resolver_ip, suffix);
-        }
-        self.apply_fresh(ifname, resolver_ip, suffix)
+        self.update(ifname, resolver_ip, suffix)
     }
 
     /// Move to the current desired configuration.
@@ -129,6 +128,7 @@ impl DnsController {
     ///
     /// Blocking; call via `spawn_blocking`.
     pub fn update(&self, ifname: &str, resolver_ip: Ipv4Addr, suffix: &str) -> osdns::Result<()> {
+        let _operation = self.operation.lock();
         if self.state.lock().lease.is_none() {
             return self.apply_fresh(ifname, resolver_ip, suffix);
         }
@@ -154,7 +154,7 @@ impl DnsController {
                     ?requested,
                     "DNS resource set changed; ending old lease for a fresh one"
                 );
-                self.restore()?;
+                self.restore_locked()?;
                 self.apply_fresh(ifname, resolver_ip, suffix)
             }
             Err(osdns::Error::ResourceGone { resource, .. }) => {
@@ -162,7 +162,7 @@ impl DnsController {
                     ?resource,
                     "DNS resource incarnation is gone; ending lease for a fresh apply"
                 );
-                self.restore()?;
+                self.restore_locked()?;
                 self.apply_fresh(ifname, resolver_ip, suffix)
             }
             Err(e @ osdns::Error::ResourceIdentity { .. }) => {
@@ -187,6 +187,11 @@ impl DnsController {
     ///
     /// Blocking; call via `spawn_blocking`.
     pub fn restore(&self) -> osdns::Result<()> {
+        let _operation = self.operation.lock();
+        self.restore_locked()
+    }
+
+    fn restore_locked(&self) -> osdns::Result<()> {
         let lease = self.state.lock().lease.take();
         let Some(lease) = lease else { return Ok(()) };
         match lease.restore() {
@@ -600,6 +605,35 @@ mod tests {
 
             // Restoring without a lease is a no-op success.
             dns.restore().unwrap();
+        }
+
+        #[test]
+        fn concurrent_dns_transitions_preserve_one_lease() {
+            let (manager, fake, _dir) = enforce_manager(full_caps());
+            let dns = DnsController::wrap(manager).unwrap();
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for worker in 0..8 {
+                    let dns = &dns;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..4 {
+                            if worker % 2 == 0 {
+                                dns.apply("eth0", MAGIC_IP, "tunnet").unwrap();
+                            } else {
+                                dns.restore().unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            dns.restore().unwrap();
+            assert!(!dns.is_active());
+            assert_eq!(
+                fake.current_state("fake:interface:1").unwrap(),
+                Some(FakeState::Empty)
+            );
         }
 
         #[test]

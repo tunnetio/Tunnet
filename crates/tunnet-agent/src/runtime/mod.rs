@@ -129,7 +129,11 @@ impl AgentRuntime {
             .publish(self.handle.transition_snapshot(AgentLifecycle::Stopping));
         let previous = std::mem::replace(&mut *phase, Phase::Stopping);
         match previous {
-            Phase::Mesh(mesh) => (*mesh).drain().await,
+            Phase::Mesh(mesh) => {
+                if let Err(error) = (*mesh).drain().await {
+                    tracing::error!(%error, "mesh shutdown cleanup failed");
+                }
+            }
             Phase::Idle
             | Phase::Joining
             | Phase::PendingApproval

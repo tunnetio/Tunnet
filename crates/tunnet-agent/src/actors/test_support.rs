@@ -24,6 +24,7 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
             ip: "10.9.0.1".parse().unwrap(),
             tags: vec![],
             network: "test".into(),
+            posture: tunnet_common::PeerPosture::Unknown,
         },
     );
     let policy = tunnet_core::PolicyEngine::new();
@@ -42,9 +43,17 @@ pub async fn test_node() -> (tunnet_core::CoreNode, tempfile::TempDir) {
     .await
     .expect("open send manager");
     let node = tunnet_core::CoreNode {
+        external_dns: Some(Arc::new(
+            tunnet_core::dns::HickoryLookup::with_runtime(
+                &tunnet_common::DnsConfig::default(),
+                tunnet_core::dns::NativeHickoryRuntimeProvider::new([None; 2], [None; 2]),
+            )
+            .expect("test external DNS"),
+        )),
         identity,
         persisted: tunnet_core::PersistedState::Direct { networks: vec![] },
         endpoint,
+        candidate_updates: None,
         pool: pool.clone(),
         peers,
         effective_config: tunnet_core::EffectiveConfigStore::new(),

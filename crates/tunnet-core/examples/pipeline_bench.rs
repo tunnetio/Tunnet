@@ -1,10 +1,8 @@
-use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::time::Instant;
 
-use bytes::Bytes;
 use tunnet_core::forward::frame::{frame, unframe};
-use tunnet_core::{ForwardingStore, PeerManager, PolicyEngine, outbound};
+use tunnet_core::{ForwardingStore, PolicyEngine, outbound};
 use tunnet_core::{RoutingTable, SelfIdentity};
 use uuid::Uuid;
 
@@ -33,6 +31,7 @@ fn setup() -> (ForwardingStore, PolicyEngine, RoutingTable) {
             hostname: "peer".into(),
             tags: vec![],
             ssh_host_key: None,
+            posture: tunnet_common::PeerPosture::Unknown,
         }],
         &[],
         &[],
@@ -76,6 +75,7 @@ fn setup() -> (ForwardingStore, PolicyEngine, RoutingTable) {
             ip: Ipv4Addr::new(100, 64, 0, 1),
             tags: vec![],
             network: "net".into(),
+            posture: tunnet_common::PeerPosture::Unknown,
         },
     );
     (store, PolicyEngine::new(), routes)
@@ -124,92 +124,4 @@ fn main() {
         let (_, ip) = unframe(&framed).unwrap();
         std::hint::black_box(ip.len());
     });
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        queue_bench(&raw, iters.min(50_000)).await;
-        transport_bench().await;
-    });
-}
-
-async fn queue_bench(raw: &[u8], iters: u64) {
-    let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .bind()
-        .await
-        .expect("bind bench endpoint");
-    let peers = PeerManager::new(endpoint, b"tunnet/bench");
-    peers.activate(1, tokio_util::sync::CancellationToken::new());
-    let ids: Vec<iroh::EndpointId> = (0..256)
-        .map(|_| iroh::SecretKey::generate().public())
-        .collect();
-    let start = Instant::now();
-    let mut admitted = 0u64;
-    for i in 0..iters {
-        let varied = ids[(i as usize) % ids.len()];
-        let out = peers.send_batch(varied, vec![Bytes::copy_from_slice(&raw[..128])]);
-        admitted += out.admitted as u64;
-    }
-    let dt = start.elapsed();
-    println!(
-        "session queue admit: {iters} iters in {:.2}s = {:.0} pkt/s ({admitted} admitted)",
-        dt.as_secs_f64(),
-        iters as f64 / dt.as_secs_f64(),
-    );
-}
-
-async fn transport_bench() {
-    const ALPN: &[u8] = b"tunnet/bench";
-    const COUNT: usize = 500;
-    const SIZE: usize = 1000;
-    let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .alpns(vec![ALPN.to_vec()])
-        .bind()
-        .await
-        .expect("bind server");
-    let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
-        .bind()
-        .await
-        .expect("bind client");
-    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<usize>(1);
-    tokio::spawn({
-        let server = server.clone();
-        async move {
-            let incoming = server.accept().await.expect("accept");
-            let conn = incoming.await.expect("handshake");
-            let mut batch: [Bytes; 32] = std::array::from_fn(|_| Bytes::new());
-            let mut total = 0usize;
-            let mut bytes = 0u64;
-            while total < COUNT {
-                let n = conn.read_many_datagrams(&mut batch).await.expect("read");
-                for dg in &batch[..n] {
-                    total += 1;
-                    bytes += dg.len() as u64;
-                }
-                batch[n..].fill(Bytes::new());
-            }
-            let _ = done_tx.send(bytes as usize).await;
-        }
-    });
-    let conn = client.connect(server.addr(), ALPN).await.expect("connect");
-    println!(
-        "quic loopback max_datagram_size: {:?}",
-        conn.max_datagram_size()
-    );
-    let mut queue: VecDeque<Bytes> = (0..COUNT).map(|_| Bytes::from(vec![0u8; SIZE])).collect();
-    let start = Instant::now();
-    let out = tunnet_core::peer::send_datagram_batch(&conn, &mut queue).await;
-    let dt = start.elapsed();
-    let bytes = done_rx.recv().await.unwrap_or(0);
-    assert_eq!(out.accepted, COUNT);
-    assert_eq!(bytes, COUNT * SIZE);
-    let mbps = bytes as f64 * 8.0 / dt.as_secs_f64() / 1e6;
-    println!(
-        "quic loopback batch drain: {COUNT}x{SIZE}B in {:.2}s = {:.1} Mbps ({:.0} pkt/s)",
-        dt.as_secs_f64(),
-        mbps,
-        COUNT as f64 / dt.as_secs_f64()
-    );
 }

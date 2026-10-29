@@ -4,10 +4,27 @@ use tun_rs::AsyncDevice;
 use tunnet_core::{ForwardingStore, PeerManager, PolicyEngine};
 
 use crate::metrics::AgentMetrics;
-use crate::tun_io::DnsPool;
+use crate::tun_io::{DnsPool, TunWriter};
+
+pub(crate) struct TaskExit {
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub notify: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for TaskExit {
+    fn drop(&mut self) {
+        if !self.cancel.is_cancelled()
+            && let Some(notify) = self.notify.take()
+        {
+            notify();
+        }
+    }
+}
 
 pub struct OutboundSpawn {
     pub tun: Arc<AsyncDevice>,
+    pub writer: TunWriter,
+    pub cancel: tokio_util::sync::CancellationToken,
     pub peers: PeerManager,
     pub policy: PolicyEngine,
     pub forwarding: ForwardingStore,
@@ -19,6 +36,8 @@ pub struct OutboundSpawn {
 pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
     let OutboundSpawn {
         tun,
+        writer,
+        cancel,
         peers,
         policy,
         forwarding,
@@ -27,18 +46,25 @@ pub fn spawn_outbound(spawn: OutboundSpawn) -> tokio::task::JoinHandle<()> {
         on_unexpected_end,
     } = spawn;
     tokio::spawn(async move {
-        if let Err(e) = crate::tun_io::run_outbound(crate::tun_io::OutboundDeps {
+        let _exit = TaskExit {
+            cancel: cancel.clone(),
+            notify: Some(on_unexpected_end),
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = crate::tun_io::run_outbound(crate::tun_io::OutboundDeps {
             tun,
+            writer,
             peers,
             policy,
             forwarding,
             metrics,
             dns,
-        })
-        .await
-        {
+            }) => result,
+        };
+        if let Err(e) = result {
             tracing::error!(?e, "outbound TUN loop exited");
-            on_unexpected_end();
         }
     })
 }

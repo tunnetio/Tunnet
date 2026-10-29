@@ -259,6 +259,18 @@ async fn run_serve(args: Args) -> anyhow::Result<()> {
         }
     });
 
+    let posture_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = crate::posture::expire_posture_claims(&posture_state).await {
+                tracing::warn!(?error, "expire_posture_claims failed");
+            }
+        }
+    });
+
     let expiry_state = state.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));

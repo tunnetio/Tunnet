@@ -128,6 +128,16 @@ struct SendInner {
     pending: Mutex<HashMap<String, PendingOffer>>,
     client_tx: Mutex<Option<mpsc::Sender<ClientMsg>>>,
     events_tx: Mutex<Option<tokio::sync::broadcast::Sender<LocalEvent>>>,
+    cancel: tokio_util::sync::CancellationToken,
+    tasks: Mutex<tokio_util::task::TaskTracker>,
+    workers: Arc<tokio::sync::Semaphore>,
+}
+
+impl Drop for SendInner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.workers.close();
+    }
 }
 
 struct PendingOffer {
@@ -178,18 +188,43 @@ impl SendManager {
                 pending: Mutex::new(HashMap::new()),
                 client_tx: Mutex::new(None),
                 events_tx: Mutex::new(None),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                tasks: Mutex::new(tokio_util::task::TaskTracker::new()),
+                workers: Arc::new(tokio::sync::Semaphore::new(32)),
             }),
         };
         let cfg = mgr.config();
         std::fs::create_dir_all(&cfg.inbox_path).ok();
-        let weak = mgr.clone();
-        tokio::spawn(async move {
+        let weak = Arc::downgrade(&mgr.inner);
+        let cancel = mgr.inner.cancel.clone();
+        mgr.inner.tasks.lock().spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                weak.gc_retained_tags().await;
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        let Some(inner) = weak.upgrade() else { break; };
+                        let manager = SendManager { inner };
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = manager.gc_retained_tags() => {},
+                        }
+                    }
+                }
             }
         });
         Ok(mgr)
+    }
+
+    pub async fn shutdown(&self) {
+        let tasks = {
+            let tasks = self.inner.tasks.lock();
+            self.inner.workers.close();
+            self.inner.cancel.cancel();
+            self.inner.pending.lock().clear();
+            tasks.close();
+            tasks.clone()
+        };
+        tasks.wait().await;
     }
 
     pub fn set_client_tx(&self, tx: mpsc::Sender<ClientMsg>) {
@@ -382,9 +417,20 @@ impl SendManager {
         transfer_id: Option<String>,
     ) -> anyhow::Result<Vec<TransferRecord>> {
         let peers = self.resolve_targets(target)?;
-        let imported = self.import_path(path).await?;
+        if peers.len() > 32 {
+            bail!("too many transfer targets");
+        }
+        let permits = peers
+            .iter()
+            .map(|_| self.inner.workers.clone().try_acquire_owned())
+            .collect::<Result<Vec<_>, _>>()
+            .context("transfer workers busy")?;
+        let imported = tokio::select! {
+            _ = self.inner.cancel.cancelled() => bail!("transfer manager stopped"),
+            result = self.import_path(path) => result?,
+        };
         let mut records = Vec::new();
-        for (i, peer) in peers.into_iter().enumerate() {
+        for (i, (peer, permit)) in peers.into_iter().zip(permits).enumerate() {
             let transfer_id = if i == 0 {
                 transfer_id
                     .clone()
@@ -446,7 +492,16 @@ impl SendManager {
             let tid = transfer_id.clone();
             let hash = imported.hash;
             let format = imported.format;
-            tokio::spawn(async move {
+            let cancel = self.inner.cancel.clone();
+            let tasks = self.inner.tasks.lock();
+            if self.inner.cancel.is_cancelled() {
+                bail!("transfer manager stopped");
+            }
+            tasks.spawn(async move {
+                let _permit = permit;
+                tokio::select! {
+                    _ = cancel.cancelled() => {},
+                    _ = async {
                 if let Err(e) = mgr
                     .run_outbound(peer_id, offer, tag_name, hash, format)
                     .await
@@ -459,6 +514,8 @@ impl SendManager {
                         rejected: false,
                     })
                     .await;
+                }
+                                } => {},
                 }
             });
             records.push(record);
@@ -576,7 +633,10 @@ impl SendManager {
         let peer_hex = format!("{}", conn.remote_id());
         if !self.inner.transport.lock().allows(&peer_hex) {
             tracing::debug!(%peer_hex, "send offer from non-member; closing");
-            conn.close(1u32.into(), b"not_member");
+            conn.close(
+                crate::transport_auth::CLOSE_NOT_MEMBER.into(),
+                crate::transport_auth::CLOSE_NOT_MEMBER_REASON,
+            );
             return;
         }
         let (mut send, mut recv) = match conn.accept_bi().await {
@@ -700,21 +760,45 @@ impl SendManager {
         peer.tags.iter().any(|t| self_tags.contains(t))
     }
 
-    pub async fn accept_pending(&self, transfer_id: &str) -> anyhow::Result<TransferRecord> {
+    pub fn begin_accept_pending(
+        &self,
+        transfer_id: &str,
+    ) -> anyhow::Result<
+        impl std::future::Future<Output = anyhow::Result<TransferRecord>> + Send + 'static,
+    > {
+        let permit = self
+            .inner
+            .workers
+            .clone()
+            .try_acquire_owned()
+            .context("transfer workers busy")?;
         let pending = self
             .inner
             .pending
             .lock()
             .remove(transfer_id)
             .with_context(|| format!("no pending transfer `{transfer_id}`"))?;
-        self.accept_offer_inner(pending.offer, pending.peer, pending.send, pending.recv)
-            .await?;
-        self.inner
-            .transfers
-            .lock()
-            .get(transfer_id)
-            .cloned()
-            .context("transfer missing after accept")
+        let manager = self.clone();
+        let transfer_id = transfer_id.to_owned();
+        Ok(async move {
+            let _permit = permit;
+            let cancel = manager.inner.cancel.clone();
+            tokio::select! {
+                _ = cancel.cancelled() => anyhow::bail!("transfer manager stopped"),
+                result = async {
+            manager
+                .accept_offer_inner(pending.offer, pending.peer, pending.send, pending.recv)
+                .await?;
+            manager
+                .inner
+                .transfers
+                .lock()
+                .get(&transfer_id)
+                .cloned()
+                .context("transfer missing after accept")
+                } => result,
+            }
+        })
     }
 
     pub async fn reject_pending(
@@ -1067,7 +1151,10 @@ impl SendManager {
         let peer_hex = format!("{}", conn.remote_id());
         if !self.inner.transport.lock().allows(&peer_hex) {
             tracing::debug!(%peer_hex, "blobs ALPN from non-member; closing");
-            conn.close(1u32.into(), b"not_member");
+            conn.close(
+                crate::transport_auth::CLOSE_NOT_MEMBER.into(),
+                crate::transport_auth::CLOSE_NOT_MEMBER_REASON,
+            );
             return;
         }
         if let Err(e) = self.inner.blobs.accept(conn).await {

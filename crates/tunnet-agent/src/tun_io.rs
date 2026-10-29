@@ -10,16 +10,165 @@ use tun_rs::DeviceBuilder;
 use tunnet_core::forward::{
     FRAME_OVERHEAD, InDecision, OutDecision, frame, inbound_frame, outbound,
 };
-use tunnet_core::peer::{SessionCtl, send_datagram};
+use tunnet_core::peer::{AuthorizedPacket, SessionCtl};
 use tunnet_core::{ForwardingStore, PeerManager, PolicyEngine};
 
-use crate::actors::dataplane::PublishedPlane;
+use crate::actors::dataplane::PublishedDataPlane;
 use crate::metrics::AgentMetrics;
 
 const INGRESS_BATCH: usize = 32;
 const OUTBOUND_DRAIN_MAX: usize = 64;
 const DNS_QUEUE: usize = 64;
 const DNS_WORKERS: usize = 4;
+const WRITE_QUEUE: usize = 128;
+
+#[derive(Clone)]
+pub struct TunWriter {
+    tx: tokio::sync::mpsc::Sender<TunWrite>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+struct TunWrite {
+    packet: Bytes,
+    authorization: Option<IngressAuthorization>,
+}
+
+pub struct IngressAuthorization {
+    network: uuid::Uuid,
+    peer: EndpointId,
+    epoch: tunnet_core::forward::snapshot::AuthorizationEpoch,
+    posture: Arc<bool>,
+    proof: Option<tunnet_core::forward::PostureAuthorization>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl TunWriter {
+    pub fn spawn(
+        device: Arc<AsyncDevice>,
+        cancel: tokio_util::sync::CancellationToken,
+        metrics: AgentMetrics,
+        forwarding: ForwardingStore,
+        on_unexpected_end: Box<dyn FnOnce() + Send>,
+    ) -> (Self, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TunWrite>(WRITE_QUEUE);
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            let _exit = crate::dataplane::TaskExit {
+                cancel: task_cancel.clone(),
+                notify: Some(on_unexpected_end),
+            };
+            loop {
+                let packet = tokio::select! {
+                    biased;
+                    _ = task_cancel.cancelled() => return,
+                    packet = rx.recv() => match packet {
+                        Some(packet) => packet,
+                        None => break,
+                    },
+                };
+                let result = loop {
+                    let attempt = {
+                        let gate = forwarding.authorization_gate();
+                        let _guard = gate.read();
+                        let allowed = !task_cancel.is_cancelled()
+                            && packet.authorization.as_ref().is_none_or(|auth| {
+                                let current = forwarding.load();
+                                !auth.cancel.is_cancelled()
+                                    && current.auth_epoch(auth.network) == auth.epoch
+                                    && current.allows_network(auth.network, auth.peer)
+                                    && Arc::ptr_eq(&auth.posture, &current.posture_ok.load_full())
+                                    && auth.proof.is_none_or(|proof| {
+                                        proof.allows(&current, auth.network, auth.peer)
+                                    })
+                            });
+                        if !allowed {
+                            metrics.dropped_inc("authorization_changed");
+                            break Ok(0);
+                        }
+                        device.try_send(&packet.packet)
+                    };
+                    match attempt {
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            tokio::select! {
+                                biased;
+                                _ = task_cancel.cancelled() => return,
+                                result = wait_writable(&device) => if let Err(e) = result { break Err(e); },
+                            }
+                        }
+                        other => break other,
+                    }
+                };
+                match result {
+                    Ok(0) => {}
+                    Ok(n) if n == packet.packet.len() => {
+                        metrics.packets_add("tun_write", 1);
+                        metrics.bytes_add("tun_write", n as u64);
+                    }
+                    _ => {
+                        metrics.dropped_inc("tun_send_failed");
+                        break;
+                    }
+                }
+            }
+        });
+        (Self { tx, cancel }, task)
+    }
+
+    pub async fn send(&self, packet: Bytes) -> bool {
+        self.submit(TunWrite {
+            packet,
+            authorization: None,
+        })
+        .await
+    }
+
+    pub fn try_send(&self, packet: Bytes) -> bool {
+        !self.cancel.is_cancelled()
+            && !packet.is_empty()
+            && packet.len() <= 65_535
+            && self
+                .tx
+                .try_send(TunWrite {
+                    packet,
+                    authorization: None,
+                })
+                .is_ok()
+    }
+
+    pub async fn send_authorized(
+        &self,
+        packet: Bytes,
+        authorization: IngressAuthorization,
+    ) -> bool {
+        self.submit(TunWrite {
+            packet,
+            authorization: Some(authorization),
+        })
+        .await
+    }
+
+    async fn submit(&self, packet: TunWrite) -> bool {
+        if packet.packet.is_empty() || packet.packet.len() > 65_535 {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => false,
+            result = self.tx.send(packet) => result.is_ok(),
+        }
+    }
+}
+
+async fn wait_writable(device: &AsyncDevice) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = device;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    device.writable().await
+}
 
 #[cfg(target_os = "android")]
 pub fn build_tun_multi(
@@ -112,39 +261,90 @@ pub fn build_tun_multi(
 
 #[derive(Clone)]
 pub struct DnsPool {
+    inner: Arc<DnsWorkers>,
+}
+
+struct DnsWorkers {
     tx: tokio::sync::mpsc::Sender<Bytes>,
+    cancel: tokio_util::sync::CancellationToken,
+    tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for DnsWorkers {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for task in self.tasks.get_mut().drain(..) {
+            task.abort();
+        }
+    }
 }
 
 impl DnsPool {
-    pub fn new(device: Arc<AsyncDevice>, dns: Arc<tunnet_core::dns::InTun>) -> Self {
+    pub fn new(
+        writer: TunWriter,
+        dns: Arc<tunnet_core::dns::InTun>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(DNS_QUEUE);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let mut tasks = Vec::with_capacity(DNS_WORKERS);
         for _ in 0..DNS_WORKERS {
             let rx = rx.clone();
-            let device = device.clone();
+            let writer = writer.clone();
             let dns = dns.clone();
-            tokio::spawn(async move {
+            let cancel = cancel.clone();
+            tasks.push(tokio::spawn(async move {
                 loop {
-                    let query: Option<Bytes> = rx.lock().await.recv().await;
+                    let query: Option<Bytes> = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        query = async { rx.lock().await.recv().await } => query,
+                    };
                     let Some(query) = query else { break };
-                    for reply in dns.handle(&query).await {
-                        if device.send(&reply).await.is_err() {
+                    let replies = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        replies = dns.handle(&query) => replies,
+                    };
+                    for reply in replies {
+                        if !writer.send(Bytes::from(reply)).await {
                             break;
                         }
                     }
                 }
-            });
+            }));
         }
-        Self { tx }
+        Self {
+            inner: Arc::new(DnsWorkers {
+                tx,
+                cancel,
+                tasks: parking_lot::Mutex::new(tasks),
+            }),
+        }
     }
 
     pub fn submit(&self, query: Bytes) -> bool {
-        self.tx.try_send(query).is_ok()
+        !self.inner.cancel.is_cancelled() && self.inner.tx.try_send(query).is_ok()
+    }
+
+    pub async fn shutdown(&self) {
+        self.inner.cancel.cancel();
+        let tasks = std::mem::take(&mut *self.inner.tasks.lock());
+        for mut task in tasks {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 }
 
 pub struct OutboundDeps {
     pub tun: Arc<AsyncDevice>,
+    pub writer: TunWriter,
     pub peers: PeerManager,
     pub policy: PolicyEngine,
     pub forwarding: ForwardingStore,
@@ -155,6 +355,7 @@ pub struct OutboundDeps {
 pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     let OutboundDeps {
         tun,
+        writer,
         peers,
         policy,
         forwarding,
@@ -165,25 +366,26 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65_536];
     let mut pool: Vec<Vec<u8>> = Vec::new();
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(OUTBOUND_DRAIN_MAX);
-    let mut by_peer: std::collections::HashMap<EndpointId, Vec<Bytes>> =
+    let mut by_peer: std::collections::HashMap<EndpointId, Vec<AuthorizedPacket>> =
         std::collections::HashMap::new();
     tracing::info!("outbound TUN→iroh loop started");
     loop {
         batch.clear();
-        drain_tun(&tun, &mut buf, &mut pool, &mut batch);
+        drain_tun(&tun, &mut buf, &mut pool, &mut batch)?;
         if batch.is_empty() {
             let n = tun.recv(&mut buf).await?;
             if n > 0 {
                 batch.push(take_packet(&mut pool, &buf[..n]));
             }
-            drain_tun(&tun, &mut buf, &mut pool, &mut batch);
+            drain_tun(&tun, &mut buf, &mut pool, &mut batch)?;
         }
         if batch.is_empty() {
             continue;
         }
         metrics.batch_observe("tun_read", batch.len() as u64);
-        let snap = forwarding.load();
-        let tun_mtu = snap.tun_mtu;
+        metrics.packets_add("tun_read", batch.len() as u64);
+        metrics.bytes_add("tun_read", batch.iter().map(|p| p.len() as u64).sum());
+        let (snap, auth_tokens, posture) = batch_authorization(&forwarding);
         by_peer.clear();
         let mut admitted = 0u64;
         let mut admitted_bytes = 0u64;
@@ -191,38 +393,39 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
             let decision = loop {
                 match outbound(&snap, &policy, &raw) {
                     OutDecision::RewriteSsh(rewrite) => {
-                        raw[rewrite.port_offset] = (rewrite.port >> 8) as u8;
-                        raw[rewrite.port_offset + 1] = (rewrite.port & 0xff) as u8;
-                        tunnet_common::packet::set_tcp_ipv4_checksum(
+                        if !tunnet_common::packet::rewrite_tcp_port(
                             &mut raw,
                             rewrite.ip_header_len,
-                        );
+                            rewrite.port_offset,
+                            rewrite.port,
+                        ) {
+                            break OutDecision::Drop {
+                                reason: "ssh_rewrite_invalid",
+                            };
+                        }
                     }
                     d => break d,
                 }
             };
             match decision {
-                OutDecision::Forward { peer, network } => {
-                    let framed_len = raw.len() + FRAME_OVERHEAD;
-                    let max_dg = peers.conn_max_datagram_size(peer);
-                    if let Some(max) = max_dg
-                        && framed_len > max
-                    {
-                        let mtu = (max.saturating_sub(FRAME_OVERHEAD).max(576) as u16).min(tun_mtu);
-                        metrics.dropped_inc("datagram_too_large");
-                        if let Some(reply) =
-                            tunnet_common::packet::synthesize_frag_needed(&raw, mtu)
-                        {
-                            let _ = tun.send(&reply).await;
-                        }
-                    } else {
-                        let budget = max_dg
-                            .map(|m| m.saturating_sub(FRAME_OVERHEAD + 40))
-                            .unwrap_or(tun_mtu as usize - 58);
-                        let mss = budget.clamp(536, 9000) as u16;
-                        tunnet_common::packet::clamp_tcp_mss(&mut raw, mss);
-                        by_peer.entry(peer).or_default().push(frame(network, &raw));
-                    }
+                OutDecision::Forward {
+                    peer,
+                    network,
+                    posture: proof,
+                } => {
+                    metrics.packets_add("authorized_out", 1);
+                    metrics.bytes_add("authorized_out", raw.len() as u64);
+                    let Some(epoch) = auth_tokens.get(&network).copied() else {
+                        metrics.dropped_inc("authorization_changed");
+                        pool.push(raw);
+                        continue;
+                    };
+                    by_peer.entry(peer).or_default().push(AuthorizedPacket {
+                        packet: frame(network, &raw),
+                        epoch,
+                        local_posture: posture.clone(),
+                        proof,
+                    });
                 }
                 OutDecision::LocalDns => {
                     if !dns.submit(Bytes::copy_from_slice(&raw)) {
@@ -233,7 +436,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
                 OutDecision::Reject { reply } => {
                     metrics.dropped_inc("fw_reject_out");
                     if !reply.is_empty() {
-                        let _ = tun.send(&reply).await;
+                        let _ = writer.send(reply).await;
                     }
                 }
                 OutDecision::Drop { reason } => metrics.dropped_inc(reason),
@@ -242,7 +445,7 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
         }
         let mut queue_full = 0u64;
         for (peer, packets) in by_peer.drain() {
-            let outcome = peers.send_batch(peer, packets);
+            let outcome = peers.send_batch_authorized(peer, packets);
             admitted += outcome.admitted as u64;
             admitted_bytes += outcome.admitted_bytes;
             queue_full += outcome.queue_full as u64;
@@ -257,11 +460,30 @@ pub async fn run_outbound(deps: OutboundDeps) -> anyhow::Result<()> {
             metrics.dropped_add("queue_full", queue_full);
         }
         if admitted > 0 {
-            metrics.packets_add("out", admitted);
-            metrics.bytes_add("out", admitted_bytes);
+            metrics.packets_add("queue_admitted", admitted);
+            metrics.bytes_add("queue_admitted", admitted_bytes);
         }
         tokio::task::yield_now().await;
     }
+}
+
+fn batch_authorization(
+    forwarding: &ForwardingStore,
+) -> (
+    Arc<tunnet_core::ForwardingSnapshot>,
+    std::collections::HashMap<uuid::Uuid, tunnet_core::forward::snapshot::AuthorizationEpoch>,
+    Arc<bool>,
+) {
+    let gate = forwarding.authorization_gate();
+    let _guard = gate.read();
+    let snap = forwarding.load();
+    let epochs = snap
+        .auth
+        .keys()
+        .map(|net| (*net, snap.auth_epoch(*net)))
+        .collect();
+    let posture = snap.posture_ok.load_full();
+    (snap, epochs, posture)
 }
 
 fn take_packet(pool: &mut Vec<Vec<u8>>, data: &[u8]) -> Vec<u8> {
@@ -276,19 +498,23 @@ fn drain_tun(
     buf: &mut [u8],
     pool: &mut Vec<Vec<u8>>,
     batch: &mut Vec<Vec<u8>>,
-) {
+) -> std::io::Result<()> {
     while batch.len() < OUTBOUND_DRAIN_MAX {
         match tun.try_recv(buf) {
             Ok(m) if m > 0 => batch.push(take_packet(pool, &buf[..m])),
-            _ => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+            Ok(_) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
         }
     }
+    Ok(())
 }
 
 #[derive(Clone)]
 pub struct SessionInbound {
-    pub tun: PublishedPlane,
-    pub peers: PeerManager,
+    pub plane: Arc<PublishedDataPlane>,
+    pub peers: tunnet_core::peer::WeakPeerManager,
     pub policy: PolicyEngine,
     pub forwarding: ForwardingStore,
     pub metrics: AgentMetrics,
@@ -301,7 +527,6 @@ pub async fn serve_tunnel_connection(
     deps: SessionInbound,
 ) {
     serve_tunnel_connection_inner(peer, conn, &ctl, deps).await;
-    ctl.finished();
 }
 
 async fn serve_tunnel_connection_inner(
@@ -311,7 +536,7 @@ async fn serve_tunnel_connection_inner(
     deps: SessionInbound,
 ) {
     let SessionInbound {
-        tun,
+        plane,
         peers,
         policy,
         forwarding,
@@ -321,16 +546,14 @@ async fn serve_tunnel_connection_inner(
     debug_assert_eq!(peer, remote_id);
     tracing::info!(%remote_id, "peer connected");
     metrics.active_conns_inc();
+    let _metrics = ActiveConnection(metrics.clone());
     if let Some(max) = conn.max_datagram_size() {
         tracing::debug!(%remote_id, max_datagram_size = max, "quic datagram limit");
     }
 
-    let Some(plane) = tun.load_full() else {
-        metrics.active_conns_dec();
-        return;
-    };
-    let device = plane.device.clone();
+    let writer = plane.writer.clone();
     let generation_cancel = plane.cancel.clone();
+    let connection_cancel = ctl.cancel();
     tracing::debug!(generation = plane.generation, %remote_id, "ingress reader pinned");
 
     let mut batch: [Bytes; INGRESS_BATCH] = std::array::from_fn(|_| Bytes::new());
@@ -342,12 +565,7 @@ async fn serve_tunnel_connection_inner(
         let received = tokio::select! {
             biased;
             _ = generation_cancel.cancelled() => break,
-            _ = async {
-                match ctl.cancel() {
-                    Some(cancel) => cancel.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            } => break,
+            _ = connection_cancel.cancelled() => break,
             res = conn.read_many_datagrams(&mut batch) => match res {
                 Ok(n) => n,
                 Err(e) => {
@@ -362,13 +580,29 @@ async fn serve_tunnel_connection_inner(
         batch[received..].fill(Bytes::new());
         if received > 0 {
             metrics.batch_observe("quic_read", received as u64);
+            metrics.packets_add("quic_read", received as u64);
+            metrics.bytes_add(
+                "quic_read",
+                batch[..received]
+                    .iter()
+                    .map(|packet| packet.len() as u64)
+                    .sum(),
+            );
         }
-        let snap = forwarding.load();
+        let (snap, auth_tokens, posture) = batch_authorization(&forwarding);
         let mut admitted = 0u64;
         let mut admitted_bytes = 0u64;
         for dg in &batch[..received] {
             match inbound_frame(&snap, &policy, dg, remote_id) {
-                InDecision::ToTun { ip, ssh } => {
+                InDecision::ToTun {
+                    ip,
+                    ssh,
+                    network,
+                    posture: proof,
+                } => {
+                    let Some(epoch) = auth_tokens.get(&network).copied() else {
+                        continue;
+                    };
                     let n = ip.len() as u64;
                     if generation_cancel.is_cancelled() {
                         break 'read;
@@ -377,17 +611,38 @@ async fn serve_tunnel_connection_inner(
                         Some(rewrite) => {
                             scratch.clear();
                             scratch.extend_from_slice(ip);
-                            scratch[rewrite.port_offset] = (rewrite.port >> 8) as u8;
-                            scratch[rewrite.port_offset + 1] = (rewrite.port & 0xff) as u8;
-                            tunnet_common::packet::set_tcp_ipv4_checksum(
+                            if !tunnet_common::packet::rewrite_tcp_port(
                                 &mut scratch,
                                 rewrite.ip_header_len,
-                            );
+                                rewrite.port_offset,
+                                rewrite.port,
+                            ) {
+                                metrics.dropped_inc("ssh_rewrite_invalid");
+                                continue;
+                            }
                             &scratch
                         }
                         None => ip,
                     };
-                    if device.send(payload).await.is_err() {
+                    let packet = if ssh.is_some() {
+                        Bytes::copy_from_slice(payload)
+                    } else {
+                        dg.slice(FRAME_OVERHEAD..FRAME_OVERHEAD + ip.len())
+                    };
+                    if !writer
+                        .send_authorized(
+                            packet,
+                            IngressAuthorization {
+                                network,
+                                peer: remote_id,
+                                epoch,
+                                posture: posture.clone(),
+                                proof,
+                                cancel: connection_cancel.clone(),
+                            },
+                        )
+                        .await
+                    {
                         tracing::debug!("tun send failed");
                         metrics.dropped_inc("tun_send_failed");
                         continue;
@@ -395,10 +650,21 @@ async fn serve_tunnel_connection_inner(
                     admitted += 1;
                     admitted_bytes += n;
                 }
-                InDecision::Reject { reply } => {
+                InDecision::Reject { reply, network } => {
                     metrics.dropped_inc("fw_reject_in");
-                    if !reply.is_empty() {
-                        let _ = send_datagram(&conn, reply).await;
+                    if !reply.is_empty()
+                        && let Some(epoch) = auth_tokens.get(&network).copied()
+                        && let Some(peers) = peers.upgrade()
+                    {
+                        let _ = peers.send_authorized(
+                            remote_id,
+                            AuthorizedPacket {
+                                packet: frame(network, &reply),
+                                epoch,
+                                local_posture: posture.clone(),
+                                proof: None,
+                            },
+                        );
                     }
                 }
                 InDecision::Spoof { network } => {
@@ -417,13 +683,22 @@ async fn serve_tunnel_connection_inner(
             }
         }
         if admitted > 0 {
-            metrics.packets_add("in", admitted);
-            metrics.bytes_add("in", admitted_bytes);
-            peers.record_bytes_in(remote_id, admitted_bytes);
+            metrics.packets_add("authorized_in", admitted);
+            metrics.bytes_add("authorized_in", admitted_bytes);
+            if let Some(peers) = peers.upgrade() {
+                peers.record_bytes_in(remote_id, admitted_bytes);
+            }
         }
     }
-    metrics.active_conns_dec();
     tracing::info!(%remote_id, "peer disconnected");
+}
+
+struct ActiveConnection(AgentMetrics);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.active_conns_dec();
+    }
 }
 
 #[cfg(test)]

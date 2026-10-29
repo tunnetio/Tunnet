@@ -21,7 +21,12 @@ pub struct PingResult {
     pub path: String,
 }
 
-pub async fn ping_peer(pool: &ConnPool, peer: EndpointId, seq: u32) -> anyhow::Result<PingResult> {
+pub async fn ping_peer(
+    pool: &ConnPool,
+    peer: EndpointId,
+    network: uuid::Uuid,
+    seq: u32,
+) -> anyhow::Result<PingResult> {
     let conn = pool
         .get_alpn(peer, TUNNEL_STREAM_ALPN)
         .await
@@ -29,6 +34,7 @@ pub async fn ping_peer(pool: &ConnPool, peer: EndpointId, seq: u32) -> anyhow::R
     let (mut send, recv) = conn.open_bi().await.context("open_bi ping")?;
 
     let header = StreamHeader {
+        network,
         dst_port: 0,
         host: PING_HOST.into(),
     };

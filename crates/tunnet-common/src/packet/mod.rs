@@ -19,8 +19,8 @@ mod frag;
 mod parse;
 
 pub use build::{
-    clamp_tcp_mss, set_tcp_ipv4_checksum, synthesize_frag_needed, synthesize_reject,
-    tcp_ipv4_checksum_of,
+    clamp_tcp_mss, fragment_ipv4, rewrite_tcp_port, set_tcp_ipv4_checksum, synthesize_frag_needed,
+    synthesize_reject, tcp_ipv4_checksum_of,
 };
 pub use frag::{CachedTransport, FragKey, ResolvedL4, frag_key};
 pub use parse::{ParseError, parse};

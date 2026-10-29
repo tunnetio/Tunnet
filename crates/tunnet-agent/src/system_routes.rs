@@ -149,6 +149,12 @@ impl RouteError {
     }
 
     fn from_io(op: RouteOp, spec: Option<&RouteSpec>, err: io::Error) -> Self {
+        #[cfg(windows)]
+        if err.raw_os_error()
+            == Some(windows_sys::Win32::Foundation::ERROR_OBJECT_ALREADY_EXISTS as i32)
+        {
+            return Self::AlreadyExists;
+        }
         let route = spec.map(ToString::to_string).unwrap_or_default();
         match err.kind() {
             io::ErrorKind::AlreadyExists => Self::AlreadyExists,
@@ -226,8 +232,8 @@ fn spec_from_route(route: &Route) -> Option<RouteSpec> {
     };
     let dest = Ipv4Net::new(dest, route.prefix()).ok()?;
     let gateway = match route.gateway() {
-        Some(IpAddr::V4(ip)) => Some(ip),
-        None => None,
+        Some(IpAddr::V4(ip)) if !ip.is_unspecified() => Some(ip),
+        Some(IpAddr::V4(_)) | None => None,
         Some(_) => return None,
     };
     let if_index = route.if_index()?;
@@ -416,7 +422,10 @@ impl RouteEngine {
 
     #[cfg(not(target_os = "android"))]
     async fn reconcile_native(&mut self, desired: &DesiredRoutes) -> Result<(), RouteError> {
-        let underlay = desired.underlay.clone().or_else(UnderlayInfo::discover);
+        let underlay = desired
+            .underlay
+            .clone()
+            .or_else(|| UnderlayInfo::discover(&desired.ifname));
         let gateway = underlay.as_ref().and_then(UnderlayInfo::gateway_v4);
         let underlay_if = underlay
             .as_ref()
@@ -456,40 +465,15 @@ impl RouteEngine {
         let want = desired.to_specs(gateway, underlay_if, tun_if, allow_default);
 
         let kernel = self.backend.list().await?;
-        let kernel_by_id: BTreeSet<_> = kernel.iter().map(RouteSpec::identity).collect();
 
         self.owned
             .retain(|owned| kernel.iter().any(|k| k.identity() == owned.identity()));
-        for spec in &want {
-            if kernel_by_id.contains(&spec.identity()) {
-                self.owned.insert(spec.clone());
-            }
-        }
-
         let mut to_del: Vec<RouteSpec> = self
             .owned
             .iter()
             .filter(|owned| !want.iter().any(|w| w.identity() == owned.identity()))
             .cloned()
             .collect();
-
-        for k in &kernel {
-            let desired_dest = want.iter().any(|w| w.dest == k.dest);
-            let tun_owned = k.if_index == tun_index && k.gateway.is_none();
-            let matches_want = want.iter().any(|w| w.identity() == k.identity());
-            if matches_want {
-                continue;
-            }
-            if tun_owned && !want.iter().any(|w| w.dest == k.dest && w.gateway.is_none()) {
-                if !to_del.iter().any(|d| d.identity() == k.identity()) {
-                    to_del.push(k.clone());
-                }
-                continue;
-            }
-            if desired_dest && !to_del.iter().any(|d| d.identity() == k.identity()) {
-                to_del.push(k.clone());
-            }
-        }
 
         to_del.sort_by_key(RouteSpec::del_rank);
         let mut errors = Vec::new();
@@ -542,9 +526,7 @@ impl RouteEngine {
                 }
                 Err(e) if e.is_idempotent_add() => {
                     let kernel = self.backend.list().await.unwrap_or_default();
-                    if kernel.iter().any(|k| k.identity() == spec.identity()) {
-                        self.owned.insert(spec.clone());
-                    } else {
+                    if !kernel.iter().any(|k| k.identity() == spec.identity()) {
                         tracing::warn!(error = %e, route = %spec, "add reported exists without matching kernel route");
                         errors.push(e);
                         if spec.is_host_escape() {
@@ -806,6 +788,43 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case(false, "10.99.0.5/32")]
+    #[case(true, "1.2.3.4/32")]
+    #[tokio::test]
+    async fn reconcile_and_clear_preserve_existing_underlay_routes(
+        #[case] exit: bool,
+        #[case] cidr: &str,
+    ) {
+        let external = spec_gw(cidr, gw(), 2);
+        let state = Arc::new(Mutex::new(MockState {
+            kernel: [external.clone()].into(),
+            ..Default::default()
+        }));
+        let mut engine = reconciler(MockBackend {
+            state: state.clone(),
+        });
+        engine
+            .reconcile(&if exit { exit_desired() } else { mesh_desired() })
+            .await
+            .unwrap();
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .kernel
+                .iter()
+                .any(|route| route.identity() == external.identity())
+        );
+        engine.clear().await.unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.kernel.len(), 1);
+        assert_eq!(
+            state.kernel.iter().next().unwrap().identity(),
+            external.identity()
+        );
+    }
+
     #[tokio::test]
     async fn failed_add_does_not_update_tracked_state() {
         let dest: Ipv4Net = "10.99.0.5/32".parse().unwrap();
@@ -893,18 +912,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_with_existing_routes_does_not_duplicate() {
-        let existing = spec_tun("10.99.0.5/32", 9);
+    async fn preexisting_tun_routes_are_not_claimed_or_removed() {
+        let existing: BTreeSet<_> =
+            [spec_tun("10.99.0.5/32", 9), spec_tun("10.99.0.1/32", 9)].into();
         let state = Arc::new(Mutex::new(MockState {
-            kernel: [existing].into(),
+            kernel: existing.clone(),
             ..Default::default()
         }));
-        let mut r = reconciler(MockBackend {
+        let mut engine = reconciler(MockBackend {
             state: state.clone(),
         });
-        r.reconcile(&mesh_desired()).await.unwrap();
-        assert!(state.lock().unwrap().add_calls.is_empty());
-        assert_eq!(r.owned.len(), 1);
+        engine.reconcile(&mesh_desired()).await.unwrap();
+        engine.clear().await.unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.kernel, existing);
+        assert!(state.add_calls.is_empty());
+        assert!(state.delete_calls.is_empty());
+        assert!(engine.owned.is_empty());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[rstest::rstest]
+    #[case(None, None)]
+    #[case(Some("0.0.0.0"), None)]
+    #[case(Some("10.0.0.1"), Some("10.0.0.1"))]
+    fn native_gateway_representation_is_normalized(
+        #[case] gateway: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut route = Route::new("10.99.0.5".parse().unwrap(), 32).with_if_index(9);
+        if let Some(ip) = gateway {
+            route = route.with_gateway(ip.parse().unwrap());
+        }
+        let spec = spec_from_route(&route).unwrap();
+        assert_eq!(spec.gateway, expected.map(|ip| ip.parse().unwrap()));
+        assert_eq!(
+            spec_from_route(&spec_to_route(&spec)).unwrap().identity(),
+            spec.identity()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ip_helper_object_exists_is_idempotent() {
+        let error = io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_OBJECT_ALREADY_EXISTS as i32,
+        );
+        assert!(matches!(
+            RouteError::from_io(RouteOp::Add, None, error),
+            RouteError::AlreadyExists
+        ));
     }
 
     #[tokio::test]
@@ -1052,34 +1109,6 @@ mod tests {
         assert!(state.lock().unwrap().kernel.contains(&unrelated));
         r.clear().await.unwrap();
         assert!(state.lock().unwrap().kernel.contains(&unrelated));
-    }
-
-    #[tokio::test]
-    async fn unallocated_broad_route_is_not_claimed() {
-        let mesh = spec_tun("10.7.0.0/24", 9);
-        let host = spec_tun("10.7.0.2/32", 9);
-        let state = Arc::new(Mutex::new(MockState {
-            kernel: [mesh.clone(), host.clone()].into(),
-            ..Default::default()
-        }));
-        let mut r = reconciler(MockBackend {
-            state: state.clone(),
-        });
-        r.reconcile(&DesiredRoutes {
-            ifname: "tun0".into(),
-            tun_if_index: Some(9),
-            profile: DeviceProfile::default(),
-            remote_subnets: vec![],
-            peer_routes: vec!["10.7.0.2/32".parse().unwrap()],
-            has_exit: false,
-            underlay_hosts: vec![],
-            underlay: Some(underlay()),
-        })
-        .await
-        .unwrap();
-        let kernel = state.lock().unwrap().kernel.clone();
-        assert!(!kernel.contains(&mesh));
-        assert!(kernel.contains(&host));
     }
 
     #[tokio::test]

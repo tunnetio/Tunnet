@@ -26,3 +26,5 @@ license.txt
 hack
 .cursor/
 bench-results/
+.audit/
+vendor/*/target/

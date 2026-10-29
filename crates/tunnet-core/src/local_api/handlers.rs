@@ -99,11 +99,13 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
 
     // Firewall from tunnet.toml
     let fw_cfg = cfg.firewall_for_network(&network);
-    state.node.forwarding.set_firewall(
-        &state.node.routes,
-        network_id,
-        crate::forward::FirewallRules::from_config(&fw_cfg),
-    );
+    if state.node.primary_docs().is_some() {
+        state.node.forwarding.set_firewall(
+            &state.node.routes,
+            network_id,
+            crate::forward::FirewallRules::from_config(&fw_cfg),
+        );
+    }
 
     // DNS into membership + routes
     let dns = cfg.dns_for_network(&network);
@@ -122,22 +124,24 @@ pub(crate) async fn reload_config(state: &LocalApiState) -> anyhow::Result<Strin
                 hostname: p.hostname.clone(),
                 tags: p.tags.clone(),
                 ssh_host_key: p.ssh_host_key.clone(),
+                posture: tunnet_common::PeerPosture::Unknown,
             })
             .collect();
         let version = state.node.routes.version() + 1;
-        state.node.routes.replace(
-            &peers,
-            &[],
-            &[],
-            &[],
-            &tunnet_common::DeviceProfile::default(),
-            &dns,
-            &network,
-            network_id,
-            &state.node.endpoint_id_hex(),
-            version,
-        );
-        state.node.forwarding.republish(&state.node.routes);
+        state.node.forwarding.update_routes(&state.node.routes, || {
+            state.node.routes.replace(
+                &peers,
+                &[],
+                &[],
+                &[],
+                &tunnet_common::DeviceProfile::default(),
+                &dns,
+                &network,
+                network_id,
+                &state.node.endpoint_id_hex(),
+                version,
+            );
+        });
     }
 
     if let Some(net) = cfg.direct.get(&network) {
@@ -233,12 +237,7 @@ pub(crate) async fn advertise_subnet_route(
     cidr: &str,
     description: Option<String>,
 ) -> anyhow::Result<String> {
-    let managed = state.node.persisted.require_managed()?;
-    let client = crate::control::SignedClient::new(
-        managed.control_url.clone(),
-        state.node.endpoint_id_hex(),
-        state.node.identity.signing_key.clone(),
-    )?;
+    let client = state.node.require_signed()?;
     client
         .create_subnet_route(cidr, description.as_deref())
         .await
@@ -270,12 +269,7 @@ pub(crate) async fn start_tunnel(
             .await;
     }
 
-    let managed = state.node.persisted.require_managed()?;
-    let client = crate::control::SignedClient::new(
-        managed.control_url.clone(),
-        state.node.endpoint_id_hex(),
-        state.node.identity.signing_key.clone(),
-    )?;
+    let client = state.node.require_signed()?;
 
     let created = client
         .create_tunnel(port, protocol, subdomain, edge)
@@ -319,14 +313,9 @@ pub(crate) async fn stop_tunnel(state: &LocalApiState, port: u16) -> anyhow::Res
     if info.relay == "local" || state.node.persisted.is_direct() {
         return Ok(info);
     }
-    let Ok(managed) = state.node.persisted.require_managed() else {
+    let Ok(client) = state.node.require_signed() else {
         return Ok(info);
     };
-    let client = crate::control::SignedClient::new(
-        managed.control_url.clone(),
-        state.node.endpoint_id_hex(),
-        state.node.identity.signing_key.clone(),
-    )?;
     if let Err(e) = client.tunnel_stopped(&info.id).await {
         tracing::warn!(?e, "tunnel stopped report failed");
     }
@@ -678,6 +667,13 @@ pub(crate) fn build_node_summary(state: &LocalApiState) -> NodeSummary {
         snapshot_version: state.node.snapshot_version(),
         networks,
         on_demand: Some(OnDemandStatusInfo {
+            queue_packets: od.queue_packets,
+            queue_bytes: od.queue_bytes,
+            quic_accepted_packets: od.quic_accepted_packets,
+            quic_accepted_bytes: od.quic_accepted_bytes,
+            transport_drops: od.transport_drops,
+            oversize_packets: od.oversize_packets,
+            pmtu_feedback_drops: od.pmtu_feedback_drops,
             reconnect_attempts: od.reconnect_attempts,
             reconnect_success: od.reconnect_success,
             reconnect_fail: od.reconnect_fail,
@@ -870,22 +866,41 @@ pub(crate) fn build_routes(state: &LocalApiState, network_id: uuid::Uuid) -> Rou
 }
 
 pub(crate) async fn build_diag(state: &LocalApiState) -> DiagInfo {
+    use iroh::Watcher;
     let peers = state.node.routes.peers();
-    let total = peers.len();
-    // Without per-connection path telemetry yet, report unknowns honestly.
+    let endpoints: std::collections::HashSet<_> = peers
+        .iter()
+        .filter(|peer| peer.endpoint != state.node.endpoint.id())
+        .map(|peer| peer.endpoint)
+        .collect();
+    let total = endpoints.len();
+    let sessions: Vec<_> = endpoints
+        .into_iter()
+        .map(|peer| state.node.peers.peer_snapshot(peer))
+        .collect();
     DiagInfo {
+        peer_transport_stats: state.node.peers.transport_stats(),
         nat_type: "unknown".into(),
         endpoint_id: state.node.endpoint_id_hex(),
-        endpoint_online: true,
-        relay_reachable: true,
+        endpoint_online: !state.node.endpoint.is_closed(),
+        relay_reachable: state
+            .node
+            .endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .any(|relay| relay.is_connected()),
         relay_rtt_ms: None,
-        direct_peers: 0,
-        relayed_peers: 0,
+        direct_peers: sessions
+            .iter()
+            .filter(|session| session.live && session.path == "direct")
+            .count(),
+        relayed_peers: sessions
+            .iter()
+            .filter(|session| session.live && session.path == "relay")
+            .count(),
         total_peers: total,
-        notes: vec![
-            "NAT classification and path telemetry land with richer peer metrics".into(),
-            format!("mesh peers known: {total}"),
-        ],
+        notes: vec![format!("mesh peers known: {total}")],
     }
 }
 
@@ -973,7 +988,14 @@ pub(crate) async fn run_ping(
     let mut path = "unknown".to_string();
 
     for seq in 1..=count {
-        match ping::ping_peer(&state.node.pool, resolved.endpoint, seq).await {
+        match ping::ping_peer(
+            &state.node.pool,
+            resolved.endpoint,
+            resolved.network_id,
+            seq,
+        )
+        .await
+        {
             Ok(result) => {
                 received += 1;
                 latencies.push(result.latency_ms);

@@ -18,6 +18,7 @@ pub enum AgentErrorKind {
     InvalidRequest,
     JoinFailed,
     ActivateFailed,
+    CleanupFailed,
     DataPlane,
     Busy,
     Stopped,

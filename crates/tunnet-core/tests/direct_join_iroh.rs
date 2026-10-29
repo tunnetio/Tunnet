@@ -1,5 +1,7 @@
 //! Protocol-level Direct join tests using two real iroh endpoints.
 
+#![cfg(feature = "direct")]
+
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -122,8 +124,6 @@ impl JoinPublisher for MemNet {
             },
         )?;
         g.members.insert(entry.endpoint_id.clone(), entry.clone());
-        self.auth
-            .insert(entry.endpoint_id.clone(), g.genesis.network_id);
         Ok(JoinAdmission {
             genesis: g.genesis.clone(),
             ipv4: entry.ipv4,
@@ -147,7 +147,6 @@ impl JoinPublisher for MemNet {
 struct JoinHandler {
     authority: DirectAuthority,
     net: MemNet,
-    auth: AuthCache,
 }
 
 impl std::fmt::Debug for JoinHandler {
@@ -159,11 +158,6 @@ impl std::fmt::Debug for JoinHandler {
 impl ProtocolHandler for JoinHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         match tunnet_core::direct::run_join_server(&conn, &self.authority, &self.net).await {
-            Ok(resp) if resp.status == JoinStatus::Admitted => {
-                for m in self.net.snapshot().members {
-                    self.auth.insert(m.endpoint_id, self.authority.network_id);
-                }
-            }
             Ok(_) => {}
             Err(e) => tracing::debug!(?e, "join server"),
         }
@@ -204,6 +198,7 @@ struct Harness {
     _router: Router,
     vk: ed25519_dalek::VerifyingKey,
     disco: MemoryLookup,
+    ctx: SharedAuthServerContext,
 }
 
 async fn harness() -> Harness {
@@ -241,6 +236,31 @@ async fn harness() -> Harness {
     let vk_for_ctx = vk;
     let net_for_ctx = net.clone();
     let ctx = Arc::new(AuthServerContext {
+        resolve_self_grant: Arc::new({
+            let net = net.clone();
+            let endpoint_id = coord.id().to_string();
+            move |network| {
+                let g = net.inner.lock();
+                if network != g.genesis.network_id {
+                    return None;
+                }
+                let now = jiff::Timestamp::now();
+                sign_grant(
+                    &g.sk,
+                    NetworkGrant {
+                        network_id: network,
+                        endpoint_id: endpoint_id.clone(),
+                        role: MemberRole::Member,
+                        network_epoch: 0,
+                        issued_at: now,
+                        expires_at: grant_expiry(now).ok()?,
+                        content_key: g.content_key.clone(),
+                        sig: String::new(),
+                    },
+                )
+                .ok()
+            }
+        }),
         resolve_coord_vk: Arc::new(move |_| Some(vk_for_ctx)),
         resolve_min_epoch: Arc::new(|_| 0),
         is_revoked: Arc::new({
@@ -254,13 +274,12 @@ async fn harness() -> Harness {
             JoinHandler {
                 authority: authority.clone(),
                 net: net.clone(),
-                auth: auth.clone(),
             },
         )
         .accept(
             AUTH_ALPN,
             AuthHandler {
-                ctx,
+                ctx: ctx.clone(),
                 auth: auth.clone(),
                 self_id: format!("{}", coord.id()),
             },
@@ -275,6 +294,7 @@ async fn harness() -> Harness {
         _router: router,
         vk,
         disco,
+        ctx,
     }
 }
 
@@ -325,7 +345,7 @@ async fn one_time_join_then_same_endpoint_retry() {
     let adm = r1.admission.unwrap();
     verify_admission(&invite, &format!("{}", a.id()), "alpha", &adm).unwrap();
     assert_eq!(h.net.member_count(), 1);
-    assert!(h.auth.contains(&format!("{}", a.id())));
+    assert!(!h.auth.contains(&format!("{}", a.id())));
 
     let r2 = join_once(&a, &h.coord, &invite.invite_secret, "alpha").await;
     assert_eq!(r2.status, JoinStatus::Admitted);
@@ -583,7 +603,7 @@ async fn revoked_peer_cannot_rejoin_or_auth() {
     assert_eq!(r2.reason.as_deref(), Some("revoked"));
 
     let conn = a.connect(h.coord.id(), AUTH_ALPN).await.expect("dial auth");
-    let err = run_auth_client(&conn, grant, &format!("{}", a.id())).await;
+    let err = run_auth_client(&conn, grant, &a.id().to_string(), &h.ctx, &AuthCache::new()).await;
     assert!(err.is_err());
 }
 
@@ -632,15 +652,27 @@ async fn create_invite_join_verified_membership_and_auth() {
     let adm = resp.admission.unwrap();
     verify_admission(&decoded, &format!("{}", a.id()), "node", &adm).unwrap();
     verify_grant(&h.vk, &adm.network_grant, 0).unwrap();
-    assert!(h.auth.contains(&format!("{}", a.id())));
+    assert!(!h.auth.contains(&format!("{}", a.id())));
 
     let conn = a
         .connect(h.coord.id(), AUTH_ALPN)
         .await
         .expect("dial grant auth");
-    run_auth_client(&conn, adm.network_grant, &format!("{}", a.id()))
-        .await
-        .expect("grant auth");
+    let client_auth = AuthCache::new();
+    run_auth_client(
+        &conn,
+        adm.network_grant,
+        &a.id().to_string(),
+        &h.ctx,
+        &client_auth,
+    )
+    .await
+    .expect("grant auth");
+    assert!(
+        h.auth
+            .contains_network(&a.id().to_string(), h.authority.network_id)
+    );
+    assert!(client_auth.contains_network(&h.coord.id().to_string(), h.authority.network_id));
 }
 
 #[tokio::test]
