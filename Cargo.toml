@@ -172,7 +172,7 @@ sysinfo = "0.39.6"
 os_info = "3"
 whoami = "2"
 rusqlite = { version = "0.39", features = ["bundled"] }
-zip = "8.6.0"
+zip = "9.0.5"
 sigstore-verify = { version = "0.13.0", default-features = false, features = [
   "rustls",
   "tuf",
