@@ -7,7 +7,14 @@ use tunnet_common::local_api::{
     NetworkCreateRequest, NetworkJoinRequest, NetworkLeaveRequest, NetworkUpgradeRequest,
 };
 
+use tunnet_core::direct::invite::{InviteAdmission, decode_invite};
+
 use crate::cmds::ipc_or_err;
+
+/// Join blocks until the coordinator decides, which can take as long as a human
+/// takes to answer, so say so instead of looking hung.
+const AWAITING_APPROVAL: &str = "This invite needs the coordinator's approval. Waiting until \
+     it runs `tunnet requests` and `tunnet accept <peer-id>` (Ctrl-C to give up).";
 
 #[derive(Args, Debug)]
 pub struct CreateArgs {
@@ -175,6 +182,12 @@ pub async fn run_join(args: JoinArgs, state_dir: Option<&str>) -> anyhow::Result
         auto_accept_firewall: args.auto_accept_firewall,
         no_encrypt_state: args.no_encrypt_state,
     };
+    // The daemon validates the invite; this read is only for the notice.
+    if decode_invite(&body.invite_code)
+        .is_ok_and(|invite| invite.admission == InviteAdmission::ApprovalRequired)
+    {
+        eprintln!("{AWAITING_APPROVAL}");
+    }
     let resp = client.network_join(&body).await?;
     println!("{}", resp.message);
     crate::cmds::wait_until_daemon(state_dir, 60).await
@@ -188,8 +201,14 @@ pub async fn run_invite(args: InviteArgs, state_dir: Option<&str>) -> anyhow::Re
         require_approval: args.reusable || args.require_approval,
         expires: args.expires,
     };
+    let require_approval = body.require_approval;
     let resp = client.direct_invite(&body).await?;
     println!("{}", resp.code);
+    if require_approval {
+        eprintln!(
+            "Joins with this invite wait for approval: `tunnet requests`, then `tunnet accept <peer-id>`."
+        );
+    }
     Ok(())
 }
 
