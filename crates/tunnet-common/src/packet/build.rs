@@ -59,6 +59,35 @@ fn synthesize_icmp_unreach(packet: &Packet<'_>) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
+/// ICMPv4 "fragmentation needed" telling the sender of `packet` to fit `mtu`.
+///
+/// `None` unless `packet` is an IPv4 datagram with DF set that is not itself an
+/// ICMP error: without DF the sender would not act on it, and RFC 1122 forbids
+/// answering an ICMP error with another.
+pub fn synthesize_frag_needed(packet: &[u8], mtu: u16) -> Option<Bytes> {
+    let ip = etherparse::Ipv4HeaderSlice::from_slice(packet).ok()?;
+    if !ip.dont_fragment() {
+        return None;
+    }
+    let header_len = ip.slice().len();
+    if ip.protocol() == etherparse::IpNumber::ICMP {
+        let icmp_type = *packet.get(header_len)?;
+        if !matches!(icmp_type, 0 | 8 | 13 | 14) {
+            return None;
+        }
+    }
+    // The quoted header plus 8 bytes is what the sender needs to find the socket.
+    let quoted = &packet[..packet.len().min(header_len + 8)];
+    let builder = PacketBuilder::ipv4(ip.destination(), ip.source(), 64).icmpv4(
+        Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu: mtu },
+        ),
+    );
+    let mut out = Vec::with_capacity(builder.size(quoted.len()));
+    builder.write(&mut out, quoted).ok()?;
+    Some(Bytes::from(out))
+}
+
 /// Recompute IPv4 + TCP checksums after an in-place TCP port rewrite.
 pub fn set_tcp_ipv4_checksum(packet: &mut [u8], ip_header_len: usize) -> bool {
     if packet.len() < ip_header_len + TcpHeader::MIN_LEN {

@@ -153,8 +153,8 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 
 # Networking
-iroh = { version = "1.3.0" }
-iroh-relay = { version = "1.3.0", default-features = false, features = [
+iroh = { version = "1.4.1" }
+iroh-relay = { version = "1.4.1", default-features = false, features = [
   "server",
 ] }
 iroh-gossip = "0.101"
@@ -219,3 +219,11 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# `Builder::direct_addr_filter` (n0-computer/iroh#4397): keeps overlay
+# addresses out of QUIC NAT traversal candidates. Drop once released upstream.
+[patch.crates-io]
+iroh = { git = "https://github.com/rayfish/iroh", rev = "1a746aac234606bc978f525d49f5a7d43c208c6d" }
+iroh-base = { git = "https://github.com/rayfish/iroh", rev = "1a746aac234606bc978f525d49f5a7d43c208c6d" }
+iroh-dns = { git = "https://github.com/rayfish/iroh", rev = "1a746aac234606bc978f525d49f5a7d43c208c6d" }
+iroh-relay = { git = "https://github.com/rayfish/iroh", rev = "1a746aac234606bc978f525d49f5a7d43c208c6d" }

@@ -1619,18 +1619,30 @@ impl ConnPool {
     }
 }
 
+/// A packet exceeded the connection's current `max_datagram_size`.
+///
+/// `max` drops to the QUIC floor (1200-byte UDP payload) whenever any path of
+/// the connection has not completed MTU discovery, which is below the TUN MTU.
+#[derive(Debug, thiserror::Error)]
+#[error("datagram_too_large: packet {len} > max_datagram_size {max}")]
+pub struct DatagramTooLarge {
+    pub len: usize,
+    pub max: usize,
+}
+
 /// Send a datagram, waiting for buffer space when congested instead of dropping.
 ///
-/// Drops packets larger than the connection's current `max_datagram_size`.
+/// Refuses packets larger than the connection's current `max_datagram_size`
+/// with [`DatagramTooLarge`].
 pub async fn send_datagram(conn: &Connection, packet: Bytes) -> anyhow::Result<()> {
     if let Some(max) = conn.max_datagram_size()
         && packet.len() > max
     {
-        anyhow::bail!(
-            "datagram_too_large: packet {} > max_datagram_size {}",
-            packet.len(),
-            max
-        );
+        return Err(DatagramTooLarge {
+            len: packet.len(),
+            max,
+        }
+        .into());
     }
     if conn.datagram_send_buffer_space() == 0 {
         conn.send_datagram_wait(packet)

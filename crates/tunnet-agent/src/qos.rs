@@ -12,7 +12,9 @@ use dashmap::DashMap;
 use iroh::EndpointId;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use tun_rs::AsyncDevice;
 use tunnet_core::ConnPool;
+use tunnet_core::iroh_pool::DatagramTooLarge;
 
 use crate::metrics::AgentMetrics;
 use tunnet_common::packet::{Packet, TcpFlags, Transport};
@@ -185,15 +187,20 @@ pub struct OutboundScheduler {
     pool: ConnPool,
     metrics: AgentMetrics,
     mtu: u16,
+    tun: Arc<AsyncDevice>,
 }
 
 impl OutboundScheduler {
-    pub fn new(pool: ConnPool, metrics: AgentMetrics, mtu: u16) -> Self {
+    /// `tun` receives ICMP "fragmentation needed" for packets the connection
+    /// cannot carry, so senders shrink their path MTU instead of retransmitting
+    /// into a drop.
+    pub fn new(pool: ConnPool, metrics: AgentMetrics, mtu: u16, tun: Arc<AsyncDevice>) -> Self {
         Self {
             peers: Arc::new(DashMap::new()),
             pool,
             metrics,
             mtu: mtu.max(576),
+            tun,
         }
     }
 
@@ -218,8 +225,9 @@ impl OutboundScheduler {
             let metrics = self.metrics.clone();
             let peers = self.peers.clone();
             let mtu = self.mtu;
+            let tun = self.tun.clone();
             tokio::spawn(async move {
-                run_peer_sender(peer, state, pool, metrics, mtu).await;
+                run_peer_sender(peer, state, pool, metrics, mtu, tun).await;
                 peers.remove(&peer);
             });
         } else {
@@ -234,6 +242,7 @@ async fn run_peer_sender(
     pool: ConnPool,
     metrics: AgentMetrics,
     mtu: u16,
+    tun: Arc<AsyncDevice>,
 ) {
     let mut deficit = [0usize; 3]; // latency, normal, bulk
     loop {
@@ -262,21 +271,27 @@ async fn run_peer_sender(
                 let n = packet.len();
                 deficit[idx] -= n;
                 sent_any = true;
-                match pool.send_or_buffer(peer, packet).await {
+                match pool.send_or_buffer(peer, packet.clone()).await {
                     Ok(()) => {
                         metrics.packets_inc("out");
                         metrics.bytes_add("out", n as u64);
                         pool.record_bytes_out(peer, n as u64);
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("datagram_too_large") {
+                    Err(e) => match e.downcast_ref::<DatagramTooLarge>() {
+                        Some(too_large) => {
                             metrics.dropped_inc("datagram_too_large");
-                        } else {
+                            let mtu = u16::try_from(too_large.max).unwrap_or(u16::MAX);
+                            if let Some(ptb) =
+                                tunnet_common::packet::synthesize_frag_needed(&packet, mtu)
+                            {
+                                let _ = tun.send(&ptb).await;
+                            }
+                        }
+                        None => {
                             tracing::debug!(%peer, ?e, "send/buffer failed");
                             metrics.dropped_inc("send_failed");
                         }
-                    }
+                    },
                 }
             }
         }

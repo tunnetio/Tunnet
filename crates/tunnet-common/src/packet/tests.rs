@@ -192,6 +192,62 @@ fn reject_rst_checksum_valid() {
     }
 }
 
+fn set_dont_fragment(packet: &mut [u8], df: bool) {
+    let (mut ip, _) = Ipv4Header::from_slice(packet).unwrap();
+    ip.dont_fragment = df;
+    ip.header_checksum = ip.calc_header_checksum();
+    let mut bytes = Vec::new();
+    ip.write(&mut bytes).unwrap();
+    packet[..bytes.len()].copy_from_slice(&bytes);
+}
+
+#[test]
+fn frag_needed_reports_mtu_and_quotes_original() {
+    let mut p = ipv4_tcp([10, 0, 0, 2], [10, 0, 0, 1], 9999, 22, &[0; 1200]);
+    set_dont_fragment(&mut p, true);
+    let reply = synthesize_frag_needed(&p, 1162).unwrap();
+
+    let (ip, rest) = Ipv4Header::from_slice(&reply).unwrap();
+    assert_eq!(ip.source, [10, 0, 0, 1]);
+    assert_eq!(ip.destination, [10, 0, 0, 2]);
+    assert_eq!(ip.header_checksum, ip.calc_header_checksum());
+    let (icmp, quoted) = etherparse::Icmpv4Header::from_slice(rest).unwrap();
+    assert_eq!(
+        icmp.icmp_type,
+        etherparse::Icmpv4Type::DestinationUnreachable(
+            etherparse::icmpv4::DestUnreachableHeader::FragmentationNeeded { next_hop_mtu: 1162 }
+        )
+    );
+    assert_eq!(icmp.checksum, icmp.icmp_type.calc_checksum(quoted));
+    assert_eq!(
+        quoted,
+        &p[..28],
+        "IP header plus the first 8 transport bytes"
+    );
+}
+
+#[test]
+fn frag_needed_requires_dont_fragment() {
+    let mut p = ipv4_udp([10, 0, 0, 2], [10, 0, 0, 1], 5000, 6000, &[0; 1200]);
+    set_dont_fragment(&mut p, false);
+    assert!(synthesize_frag_needed(&p, 1162).is_none());
+}
+
+#[test]
+fn frag_needed_never_answers_an_icmp_error() {
+    let mut inner = ipv4_udp([10, 0, 0, 1], [10, 0, 0, 2], 5000, 6000, &[]);
+    set_dont_fragment(&mut inner, true);
+    let mut error = synthesize_frag_needed(&inner, 1162).unwrap().to_vec();
+    set_dont_fragment(&mut error, true);
+    assert!(synthesize_frag_needed(&error, 1162).is_none());
+
+    let b = PacketBuilder::ipv4([10, 0, 0, 1], [10, 0, 0, 2], 64).icmpv4_echo_request(1, 1);
+    let mut echo = Vec::new();
+    b.write(&mut echo, &[0; 1200]).unwrap();
+    set_dont_fragment(&mut echo, true);
+    assert!(synthesize_frag_needed(&echo, 1162).is_some());
+}
+
 #[test]
 fn protocol_any_is_not_unknown() {
     assert_ne!(Protocol::from_ip_number(47), Protocol::Any);
