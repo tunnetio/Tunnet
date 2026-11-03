@@ -7,6 +7,19 @@ pub struct AgentMetrics {
     handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
+/// Decrements `tunnet_active_connections` on drop.
+///
+/// Readers are aborted when a newer one replaces them, which skips any code
+/// after the await they were parked on, so the decrement cannot be a statement.
+#[must_use]
+pub struct ActiveConn(());
+
+impl Drop for ActiveConn {
+    fn drop(&mut self) {
+        gauge!("tunnet_active_connections").decrement(1.0);
+    }
+}
+
 impl AgentMetrics {
     /// Test handle without installing a global recorder (parallel tests).
     #[cfg(test)]
@@ -85,12 +98,10 @@ impl AgentMetrics {
         counter!("tunnet_dropped_packets_total", "reason" => reason).increment(1);
     }
 
-    pub fn active_conns_inc(&self) {
+    /// Count one tunnel reader in `tunnet_active_connections` while the guard lives.
+    pub fn active_conn(&self) -> ActiveConn {
         gauge!("tunnet_active_connections").increment(1.0);
-    }
-
-    pub fn active_conns_dec(&self) {
-        gauge!("tunnet_active_connections").decrement(1.0);
+        ActiveConn(())
     }
 
     pub fn direct_conflict(&self, category: &'static str, count: f64) {
