@@ -1657,19 +1657,14 @@ pub(crate) fn direct_keep_alive(
     enable: bool,
 ) -> anyhow::Result<String> {
     let _ = state.node.persisted.require_direct_network(None)?;
-    if enable {
-        state.node.pool.add_keep_alive_host(hostname);
-        if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
-            state.node.pool.set_peer_keep_alive(peer.endpoint, true);
-        }
-        Ok(format!("Keep-alive enabled for {hostname}"))
-    } else {
-        state.node.pool.remove_keep_alive_host(hostname);
-        if let Some(peer) = state.node.routes.lookup_hostname(hostname) {
-            state.node.pool.set_peer_keep_alive(peer.endpoint, false);
-        }
-        Ok(format!("Keep-alive disabled for {hostname}"))
-    }
+    let Some(peer) = state.node.routes.lookup_hostname(hostname) else {
+        anyhow::bail!("no peer named {hostname} in the joined networks");
+    };
+    state.node.pool.set_peer_keep_alive(peer.endpoint, enable);
+    Ok(format!(
+        "Keep-alive {} for {hostname}",
+        if enable { "enabled" } else { "disabled" }
+    ))
 }
 
 #[cfg(test)]
